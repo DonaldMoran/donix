@@ -878,6 +878,32 @@ void sys_arch_set_fs(void* base) {
     wrmsr(0xC0000100, addr);
 }
 
+/*
+ * Linux x86_64 arch_prctl(2).
+ *
+ * musl's __init_tls calls arch_prctl(ARCH_SET_FS, tp) before
+ * __libc_start_main, so a musl binary will hit this before main().
+ *
+ * Only ARCH_SET_FS (0x1002) is implemented in A2 item 1.  Other
+ * codes return -1 for now; -EINVAL and the remaining subcodes
+ * (ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS) come later if a specific
+ * musl or busybox path needs them.
+ *
+ * Distinct syscall from SYS_ARCH_SET_FS (11), which takes only the
+ * base address and is what the newlib userland uses.  Case 11 stays
+ * in place so the regression canary keeps working.
+ */
+#define ARCH_SET_FS 0x1002
+
+long sys_arch_prctl(int code, void* addr) {
+    if (code == ARCH_SET_FS) {
+        wrmsr(0xC0000100, (uint64_t)addr);
+        return 0;
+    }
+    return -1;
+}
+
+
 static void kernel_do_reboot(void) {
     serial_print("[REBOOT] closing file handles before reset\n");
     close_all_files(process_get_current());
@@ -898,6 +924,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case 9:  return (uint64_t)sys_waitpid((long)arg0, (int*)arg1, (int)arg2);
         case 10: return (uint64_t)sys_brk((long)arg0);
         case 11: sys_arch_set_fs((void*)arg0); return 0;
+        case 158: return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case 12: return (uint64_t)sys_opendir((const char*)arg0);
         case 13: return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
         case 14: return (uint64_t)sys_closedir((int)arg0);
