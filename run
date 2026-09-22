@@ -20,7 +20,8 @@ menu() {
     # the single-drive config. The `runkernel64-single` target re-runs that
     # same `make` (see the top-level Makefile), which is a no-op if nothing
     # changed. So we skip the explicit second build here.
-    make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
+    make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-debug-log > capture.txt
+    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-kvm-single > capture.txt
 
     :  # no-op so an empty body is valid
