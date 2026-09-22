@@ -223,8 +223,9 @@ pm_entry:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov esp, 0x90000
-
+;   mov esp, 0x90000
+    mov esp, 0x1FFF0
+    
     mov eax, cr4
     or  eax, 1 << 5
     mov cr4, eax
