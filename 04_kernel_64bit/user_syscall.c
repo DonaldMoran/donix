@@ -802,6 +802,32 @@ long sys_write(int fd, const void* buf, size_t count) {
     return -1;
 }
 
+struct iovec {
+    void*  iov_base;
+    size_t iov_len;
+};
+
+/*
+ * Linux x86_64 writev(2) — syscall 20.
+ *
+ * musl's stdio uses writev for buffered output.  This is a thin
+ * loop over sys_write; partial writes are returned as a short
+ * count (which is what write(2) semantics allow and what musl
+ * expects).  Stops early on a short write, like the kernel.
+ */
+long sys_writev(int fd, const struct iovec* iov, int iovcnt) {
+    if (!iov || iovcnt <= 0) return 0;
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        long n = sys_write(fd, iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return (total > 0) ? total : n;
+        total += n;
+        if ((size_t)n < iov[i].iov_len) break;  /* short write — stop */
+    }
+    return total;
+}
+
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
@@ -916,6 +942,27 @@ long sys_set_tid_address(int* tidptr) {
     return (long)current->pid;
 }
 
+/*
+ * Linux x86_64 ioctl(2) — minimal stub.
+ *
+ * musl's __stdout_write calls ioctl(1, TCGETS, &tio) to decide
+ * whether stdout is a terminal.  If the ioctl fails, musl treats
+ * stdout as a regular file and uses fully-buffered stdio, flushing
+ * on exit.  That is exactly the behavior we want for donix's serial
+ * console, which is not a POSIX tty.
+ *
+ * Return -ENOTTY (errno 25) for all requests.  The Linux syscall ABI
+ * expects negative errno in the return register.
+ *
+ * If a later test genuinely needs a working TCGETS (e.g. busybox's
+ * `tput` or `stty`), implement a proper termios response then.
+ */
+#define ENOTTY 25
+long sys_ioctl(int fd, unsigned long request, void* argp) {
+    (void)fd; (void)request; (void)argp;
+    return -(long)ENOTTY;
+}
+
 void sys_exit(int status) {
     pcb_t* self = process_get_current();
     if (self) {
@@ -979,10 +1026,12 @@ uint64_t syscall_dispatch(uint64_t num,
         case 158: return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case 218: return (uint64_t)sys_set_tid_address((int*)arg0);
         case 231: sys_exit((int)arg0); return 0;
+        case 16: return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case 12: return (uint64_t)sys_opendir((const char*)arg0);
         case 13: return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
         case 14: return (uint64_t)sys_closedir((int)arg0);
-        case 20: return (uint64_t)sys_getpid();
+        case 20: return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case 39: return (uint64_t)sys_getpid();
         case 25: kernel_do_reboot(); return 0;
         case 60: sys_exit((int)arg0); return 0;
         default:
