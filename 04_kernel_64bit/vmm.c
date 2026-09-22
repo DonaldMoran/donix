@@ -335,6 +335,17 @@ uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
     uint64_t* pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
 
     if (!(pd[pd_idx] & PT_PRESENT)) return 0;
+
+    /* If the PDE is a 2 MB huge page (PS bit set), compute the
+       physical address directly.  Without this, the walk would
+       dereference the huge page's physical base as a page-table
+       pointer and return garbage. */
+    if (pd[pd_idx] & 0x80) {
+        uint64_t huge_phys = pd[pd_idx] & ~0x1FFFFFULL;
+        uint64_t offset_2m = virt & 0x1FFFFFULL;
+        return huge_phys + offset_2m;
+    }
+
     uint64_t* pt = (uint64_t*)phys_to_virt(pd[pd_idx] & ~0xFFFULL);
 
     if (!(pt[pt_idx] & PT_PRESENT)) return 0;
@@ -381,6 +392,36 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     } else {
         pdpt[pdpt_idx] |= (PT_WRITE | PT_USER);
         pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    }
+
+    /* If the PDE is a 2 MB huge page (PS bit set), split it into
+       512 4 KB PTEs before continuing.  The bootloader installs
+       2 MB huge pages for the low-memory identity map and the HHDM.
+       Without this split, the code below would treat the huge page's
+       physical base as a page-table pointer and write the new PTE
+       into memory that isn't a page table.  Splits are on-demand. */
+    if (pd[pd_idx] & 0x80) {
+        uint64_t huge_phys  = pd[pd_idx] & ~0x1FFFFFULL;
+        uint64_t huge_flags = pd[pd_idx] & 0xFFF;
+
+        uint64_t new_pt_phys = pmm_alloc_page_for_tables();
+        if (!new_pt_phys) return;
+        uint64_t* split_pt = (uint64_t*)phys_to_virt(new_pt_phys);
+
+        uint64_t carry = huge_flags & (PT_PRESENT | PT_WRITE | PT_USER);
+        for (int m = 0; m < 512; m++) {
+            split_pt[m] = (huge_phys + (uint64_t)m * 0x1000) | carry;
+        }
+        pd[pd_idx] = new_pt_phys | carry;
+
+        uint64_t active_cr3_split;
+        asm volatile("mov %%cr3, %0" : "=r"(active_cr3_split));
+        if ((active_cr3_split & ~0xFFFULL) == (cr3 & ~0xFFFULL)) {
+            uint64_t base = virt & ~0x1FFFFFULL;
+            for (uint64_t a = base; a < base + 0x200000; a += 0x1000) {
+                asm volatile("invlpg (%0)" : : "r"(a) : "memory");
+            }
+        }
     }
 
     uint64_t* pt;
