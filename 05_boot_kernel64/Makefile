@@ -120,6 +120,16 @@ run-kvm-single: hdd-single.img
 		-serial stdio -display sdl -enable-kvm -cpu host
 run-telnet:
 	qemu-system-x86_64 -cpu max -drive file=hdd.img,format=raw -serial telnet::4444,server,nowait -display sdl
+run-gdb-single: hdd-single.img
+	qemu-system-x86_64 -cpu max \
+		-drive file=hdd-single.img,format=raw,if=ide,index=0 \
+		-serial stdio -display sdl -monitor none \
+		-s -S
+run-debug-log: hdd-single.img
+	qemu-system-x86_64 -cpu max \
+		-drive file=hdd-single.img,format=raw,if=ide,index=0 \
+		-serial stdio -display sdl -monitor none \
+		-d in_asm,cpu -D /tmp/qemu-log.txt
 log:
 	qemu-system-x86_64 -cpu max -drive file=hdd.img,format=raw \
 		-d int,cpu_reset,guest_errors,unimp,page -no-reboot -no-shutdown \
