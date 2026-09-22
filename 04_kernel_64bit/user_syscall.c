@@ -864,6 +864,28 @@ long sys_getpid(void) {
     return (long)current->pid;
 }
 
+/*
+ * Linux x86_64 set_tid_address(2).
+ *
+ * musl's __libc_start_main calls this during init and uses the
+ * return value as the caller's TID (in musl's single-threaded
+ * model, that's the same as the pid).  The kernel's job is just
+ * to return a stable, positive number.
+ *
+ * The tidptr argument is the address the kernel is supposed to
+ * clear when the thread exits (clear_child_tid).  We don't track
+ * that yet — musl only uses the return value in __libc_start_main,
+ * and busybox doesn't rely on clear_child_tid for correctness in
+ * our single-threaded model.  Add the pointer tracking later if a
+ * specific test requires it.
+ */
+long sys_set_tid_address(int* tidptr) {
+    (void)tidptr;
+    pcb_t* current = process_get_current();
+    if (!current) return 1;
+    return (long)current->pid;
+}
+
 void sys_exit(int status) {
     pcb_t* self = process_get_current();
     if (self) {
@@ -925,6 +947,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case 10: return (uint64_t)sys_brk((long)arg0);
         case 11: sys_arch_set_fs((void*)arg0); return 0;
         case 158: return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
+        case 218: return (uint64_t)sys_set_tid_address((int*)arg0);
         case 12: return (uint64_t)sys_opendir((const char*)arg0);
         case 13: return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
         case 14: return (uint64_t)sys_closedir((int)arg0);
