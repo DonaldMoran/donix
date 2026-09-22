@@ -717,6 +717,36 @@ long sys_waitpid(long pid, int* user_status, int options) {
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
+
+        /*
+         * Late re-scan.  A child may have exited between the scan above
+         * and this point: we were preemptible, and the child could have
+         * run to completion on another CPU tick, become a zombie, and
+         * tried to wake us — but failed, because our state was still
+         * RUNNING when it looked.  Without this re-scan, we would block
+         * on a child that has already exited and nobody would ever wake
+         * us.
+         *
+         * If a zombie is now visible, un-block, restore state, and
+         * loop; the outer for(;;) will reap it and return.
+         */
+        {
+            pcb_t* late_zombie = NULL;
+            for (uint64_t child_pid = 1; child_pid < 1000; child_pid++) {
+                pcb_t* c = process_find_by_pid(child_pid);
+                if (!c) continue;
+                if (c->parent_pid != self->pid) continue;
+                if (target != (uint64_t)-1 && c->pid != target) continue;
+                if (c->state == PROC_STATE_ZOMBIE) { late_zombie = c; break; }
+            }
+            if (late_zombie) {
+                self->state = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                self->wait_pid = 0;
+                continue;
+            }
+        }
+
         process_yield();
     }
 }
@@ -948,6 +978,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case 11: sys_arch_set_fs((void*)arg0); return 0;
         case 158: return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case 218: return (uint64_t)sys_set_tid_address((int*)arg0);
+        case 231: sys_exit((int)arg0); return 0;
         case 12: return (uint64_t)sys_opendir((const char*)arg0);
         case 13: return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
         case 14: return (uint64_t)sys_closedir((int)arg0);
