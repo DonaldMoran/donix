@@ -83,7 +83,7 @@ user_syscall_entry:
     call syscall_dispatch
     add rsp, 8                      ; discard stacked arg5
 
-    cmp rbx, 2
+    cmp rbx, 60
     je .handle_exit
 
     pop r9

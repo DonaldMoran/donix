@@ -4,8 +4,8 @@
 #include <stddef.h>
 
 #define SYS_WRITE 1
-#define SYS_EXIT  2
-#define SYS_READ  3
+#define SYS_EXIT  60
+#define SYS_READ  0
 
 /*
  * Directory syscalls (v0.6.x, Stage 3).
@@ -28,8 +28,8 @@
 #define SYS_PROCLIST    20
 #define SYS_REBOOT      25
 
-#define SYS_OPEN   4
-#define SYS_CLOSE  6
+#define SYS_OPEN   2
+#define SYS_CLOSE  3
 #define SYS_UNLINK 7
 
 /*

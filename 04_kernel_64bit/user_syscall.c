@@ -889,11 +889,10 @@ uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     (void)arg3; (void)arg4; (void)arg5;
     switch (num) {
+        case 0:  return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
         case 1:  return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
-        case 2:  sys_exit((int)arg0); return 0;
-        case 3:  return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
-        case 4:  return (uint64_t)sys_open((const char*)arg0, (int)arg1);
-        case 6:  return (uint64_t)sys_close((int)arg0);
+        case 2:  return (uint64_t)sys_open((const char*)arg0, (int)arg1);
+        case 3:  return (uint64_t)sys_close((int)arg0);
         case 7:  return (uint64_t)sys_unlink((const char*)arg0);
         case 8:  return (uint64_t)sys_exec((const char*)arg0, (int)arg1, (char**)arg2);
         case 9:  return (uint64_t)sys_waitpid((long)arg0, (int*)arg1, (int)arg2);
@@ -904,6 +903,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case 14: return (uint64_t)sys_closedir((int)arg0);
         case 20: return (uint64_t)sys_getpid();
         case 25: kernel_do_reboot(); return 0;
+        case 60: sys_exit((int)arg0); return 0;
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");
