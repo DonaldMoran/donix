@@ -20,6 +20,7 @@ CAT_ELF       := $(USERLAND_DIR)/apps/cat.elf
 ECHO_ELF      := $(USERLAND_DIR)/apps/echo.elf
 MUSL_MIN      := /tmp/musl_min
 MUSL_PRINTF   := /tmp/musl_printf
+MUSL_MALLOC   := /tmp/musl_malloc
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -85,7 +86,8 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(CAT_ELF)"       CAT.ELF ; \
 	mcopy_one "$(ECHO_ELF)"      ECHO.ELF ; \
 	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
-	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF
+	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
+	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF
 	
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
