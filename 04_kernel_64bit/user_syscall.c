@@ -135,7 +135,7 @@ static int safe_copy_to_user(void* user_dest, const void* kernel_src, size_t cou
 
 /*
  * Like safe_copy_to_user, but resolves the destination against an
- * explicit cr3 rather than the current process's.  Used by sys_exec
+ * explicit cr3 rather than the current process's.  Used by sys_execve
  * to write the child's argv region before the child ever runs.
  *
  * Does NOT switch cr3.  vmm_get_phys_from_cr3 walks the target page
@@ -323,7 +323,7 @@ long sys_unlink(const char* path) {
 }
 
 // ============================================================
-// DIRECTORY SYSCALLS
+// DIRECTORY SYSCALLS (donix-private, 500-range)
 // ============================================================
 long sys_opendir(const char* path) {
     pcb_t* self = process_get_current();
@@ -397,31 +397,33 @@ long sys_closedir(int dirfd) {
 }
 
 // ============================================================
-// SYS_EXEC — spawn a process, with argv
+// SYS_EXECVE (59) — spawn a process, with argv
+//
+// Spawn semantics, not POSIX execve.  See include/syscall.h.
 // ============================================================
-long sys_exec(const char* user_path, int argc, char** user_argv) {
+long sys_execve(const char* user_path, int argc, char** user_argv) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) return -1;
 
     if (argc < 0 || argc > EXEC_MAX_ARGC) {
-        serial_print("sys_exec: argc out of range\n");
+        serial_print("sys_execve: argc out of range\n");
         return -1;
     }
     if (argc > 0 && !user_argv) {
-        serial_print("sys_exec: argv NULL but argc > 0\n");
+        serial_print("sys_execve: argv NULL but argc > 0\n");
         return -1;
     }
 
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
-        serial_print("sys_exec: bad path pointer\n");
+        serial_print("sys_execve: bad path pointer\n");
         return -1;
     }
 
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
     if (fr != FR_OK) {
-        serial_print("sys_exec: f_open(");
+        serial_print("sys_execve: f_open(");
         serial_print(path);
         serial_print(") -> ");
         serial_print_dec(fr);
@@ -433,60 +435,60 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
     UINT got = 0;
     fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
     if (fr != FR_OK || got != sizeof(ehdr)) {
-        serial_print("sys_exec: short read of ELF header\n");
+        serial_print("sys_execve: short read of ELF header\n");
         f_close(&file);
         return -1;
     }
 
     if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
-        serial_print("sys_exec: not an ELF file\n");
+        serial_print("sys_execve: not an ELF file\n");
         f_close(&file);
         return -1;
     }
-    if (ehdr.e_ident[4] != 2) { serial_print("sys_exec: not ELFCLASS64\n"); f_close(&file); return -1; }
-    if (ehdr.e_ident[5] != 1) { serial_print("sys_exec: not little-endian\n"); f_close(&file); return -1; }
-    if (ehdr.e_type != 2)     { serial_print("sys_exec: not ET_EXEC\n"); f_close(&file); return -1; }
-    if (ehdr.e_machine != 62) { serial_print("sys_exec: not x86-64\n"); f_close(&file); return -1; }
+    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n"); f_close(&file); return -1; }
+    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n"); f_close(&file); return -1; }
+    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n"); f_close(&file); return -1; }
+    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n"); f_close(&file); return -1; }
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
         ehdr.e_phnum == 0 || ehdr.e_phnum > EXEC_MAX_PHDRS) {
-        serial_print("sys_exec: bad program header table\n");
+        serial_print("sys_execve: bad program header table\n");
         f_close(&file);
         return -1;
     }
 
     Elf64_Phdr phdrs[EXEC_MAX_PHDRS];
     if (ehdr.e_phoff > 0xFFFFFFFFULL) {
-        serial_print("sys_exec: e_phoff out of range\n");
+        serial_print("sys_execve: e_phoff out of range\n");
         f_close(&file);
         return -1;
     }
     fr = f_lseek(&file, (FSIZE_t)ehdr.e_phoff);
-    if (fr != FR_OK) { serial_print("sys_exec: lseek to phdrs failed\n"); f_close(&file); return -1; }
+    if (fr != FR_OK) { serial_print("sys_execve: lseek to phdrs failed\n"); f_close(&file); return -1; }
     UINT phbytes = (UINT)(ehdr.e_phnum * sizeof(Elf64_Phdr));
     fr = f_read(&file, phdrs, phbytes, &got);
     if (fr != FR_OK || got != phbytes) {
-        serial_print("sys_exec: short read of phdrs\n");
+        serial_print("sys_execve: short read of phdrs\n");
         f_close(&file);
         return -1;
     }
 
     FSIZE_t file_size = f_size(&file);
     if (file_size == 0 || file_size > 4ULL * 1024 * 1024) {
-        serial_print("sys_exec: file size out of range\n");
+        serial_print("sys_execve: file size out of range\n");
         f_close(&file);
         return -1;
     }
     uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
     if (!elf_buf) {
-        serial_print("sys_exec: kmalloc failed for ");
+        serial_print("sys_execve: kmalloc failed for ");
         serial_print_dec((uint64_t)file_size);
         serial_print(" bytes\n");
         f_close(&file);
         return -1;
     }
     fr = f_lseek(&file, 0);
-    if (fr != FR_OK) { serial_print("sys_exec: rewind failed\n"); kfree(elf_buf); f_close(&file); return -1; }
+    if (fr != FR_OK) { serial_print("sys_execve: rewind failed\n"); kfree(elf_buf); f_close(&file); return -1; }
     UINT total = 0;
     while (total < file_size) {
         UINT br = 0;
@@ -494,7 +496,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
         if (want > 4096) want = 4096;
         fr = f_read(&file, elf_buf + total, want, &br);
         if (fr != FR_OK) {
-            serial_print("sys_exec: read failed at offset ");
+            serial_print("sys_execve: read failed at offset ");
             serial_print_dec(total);
             serial_print("\n");
             kfree(elf_buf); f_close(&file);
@@ -505,7 +507,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
     }
     f_close(&file);
     if (total != file_size) {
-        serial_print("sys_exec: short read of file body\n");
+        serial_print("sys_execve: short read of file body\n");
         kfree(elf_buf);
         return -1;
     }
@@ -532,7 +534,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
 
     pcb_t* child = process_create(proc_name, USER_CODE_BASE, 0);
     if (!child) {
-        serial_print("sys_exec: process_create failed\n");
+        serial_print("sys_execve: process_create failed\n");
         kfree(elf_buf);
         return -1;
     }
@@ -542,7 +544,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
     kfree(elf_buf);
 
     if (entry == 0) {
-        serial_print("sys_exec: elf_load_into_process failed\n");
+        serial_print("sys_execve: elf_load_into_process failed\n");
         process_destroy(child);
         return -1;
     }
@@ -584,7 +586,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
             if (safe_copy_from_user(&user_str_va,
                                     (const char**)user_argv + i,
                                     sizeof(user_str_va)) != 0) {
-                serial_print("sys_exec: bad argv[");
+                serial_print("sys_execve: bad argv[");
                 serial_print_dec(i);
                 serial_print("] pointer\n");
                 process_destroy(child);
@@ -594,7 +596,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
             char scratch[EXEC_MAX_ARG_LEN];
             if (copy_user_string(scratch, sizeof(scratch),
                                  (const char*)user_str_va) != 0) {
-                serial_print("sys_exec: bad argv[");
+                serial_print("sys_execve: bad argv[");
                 serial_print_dec(i);
                 serial_print("] string\n");
                 process_destroy(child);
@@ -605,7 +607,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
             slen++;  /* include NUL */
 
             if (cursor + slen > argv_region_top) {
-                serial_print("sys_exec: argv region overflow\n");
+                serial_print("sys_execve: argv region overflow\n");
                 process_destroy(child);
                 return -1;
             }
@@ -613,7 +615,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
 
             if (safe_copy_to_user_cr3(child->cr3, (void*)dst,
                                       scratch, slen) != 0) {
-                serial_print("sys_exec: failed to write argv[");
+                serial_print("sys_execve: failed to write argv[");
                 serial_print_dec(i);
                 serial_print("] to child\n");
                 process_destroy(child);
@@ -629,7 +631,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
 
         if (safe_copy_to_user_cr3(child->cr3, (void*)array_base,
                                   array_data, array_bytes) != 0) {
-            serial_print("sys_exec: failed to write argv array to child\n");
+            serial_print("sys_execve: failed to write argv array to child\n");
             process_destroy(child);
             return -1;
         }
@@ -651,7 +653,7 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
     keyboard_buffer_flush();
     scheduler_ready_queue_add(child);
 
-    serial_print("sys_exec: spawned pid=");
+    serial_print("sys_execve: spawned pid=");
     serial_print_dec(child->pid);
     serial_print(" entry=0x");
     serial_print_hex(entry);
@@ -667,9 +669,9 @@ long sys_exec(const char* user_path, int argc, char** user_argv) {
 }
 
 // ============================================================
-// SYS_WAITPID
+// SYS_WAIT4 (61)
 // ============================================================
-long sys_waitpid(long pid, int* user_status, int options) {
+long sys_wait4(long pid, int* user_status, int options) {
     pcb_t* self = process_get_current();
     if (!self) return -1;
 
@@ -963,6 +965,99 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
     return -(long)ENOTTY;
 }
 
+/*
+ * Linux x86_64 mmap(2) — stub.
+ *
+ * Return -ENOMEM (errno 12).  musl's malloc will see this and fail.
+ * This is intentional for A1-completion: the syscall is now at the
+ * right number, but not yet implemented.  Real mmap lands in A2.7.
+ */
+#define ENOMEM 12
+long sys_mmap(void* addr, size_t length, int prot, int flags,
+              int fd, long offset) {
+    (void)addr; (void)length; (void)prot; (void)flags;
+    (void)fd; (void)offset;
+    return -(long)ENOMEM;
+}
+
+/*
+ * Linux x86_64 munmap(2) — stub.  Return 0 (nothing to unmap yet).
+ */
+long sys_munmap(void* addr, size_t length) {
+    (void)addr; (void)length;
+    return 0;
+}
+
+/*
+ * Linux x86_64 rt_sigaction / rt_sigprocmask — stubs.
+ *
+ * Return 0 (success).  musl's __libc_start_main installs a few
+ * signal handlers during init; the kernel doesn't do anything with
+ * them, but musl doesn't check the result in a way that matters.
+ * If musl later reads back sigaction to inspect SA_RESTORER, this
+ * will need a real table.
+ */
+long sys_rt_sigaction(int signum, const void* act, void* oldact,
+                      size_t sigsetsize) {
+    (void)signum; (void)act; (void)oldact; (void)sigsetsize;
+    return 0;
+}
+
+long sys_rt_sigprocmask(int how, const void* set, void* oldset,
+                        size_t sigsetsize) {
+    (void)how; (void)set; (void)oldset; (void)sigsetsize;
+    return 0;
+}
+
+/*
+ * Linux x86_64 set_robust_list — stub.  Return 0.
+ * musl calls this once at thread start; single-threaded programs
+ * never actually have anything to put in the list.
+ */
+long sys_set_robust_list(void* head, size_t len) {
+    (void)head; (void)len;
+    return 0;
+}
+
+/*
+ * Linux x86_64 getrandom / rseq — stubs.  Return -ENOSYS.
+ * musl doesn't require either for a static single-threaded binary;
+ * it falls back to /dev/urandom or to a fixed seed.  If a program
+ * needs real randomness later, implement getrandom against the PIT
+ * or RDRAND.
+ */
+#define ENOSYS 38
+long sys_getrandom(void* buf, size_t buflen, unsigned int flags) {
+    (void)buf; (void)buflen; (void)flags;
+    return -(long)ENOSYS;
+}
+
+long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
+    (void)rseq; (void)rseq_len; (void)flags; (void)sig;
+    return -(long)ENOSYS;
+}
+
+/*
+ * Linux x86_64 getdents64(2) — stub.  Return -ENOSYS.
+ * Real implementation lands in A2.14; musl's readdir() will then
+ * work.  For now, musl programs that need directory listing will
+ * fail cleanly.
+ */
+long sys_getdents64(int fd, void* dirp, size_t count) {
+    (void)fd; (void)dirp; (void)count;
+    return -(long)ENOSYS;
+}
+
+/*
+ * Linux x86_64 fork(2) — stub.  Return -ENOSYS.
+ * Real implementation lands in A2.11; needs cr3 clone and
+ * eager user-stack copy.  For now, musl programs that call fork
+ * will fail cleanly.
+ */
+long sys_fork(void) {
+    return -(long)ENOSYS;
+}
+
 void sys_exit(int status) {
     pcb_t* self = process_get_current();
     if (self) {
@@ -988,8 +1083,8 @@ void sys_arch_set_fs(void* base) {
  * (ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS) come later if a specific
  * musl or busybox path needs them.
  *
- * Distinct syscall from SYS_ARCH_SET_FS (11), which takes only the
- * base address and is what the newlib userland uses.  Case 11 stays
+ * Distinct syscall from SYS_ARCH_SET_FS (504), which takes only the
+ * base address and is what the newlib userland uses.  Case 504 stays
  * in place so the regression canary keeps working.
  */
 #define ARCH_SET_FS 0x1002
@@ -1014,26 +1109,40 @@ uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     (void)arg3; (void)arg4; (void)arg5;
     switch (num) {
-        case 0:  return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
-        case 1:  return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
-        case 2:  return (uint64_t)sys_open((const char*)arg0, (int)arg1);
-        case 3:  return (uint64_t)sys_close((int)arg0);
-        case 7:  return (uint64_t)sys_unlink((const char*)arg0);
-        case 8:  return (uint64_t)sys_exec((const char*)arg0, (int)arg1, (char**)arg2);
-        case 9:  return (uint64_t)sys_waitpid((long)arg0, (int*)arg1, (int)arg2);
-        case 10: return (uint64_t)sys_brk((long)arg0);
-        case 11: sys_arch_set_fs((void*)arg0); return 0;
-        case 158: return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
-        case 218: return (uint64_t)sys_set_tid_address((int*)arg0);
-        case 231: sys_exit((int)arg0); return 0;
-        case 16: return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
-        case 12: return (uint64_t)sys_opendir((const char*)arg0);
-        case 13: return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
-        case 14: return (uint64_t)sys_closedir((int)arg0);
-        case 20: return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
-        case 39: return (uint64_t)sys_getpid();
-        case 25: kernel_do_reboot(); return 0;
-        case 60: sys_exit((int)arg0); return 0;
+
+        /* --- Linux x86_64 numbers --- */
+        case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
+        case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
+        case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
+        case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
+        case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
+        case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
+        case SYS_BRK:             return (uint64_t)sys_brk((long)arg0);
+        case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+        case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+        case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
+        case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case SYS_GETPID:          return (uint64_t)sys_getpid();
+        case SYS_FORK:            return (uint64_t)sys_fork();
+        case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (int)arg1, (char**)arg2);
+        case SYS_EXIT:            sys_exit((int)arg0); return 0;
+        case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
+        case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
+        case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
+        case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
+        case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
+        case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
+        case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
+
+        /* --- donix-private numbers (500+) --- */
+        case SYS_OPENDIR:         return (uint64_t)sys_opendir((const char*)arg0);
+        case SYS_READDIR:         return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
+        case SYS_CLOSEDIR:        return (uint64_t)sys_closedir((int)arg0);
+        case SYS_REBOOT:          kernel_do_reboot(); return 0;
+        case SYS_ARCH_SET_FS:     sys_arch_set_fs((void*)arg0); return 0;
+
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");

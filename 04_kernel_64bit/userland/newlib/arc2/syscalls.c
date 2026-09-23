@@ -5,19 +5,22 @@
 #include <stdio.h>
 #include "donsdos.h"
 
-#define SYS_WRITE     1
-#define SYS_EXIT      60
+/* Linux x86_64 numbers — match include/syscall.h in the kernel tree. */
 #define SYS_READ      0
+#define SYS_WRITE     1
 #define SYS_OPEN      2
 #define SYS_CLOSE     3
-#define SYS_UNLINK    7
-#define SYS_EXEC      8
-#define SYS_WAITPID   9
-#define SYS_BRK      10
-#define SYS_OPENDIR  12
-#define SYS_READDIR  13
-#define SYS_CLOSEDIR 14
-#define SYS_REBOOT   25
+#define SYS_EXIT      60
+#define SYS_UNLINK    87
+#define SYS_EXEC      59
+#define SYS_WAITPID   61
+#define SYS_BRK       12
+
+/* donix-private numbers (500-range) — no Linux equivalent. */
+#define SYS_OPENDIR   500
+#define SYS_READDIR   501
+#define SYS_CLOSEDIR  502
+#define SYS_REBOOT    503
 
 static inline int64_t syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
     int64_t ret;
@@ -92,6 +95,8 @@ int unlink(const char *path) {
  *
  * Passes argc in the second syscall argument (rsi) and argv in the
  * third (rdx).  The kernel reads them as arg1 and arg2.
+ *
+ * Number is 59 (Linux execve) so it matches the kernel's SYS_EXECVE.
  */
 int spawn(const char *path, int argc, char **argv) {
     return (int)syscall3(SYS_EXEC,
