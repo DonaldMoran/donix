@@ -345,9 +345,73 @@ void pmm_init(BootInfo *info) {
     serial_unlock();
 }
 
+/*
+ * TEMPORARY DIAGNOSTIC — PMM HIGH-zone accounting anomaly.
+ *
+ * Prints every call to pmm_alloc_page before the IRQ-save critical
+ * section, with the caller's return address.  The point is to
+ * distinguish three cases:
+ *
+ *   (a) A flood of legitimate allocations from a kernel path we have
+ *       not identified.  The RA distribution tells us which caller.
+ *
+ *   (b) A small number of calls with pmm_free_pages corrupted by an
+ *       out-of-bounds write elsewhere in the kernel.  The call count
+ *       will not match the free-page delta between consecutive prints.
+ *
+ *   (c) The counter jumping by thousands between two consecutive
+ *       prints with the same RA — corruption happening in the window
+ *       between calls, not inside them.
+ *
+ * Caveat: this print itself perturbs timing (serial_lock holds IF=0
+ * for the duration of the line).  If the anomaly is preemption-
+ * dependent, it may not reproduce with the diagnostic in place.  If
+ * it does not reproduce, that is itself a signal.
+ *
+ * Remove this block once the anomaly is understood.
+ */
+#define PMM_ALLOC_DIAG 1
+#if PMM_ALLOC_DIAG
+static uint64_t pmm_alloc_diag_count = 0;
+#endif
+
 uint64_t pmm_alloc_page(page_type_t type) {
     uint64_t max_pages = pmm_max_physical / PAGE_SIZE;
     if (max_pages > MAX_PAGES) max_pages = MAX_PAGES;
+
+#if PMM_ALLOC_DIAG
+    /*
+     * Filter: suppress lines whose caller is inside sys_brk.
+     *
+     * sys_brk's growth loop calls pmm_alloc_page_for_elf once per
+     * page.  When musl mis-uses the old increment-based brk ABI, that
+     * loop runs for tens of thousands of iterations and floods the
+     * log.  The interesting events are everything else.
+     *
+     * The comparison range [0xFFFFFFFF8010BBD0, 0xFFFFFFFF8010BDAF)
+     * is sys_brk's symbol extent in the current kernel.elf.  If the
+     * kernel layout changes, this range must be updated.  It is a
+     * diagnostic filter, not a correctness check.
+     */
+    uint64_t ra = (uint64_t)__builtin_return_address(0);
+    if (ra < 0xFFFFFFFF8010BBD0ULL || ra > 0xFFFFFFFF8010BDAFULL) {
+        serial_lock();
+        serial_print("pmm_alloc[");
+        serial_print_dec(pmm_alloc_diag_count++);
+        serial_print("]: type=");
+        serial_print_dec((uint64_t)type);
+        serial_print(" free=");
+        serial_print_dec(pmm_free_pages);
+        serial_print(" next_low=");
+        serial_print_dec(pmm_next_low_page);
+        serial_print(" next_high=");
+        serial_print_dec(pmm_next_high_page);
+        serial_print(" ra=0x");
+        serial_print_hex(ra);
+        serial_print("\n");
+        serial_unlock();
+    }
+#endif
 
     /* Interrupts off: the test-and-set on the bitmap below must be
      * atomic with respect to any other allocation path. See the
