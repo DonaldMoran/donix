@@ -21,6 +21,10 @@ ECHO_ELF      := $(USERLAND_DIR)/apps/echo.elf
 MUSL_MIN      := /tmp/musl_min
 MUSL_PRINTF   := /tmp/musl_printf
 MUSL_MALLOC   := /tmp/musl_malloc
+PRINTNUM      := /tmp/printnum
+BRK_VERIFY    := /tmp/brk_verify
+BRKRAW        := /tmp/brkraw
+BRKGROW       := /tmp/brkgrow
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -87,7 +91,11 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(ECHO_ELF)"      ECHO.ELF ; \
 	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
 	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
-	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF
+	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF ; \
+	mcopy_one "$(PRINTNUM)"      PRINTNUM.ELF ; \
+	mcopy_one "$(BRK_VERIFY)"    BRK_VERIFY.ELF ; \
+	mcopy_one "$(BRKRAW)"        BRKRAW.ELF ; \
+	mcopy_one "$(BRKGROW)"       BRKGROW.ELF
 	
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true

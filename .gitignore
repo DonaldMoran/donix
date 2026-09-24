@@ -36,6 +36,7 @@ archive/
 diff.sh
 collect_full_sources.sh
 capture.txt
+handoff.md
 
 # OS-specific build outputs (added)
 04_kernel_64bit/test_program
