@@ -110,10 +110,14 @@ the next):
    absence caused a `#GP`.  Real permission changes not implemented.
 10. `getrandom` = 318, `rseq` = 334 (stubs returning `-ENOSYS`) — complete
 11. `fork` = 57 — **complete at `20260924D`**
-12. `execve` = 59 — **step 1 complete at `20260924F`/`20260924H`;
-    step 2 (real in-place execve) next**
-13. `wait4` = 61
-14. `getdents64` = 217
+12. `execve` = 59 — **complete at `20260924I`** (both steps: spawn
+    moved to 507, real in-place execve at 59).  Exercised by the new
+    `musl_exec` test.
+13. `wait4` = 61 — **working at `20260924I`** (blocking wait, reap,
+    parent-pid preserved across execve — all exercised by
+    `musl_exec`).  Status-propagation and `WNOHANG` tests still to
+    be added; see Part 2 "Next step".
+14. `getdents64` = 217 — **next**, currently a `-ENOSYS` stub
 
 Each of the remaining items is its own milestone. **Commit after each.**
 After each, newlib's `hello` / `memtest` / `ls` / `cat` / `echo` /
@@ -182,8 +186,13 @@ Apply each only when a specific problem requires it.
   `[user_stack_virt, user_stack_top)`, allocate fresh pages with
   `pmm_alloc_page_for_elf`, copy, remap child PTEs.
 
-- **`execve` must update the resume frame's RIP (+0x78) and RSP (+0x90)**,
-  not just the PCB.  The resume path reads the frame.
+- **`execve` must update the syscall-entry frame's RIP and RSP**, not
+  just the PCB.  The return path (`user_syscall_entry.asm`'s `sysret`)
+  reads the frame at `[kernel_stack_top - 56]` (user RIP) and
+  `[kernel_stack_top - 72]` (user RSP).  These are `ktop[-7]` and
+  `ktop[-9]` in C.  The shipped `sys_execve` writes exactly these two
+  slots.  If the assembly push order changes, these offsets must
+  change with it.
 
 - **`sys_execve` must be atomic** (`cli`/`sti`).  A previous session saw
   `#GP` when the timer fired mid-operation.
@@ -247,10 +256,10 @@ Apply each only when a specific problem requires it.
 
 - **`SYS_DONIX_SPAWN` (507) is the newlib spawn number.**  The newlib
   userland calls 507 for spawn semantics (`arc2/syscalls.c:spawn`).
-  Number 59 is reserved for the real Linux `execve` (A2.12 step 2).
-  In the current tree, 59 still dispatches to `sys_spawn` as a
-  placeholder — that is intentional and documented in
-  `include/syscall.h`.  Do not point newlib at 59.
+  Number 59 is the real Linux `execve`, implemented at `20260924I`.
+  `sys_spawn` (507) still creates a new process; `sys_execve` (59)
+  replaces the caller's address space in place.  Do not point newlib
+  at 59.
 
 ### stdio / newlib
 
@@ -278,6 +287,11 @@ Apply each only when a specific problem requires it.
   hours.  Before each build, run `git status` (shows the file as
   modified) and a targeted `grep` on the changed function.  If
   either is unexpected, stop and fix the tree before building.
+- **QEMU `-d in_asm,cpu -D /tmp/qemu-log.txt` makes everything run
+  ~1000× slower.**  It's fine for one-off instruction traces, but if
+  left on, a loop of a few hundred thousand iterations looks like a
+  hang.  Turn it off for normal testing; turn it back on only for a
+  specific investigation.
 
 ### Git hygiene (learned 2026-09-24, tag `20260924F`)
 
@@ -355,6 +369,33 @@ Apply each only when a specific problem requires it.
   protection, add the page-table walk in `sys_mprotect` and update
   the PTE bits.
 
+- **Copy-then-swap `execve` (abandoned)** (investigated 2026-09-24,
+  tag `20260924I`).  The first design for in-place `execve` built the
+  new address space in a scratch CR3 that shared the caller's kernel
+  half, then swapped.  The idea was to preserve the caller's old
+  address space on failure (Linux contract).
+
+  It failed.  The scratch CR3 had to share high-half page tables
+  with the caller's CR3; `vmm_free_user_page_tables(old_cr3)` then
+  freed page-table pages that the new CR3 still referenced, causing
+  8 double-frees and a page-fault cascade (recursive #PF, RSP
+  marching down by the handler frame size).  Two separate attempts
+  at narrowing the shared state both failed.
+
+  Fix: **abandoned copy-then-swap.**  The shipped `execve` does
+  teardown-then-load directly in `self->cr3`: no scratch, no swap,
+  no shared page tables.  Failure after teardown calls
+  `sys_exit(-1)` instead of returning `-errno`; the Linux contract
+  is not fully honored on those paths, but the paths are unreachable
+  for a validated in-memory ELF.  If a caller-recoverable failure
+  is ever needed, revisit copy-then-swap with proper page-table
+  ownership.
+
+  The two helper functions written for the abandoned design
+  (`vmm_clone_kernel_half`, `vmm_free_user_page_tables` in `vmm.c`)
+  are currently unused but kept in the tree; they may be useful when
+  `fork` needs real copy-on-write.
+
 - **`musl_printf` / `printnum` dump garbage — musl-internal, not
   kernel** (investigated 2026-09-24, tag `20260924C`).  `printf` of a
   literal or a `%d` value on musl/donix prints the correct bytes and
@@ -386,9 +427,10 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **None blocking.**  The intermittent halt was resolved at
-  `20260924F`.  See "Resolved bugs."  If the "prompt returns, keyboard
-  dead" symptom reappears, reopen it here.
+- **None blocking.**  `execve` (A2.12) and the initial `wait4` exercise
+  (A2.13) are complete at `20260924I`.  The next milestone is
+  `getdents64` (A2.14).  If the "prompt returns, keyboard dead"
+  symptom reappears, reopen it here.
 
 ### Cosmetic / housekeeping
 
@@ -398,6 +440,10 @@ Apply each only when a specific problem requires it.
 - `sys_spawn` still prints its serial trace with the prefix
   `sys_execve:` (a string literal, not a symbol).  Cosmetic; rename
   the literal to `sys_spawn:` at the next convenient edit.
+- `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in `vmm.c`
+  / `vmm.h` are unused (written for the abandoned copy-then-swap
+  `execve`).  Kept for future copy-on-write work.  If still unused
+  after A3, delete in a cleanup commit.
 
 ## Testing harness
 
@@ -407,6 +453,11 @@ Apply each only when a specific problem requires it.
 - **QEMU:** `make runkernel64-kvm-single` (fast),
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
+- **musl test binaries** are built by `build_musl_tests.sh` (tracked,
+  committed at `57a3f9e`, extended at `20260924I` with `musl_exec`).
+  Sources are heredoc'd into `/tmp/` and linked with `musl-gcc
+  -static -no-pie -O2 -mcmodel=large`.  The image build copies
+  `/tmp/musl_*` to `::/MUSL_*.ELF` on the FAT.
 
 ## Recovery
 
@@ -448,52 +499,40 @@ musl lands.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-24 (evening, session 3)
-**Current tag / HEAD:** `20260924H`
-**Last known-good tag:** `20260924H`
+**Last updated:** 2026-09-24 (late evening, session 3)
+**Current tag / HEAD:** `20260924I` (or the handoff commit on top of it)
+**Last known-good tag:** `20260924I`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 12 — `execve` = 59.  Step 1 complete; step 2 next.**
+**A2 item 12 — `execve` = 59.  COMPLETE at `20260924I`.**
 
-Step 1 moved spawn semantics off number 59 and onto a donix-private
-number so that 59 is free for the real Linux `execve`.  The rename
-landed in `20260924F` (bundled with the halt fix — see "Git hygiene"
-in Part 1), and the header documentation for 59 was updated in
-`20260924H`.  `SYS_DONIX_SPAWN` is 507; `arc2/syscalls.c:spawn` calls
-507; the kernel dispatcher still routes 59 to `sys_spawn` as a
-placeholder.
+Both steps are done:
+- Step 1 (`20260924F`/`20260924H`): spawn moved to `SYS_DONIX_SPAWN`
+  (507); 59 reserved for Linux execve.
+- Step 2 (`20260924I`): real in-place execve.  `sys_execve` replaces
+  the calling process's user address space (teardown-then-load into
+  `self->cr3`), lays out argv on a fresh user stack, rewrites the
+  syscall-entry frame, and returns 0 to the new program's entry.
+  Same pid, no new process.  Exercised by the new `musl_exec` test.
 
-Step 2 replaces the placeholder with real in-place `execve`
-semantics: the calling process's address space is replaced, no new
-process is created, the resume frame's user RIP and RSP are rewritten
-to point at the new program, and the syscall returns 0 into the new
-program's entry.
+**A2 item 13 — `wait4` = 61.**  Working, exercised by `musl_exec`
+(blocking wait, reap, parent-pid preserved across execve).  Still
+needs a status-propagation + `WNOHANG` test — see "Next step" below.
 
-### Plan for step 2
+**A2 item 14 — `getdents64` = 217.**  Next.  Currently a `-ENOSYS`
+stub in `sys_getdents64`.
 
-1. Paste `04_kernel_64bit/user_syscall_entry.asm` first — the resume
-   frame offsets in `process_fork_copy_frame`'s comment (`-56` user
-   RIP, `-72` user RSP) must be verified against the actual push order
-   in the assembly before writing any code.
-2. Design the in-place `execve`:
-   - Free the current process's old ELF pages and old user stack.
-   - Load the new ELF into the **same** CR3 (`current->cr3`).
-   - Write argv into the current process's user stack.
-   - Rewrite the current process's syscall-entry frame so the return
-     path resumes at the new program's entry with the new stack.
-3. The syscall must run with interrupts disabled (`cli`/`sti`), like
-   `sys_fork` does.
-4. Test with a musl `fork` + `execve` program; the newlib shell's
-   `spawn` path is unaffected because it now calls 507.
+`musl_printf` / `printnum` remain deferred (musl-internal, see
+"Resolved bugs" in Part 1).
 
-## Canary state (green as of `20260924H`)
+## Canary state (green as of `20260924I`)
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | |
-| ls | green | lists 18 files |
+| ls | green | lists 19 files |
 | cat | green | reads HELLO-WORLD.TXT |
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
@@ -501,6 +540,7 @@ program's entry.
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
 | musl_fork | green | prints `A`, `P`, `C` |
 | musl_fork_raw | green | prints `A`, `P`, `C` |
+| musl_exec | green | prints `EXEC-PARENT-START`, child execve's `MUSL_MIN.ELF` in place (pid preserved), `MUSL-START`, `EXEC-PARENT-DONE` |
 | musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
 | printnum | red | same root cause as `musl_printf`. |
 | brkraw | red | test binary needs re-run against the current kernel; `sys_brk` is now Linux-ABI |
@@ -509,46 +549,76 @@ program's entry.
 
 ## Next step (exactly this, then stop)
 
-**A2 item 12 step 2 — real in-place `execve`.**
+**A2 item 13 — `wait4` = 61, add a status-propagation + `WNOHANG`
+test.**
 
-1. Confirm working tree clean: `git status` shows nothing modified,
-   and HEAD is `20260924H` (or later if the handoff commit has been
-   made on top).
-2. Paste `handoff.md` plus these files:
-   - `04_kernel_64bit/user_syscall_entry.asm`
-   - `04_kernel_64bit/process.c`
-   - `04_kernel_64bit/include/process.h`
-   - `04_kernel_64bit/user_syscall.c` (the current `sys_spawn` handler
-     and dispatcher)
-   - `04_kernel_64bit/elf.c`
-3. Say: "Continue from here.  Implement A2 item 12 step 2: the real
-   Linux `execve`.  The current `case SYS_EXECVE` in `user_syscall.c`
-   routes to `sys_spawn`, which creates a new process.  Replace it
-   with an in-place `execve` that replaces the calling process's
-   address space: free the old ELF pages and user stack, load the new
-   ELF into `current->cr3`, write argv onto the current user stack,
-   rewrite the current process's resume frame (user RIP and user RSP)
-   so the syscall return path resumes at the new program's entry, and
-   return 0.  The frame offsets in `process_fork_copy_frame` claim
-   `kernel_stack_top - 56` is user RIP and `- 72` is user RSP — verify
-   those against `user_syscall_entry.asm` before writing code."
+`sys_wait4` is already exercised by `musl_exec` (blocking wait, reap,
+parent-pid preserved across execve).  What's not yet tested:
 
-`musl_printf` / `printnum` remain deferred — see "Resolved bugs" in
-Part 1.  Do not spend time on them in this session.
+1. **Non-zero exit status propagation.**  A child `_exit(42)` should
+   give the parent `WEXITSTATUS(status) == 42`.
+2. **`WNOHANG` semantics.**  `wait4(pid, &status, WNOHANG)` on a
+   still-running child must return 0 immediately, not block.
+3. **`wait4(-1, ...)`.**  Wait for any child, not a specific pid.
+
+Plan:
+
+1. Confirm working tree clean and HEAD is `20260924I` (or the handoff
+   commit on top of it).
+2. Add a new test `musl_wait` to `build_musl_tests.sh` (same pattern
+   as `musl_exec`: heredoc into `/tmp/`, `musl-gcc -static -no-pie
+   -O2 -mcmodel=large`).  The test should:
+   - fork a child that `_exit(42)`; parent `wait4` and assert
+     `WEXITSTATUS(status) == 42`;
+   - fork a child that sleeps (`nanosleep` or a `for` loop with a
+     `write`); parent `wait4(pid, &status, WNOHANG)` before it exits
+     and assert the return is 0; then `wait4(pid, &status, 0)` to
+     reap it;
+   - fork two children that exit with different codes; parent calls
+     `wait4(-1, &status, 0)` twice and asserts both pids are reaped.
+3. Add the `mcopy /tmp/musl_wait -> ::/MUSL_WAIT.ELF` line to the
+   image build (next to the other `mcopy /tmp/musl_*` lines).
+4. Add `/tmp/musl_wait` to the verification loop at the bottom of
+   `build_musl_tests.sh`.
+5. Run `./build_musl_tests.sh`, `make kernel64`, boot QEMU, run
+   `musl_wait`, paste serial output.
+
+If `sys_wait4` needs changes, they'll be small — the current
+implementation already has the `WNOHANG` branch and the
+`pid <= 0 → (uint64_t)-1` translation.  Possible gaps: whether
+`exit_status` is copied correctly (it is set in `sys_exit`, read in
+`sys_wait4`), and whether `wait4(-1)` correctly matches any child
+(the current loop does check `target != (uint64_t)-1`).  Expect
+green on the first run.
+
+After `musl_wait` is green, **A2 item 14 — `getdents64` = 217** is
+next.  Needed by musl's `readdir`, which the shell and `ls` will
+need once they're musl.
 
 ## State on disk
 
+- `/tmp/qemu-log.txt` — grew large during the copy-then-swap
+  debugging; delete it and remove `-d in_asm,cpu -D /tmp/qemu-log.txt`
+  from the QEMU invocation in the Makefile.  Turn the flag back on
+  only for a specific instruction-trace investigation.
+- `/tmp/musl_*` — musl test binaries, rebuilt by
+  `build_musl_tests.sh`.  `musl_exec` is new this session;
+  `musl_wait` will be added next.
 - `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
-- `/tmp/musl_*` — musl test binaries, rebuilt by
-  `build_musl_tests.sh` (tracked in the repo, committed at `57a3f9e`).
 - `~/code/x` — snapshot of the pre-cleanup tree, kept for diffing.
   Can be deleted; the halt it was being kept for is now resolved.
+- `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in
+  `vmm.c` / `vmm.h` are currently unused (written for the abandoned
+  copy-then-swap `execve`).  Leave them; they may be useful when
+  `fork` needs real copy-on-write.  If still unused after A3, delete
+  in a cleanup commit.
 
 ## Open items
 
-- **None blocking.**  Step 2 of `execve` is the next milestone.
+- **None blocking.**  Next milestone is `wait4` status-propagation
+  test, then `getdents64` (A2.14), then A3 (musl shell).
 - Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
 ## How to use this file
