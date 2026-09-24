@@ -23,6 +23,7 @@
 #define SYS_OPEN            2
 #define SYS_CLOSE           3
 #define SYS_MMAP            9
+#define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
 #define SYS_BRK             12
 #define SYS_RT_SIGACTION    13
@@ -49,6 +50,7 @@
 #define SYS_CLOSEDIR  502
 #define SYS_REBOOT    503
 #define SYS_ARCH_SET_FS 504
+#define SYS_DONIX_SBRK  505
 
 /* ============================================================
  * Argument conventions for the donix-private syscalls
@@ -102,7 +104,9 @@
 long sys_write(int fd, const void* buf, size_t count);
 void sys_exit(int status);
 long sys_read(int fd, void* buf, size_t count);
-void* sys_brk(long inc);
+long sys_mprotect(void* addr, size_t len, int prot);
+void* sys_brk(void* addr);
+void* sys_sbrk(long inc);
 void sys_arch_set_fs(void* base);
 
 long sys_open(const char* path, int flags);

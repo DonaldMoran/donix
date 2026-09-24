@@ -880,7 +880,99 @@ long sys_read(int fd, void* buf, size_t count) {
     return 0;
 }
 
-void* sys_brk(long inc) {
+/*
+ * Linux x86_64 brk(2) — absolute-address ABI.
+ *
+ * EXPERIMENTAL: this change breaks newlib's `sbrk` in arc2/syscalls.c,
+ * which still passes an increment.  That is intentional for this
+ * diagnostic run — the goal is to confirm the runaway-`brk` hypothesis
+ * for the MUSL_MALLOC.ELF failure.  If confirmed, the real fix is to
+ * add a donix-private increment-based syscall for newlib and leave
+ * this one Linux-ABI.
+ *
+ * ABI notes:
+ *   - brk(0)            returns the current break, unchanged.
+ *   - brk(addr)         sets the break to `addr`.
+ *   - Grows or shrinks; if it cannot move the break, returns the
+ *     OLD (unchanged) break.  Never returns -1.  Callers detect
+ *     failure by comparing the return value to the requested address.
+ *   - Refuses to move the break below heap_base.
+ *
+ * The shrink path is a no-op (returns old_brk without touching
+ * brk_virt).  Nothing in musl or busybox needs shrinking yet; add it
+ * when a specific test requires it.
+ */
+void* sys_brk(void* addr) {
+    pcb_t* current = process_get_current();
+    if (!current) return (void*)-1;
+
+    static uint64_t heap_base = 0;
+    if (heap_base == 0) heap_base = 0x8000200000ULL;
+
+    if (current->brk_virt == 0) {
+        current->brk_virt = heap_base;
+    }
+    uint64_t old_brk = current->brk_virt;
+
+    /* brk(0): query only, no change. */
+    if (addr == (void*)0) {
+        return (void*)old_brk;
+    }
+
+    uint64_t new_brk = (uint64_t)addr;
+
+    /* Refuse to move the break below the heap base. */
+    if (new_brk < heap_base) {
+        return (void*)old_brk;
+    }
+
+    if (new_brk > old_brk) {
+        uint64_t old_page = (old_brk + 0xFFF) & ~0xFFFULL;
+        uint64_t new_page = (new_brk + 0xFFF) & ~0xFFFULL;
+
+        for (uint64_t virt = old_page; virt < new_page; virt += 4096) {
+            uint64_t phys = pmm_alloc_page_for_elf();
+            if (!phys) {
+                /*
+                 * Partial growth.  We have mapped [old_page, virt) but
+                 * cannot finish.  Return the OLD break: the Linux ABI
+                 * says the caller sees the unchanged break and treats
+                 * that as failure.  The partially-mapped pages stay
+                 * mapped and are still tracked in elf_page_list; they
+                 * will be reclaimed when the process exits.
+                 */
+                return (void*)old_brk;
+            }
+
+            void* hhdm = (void*)(HHDM_START + phys);
+            for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
+
+            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
+            vmm_map_page_in_cr3(current->cr3, virt, phys, map_flags);
+            elf_add_page_to_pcb(current, phys);
+        }
+    } else if (new_brk < old_brk) {
+        /* Shrink: not implemented.  Leave the break where it is. */
+        return (void*)old_brk;
+    }
+
+    current->brk_virt = new_brk;
+    return (void*)new_brk;
+}
+
+/*
+ * donix-private sbrk (505) — increment-based, for newlib.
+ *
+ * This is the OLD sys_brk semantics, moved to a private syscall
+ * number so it no longer conflicts with the Linux brk(2) ABI at
+ * number 12.  newlib's arc2/syscalls.c:sbrk calls this.
+ *
+ * arg0: long inc  (bytes to add to the current break)
+ * returns: the OLD break on success, or (void*)-1 on failure.
+ *          This is the traditional Unix sbrk() contract, which is
+ *          what newlib's sbrk() expects.
+ */
+void* sys_sbrk(long inc) {
     pcb_t* current = process_get_current();
     if (!current) return (void*)-1;
 
@@ -891,7 +983,7 @@ void* sys_brk(long inc) {
     if (old_brk == 0) {
         current->brk_virt = heap_base; old_brk = heap_base;
     }
-    if (inc == 0) return (void*)current->brk_virt;
+    if (inc == 0) return (void*)old_brk;
 
     uint64_t new_brk = old_brk + inc;
     if (inc < 0 && new_brk < heap_base) return (void*)-1;
@@ -913,7 +1005,7 @@ void* sys_brk(long inc) {
         }
     }
     current->brk_virt = new_brk;
-    return (void*)new_brk;
+    return (void*)old_brk;
 }
 
 long sys_getpid(void) {
@@ -966,18 +1058,98 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
 }
 
 /*
- * Linux x86_64 mmap(2) — stub.
+ * Linux x86_64 mmap(2) — minimal anonymous implementation.
  *
- * Return -ENOMEM (errno 12).  musl's malloc will see this and fail.
- * This is intentional for A1-completion: the syscall is now at the
- * right number, but not yet implemented.  Real mmap lands in A2.7.
+ * TEMPORARY: reconstructed for PMM diagnostic purposes only.
+ *
+ * Handles:
+ *   - MAP_PRIVATE | MAP_ANONYMOUS, addr = NULL  (musl malloc)
+ *   - MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, addr = <page-aligned>
+ *     (musl malloc's guard-page request after brk)
+ *
+ * Ignores: fd, offset, PROT_* bits (always maps PT_PRESENT|PT_WRITE|
+ * PT_USER).  Returns -ENOMEM for anything else.
+ *
+ * Per-iteration prints match the original diagnostic run's format so
+ * the two logs can be compared directly.
+ *
+ * MMAP_BASE is 0x8010000000, same as the original.
  */
 #define ENOMEM 12
+#define MMAP_BASE 0x8010000000ULL
+#define MAP_ANONYMOUS 0x20
+#define MAP_FIXED     0x10
+
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
-    (void)addr; (void)length; (void)prot; (void)flags;
-    (void)fd; (void)offset;
-    return -(long)ENOMEM;
+    serial_lock();
+    serial_print("sys_mmap: addr=0x");
+    serial_print_hex((uint64_t)addr);
+    serial_print(" len=0x");
+    serial_print_hex((uint64_t)length);
+    serial_print(" prot=0x");
+    serial_print_hex((uint64_t)(unsigned)prot);
+    serial_print(" flags=0x");
+    serial_print_hex((uint64_t)(unsigned)flags);
+    serial_print(" fd=");
+    serial_print_dec((uint64_t)(int64_t)fd);
+    serial_print(" off=0x");
+    serial_print_hex((uint64_t)offset);
+    serial_print(" pmm_free=");
+    serial_print_dec(pmm_get_free_pages());
+    serial_print("\n");
+    serial_unlock();
+
+    if (length == 0) return -(long)22;  /* -EINVAL */
+
+    if ((flags & MAP_ANONYMOUS) == 0 || fd != -1) {
+        serial_lock();
+        serial_print("sys_mmap: unsupported flags/fd\n");
+        serial_unlock();
+        return -(long)ENOMEM;
+    }
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)ENOMEM;
+
+    uint64_t base;
+    if (flags & MAP_FIXED) {
+        base = (uint64_t)addr & ~0xFFFULL;
+    } else {
+        base = MMAP_BASE;
+    }
+    uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
+
+    for (uint64_t v = base; v < base + rounded; v += 0x1000) {
+        serial_lock();
+        serial_print("  mmap loop: v=0x");
+        serial_print_hex(v);
+        serial_print(" free=");
+        serial_print_dec(pmm_get_free_pages());
+        serial_print("\n");
+        serial_unlock();
+
+        uint64_t phys = pmm_alloc_page_for_elf();
+        if (!phys) {
+            serial_lock();
+            serial_print("  mmap loop: alloc failed at v=0x");
+            serial_print_hex(v);
+            serial_print(" free=");
+            serial_print_dec(pmm_get_free_pages());
+            serial_print("\n");
+            serial_unlock();
+            return -(long)ENOMEM;
+        }
+
+        void* hhdm = (void*)(HHDM_START + phys);
+        for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
+
+        uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
+        vmm_map_page_in_cr3(self->cr3, v, phys, map_flags);
+        elf_add_page_to_pcb(self, phys);
+    }
+
+    return (long)base;
 }
 
 /*
@@ -985,6 +1157,24 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
  */
 long sys_munmap(void* addr, size_t length) {
     (void)addr; (void)length;
+    return 0;
+}
+
+/*
+ * Linux x86_64 mprotect(2) — stub.
+ *
+ * musl calls this after mmap to set page permissions.  We don't
+ * implement real permission changes yet: every page is mapped
+ * PT_PRESENT|PT_WRITE|PT_USER by sys_mmap and sys_brk, and the
+ * caller already has read/write access.  Returning 0 tells musl
+ * the operation succeeded.
+ *
+ * If a later test requires real protection (e.g. a guard page that
+ * actually faults on access), implement the page-table walk here
+ * and update the PTE bits.
+ */
+long sys_mprotect(void* addr, size_t len, int prot) {
+    (void)addr; (void)len; (void)prot;
     return 0;
 }
 
@@ -1116,8 +1306,9 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
+        case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
-        case SYS_BRK:             return (uint64_t)sys_brk((long)arg0);
+        case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
@@ -1142,6 +1333,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_CLOSEDIR:        return (uint64_t)sys_closedir((int)arg0);
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
         case SYS_ARCH_SET_FS:     sys_arch_set_fs((void*)arg0); return 0;
+        case SYS_DONIX_SBRK:      return (uint64_t)sys_sbrk((long)arg0);
 
         default:
             serial_print("Unknown syscall: ");

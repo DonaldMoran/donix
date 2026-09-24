@@ -21,6 +21,7 @@
 #define SYS_READDIR   501
 #define SYS_CLOSEDIR  502
 #define SYS_REBOOT    503
+#define SYS_DONIX_SBRK 505
 
 static inline int64_t syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
     int64_t ret;
@@ -51,31 +52,28 @@ void exit(int status) {
     }
 }
 
+/*
+ * sbrk — increment-based, donix-private syscall 505.
+ *
+ * Syscall 12 (SYS_BRK) is Linux ABI: it takes an absolute address
+ * and returns the new break.  newlib's sbrk() is the traditional
+ * Unix contract: it takes an increment and returns the OLD break.
+ * The two are not compatible, so the kernel exposes the increment
+ * form at 505.
+ *
+ * The kernel's sys_sbrk(505) implements the whole operation: it
+ * remembers the current break per process, adds the increment,
+ * maps pages as needed, and returns the OLD break.  So this
+ * function does not need to cache or compute anything itself —
+ * it just forwards, and returns whatever the kernel returned.
+ */
 void *sbrk(ptrdiff_t incr) {
-    static int64_t heap_end_cached = 0;
-
-    if (heap_end_cached == 0) {
-        int64_t current_break = syscall3(SYS_BRK, 0, 0, 0);
-        if (current_break == -1) {
-            errno = ENOMEM;
-            return (void *)-1;
-        }
-        heap_end_cached = current_break;
-    }
-
-    if (incr == 0) {
-        return (void *)heap_end_cached;
-    }
-
-    int64_t extended_break = syscall3(SYS_BRK, (uint64_t)incr, 0, 0);
-    if (extended_break == -1) {
+    int64_t ret = syscall3(SYS_DONIX_SBRK, (uint64_t)incr, 0, 0);
+    if (ret == -1) {
         errno = ENOMEM;
         return (void *)-1;
     }
-
-    void *previous_heap_boundary = (void *)heap_end_cached;
-    heap_end_cached = extended_break;
-    return previous_heap_boundary;
+    return (void *)ret;
 }
 
 int open(const char *path, int flags, int mode) {
