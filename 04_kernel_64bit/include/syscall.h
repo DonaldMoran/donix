@@ -85,24 +85,23 @@
  * ============================================================ */
 
 /*
- * SYS_EXECVE (59) — spawn a new process from an ELF on the FAT volume.
+ * SYS_EXECVE (59) — Linux execve.  NOT YET IMPLEMENTED.
  *
- * Spawn semantics, not execve.  Creates a new process, loads the
- * named ELF into it, places argv on the child's user stack, queues
- * it, and returns its pid.  The calling process is untouched and
- * continues running.
+ * As of 20260924H, the dispatcher still routes 59 to sys_spawn as a
+ * placeholder.  The next milestone (A2.12 step 2) flips 59 to a real
+ * in-place execve that:
+ *   - replaces the calling process's address space in place,
+ *   - does not create a new process,
+ *   - does not return on success.
  *
- * NOTE: this is NOT POSIX execve.  It does not replace the calling
- * process.  It is exposed to musl at number 59 because musl's
- * higher-level code (posix_spawn, system()) calls execve and we
- * currently approximate it with a spawn.  A real execve lands in
- * A2.12.
+ * The spawn behavior that used to live at 59 is now at
+ * SYS_DONIX_SPAWN (507); see the block above.
  *
- * arg0: const char* path (user pointer, NUL-terminated, "0:/NAME.EXT")
- * arg1: int argc         (0 if no arguments; capped at EXEC_MAX_ARGC)
- * arg2: char** argv      (user pointer to array of user string
- *                         pointers; NULL if argc == 0)
- * returns: pid (>0) on success, -1 on failure
+ * arg0: const char* path        (user pointer, NUL-terminated)
+ * arg1: char* const argv[]      (user pointer to array of user string
+ *                                pointers; NULL if argc == 0)
+ * arg2: char* const envp[]      (ignored for now)
+ * returns: only on failure, as -errno
  */
 #define EXEC_MAX_ARGC 16
 #define EXEC_MAX_ARG_LEN 256
