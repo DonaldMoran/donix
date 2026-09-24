@@ -12,7 +12,7 @@
 #define SYS_CLOSE     3
 #define SYS_EXIT      60
 #define SYS_UNLINK    87
-#define SYS_EXEC      59
+#define SYS_SPAWN     507
 #define SYS_WAITPID   61
 #define SYS_BRK       12
 
@@ -94,10 +94,12 @@ int unlink(const char *path) {
  * Passes argc in the second syscall argument (rsi) and argv in the
  * third (rdx).  The kernel reads them as arg1 and arg2.
  *
- * Number is 59 (Linux execve) so it matches the kernel's SYS_EXECVE.
+ * Number is 507 (SYS_DONIX_SPAWN), the donix-private spawn number.
+ * Number 59 is reserved for Linux execve and does NOT have spawn
+ * semantics — do not point this at 59.
  */
 int spawn(const char *path, int argc, char **argv) {
-    return (int)syscall3(SYS_EXEC,
+    return (int)syscall3(SYS_SPAWN,
                          (uint64_t)path,
                          (uint64_t)(int64_t)argc,
                          (uint64_t)argv);

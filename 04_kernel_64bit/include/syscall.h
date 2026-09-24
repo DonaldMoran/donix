@@ -45,12 +45,32 @@
 #define SYS_RSEQ            334
 
 /* --- donix-private numbers (500+) --- */
-#define SYS_OPENDIR   500
-#define SYS_READDIR   501
-#define SYS_CLOSEDIR  502
-#define SYS_REBOOT    503
+#define SYS_OPENDIR     500
+#define SYS_READDIR     501
+#define SYS_CLOSEDIR    502
+#define SYS_REBOOT      503
 #define SYS_ARCH_SET_FS 504
 #define SYS_DONIX_SBRK  505
+
+/*
+ * SYS_DONIX_SPAWN (507) — spawn semantics, donix-private.
+ *
+ * This is the old sys_execve behavior, moved off number 59 so that
+ * 59 can become Linux execve (A2.12 step 2).  The newlib userland
+ * (arc2/syscalls.c:spawn) now calls this number.  musl never calls
+ * it; when musl's shell uses fork+execve it will hit number 59.
+ *
+ * Behavior: creates a NEW process, loads the named ELF into it,
+ * lays argv on its stack, queues it, returns its pid.  The caller
+ * is untouched.  This is NOT POSIX execve.
+ *
+ * arg0: const char* path (user pointer, NUL-terminated, "0:/NAME.EXT")
+ * arg1: int argc         (0 if no arguments; capped at EXEC_MAX_ARGC)
+ * arg2: char** argv      (user pointer to array of user string
+ *                         pointers; NULL if argc == 0)
+ * returns: pid (>0) on success, -1 on failure
+ */
+#define SYS_DONIX_SPAWN 507
 
 /* ============================================================
  * Argument conventions for the donix-private syscalls
@@ -112,10 +132,10 @@ void sys_arch_set_fs(void* base);
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
 long sys_unlink(const char* path);
-long sys_execve(const char* user_path, int argc, char** user_argv);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_opendir(const char* path);
 long sys_readdir(int dirfd, void* user_dirent);
 long sys_closedir(int dirfd);
 
+long sys_spawn(const char* user_path, int argc, char** user_argv);
 #endif

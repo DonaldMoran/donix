@@ -399,11 +399,16 @@ long sys_closedir(int dirfd) {
 }
 
 // ============================================================
-// SYS_EXECVE (59) — spawn a process, with argv
+// SYS_DONIX_SPAWN (507) — spawn a process, with argv
 //
 // Spawn semantics, not POSIX execve.  See include/syscall.h.
+//
+// This is the old sys_execve body, renamed and moved to the
+// donix-private number 507 so that 59 can become Linux execve.
+// The body is byte-for-byte unchanged; only the name and the
+// dispatcher case below are new.
 // ============================================================
-long sys_execve(const char* user_path, int argc, char** user_argv) {
+long sys_spawn(const char* user_path, int argc, char** user_argv) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) return -1;
 
@@ -1405,7 +1410,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
-        case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (int)arg1, (char**)arg2);
+        /* TEMP (A2.12 step 1): 59 still spawn; moves to Linux execve in step 2. */
+        case SYS_EXECVE:          return (uint64_t)sys_spawn((const char*)arg0, (int)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
@@ -1424,6 +1430,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
         case SYS_ARCH_SET_FS:     sys_arch_set_fs((void*)arg0); return 0;
         case SYS_DONIX_SBRK:      return (uint64_t)sys_sbrk((long)arg0);
+        case SYS_DONIX_SPAWN:     return (uint64_t)sys_spawn((const char*)arg0, (int)arg1, (char**)arg2);
 
         default:
             serial_print("Unknown syscall: ");

@@ -206,6 +206,42 @@ void __attribute__((noreturn)) process_exit(void) {
             while (1) __asm__ volatile("hlt");
         }
 
+        /*
+         * No runnable process.  But idle (pid 1) is always a valid
+         * target: it is not on the ready queue by design (removed at
+         * init), and it just hlt's.  Switching to idle lets the
+         * timer keep ticking; the next keyboard IRQ will wake the
+         * shell (process_wake_all_blocked sets it READY and adds it
+         * to the queue), and timer_preempt_handler will then pick
+         * it up on the next tick.
+         *
+         * The previous behavior — halt here — broke any sequence
+         * where a forked child exited while its parent (the shell)
+         * was blocked in sys_read.  The shell was off the queue,
+         * the queue was empty, and the halt path is not what a
+         * preemptible kernel should do when idle exists.
+         *
+         * If for some reason idle is gone, fall through to the old
+         * halt path as a last resort.
+         */
+        if (idle) {
+            serial_lock();
+            serial_print("EXIT-FALLBACK: switching to idle, exiting pid=");
+            serial_print_dec(exiting->pid);
+            serial_print(" name=");
+            serial_print(exiting->name);
+            serial_print("\n");
+            serial_unlock();
+
+            current_process = idle;
+            process_set_current(idle);
+            idle->state = PROC_STATE_RUNNING;
+            idle->total_ticks++;
+
+            context_switch(exiting, idle);
+            /* Not reached. */
+        }
+
         serial_lock();
         serial_print("HALT: exiting pid=");
         serial_print_dec(exiting->pid);

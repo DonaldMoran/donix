@@ -343,7 +343,11 @@ void irq1_handler(void) {
            that when sys_read starts blocking, the wake path is in
            place. Do NOT context-switch here — the timer picks the
            woken process up on the next tick. */
+        /* --- DIAGNOSTIC (added 2026-09-24 evening) --- */
+        process_debug_dump_blocked("IRQ1-pre");
         process_wake_all_blocked();
+        process_debug_dump_blocked("IRQ1-post");
+        /* --- end DIAGNOSTIC --- */
     }
     outb(PIC1_CMD, PIC_EOI);
 }
@@ -423,7 +427,7 @@ void isr8_handler(exception_frame_t *frame) {
 
     vga_print("\n!!! DOUBLE FAULT (#DF) !!!\n");
     vga_print("  Error Code : 0x"); vga_print_hex_cur(error_code); vga_print("\n");
-    vga_print("  RIP        : 0x"); vga_print_hex_cur(fault_rip); vga_print("\n");
+    vga_print("  RIP        : 0x"); vga_print_hex_cur(fault_rip);  vga_print("\n");
     vga_print("  CS         : 0x"); vga_print_hex_cur(fault_cs);  vga_print("\n");
     vga_print("  RSP        : 0x"); vga_print_hex_cur(fault_rsp); vga_print("\n");
     vga_print("  SS         : 0x"); vga_print_hex_cur(fault_ss);  vga_print("\n");
