@@ -236,13 +236,39 @@ Apply each only when a specific problem requires it.
   protection, add the page-table walk in `sys_mprotect` and update
   the PTE bits.
 
+- **`musl_printf` / `printnum` dump garbage — musl-internal, not
+  kernel** (investigated 2026-09-24, tag `20260924C`).  `printf` of a
+  literal or a `%d` value on musl/donix prints the correct bytes and
+  then dumps large chunks of the binary's own `.rodata` / `.eh_frame`.
+  The newline from `printf("MUSL-PRINTF\n")` is silently dropped.
+
+  Diagnosis: a raw-byte dump of the user's iov array in `sys_writev`
+  showed that musl itself writes a garbage `iov[1]`:
+
+      [writev raw] 28 42 40 00 00 00 00 00   iov[0].base = 0x404228
+                   0b 00 00 00 00 00 00 00   iov[0].len  = 11
+                   57 ff 0f 00 80 00 00 00   iov[1].base = 0x80000FFF57
+                   20 ff 0f 00 80 00 00 00   iov[1].len  = 0x80000FFF20
+
+  The kernel faithfully copies what musl wrote; the corruption is in
+  musl's `__stdio_write` stack frame on donix.  Two user-stack
+  addresses appear where `iov[1].base` / `iov[1].len` should be.
+
+  This is a userland porting problem (a musl assumption about the
+  runtime or ABI that donix does not satisfy), not a syscall-layer
+  problem.  Every kernel canary is green: `hello`, `memtest`, `ls`,
+  `cat`, `echo`, `musl_min`, `musl_malloc`.
+
+  **Must be resolved before Phase A3 (musl shell).**  Planned as the
+  first task after `fork`/`execve`/`wait4` are in, because a working
+  `execve` will let us run more musl test programs and narrow the
+  cause.  Do **not** attempt to fix this from the kernel side; the
+  kernel is behaving correctly.
+
 ### Cosmetic / housekeeping
 
 - `syscall.c:29` has an old stub `sys_brk` that shadows the real one in
   `user_syscall.c`. Not fatal, but confusing. Clean up later.
-- The buffered-`printf` `.rodata` dump (from `PRINTNUM.ELF`) is not a
-  printf bug; likely an mmap-shaped problem in disguise. Revisit after
-  mmap works.
 - Shell line-editing has a backspace echo bug. Not on critical path.
 
 ## Testing harness
@@ -299,9 +325,14 @@ musl lands.**
 
 ## Current milestone
 
-**A2 item 11 — `fork` = 57.** Items 1–10 of the A2 list are complete
+**A2 item 11 — `fork` = 57.**  Items 1–10 of the A2 list are complete
 (see Part 1).  The `brk` runaway is fixed, `mmap` and `mprotect` work
-well enough for musl's malloc, and the newlib canary is green.
+well enough for musl's malloc, and `sys_writev` now reads its iov
+array via `safe_copy_from_user`.  The newlib canary is green.
+
+`musl_printf` and `printnum` remain red and are recorded as
+musl-internal — see "Resolved bugs" in Part 1.  They are **not**
+blocking `fork`.
 
 `fork` will need: CR3 clone, `process_copy_kernel_frame` (must copy
 callee-saved GPRs), eager user-stack copy after CR3 clone, and
@@ -317,19 +348,22 @@ atomicity around the page-table walk.  See the gotchas in Part 1.
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
 | musl_min | green | prints `MUSL-START` |
-| musl_printf | green | prints both lines |
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
-| brkraw | red | needs Linux `brk` ABI; sys_brk now does, but the test binary was built against the old kernel and hasn't been re-run |
+| musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
+| printnum | red | same root cause as `musl_printf`. |
+| brkraw | red | test binary needs re-run against the current kernel; `sys_brk` is now Linux-ABI |
 | brkgrow | red | same |
-| brk_verify | red | needs mmap; mmap is now implemented, test needs re-run |
-| printnum | red | buffered-printf problem, likely mmap-shaped; re-run now that mmap works |
+| brk_verify | red | same |
 
 ## Next step (exactly this, then stop)
 
+**Last updated:** 2026-09-24 (evening)
+**Current tag / HEAD:** `20260924C`
+**Last known-good tag:** `20260924C`
+**Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
+
 1. Confirm working tree clean: `git status` shows nothing modified.
-2. Update `handoff.md` with the three edits above and commit it as a
-   fourth commit (tag `20260924C` or leave untagged — it's doc only).
-3. Start **A2 item 11 (`fork`)**.  Paste `handoff.md` plus these files:
+2. Start **A2 item 11 (`fork`)**.  Paste `handoff.md` plus these files:
    - `04_kernel_64bit/process.c`
    - `04_kernel_64bit/include/process.h`
    - `04_kernel_64bit/user_syscall_entry.asm`
@@ -340,10 +374,16 @@ atomicity around the page-table walk.  See the gotchas in Part 1.
    (callee-saved), eager user-stack copy after CR3 clone, and
    atomicity."
 
-   Do **not** touch `pmm.c`'s `PMM_ALLOC_DIAG` — leave it on for `fork`.
+   `PMM_ALLOC_DIAG` is now 0 in `pmm.c` — turn it back on if the
+   fork work needs the allocation trace.
 
-4. After `fork` works: start A2 item 12 (`execve`).  Paste `process.c`,
-   `process.h`, `user_syscall.c` (execve handler), `elf.c`.
+3. After `fork` works: start A2 item 12 (`execve`).  Paste
+   `process.c`, `process.h`, `user_syscall.c` (execve handler),
+   `elf.c`.
+
+4. `musl_printf` / `printnum` are deferred to Phase A3/A4 — see
+   "Resolved bugs" in Part 1.  Do not spend time on them in the
+   `fork` session.
 
 ## State on disk
 

@@ -839,45 +839,6 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
         return -14;  /* -EFAULT */
     }
 
-    serial_lock();
-    serial_print("[writev fd=");
-    serial_print_dec((uint64_t)fd);
-    serial_print(" iovcnt=");
-    serial_print_dec((uint64_t)iovcnt);
-    serial_print(" user_iov=0x");
-    serial_print_hex((uint64_t)user_iov);
-    serial_print("]");
-    for (int i = 0; i < iovcnt; i++) {
-        serial_print(" iov[");
-        serial_print_dec((uint64_t)i);
-        serial_print("]={0x");
-        serial_print_hex((uint64_t)local[i].iov_base);
-        serial_print(",");
-        serial_print_dec((uint64_t)local[i].iov_len);
-        serial_print("}");
-    }
-    serial_print("\n");
-    {
-        uint8_t raw[64];
-        size_t rawlen = bytes > 64 ? 64 : bytes;
-        if (safe_copy_from_user(raw, user_iov, rawlen) == 0) {
-            serial_print("[writev raw]");
-            for (size_t i = 0; i < rawlen; i++) {
-                static const char hexd[] = "0123456789abcdef";
-                char b[4];
-                b[0] = ' ';
-                b[1] = hexd[(raw[i] >> 4) & 0xf];
-                b[2] = hexd[raw[i] & 0xf];
-                b[3] = '\0';
-                serial_print(b);
-            }
-            serial_print("\n");
-        } else {
-            serial_print("[writev raw] safe_copy_from_user FAILED\n");
-        }
-    }
-    serial_unlock();
-
     long total = 0;
     for (int i = 0; i < iovcnt; i++) {
         if (local[i].iov_len == 0) continue;
