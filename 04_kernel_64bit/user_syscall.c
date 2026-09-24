@@ -762,6 +762,15 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (!self) return -1;
 
     if (fd == 1 || fd == 2) {
+        serial_lock();
+        serial_print("[w fd=");
+        serial_print_dec((uint64_t)fd);
+        serial_print(" buf=0x");
+        serial_print_hex((uint64_t)buf);
+        serial_print(" n=");
+        serial_print_dec((uint64_t)count);
+        serial_print("]\n");
+        serial_unlock();
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
@@ -816,16 +825,53 @@ struct iovec {
  * loop over sys_write; partial writes are returned as a short
  * count (which is what write(2) semantics allow and what musl
  * expects).  Stops early on a short write, like the kernel.
+ *
+ * The iov array is a user pointer and must be copied through
+ * safe_copy_from_user.  Dereferencing it directly reads whatever
+ * happens to live at that kernel virtual address, which is not
+ * the user's iov array.  This bug was latent because the
+ * mis-read values sometimes happened to look like valid iov
+ * entries.  printnum's stack layout made it visible.
+ *
+ * iovcnt is capped at WRITEV_MAX_IOVS to bound the kernel stack
+ * usage of the local copy.
  */
-long sys_writev(int fd, const struct iovec* iov, int iovcnt) {
-    if (!iov || iovcnt <= 0) return 0;
+#define WRITEV_MAX_IOVS 16
+
+long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
+    if (!user_iov || iovcnt <= 0) return 0;
+    if (iovcnt > WRITEV_MAX_IOVS) return -22;  /* -EINVAL */
+
+    struct iovec local[WRITEV_MAX_IOVS];
+    size_t bytes = (size_t)iovcnt * sizeof(struct iovec);
+    if (safe_copy_from_user(local, user_iov, bytes) != 0) {
+        return -14;  /* -EFAULT */
+    }
+
+    serial_lock();
+    serial_print("[writev fd=");
+    serial_print_dec((uint64_t)fd);
+    serial_print(" iovcnt=");
+    serial_print_dec((uint64_t)iovcnt);
+    for (int i = 0; i < iovcnt; i++) {
+        serial_print(" iov[");
+        serial_print_dec((uint64_t)i);
+        serial_print("]={0x");
+        serial_print_hex((uint64_t)local[i].iov_base);
+        serial_print(",");
+        serial_print_dec((uint64_t)local[i].iov_len);
+        serial_print("}");
+    }
+    serial_print("\n");
+    serial_unlock();
+
     long total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len == 0) continue;
-        long n = sys_write(fd, iov[i].iov_base, iov[i].iov_len);
+        if (local[i].iov_len == 0) continue;
+        long n = sys_write(fd, local[i].iov_base, local[i].iov_len);
         if (n < 0) return (total > 0) ? total : n;
         total += n;
-        if ((size_t)n < iov[i].iov_len) break;  /* short write — stop */
+        if ((size_t)n < local[i].iov_len) break;  /* short write — stop */
     }
     return total;
 }

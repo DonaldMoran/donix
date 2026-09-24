@@ -33,12 +33,8 @@ musl-gcc \
 
 cat > /tmp/musl_printf.c <<'EOF'
 #include <stdio.h>
-
 int main(void) {
-    printf("MUSL-PRINTF");
-    printf("\n");
-    printf("\n");
-    printf("Now it prints ok\n");
+    printf("MUSL-PRINTF\n");
     return 0;
 }
 EOF
