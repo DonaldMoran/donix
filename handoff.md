@@ -101,15 +101,16 @@ the next):
 6. `ioctl` = 16 (`TCGETS` for stdio, `-ENOTTY` otherwise) — **complete**
 7. `brk` = 12 — **complete at `20260924B`**, Linux absolute-address ABI
 8. **Test:** minimal musl program reaches `main` and `printf` works —
-   `musl_min` and `musl_printf` green
+   `musl_min` and `musl_printf` green (printf still red as a
+   musl-internal issue, see "Resolved bugs")
 9. `mmap` = 9, `munmap` = 11 — **complete at `20260924B`** (minimal
    anonymous-private implementation)
 9.5. `mprotect` = 10 — **stub added at `20260924B`**, returns 0.
    Not on the original list; musl calls it after `mmap` and its
    absence caused a `#GP`.  Real permission changes not implemented.
 10. `getrandom` = 318, `rseq` = 334 (stubs returning `-ENOSYS`) — complete
-11. `fork` = 57 — **next**
-12. `execve` = 59
+11. `fork` = 57 — **complete at `20260924D`**
+12. `execve` = 59 — **next**
 13. `wait4` = 61
 14. `getdents64` = 217
 
@@ -159,21 +160,53 @@ Apply each only when a specific problem requires it.
 
 ### Process / scheduler
 
-- **`process_copy_kernel_frame` must copy callee-saved GPRs**
-  (`%rbx`, `%rbp`, `%r12`–`%r15`) from parent to child. Otherwise the
-  child resumes at the parent's RIP with zeroed callee-saved regs and
-  crashes on function epilogue. Parent's saved GPRs are at
-  `[parent->kernel_stack_top - 8*1] .. [parent->kernel_stack_top - 8*6]`;
-  see `user_syscall_entry.asm` push order.
+- **`process_fork_copy_frame` must preserve the registers that the
+  parent's syscall-return path preserves.**  That is: the
+  callee-saved set (`%rbx`, `%rbp`, `%r12`–`%r15`) **plus `%r8` and
+  `%r9`**.  The syscall entry code (`user_syscall_entry.asm`) pushes
+  `%r8` and `%r9` before the argument shuffle and pops them on return,
+  so the parent's `%r8`/`%r9` survive across a syscall, and the
+  compiler may rely on them.  An earlier version of `fork` zeroed
+  `%r8`, which made the child call `read` instead of `write` because
+  the code after the `syscall` in `musl_fork_raw`'s `main` was
+  `mov %r8, %rax` (setting up the `write` fd argument).
+
+  Parent's saved GPRs are at `[parent->kernel_stack_top - 8*k]`:
+  `-8=rbx, -16=rbp, -24=r12, -32=r13, -40=r14, -48=r15, -56=user RIP,
+  -64=user RFLAGS, -72=user RSP, -80=r8, -88=r9`.
+
 - **`fork` needs eager user-stack copy after CR3 clone.**
   `vmm_clone_page_table` shares leaf physical pages; the parent's stack
-  writes clobber the child. Walk
+  writes clobber the child.  Walk
   `[user_stack_virt, user_stack_top)`, allocate fresh pages with
   `pmm_alloc_page_for_elf`, copy, remap child PTEs.
+
 - **`execve` must update the resume frame's RIP (+0x78) and RSP (+0x90)**,
-  not just the PCB. The resume path reads the frame.
-- **`sys_execve` must be atomic** (`cli`/`sti`). A previous session saw
+  not just the PCB.  The resume path reads the frame.
+
+- **`sys_execve` must be atomic** (`cli`/`sti`).  A previous session saw
   `#GP` when the timer fired mid-operation.
+
+### Scheduler queue discipline
+
+- **`scheduler_ready_queue_add` is idempotent.**  A process that is
+  already on the queue must not be linked again; the second link
+  overwrites `prev`/`next` and can produce a self-link or a cycle.
+  `scheduler_ready_queue_contains` is the guard.
+
+- **`process_wake_all_blocked` must skip processes already on the
+  queue.**  `sys_read`'s blocking loop sets `state = BLOCKED` and
+  `hlt`s; a timer tick can run `process_wake_all_blocked` before the
+  `hlt` returns, and without the skip the process is added on every
+  tick.  The symptom was a fork child being added behind the shell in
+  the ready queue, so the child never ran before the parent's zombie
+  wake resumed the shell.
+
+- **`process_yield` removes a BLOCKED process from the ready queue.**
+  The timer handler pops a RUNNING process from the queue and then
+  re-adds it; a process that blocks between the pop and the yield can
+  be left on the queue.  A process that is on the ready queue while
+  BLOCKED will be picked ahead of runnable processes.
 
 ### Syscall ABI
 
@@ -223,9 +256,7 @@ Apply each only when a specific problem requires it.
   semantics; `arc2/syscalls.c:sbrk` was updated to call it.
 
   The PMM was never broken.  The "anomaly" was a correct counter
-  reflecting a runaway caller.  `pmm_alloc_page`'s per-call diagnostic
-  is what distinguished "23,700 legitimate calls" from "a few calls
-  with a corrupted counter"; keep it in the tree until `fork` is done.
+  reflecting a runaway caller.
 
 - **`mprotect` missing** (resolved 2026-09-24, tag `20260924B`).
   musl calls `mprotect` right after `mmap` to set permissions on the
@@ -264,6 +295,42 @@ Apply each only when a specific problem requires it.
   `execve` will let us run more musl test programs and narrow the
   cause.  Do **not** attempt to fix this from the kernel side; the
   kernel is behaving correctly.
+
+### Open issues
+
+- **Intermittent halt after a long command sequence with forking
+  programs** (found 2026-09-24, tag `20260924D`).  After running a
+  sequence like `hello`, `memtest`, `ls`, `cat`, `echo`, `musl_min`,
+  `musl_malloc`, `musl_fork_raw`, the kernel *sometimes* halts with
+  `process_exit: no runnable process, halting`.  The same sequence on
+  a fresh boot does not always halt — the bug is nondeterministic.
+
+  The halt happens when a forked child exits while the shell is
+  blocked in `sys_read` (keyboard block).  `process_exit`'s fallback
+  path finds the ready queue empty (the shell is BLOCKED on read, not
+  on the queue) and, because the exiting process is a user process,
+  takes the halt path instead of idling on pid 1.
+
+  The halt did not appear before we removed the diagnostic prints
+  from `scheduler.c` and `interrupts.c`.  Those prints included
+  `serial_lock` / `serial_unlock` (cli/sti) windows of ~5–15 ms each,
+  which changed the interleaving of the child's exit and the shell's
+  wake.  So this is a timing race that the prints were masking, not a
+  semantic change from the print removal.
+
+  Diagnostic prints have been left in `scheduler.c` at the top of
+  `process_exit` (`EXIT: pid=... state=... parent=... qhead=...`) and
+  before the halt message (`HALT: exiting pid=... name=...
+  entry=... parent=...`).  The next time the halt fires, capture the
+  log — those two lines will show which process exited and what the
+  queue looked like.
+
+  Likely fix: in `process_exit`'s fallback path, if the ready queue
+  is empty and the exiting process is a user process, pick the idle
+  process (pid 1) and switch to it instead of halting.  Idle is
+  BLOCKED on `hlt` and will be woken by the next timer tick; the
+  shell will be woken by the next keyboard IRQ.  This has not been
+  tested — verify with a reproduction first.
 
 ### Cosmetic / housekeeping
 
@@ -318,37 +385,42 @@ musl lands.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-24 (evening)
-**Current tag / HEAD:** `20260924B` (`57a3f9e`)
-**Last known-good tag:** `20260924B`
+**Last updated:** 2026-09-24 (evening, session 2)
+**Current tag / HEAD:** `20260924D`
+**Last known-good tag:** `20260924C`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 11 — `fork` = 57.**  Items 1–10 of the A2 list are complete
-(see Part 1).  The `brk` runaway is fixed, `mmap` and `mprotect` work
-well enough for musl's malloc, and `sys_writev` now reads its iov
-array via `safe_copy_from_user`.  The newlib canary is green.
+**A2 item 11 — `fork` = 57 — complete at `20260924D`.**  The fork work
+is done: `sys_fork` creates a child that resumes at the parent's user
+RIP with `%rax = 0`, and the child can run, print, and exit cleanly.
+Verified with `musl_fork_raw` (prints `A`, `P`, `C`).
 
-`musl_printf` and `printnum` remain red and are recorded as
-musl-internal — see "Resolved bugs" in Part 1.  They are **not**
-blocking `fork`.
+The fix that got it working was in `process_fork_copy_frame`:
+preserve `%r8` and `%r9` from the parent's syscall-entry frame in
+addition to the callee-saved set.  An earlier version zeroed `%r8`,
+which broke the child because the compiler-generated code after the
+`syscall` in `musl_fork_raw`'s `main` was `mov %r8, %rax` (setting up
+the `write` fd argument), and `%rax = 0` made the child call `read`.
 
-`fork` will need: CR3 clone, `process_copy_kernel_frame` (must copy
-callee-saved GPRs), eager user-stack copy after CR3 clone, and
-atomicity around the page-table walk.  See the gotchas in Part 1.
+Three scheduler fixes were also needed and are now in:
+- `scheduler_ready_queue_add` is idempotent.
+- `process_wake_all_blocked` skips processes already on the queue.
+- `process_yield` removes a BLOCKED process from the ready queue.
 
-## Canary state (all green as of `20260924B`)
+## Canary state (green as of `20260924D`)
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | |
-| ls | green | lists 16 files |
+| ls | green | lists 18 files |
 | cat | green | reads HELLO-WORLD.TXT |
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
 | musl_min | green | prints `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
+| musl_fork_raw | green | prints `A`, `P`, `C` |
 | musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
 | printnum | red | same root cause as `musl_printf`. |
 | brkraw | red | test binary needs re-run against the current kernel; `sys_brk` is now Linux-ABI |
@@ -357,33 +429,46 @@ atomicity around the page-table walk.  See the gotchas in Part 1.
 
 ## Next step (exactly this, then stop)
 
-**Last updated:** 2026-09-24 (evening)
-**Current tag / HEAD:** `20260924C`
-**Last known-good tag:** `20260924C`
-**Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
+**Two paths, decide at the start of the session:**
+
+### Path A — fix the intermittent halt first
+
+1. Confirm the reproduction: boot fresh, run
+   `hello; memtest; ls; cat hello-world.txt; echo hi; musl_min;
+   musl_malloc; musl_fork_raw` in sequence.  Repeat the sequence a
+   few times if the halt does not fire on the first try.  The two
+   diagnostics in `process_exit` (`EXIT:` and `HALT:`) will show
+   which process exited and the queue state if the halt fires.
+2. If reproducible, the likely fix is in `process_exit`'s fallback
+   path: if the ready queue is empty and the exiting process is a
+   user process, switch to the idle process (pid 1) instead of
+   halting.  Idle will be woken by the next timer tick; the shell
+   will be woken by the next keyboard IRQ.
+3. Test: re-run the full command sequence several times.  No halt.
+4. Then move to Path B.
+
+### Path B — start A2 item 12 (`execve`)
 
 1. Confirm working tree clean: `git status` shows nothing modified.
-2. Start **A2 item 11 (`fork`)**.  Paste `handoff.md` plus these files:
+2. Start **A2 item 12 (`execve`)**.  Paste `handoff.md` plus these
+   files:
    - `04_kernel_64bit/process.c`
    - `04_kernel_64bit/include/process.h`
-   - `04_kernel_64bit/user_syscall_entry.asm`
-   - `04_kernel_64bit/context_switch.asm`
+   - `04_kernel_64bit/user_syscall.c` (the current `sys_execve` handler)
+   - `04_kernel_64bit/elf.c`
 
-   Say: "Continue from here. Implement A2 item 11 (fork).  Design
-   `sys_fork` with the three known gotchas in mind: frame GPR copy
-   (callee-saved), eager user-stack copy after CR3 clone, and
-   atomicity."
+   Say: "Continue from here.  Implement A2 item 12 (execve).  The
+   current `sys_execve` is a spawn — it creates a new process and
+   returns its pid.  Linux `execve` replaces the calling process's
+   address space in place, without creating a new process.  Design
+   the replacement semantics with the fork work in mind: the caller
+   is a forked child, `sys_execve` should replace its CR3, load the
+   new ELF into it, reset the resume frame's RIP and RSP, and return
+   `0` from `sys_execve` to the caller's `main`."
 
-   `PMM_ALLOC_DIAG` is now 0 in `pmm.c` — turn it back on if the
-   fork work needs the allocation trace.
-
-3. After `fork` works: start A2 item 12 (`execve`).  Paste
-   `process.c`, `process.h`, `user_syscall.c` (execve handler),
-   `elf.c`.
-
-4. `musl_printf` / `printnum` are deferred to Phase A3/A4 — see
-   "Resolved bugs" in Part 1.  Do not spend time on them in the
-   `fork` session.
+3. `musl_printf` / `printnum` are deferred to Phase A3/A4 — see
+   "Resolved bugs" in Part 1.  Do not spend time on them in this
+   session.
 
 ## State on disk
 
@@ -393,11 +478,15 @@ atomicity around the page-table walk.  See the gotchas in Part 1.
 - `/tmp/musl_*` — musl test binaries, rebuilt by
   `build_musl_tests.sh` (now tracked in the repo).
 - `build_musl_tests.sh` — committed at `57a3f9e`.
+- `~/code/x` — snapshot of the pre-cleanup tree, kept for diffing.
+  Can be deleted once the halt is resolved.
 
 ## Open items
 
-No substantive open bugs.  The two previous entries (Linux `brk` ABI,
-PMM HIGH-zone anomaly) are resolved — see "Resolved bugs" in Part 1.
+- **Intermittent halt after a long command sequence with forking
+  programs.**  See "Open issues" in Part 1 for details.  Two
+  diagnostics left in `scheduler.c` to capture the state if it fires
+  again.
 
 Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
