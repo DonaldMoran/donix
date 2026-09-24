@@ -264,6 +264,75 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
     scheduler_ready_queue_add(pcb);
     return pcb;
 }
+
+/*
+ * Build the child's resume frame for fork(2).
+ *
+ * See the declaration in include/process.h for the layout.  Short
+ * version: the child resumes via iretq at the parent's user RIP and
+ * RSP with %rax = 0, as if the parent's fork() syscall had returned
+ * 0 in the child.
+ *
+ * The parent's kernel stack top is the current %rsp of the caller
+ * (which is running on the parent's kernel stack inside the
+ * syscall).  We read the parent's pushed callee-saved registers
+ * from there.
+ *
+ * Do NOT read parent->kernel_stack_top and assume the frame is at
+ * the top.  The syscall entry path pushes 12 slots and then calls
+ * syscall_dispatch, which pushes more.  By the time this function
+ * runs, the parent's %rsp is somewhere below kernel_stack_top.
+ * We use kernel_stack_top as the anchor only because the syscall
+ * entry frame was built by pushes starting from that address, and
+ * the values we need are at fixed offsets from it.
+ */
+void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
+    if (!child || !parent) return;
+
+    uint64_t ptop = parent->kernel_stack_top;
+
+    /* Callee-saved GPRs, plus r8/r9 which the syscall entry code
+       saves and restores. */
+    uint64_t p_rbx   = *(uint64_t*)(ptop - 8);
+    uint64_t p_rbp   = *(uint64_t*)(ptop - 16);
+    uint64_t p_r12   = *(uint64_t*)(ptop - 24);
+    uint64_t p_r13   = *(uint64_t*)(ptop - 32);
+    uint64_t p_r14   = *(uint64_t*)(ptop - 40);
+    uint64_t p_r15   = *(uint64_t*)(ptop - 48);
+    uint64_t p_rip   = *(uint64_t*)(ptop - 56);
+    uint64_t p_flags = *(uint64_t*)(ptop - 64);
+    uint64_t p_rsp   = *(uint64_t*)(ptop - 72);
+    uint64_t p_r8    = *(uint64_t*)(ptop - 80);
+    uint64_t p_r9    = *(uint64_t*)(ptop - 88);
+
+    uint64_t frame_base = child->kernel_stack_top - 20 * 8;
+    uint64_t* f = (uint64_t*)frame_base;
+
+    f[0x00 / 8] = p_r15;
+    f[0x08 / 8] = p_r14;
+    f[0x10 / 8] = p_r13;
+    f[0x18 / 8] = p_r12;
+    f[0x20 / 8] = p_flags;   /* r11 slot */
+    f[0x28 / 8] = 0;         /* r10 — not preserved by entry/exit */
+    f[0x30 / 8] = p_r9;      /* r9  — preserved by entry/exit */
+    f[0x38 / 8] = p_r8;      /* r8  — preserved by entry/exit */
+    f[0x40 / 8] = p_rbp;
+    f[0x48 / 8] = 0;         /* rdi — not preserved */
+    f[0x50 / 8] = 0;         /* rsi — not preserved */
+    f[0x58 / 8] = 0;         /* rdx — not preserved */
+    f[0x60 / 8] = p_rip;     /* rcx slot: user RIP, from syscall entry */
+    f[0x68 / 8] = p_rbx;
+    f[0x70 / 8] = 0;         /* rax: fork() returns 0 in the child */
+    f[0x78 / 8] = p_rip;     /* RIP */
+    f[0x80 / 8] = 0x33;      /* CS: user code segment */
+    f[0x88 / 8] = p_flags;   /* RFLAGS */
+    f[0x90 / 8] = p_rsp;     /* RSP: parent's user stack pointer */
+    f[0x98 / 8] = 0x2B;      /* SS: user data segment */
+
+    child->rsp = frame_base;
+    child->rip = p_rip;
+}
+
 pcb_t* process_get_current(void) {
     return current_process;
 }
@@ -296,11 +365,32 @@ pcb_t* process_find_by_pid(uint64_t pid) {
 void process_wake_all_blocked(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (&pcb_pool[i] == g_kernel_shell_pcb) continue;
-        if (pcb_pool[i].state == PROC_STATE_BLOCKED &&
-            pcb_pool[i].block_kind == BLOCK_KIND_NONE) {
+        if (pcb_pool[i].state != PROC_STATE_BLOCKED) continue;
+        if (pcb_pool[i].block_kind != BLOCK_KIND_NONE) continue;
+
+        /*
+         * Skip if already on the ready queue.
+         *
+         * sys_read's blocking loop sets state=BLOCKED and hlt's,
+         * and a timer tick can run this function before the hlt
+         * returns.  Without this check, the process is added to
+         * the queue on every tick while it is still inside the
+         * hlt, corrupting the queue (prev/next overwritten, self-
+         * links).  The symptom was a fork child being added behind
+         * the shell in the ready queue, so the child never ran
+         * before the parent's zombie wake resumed the shell.
+         *
+         * scheduler_ready_queue_add is also idempotent now, but
+         * checking here keeps the state transitions clear and
+         * avoids the redundant call.
+         */
+        if (scheduler_ready_queue_contains(&pcb_pool[i])) {
             pcb_pool[i].state = PROC_STATE_READY;
-            scheduler_ready_queue_add(&pcb_pool[i]);
+            continue;
         }
+
+        pcb_pool[i].state = PROC_STATE_READY;
+        scheduler_ready_queue_add(&pcb_pool[i]);
     }
 }
 

@@ -17,6 +17,8 @@
 /* Defined in kmain.c — reboots the machine via keyboard controller + ACPI reset port. */
 extern void handle_reboot_sequence(void);
 
+extern uint64_t g_syscall_stack_top;
+
 #define WRITE_CHUNK 256
 static char g_write_bounce[WRITE_CHUNK];
 
@@ -1080,8 +1082,6 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
 /*
  * Linux x86_64 mmap(2) — minimal anonymous implementation.
  *
- * TEMPORARY: reconstructed for PMM diagnostic purposes only.
- *
  * Handles:
  *   - MAP_PRIVATE | MAP_ANONYMOUS, addr = NULL  (musl malloc)
  *   - MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, addr = <page-aligned>
@@ -1090,10 +1090,7 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
  * Ignores: fd, offset, PROT_* bits (always maps PT_PRESENT|PT_WRITE|
  * PT_USER).  Returns -ENOMEM for anything else.
  *
- * Per-iteration prints match the original diagnostic run's format so
- * the two logs can be compared directly.
- *
- * MMAP_BASE is 0x8010000000, same as the original.
+ * MMAP_BASE is 0x8010000000.
  */
 #define ENOMEM 12
 #define MMAP_BASE 0x8010000000ULL
@@ -1102,30 +1099,11 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
 
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
-    serial_lock();
-    serial_print("sys_mmap: addr=0x");
-    serial_print_hex((uint64_t)addr);
-    serial_print(" len=0x");
-    serial_print_hex((uint64_t)length);
-    serial_print(" prot=0x");
-    serial_print_hex((uint64_t)(unsigned)prot);
-    serial_print(" flags=0x");
-    serial_print_hex((uint64_t)(unsigned)flags);
-    serial_print(" fd=");
-    serial_print_dec((uint64_t)(int64_t)fd);
-    serial_print(" off=0x");
-    serial_print_hex((uint64_t)offset);
-    serial_print(" pmm_free=");
-    serial_print_dec(pmm_get_free_pages());
-    serial_print("\n");
-    serial_unlock();
+    (void)prot;
 
     if (length == 0) return -(long)22;  /* -EINVAL */
 
     if ((flags & MAP_ANONYMOUS) == 0 || fd != -1) {
-        serial_lock();
-        serial_print("sys_mmap: unsupported flags/fd\n");
-        serial_unlock();
         return -(long)ENOMEM;
     }
 
@@ -1141,23 +1119,8 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
     uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
 
     for (uint64_t v = base; v < base + rounded; v += 0x1000) {
-        serial_lock();
-        serial_print("  mmap loop: v=0x");
-        serial_print_hex(v);
-        serial_print(" free=");
-        serial_print_dec(pmm_get_free_pages());
-        serial_print("\n");
-        serial_unlock();
-
         uint64_t phys = pmm_alloc_page_for_elf();
         if (!phys) {
-            serial_lock();
-            serial_print("  mmap loop: alloc failed at v=0x");
-            serial_print_hex(v);
-            serial_print(" free=");
-            serial_print_dec(pmm_get_free_pages());
-            serial_print("\n");
-            serial_unlock();
             return -(long)ENOMEM;
         }
 
@@ -1259,13 +1222,113 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 }
 
 /*
- * Linux x86_64 fork(2) — stub.  Return -ENOSYS.
- * Real implementation lands in A2.11; needs cr3 clone and
- * eager user-stack copy.  For now, musl programs that call fork
- * will fail cleanly.
+ * Linux x86_64 fork(2) — syscall 57.
+ *
+ * First cut.  Creates a child that resumes at the parent's user RIP
+ * with %rax = 0.  The child inherits a clone of the parent's page
+ * table (vmm_clone_page_table), but the leaf physical pages are
+ * shared at first; we then eagerly copy the user stack so the
+ * parent's later stack writes do not clobber the child's view.
+ *
+ * Known limitations:
+ *
+ *   1. ELF segment pages (.text, .data, .bss) are still shared with
+ *      the parent after fork.  Writes to .data or .bss in either
+ *      process are visible to the other.  This is not a problem for
+ *      the immediate use case (fork + execve, where the child
+ *      replaces its address space before writing anything), but it
+ *      is not correct fork semantics.  Real copy-on-write comes
+ *      later.
+ *
+ *   2. Only the callee-saved registers are preserved in the child.
+ *      See process_fork_copy_frame's declaration for the details.
+ *
+ *   3. The child does not inherit the parent's brk.  It gets the
+ *      parent's brk_virt, but the child's ELF pages aren't duplicated
+ *      so writes to the brk region in either process alias.  Again,
+ *      not a problem for fork + execve.
+ *
+ * Runs with interrupts disabled across the whole operation.  A timer
+ * tick mid-clone could schedule another process whose allocations
+ * race with ours.
  */
 long sys_fork(void) {
-    return -(long)ENOSYS;
+    __asm__ volatile("cli");
+
+    pcb_t* parent = process_get_current();
+    if (!parent) {
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    /*
+     * process_create clones the parent's current CR3 and allocates a
+     * fresh kernel stack for the child.  It also builds an initial
+     * frame at the child's kernel_stack_top, but we discard that and
+     * build the real fork frame below.
+     */
+    pcb_t* child = process_create(parent->name, parent->entry_point, 0);
+    if (!child) {
+        __asm__ volatile("sti");
+        return -1;
+    }
+    scheduler_ready_queue_remove(child);
+
+    /*
+     * Eager user-stack copy.
+     *
+     * vmm_clone_page_table shares leaf physical pages, so the child's
+     * user-stack PTEs currently point at the parent's stack pages.
+     * Walk the range, allocate fresh pages, copy the contents, and
+     * remap the child's PTEs.
+     */
+    if (parent->user_stack_virt && parent->user_stack_top) {
+        for (uint64_t virt = parent->user_stack_virt;
+             virt < parent->user_stack_top;
+             virt += 4096) {
+
+            uint64_t parent_phys = vmm_get_phys_from_cr3(parent->cr3, virt);
+            if (!parent_phys) continue;
+
+            uint64_t new_phys = pmm_alloc_page_for_elf();
+            if (!new_phys) {
+                serial_print("sys_fork: out of memory for stack page\n");
+                process_destroy(child);
+                __asm__ volatile("sti");
+                return -1;
+            }
+
+            const uint8_t* src = (const uint8_t*)(HHDM_START + parent_phys);
+            uint8_t* dst = (uint8_t*)(HHDM_START + new_phys);
+            for (uint64_t i = 0; i < 4096; i++) dst[i] = src[i];
+
+            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
+            vmm_map_page_in_cr3(child->cr3, virt, new_phys, map_flags);
+            elf_add_page_to_pcb(child, new_phys);
+        }
+    }
+
+    /*
+     * Build the child's iretq-resume frame from the parent's current
+     * syscall-entry frame.  This sets the child's %rax to 0, which is
+     * how fork() signals "you are the child" to user code.
+     */
+    process_fork_copy_frame(child, parent);
+
+    /*
+     * Child inherits the parent's heap break so its brk region starts
+     * where the parent's was.  The pages themselves are not copied
+     * (see the limitation note above), but brk_virt must match so the
+     * child's subsequent brk calls land in a plausible range.
+     */
+    child->brk_virt = parent->brk_virt;
+
+    child->parent_pid = parent->pid;
+    child->state = PROC_STATE_READY;
+    scheduler_ready_queue_add(child);
+
+    __asm__ volatile("sti");
+    return (long)child->pid;
 }
 
 void sys_exit(int status) {
@@ -1318,6 +1381,7 @@ uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     (void)arg3; (void)arg4; (void)arg5;
+    
     switch (num) {
 
         /* --- Linux x86_64 numbers --- */

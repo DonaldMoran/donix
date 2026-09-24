@@ -19,13 +19,24 @@ pcb_t* scheduler_ready_queue_peek_next(void) {
 
 void scheduler_ready_queue_add(pcb_t* process) {
     if (!process) return;
+
+    /*
+     * Idempotency guard.  See scheduler_ready_queue_contains for
+     * the failure mode.  A process that is already on the queue
+     * must not be linked in again: the second link overwrites its
+     * prev/next and can produce a self-link (prev == self) or a
+     * cycle.
+     */
+    if (scheduler_ready_queue_contains(process)) {
+        return;
+    }
+
     if (process->state == PROC_STATE_RUNNING) {
         process->state = PROC_STATE_READY;
     }
 
     process->next = NULL;
     process->prev = ready_queue_tail;
-
     if (ready_queue_tail) {
         ready_queue_tail->next = process;
     } else {
@@ -80,6 +91,19 @@ int scheduler_ready_queue_empty(void) {
     return ready_queue_head == NULL;
 }
 
+int scheduler_ready_queue_contains(pcb_t* process) {
+    if (!process) return 0;
+    /*
+     * A process is on the queue if any of these hold:
+     *   - it has a prev (not the head)
+     *   - it has a next (not the tail)
+     *   - it is the head (covers the single-element case)
+     */
+    return process->prev != NULL
+        || process->next != NULL
+        || process == ready_queue_head;
+}
+
 void scheduler_reset(void) {
     ready_queue_head = NULL;
     ready_queue_tail = NULL;
@@ -103,6 +127,22 @@ void __attribute__((noreturn)) process_exit(void) {
 
     pcb_t* exiting = current_process;
 
+    {
+        pcb_t* head = scheduler_ready_queue_peek_next();
+        serial_lock();
+        serial_print("EXIT: pid=");
+        serial_print_dec(exiting->pid);
+        serial_print(" state=");
+        serial_print_dec((uint64_t)exiting->state);
+        serial_print(" parent=");
+        serial_print_dec(exiting->parent_pid);
+        serial_print(" qhead=");
+        if (head) serial_print_dec(head->pid);
+        else serial_print("(empty)");
+        serial_print("\n");
+        serial_unlock();
+    }
+
     exiting->state = PROC_STATE_TERMINATED;
     scheduler_ready_queue_remove(exiting);
 
@@ -125,12 +165,9 @@ void __attribute__((noreturn)) process_exit(void) {
      * meaningful.
      */
     if (exiting->parent_pid != 0) {
-        /* Zombie path.  Do NOT process_reclaim; the parent will.
-         * Wake the parent if it is blocked in waitpid. */
         exiting->state = PROC_STATE_ZOMBIE;
         process_wake_parent_if_waiting(exiting);
     } else {
-        /* No-parent path.  Reclaim now, as before. */
         process_reclaim(exiting);
     }
 
@@ -168,6 +205,18 @@ void __attribute__((noreturn)) process_exit(void) {
             __asm__ volatile("cli");
             while (1) __asm__ volatile("hlt");
         }
+
+        serial_lock();
+        serial_print("HALT: exiting pid=");
+        serial_print_dec(exiting->pid);
+        serial_print(" name=");
+        serial_print(exiting->name);
+        serial_print(" entry=0x");
+        serial_print_hex(exiting->entry_point);
+        serial_print(" parent=");
+        serial_print_dec(exiting->parent_pid);
+        serial_print("\n");
+        serial_unlock();
 
         serial_print("process_exit: no runnable process, halting\n");
         __asm__ volatile("cli");
@@ -251,6 +300,20 @@ void process_yield(void) {
     if (current_process->state == PROC_STATE_RUNNING) {
         current_process->state = PROC_STATE_READY;
         scheduler_ready_queue_add(current_process);
+    } else {
+        /*
+         * Blocked (or otherwise not runnable).  The process must not
+         * remain on the ready queue: the timer handler pops a RUNNING
+         * process from the queue and then re-adds it, and a process
+         * that blocks between the pop and the yield can be left on
+         * the queue.  A process that is on the ready queue while
+         * BLOCKED will be picked by scheduler_ready_queue_next()
+         * before other runnable processes, delaying them.
+         *
+         * scheduler_ready_queue_remove is idempotent: it returns
+         * without doing anything if the process is not on the queue.
+         */
+        scheduler_ready_queue_remove(current_process);
     }
 
     pcb_t* next = scheduler_ready_queue_next();

@@ -113,6 +113,38 @@ void process_test_clone(void);
 void process_start(pcb_t* process);
 void process_destroy(pcb_t* process);
 void process_cleanup_elf_pages(pcb_t* pcb);
+/*
+ * Build the child's resume frame for fork(2).
+ *
+ * The parent called fork() and is currently in a syscall.  Its
+ * callee-saved registers are on the parent's kernel stack, pushed by
+ * user_syscall_entry.asm in this order (relative to kernel_stack_top):
+ *
+ *   [top -  8] = rbx
+ *   [top - 16] = rbp
+ *   [top - 24] = r12
+ *   [top - 32] = r13
+ *   [top - 40] = r14
+ *   [top - 48] = r15
+ *   [top - 56] = user RIP   (from RCX at syscall entry)
+ *   [top - 64] = user RFLAGS (from R11)
+ *   [top - 72] = user RSP   (from g_user_rsp_save)
+ *
+ * The child's frame is built at child->kernel_stack_top - 0xA0, in
+ * the same 20-slot iretq-resumable layout that process_create builds
+ * and that context_switch.asm restores.  The child's %rax is 0, so
+ * fork() returns 0 in the child.
+ *
+ * Only the callee-saved registers are copied from the parent's
+ * frame.  The caller-saved registers (rax, rcx, rdx, rsi, rdi, r8,
+ * r9, r10, r11) were either clobbered by the syscall argument
+ * shuffling or are the caller's responsibility to save.  This is a
+ * deliberate first-cut limitation: it differs from Linux, which
+ * preserves all registers except %rax.  If a future test fails
+ * because a register has an unexpected value after fork, this is
+ * the first place to look.
+ */
+void process_fork_copy_frame(pcb_t* child, pcb_t* parent);
 void process_reclaim(pcb_t* pcb);
 void process_exit(void) __attribute__((noreturn));
 void kernel_idle_loop(void);

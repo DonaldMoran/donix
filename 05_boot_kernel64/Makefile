@@ -25,6 +25,8 @@ PRINTNUM      := /tmp/printnum
 BRK_VERIFY    := /tmp/brk_verify
 BRKRAW        := /tmp/brkraw
 BRKGROW       := /tmp/brkgrow
+MUSL_FORK     := /tmp/musl_fork
+MUSL_FORK_RAW := /tmp/musl_fork_raw
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -92,11 +94,13 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
 	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
 	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF ; \
+	mcopy_one "$(MUSL_FORK)"       MUSL_FORK.ELF ; \
+	mcopy_one "$(MUSL_FORK_RAW)"   MUSL_FORK_RAW.ELF ; \
 	mcopy_one "$(PRINTNUM)"      PRINTNUM.ELF ; \
 	mcopy_one "$(BRK_VERIFY)"    BRK_VERIFY.ELF ; \
 	mcopy_one "$(BRKRAW)"        BRKRAW.ELF ; \
 	mcopy_one "$(BRKGROW)"       BRKGROW.ELF
-	
+		
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
 	@echo "--- verifying FAT boot sector at LBA $(SINGLE_DRIVE_LBA) ---"
