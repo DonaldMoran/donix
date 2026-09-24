@@ -214,6 +214,27 @@ Apply each only when a specific problem requires it.
   syscall reference in assembly.
 - **`-mcmodel=large` is required for userland** (linked above 4 GB).
   `-mcmodel=small`/`medium` don't work. `-no-pie` is not needed.
+- **The syscall entry/return frame saves 16 slots, not 12.**  In
+  addition to the callee-saved registers and the user RIP/RFLAGS/RSP,
+  `user_syscall_entry.asm` now pushes `%rdi`, `%rsi`, `%rdx`, `%r10`
+  before the argument shuffle.  The parent's return path restores
+  `%rdi`, `%rsi`, `%rdx` and discards `%r10` (the exit path uses `%r10`
+  as the user-RSP scratch).  This matches the Linux syscall ABI more
+  closely: only `%rax`, `%rcx`, `%r11` are architecturally clobbered.
+  Compilers *do* rely on `%rdi`, `%rsi`, `%rdx` surviving a syscall;
+  musl's fork wrapper caches the TLS base in `%rdx` before the raw
+  fork syscall and writes through it after the child resumes, and was
+  faulting at CR2=0x98 without the restore.
+
+  Frame layout, offsets from `parent->kernel_stack_top` (first push =
+  offset `-8`):
+  `-8=rbx, -16=rbp, -24=r12, -32=r13, -40=r14, -48=r15, -56=user RIP,
+  -64=user RFLAGS, -72=user RSP, -80=r8, -88=r9, -96=rdi, -104=rsi,
+  -112=rdx, -120=r10, -128=arg5 (discarded)`.
+
+  `process_fork_copy_frame` reads from those offsets to build a fork
+  child's frame.  If the assembly push order changes, that function's
+  offsets must change with it.
 
 ### stdio / newlib
 
@@ -234,7 +255,14 @@ Apply each only when a specific problem requires it.
 - **Always confirm the .elf is relinked** after touching a source:
   `ls -l apps/NAME.elf` should be newer than the `.o` files. A stale
   link can hide a real fix for an entire session.
-
+- **After every patch, verify the edit actually landed in the
+  tree you are building.**  A session was lost to editing the wrong
+  project directory: the kernel was built from a stale file, and
+  every test produced the same "the fix didn't work" result for
+  hours.  Before each build, run `git status` (shows the file as
+  modified) and a targeted `grep` on the changed function.  If
+  either is unexpected, stop and fix the tree before building.
+  
 ### Resolved bugs (kept for the record)
 
 - **Linux `brk` ABI vs. increment `sbrk`** (resolved 2026-09-24, tag
@@ -386,30 +414,48 @@ musl lands.**
 # Part 2 — Session Status
 
 **Last updated:** 2026-09-24 (evening, session 2)
-**Current tag / HEAD:** `20260924D`
-**Last known-good tag:** `20260924C`
+**Current tag / HEAD:** `20260924E`
+**Last known-good tag:** `20260924E`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 11 — `fork` = 57 — complete at `20260924D`.**  The fork work
-is done: `sys_fork` creates a child that resumes at the parent's user
-RIP with `%rax = 0`, and the child can run, print, and exit cleanly.
-Verified with `musl_fork_raw` (prints `A`, `P`, `C`).
+**A2 item 12 — `execve` = 59.**  A2 item 11 (`fork`) is complete:
+`musl_fork` and `musl_fork_raw` both print `A`, `P`, `C` cleanly.
+The remaining blocker for the musl shell (A3) is Linux `execve`
+semantics: the current `sys_execve` is a *spawn* (creates a new
+process, returns its pid), and musl expects `execve` to replace the
+calling process's address space in place.
 
-The fix that got it working was in `process_fork_copy_frame`:
-preserve `%r8` and `%r9` from the parent's syscall-entry frame in
-addition to the callee-saved set.  An earlier version zeroed `%r8`,
-which broke the child because the compiler-generated code after the
-`syscall` in `musl_fork_raw`'s `main` was `mov %r8, %rax` (setting up
-the `write` fd argument), and `%rax = 0` made the child call `read`.
+The fix that got `fork` working was in `user_syscall_entry.asm` and
+`process_fork_copy_frame`: the syscall entry/return frame now saves
+`%rdi`, `%rsi`, `%rdx`, `%r10` (in addition to the callee-saved set
+and `%r8`/`%r9`), the parent's return path restores `%rdi`/`%rsi`/
+`%rdx` and discards `%r10`, and the child's frame in
+`process_fork_copy_frame` is populated from those slots.  Without
+the parent-side restore, musl's fork wrapper faulted at RIP
+`0x401383` with CR2=0x98 because `%rdx` (cached TLS base) was
+clobbered by the syscall argument shuffle.
 
 Three scheduler fixes were also needed and are now in:
 - `scheduler_ready_queue_add` is idempotent.
 - `process_wake_all_blocked` skips processes already on the queue.
 - `process_yield` removes a BLOCKED process from the ready queue.
 
-## Canary state (green as of `20260924D`)
+### Plan for `execve` (two commits)
+
+The newlib shell uses `spawn` via `arc2/syscalls.c` and depends on
+the current spawn semantics.  If we change syscall 59 to Linux
+`execve`, the newlib shell breaks.  Resolution:
+
+1. Add `SYS_DONIX_SPAWN` (507) with the current spawn behavior,
+   rename `sys_execve` to `sys_spawn`, keep 59 pointing at spawn
+   for this commit, and change `arc2/syscalls.c`'s `spawn` to call
+   507.  Test: canary green.
+2. Change syscall 59 to Linux `execve`.  Test: canary green, plus
+   a `fork` + `execve` musl test binary.
+
+## Canary state (green as of `20260924E`)
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -420,6 +466,7 @@ Three scheduler fixes were also needed and are now in:
 | memtest (newlib) | green | `[memtest] PASS` |
 | musl_min | green | prints `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
+| musl_fork | green | prints `A`, `P`, `C`; musl's fork wrapper, uses `arch_prctl(158)` to set FS base |
 | musl_fork_raw | green | prints `A`, `P`, `C` |
 | musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
 | printnum | red | same root cause as `musl_printf`. |

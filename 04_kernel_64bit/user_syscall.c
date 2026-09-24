@@ -1261,6 +1261,12 @@ long sys_fork(void) {
         return -1;
     }
 
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100));
+        uint64_t fsbase = ((uint64_t)hi << 32) | lo;
+    }
+
     /*
      * process_create clones the parent's current CR3 and allocates a
      * fresh kernel stack for the child.  It also builds an initial
@@ -1381,7 +1387,7 @@ uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     (void)arg3; (void)arg4; (void)arg5;
-    
+
     switch (num) {
 
         /* --- Linux x86_64 numbers --- */

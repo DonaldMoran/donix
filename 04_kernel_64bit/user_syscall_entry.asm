@@ -70,6 +70,27 @@ user_syscall_entry:
     push r8
     push r9
 
+    ; Save rdi/rsi/rdx/r10 so we can restore them on the parent's return
+    ; path AND give a fork child the parent's pre-syscall values.  The
+    ; C ABI marks these caller-saved, but the syscall ABI is stricter:
+    ; only rcx and r11 are architecturally clobbered.  Compilers do rely
+    ; on the other GPRs surviving, and musl's fork wrapper does exactly
+    ; that — it caches the TLS base in rdx before the fork syscall and
+    ; writes through it after the child resumes:
+    ;
+    ;     mov %fs:0x0, %rdx
+    ;     syscall
+    ;     movq $0x0, 0x98(%rdx)
+    ;
+    ; Without saving rdx, the parent faults at CR2 = 0x98 after the
+    ; syscall returns (rdx was overwritten with arg1, which is 0 for
+    ; fork).  Without giving the child the parent's rdx, the child
+    ; faults at the same instruction.  Same argument for rsi, rdi, r10.
+    push rdi
+    push rsi
+    push rdx
+    push r10
+
     ; Arg5 -> 7th C argument, on stack.
     push r9
     mov rbx, rax                    ; save syscall number
@@ -85,6 +106,16 @@ user_syscall_entry:
 
     cmp rbx, 60
     je .handle_exit
+
+    ; Pop the extra saved GPRs.  r10 is discarded: the exit path below
+    ; needs r10 as the user-RSP scratch, and the C ABI permits the
+    ; callee to clobber it, so the parent's compiler does not rely on
+    ; it surviving the syscall.  rdi/rsi/rdx ARE restored, because
+    ; compilers (notably musl's fork wrapper) do rely on those.
+    pop r10                         ; discard saved r10
+    pop rdx                         ; restore user rdx
+    pop rsi                         ; restore user rsi
+    pop rdi                         ; restore user rdi
 
     pop r9
     pop r8
@@ -113,6 +144,10 @@ user_syscall_entry:
     ; Same teardown, but we do not return to user mode: process_exit
     ; never returns. The kernel stack we are on belongs to the exiting
     ; process and will be reused by whichever process gets its slot.
+    pop r10                         ; discard saved r10
+    pop rdx                         ; discard saved rdx
+    pop rsi                         ; discard saved rsi
+    pop rdi                         ; discard saved rdi
     pop r9
     pop r8
     add rsp, 8                      ; discard user RSP slot

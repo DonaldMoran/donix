@@ -275,24 +275,50 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
  *
  * The parent's kernel stack top is the current %rsp of the caller
  * (which is running on the parent's kernel stack inside the
- * syscall).  We read the parent's pushed callee-saved registers
- * from there.
+ * syscall).  We read the parent's pushed registers from there.
  *
  * Do NOT read parent->kernel_stack_top and assume the frame is at
- * the top.  The syscall entry path pushes 12 slots and then calls
+ * the top.  The syscall entry path pushes 16 slots and then calls
  * syscall_dispatch, which pushes more.  By the time this function
  * runs, the parent's %rsp is somewhere below kernel_stack_top.
  * We use kernel_stack_top as the anchor only because the syscall
  * entry frame was built by pushes starting from that address, and
  * the values we need are at fixed offsets from it.
+ *
+ * Frame layout, offsets from parent->kernel_stack_top, as built by
+ * user_syscall_entry.asm (first push = offset -8):
+ *
+ *   -8   rbx
+ *   -16  rbp
+ *   -24  r12
+ *   -32  r13
+ *   -40  r14
+ *   -48  r15
+ *   -56  user RIP      (from CPU rcx at syscall)
+ *   -64  user RFLAGS   (from CPU r11 at syscall)
+ *   -72  user RSP      (saved before stack switch)
+ *   -80  r8            (saved before arg shuffle)
+ *   -88  r9            (saved before arg shuffle)
+ *   -96  rdi           (saved before arg shuffle)
+ *   -104 rsi           (saved before arg shuffle)
+ *   -112 rdx           (saved before arg shuffle)
+ *   -120 r10           (saved before arg shuffle)
+ *   -128 arg5          (pushed for the C call, discarded at return)
+ *
+ * The parent's return path pops only through -120 (rdi/rsi/rdx/r10
+ * are skipped with add rsp, 32) and does not restore them.  The
+ * only consumer of those four slots is this function: a fork child
+ * needs the parent's pre-syscall values for all GPRs except %rax
+ * (0), %rcx (user RIP) and %r11 (user RFLAGS), the way Linux's
+ * syscall ABI promises.
  */
 void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
     if (!child || !parent) return;
 
     uint64_t ptop = parent->kernel_stack_top;
 
-    /* Callee-saved GPRs, plus r8/r9 which the syscall entry code
-       saves and restores. */
+    /* Registers the parent's syscall-return path preserves, plus the
+       four extra GPRs saved at entry for the child's benefit. */
     uint64_t p_rbx   = *(uint64_t*)(ptop - 8);
     uint64_t p_rbp   = *(uint64_t*)(ptop - 16);
     uint64_t p_r12   = *(uint64_t*)(ptop - 24);
@@ -304,6 +330,10 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
     uint64_t p_rsp   = *(uint64_t*)(ptop - 72);
     uint64_t p_r8    = *(uint64_t*)(ptop - 80);
     uint64_t p_r9    = *(uint64_t*)(ptop - 88);
+    uint64_t p_rdi   = *(uint64_t*)(ptop - 96);
+    uint64_t p_rsi   = *(uint64_t*)(ptop - 104);
+    uint64_t p_rdx   = *(uint64_t*)(ptop - 112);
+    uint64_t p_r10   = *(uint64_t*)(ptop - 120);
 
     uint64_t frame_base = child->kernel_stack_top - 20 * 8;
     uint64_t* f = (uint64_t*)frame_base;
@@ -312,15 +342,15 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
     f[0x08 / 8] = p_r14;
     f[0x10 / 8] = p_r13;
     f[0x18 / 8] = p_r12;
-    f[0x20 / 8] = p_flags;   /* r11 slot */
-    f[0x28 / 8] = 0;         /* r10 — not preserved by entry/exit */
-    f[0x30 / 8] = p_r9;      /* r9  — preserved by entry/exit */
-    f[0x38 / 8] = p_r8;      /* r8  — preserved by entry/exit */
+    f[0x20 / 8] = p_flags;   /* r11: user RFLAGS (from r11 at syscall entry) */
+    f[0x28 / 8] = p_r10;     /* r10: parent's pre-syscall value */
+    f[0x30 / 8] = p_r9;      /* r9:  preserved by entry/exit */
+    f[0x38 / 8] = p_r8;      /* r8:  preserved by entry/exit */
     f[0x40 / 8] = p_rbp;
-    f[0x48 / 8] = 0;         /* rdi — not preserved */
-    f[0x50 / 8] = 0;         /* rsi — not preserved */
-    f[0x58 / 8] = 0;         /* rdx — not preserved */
-    f[0x60 / 8] = p_rip;     /* rcx slot: user RIP, from syscall entry */
+    f[0x48 / 8] = p_rdi;     /* rdi: parent's pre-syscall value */
+    f[0x50 / 8] = p_rsi;     /* rsi: parent's pre-syscall value */
+    f[0x58 / 8] = p_rdx;     /* rdx: parent's pre-syscall value */
+    f[0x60 / 8] = p_rip;     /* rcx slot: user RIP */
     f[0x68 / 8] = p_rbx;
     f[0x70 / 8] = 0;         /* rax: fork() returns 0 in the child */
     f[0x78 / 8] = p_rip;     /* RIP */
