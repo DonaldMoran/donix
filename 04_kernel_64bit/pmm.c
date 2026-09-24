@@ -370,7 +370,7 @@ void pmm_init(BootInfo *info) {
  *
  * Remove this block once the anomaly is understood.
  */
-#define PMM_ALLOC_DIAG 1
+#define PMM_ALLOC_DIAG 0
 #if PMM_ALLOC_DIAG
 static uint64_t pmm_alloc_diag_count = 0;
 #endif

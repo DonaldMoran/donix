@@ -762,15 +762,6 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (!self) return -1;
 
     if (fd == 1 || fd == 2) {
-        serial_lock();
-        serial_print("[w fd=");
-        serial_print_dec((uint64_t)fd);
-        serial_print(" buf=0x");
-        serial_print_hex((uint64_t)buf);
-        serial_print(" n=");
-        serial_print_dec((uint64_t)count);
-        serial_print("]\n");
-        serial_unlock();
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
@@ -853,6 +844,9 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
     serial_print_dec((uint64_t)fd);
     serial_print(" iovcnt=");
     serial_print_dec((uint64_t)iovcnt);
+    serial_print(" user_iov=0x");
+    serial_print_hex((uint64_t)user_iov);
+    serial_print("]");
     for (int i = 0; i < iovcnt; i++) {
         serial_print(" iov[");
         serial_print_dec((uint64_t)i);
@@ -863,6 +857,25 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
         serial_print("}");
     }
     serial_print("\n");
+    {
+        uint8_t raw[64];
+        size_t rawlen = bytes > 64 ? 64 : bytes;
+        if (safe_copy_from_user(raw, user_iov, rawlen) == 0) {
+            serial_print("[writev raw]");
+            for (size_t i = 0; i < rawlen; i++) {
+                static const char hexd[] = "0123456789abcdef";
+                char b[4];
+                b[0] = ' ';
+                b[1] = hexd[(raw[i] >> 4) & 0xf];
+                b[2] = hexd[raw[i] & 0xf];
+                b[3] = '\0';
+                serial_print(b);
+            }
+            serial_print("\n");
+        } else {
+            serial_print("[writev raw] safe_copy_from_user FAILED\n");
+        }
+    }
     serial_unlock();
 
     long total = 0;
