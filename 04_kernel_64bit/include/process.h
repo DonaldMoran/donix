@@ -149,7 +149,6 @@ void process_reclaim(pcb_t* pcb);
 void process_exit(void) __attribute__((noreturn));
 void kernel_idle_loop(void);
 void process_wake_all_blocked(void);
-void process_debug_dump_blocked(const char* tag);
 
 /*
  * Wake the parent of `child` if it is blocked in waitpid on this

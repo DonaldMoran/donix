@@ -343,11 +343,7 @@ void irq1_handler(void) {
            that when sys_read starts blocking, the wake path is in
            place. Do NOT context-switch here — the timer picks the
            woken process up on the next tick. */
-        /* --- DIAGNOSTIC (added 2026-09-24 evening) --- */
-        process_debug_dump_blocked("IRQ1-pre");
         process_wake_all_blocked();
-        process_debug_dump_blocked("IRQ1-post");
-        /* --- end DIAGNOSTIC --- */
     }
     outb(PIC1_CMD, PIC_EOI);
 }

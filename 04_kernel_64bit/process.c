@@ -381,47 +381,6 @@ pcb_t* process_find_by_pid(uint64_t pid) {
 }
 
 /*
- * ============================================================
- * DIAGNOSTIC: dump every BLOCKED process.
- * Added 2026-09-24 evening to chase the intermittent
- * dead-keyboard bug after musl_fork.
- *
- * Safe to call from IRQ context on a single CPU: serial_lock is
- * cli-based (or a nesting counter), so re-entering it from IRQ1
- * when the main line is not printing is fine.
- * ============================================================
- */
-void process_debug_dump_blocked(const char* tag) {
-    serial_lock();
-    serial_print("[");
-    serial_print(tag);
-    serial_print("] BLOCKED dump:\n");
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        pcb_t* p = &pcb_pool[i];
-        if (p->state == PROC_STATE_UNUSED) continue;
-        if (p->state != PROC_STATE_BLOCKED) continue;
-
-        serial_print("  pid=");
-        serial_print_dec(p->pid);
-        serial_print(" name=");
-        serial_print(p->name);
-        serial_print(" kind=");
-        serial_print_dec(p->block_kind);
-        serial_print(" wait_pid=");
-        serial_print_dec(p->wait_pid);
-        serial_print(" onq=");
-        serial_print_dec(scheduler_ready_queue_contains(p) ? 1 : 0);
-        serial_print(" kstack_top=0x");
-        serial_print_hex(p->kernel_stack_top);
-        serial_print("\n");
-    }
-    serial_print("[/");
-    serial_print(tag);
-    serial_print("]\n");
-    serial_unlock();
-}
-
-/*
  * Wake every process blocked on input (BLOCKED).
  *
  * The kernel shell is deliberately excluded. Its BLOCKED state means
@@ -455,27 +414,10 @@ void process_wake_all_blocked(void) {
          * checking here keeps the state transitions clear and
          * avoids the redundant call.
          */
-        /* --- DIAGNOSTIC (added 2026-09-24 evening) --- */
-        {
-            int was_onq = scheduler_ready_queue_contains(&pcb_pool[i]) ? 1 : 0;
-            serial_lock();
-            serial_print("WAKE: pid=");
-            serial_print_dec(pcb_pool[i].pid);
-            serial_print(" name=");
-            serial_print(pcb_pool[i].name);
-            serial_print(" kind=");
-            serial_print_dec(pcb_pool[i].block_kind);
-            serial_print(" onq=");
-            serial_print_dec(was_onq);
-            serial_print("\n");
-            serial_unlock();
-            if (was_onq) {
-                pcb_pool[i].state = PROC_STATE_READY;
-                continue;
-            }
+        if (scheduler_ready_queue_contains(&pcb_pool[i])) {
+            pcb_pool[i].state = PROC_STATE_READY;
+            continue;
         }
-        /* --- end DIAGNOSTIC --- */
-
         pcb_pool[i].state = PROC_STATE_READY;
         scheduler_ready_queue_add(&pcb_pool[i]);
     }
