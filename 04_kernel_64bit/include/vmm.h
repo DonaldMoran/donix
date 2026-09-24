@@ -24,4 +24,15 @@ void vmm_dump_page_table(uint64_t virt);
 uint64_t vmm_clone_page_table(uint64_t src_cr3);
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt);
 void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
-void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);   // ← added
+void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);
+
+/*
+ * execve support.  vmm_clone_kernel_half makes a fresh PML4 that
+ * shares the kernel high half with src_cr3 and has an empty user low
+ * half — the scratch address space execve builds before swapping in.
+ * vmm_free_user_page_tables frees the low-half page-table pages and
+ * the PML4 itself (not the data pages) after the caller has stopped
+ * using the CR3.
+ */
+uint64_t vmm_clone_kernel_half(uint64_t src_cr3);
+void     vmm_free_user_page_tables(uint64_t cr3);

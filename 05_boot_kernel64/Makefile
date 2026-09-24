@@ -27,6 +27,7 @@ BRKRAW        := /tmp/brkraw
 BRKGROW       := /tmp/brkgrow
 MUSL_FORK     := /tmp/musl_fork
 MUSL_FORK_RAW := /tmp/musl_fork_raw
+MUSL_EXEC     := /tmp/musl_exec
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -99,7 +100,8 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(PRINTNUM)"      PRINTNUM.ELF ; \
 	mcopy_one "$(BRK_VERIFY)"    BRK_VERIFY.ELF ; \
 	mcopy_one "$(BRKRAW)"        BRKRAW.ELF ; \
-	mcopy_one "$(BRKGROW)"       BRKGROW.ELF
+	mcopy_one "$(BRKGROW)"       BRKGROW.ELF ; \
+	mcopy_one "$(MUSL_EXEC)"     MUSL_EXEC.ELF
 		
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true

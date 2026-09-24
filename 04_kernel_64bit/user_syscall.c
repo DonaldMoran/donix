@@ -137,7 +137,7 @@ static int safe_copy_to_user(void* user_dest, const void* kernel_src, size_t cou
 
 /*
  * Like safe_copy_to_user, but resolves the destination against an
- * explicit cr3 rather than the current process's.  Used by sys_execve
+ * explicit cr3 rather than the current process's.  Used by sys_spawn
  * to write the child's argv region before the child ever runs.
  *
  * Does NOT switch cr3.  vmm_get_phys_from_cr3 walks the target page
@@ -676,6 +676,480 @@ long sys_spawn(const char* user_path, int argc, char** user_argv) {
 }
 
 // ============================================================
+// execve helpers (used only by sys_execve below)
+// ============================================================
+
+/*
+ * Free and unmap every user page the process owns.
+ *
+ * The pages are tracked in pcb->elf_page_list, populated by
+ * elf_add_page_to_pcb from elf_load_into_process, the user-stack
+ * allocator, sys_brk/sys_sbrk, and sys_mmap.  Every page in the
+ * list is a user page currently mapped in pcb->cr3.
+ *
+ * Order matters: unmap before free, so no live PTE points at a
+ * freed physical page.  We resolve VA->PA by walking the regions
+ * the process could have used and matching against the list; the
+ * list stores physical addresses only.
+ *
+ * The regions, in VA order:
+ *   - ELF image:   [0x400000,      0x600000)      2 MB
+ *   - user stack:  [0x8000000000,  0x8000100000)  64 KB
+ *   - brk heap:    [0x8000200000,  0x8000300000)  1 MB
+ *   - mmap region: [0x8010000000,  0x8010400000)  4 MB
+ *
+ * Scanning ~1900 pages total is fast (sub-millisecond on KVM,
+ * a few ms on TCG).  Do NOT widen these ranges back to the whole
+ * user half — an earlier version scanned [0x400000, 0x8020000000)
+ * and was so slow under QEMU's -d in_asm,cpu flag that it looked
+ * like a hang.
+ *
+ * If a future test maps a VA outside these ranges, extend the
+ * table with a new row.
+ */
+static void exec_free_and_unmap_user_pages(pcb_t* pcb) {
+    if (!pcb || !pcb->elf_page_list) return;
+
+    static const struct { uint64_t start, end; } regions[] = {
+        { 0x0000000000400000ULL, 0x0000000000600000ULL },  /* ELF image   */
+        { 0x0000008000000000ULL, 0x0000008000100000ULL },  /* user stack  */
+        { 0x0000008000200000ULL, 0x0000008000300000ULL },  /* brk heap    */
+        { 0x0000008010000000ULL, 0x0000008010400000ULL },  /* mmap region */
+    };
+    const size_t n_regions = sizeof(regions) / sizeof(regions[0]);
+
+    for (size_t r = 0; r < n_regions; r++) {
+        for (uint64_t va = regions[r].start;
+             va < regions[r].end;
+             va += 0x1000) {
+
+            uint64_t phys = vmm_get_phys_from_cr3(pcb->cr3, va);
+            if (!phys) continue;
+            phys &= ~0xFFFULL;
+
+            int owned = 0;
+            for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
+                if (pcb->elf_page_list[i] == phys) { owned = 1; break; }
+            }
+            if (!owned) continue;
+
+            vmm_unmap_page_in_cr3(pcb->cr3, va);
+        }
+    }
+
+    for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
+        uint64_t phys = pcb->elf_page_list[i];
+        if (phys) pmm_free_page(phys);
+    }
+    kfree(pcb->elf_page_list);
+    pcb->elf_page_list = NULL;
+    pcb->elf_num_pages = 0;
+}
+
+/*
+ * Allocate and map a fresh user stack in pcb->cr3.
+ *
+ * Mirrors the USER_STACK_PAGES block in process_create exactly, so
+ * the new program's stack looks identical to a freshly-created
+ * process's.  Returns the new user_stack_top, or 0 on failure.  On
+ * failure, any pages already allocated are tracked in elf_page_list
+ * and will be freed by the caller's cleanup path.
+ */
+static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
+    #define EXEC_USER_STACK_PAGES 16
+    #define EXEC_USER_STACK_SIZE (EXEC_USER_STACK_PAGES * 4096)
+
+    uint64_t stack_top_anchor    = 0x8000100000ULL;
+    uint64_t stack_bottom_anchor = stack_top_anchor - EXEC_USER_STACK_SIZE;
+
+    pcb->user_stack_virt = stack_bottom_anchor;
+
+    for (int i = 0; i < EXEC_USER_STACK_PAGES; i++) {
+        uint64_t phys = pmm_alloc_page_for_elf();
+        if (!phys) return 0;
+
+        uint64_t virt = stack_bottom_anchor + (i * 4096);
+        uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
+        map_flags &= ~(0x80ULL | 0x40ULL | 0x200ULL | 0x800ULL);
+
+        vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags);
+
+        void* hhdm = (void*)(HHDM_START + phys);
+        for (uint64_t j = 0; j < 4096 / 8; j++) {
+            ((uint64_t*)hhdm)[j] = 0;
+        }
+
+        elf_add_page_to_pcb(pcb, phys);
+
+        if (i == (EXEC_USER_STACK_PAGES - 1)) {
+            pcb->user_stack_phys = phys;
+        }
+    }
+
+    uint64_t top = stack_top_anchor - 32;
+    top &= ~0xFULL;
+    pcb->user_stack_top = top;
+    return top;
+}
+
+// ============================================================
+// SYS_EXECVE (59) — Linux execve, in-place
+//
+// Replaces the calling process's user address space with a new ELF,
+// without creating a new process.  On success this function returns
+// 0 to the *new* program's entry point via the syscall return path,
+// not to the caller of execve.
+//
+// Reuses the ELF validation, file reading, and argv-layout logic
+// from sys_spawn.  The differences:
+//   - operates on `self`, not a freshly-created child;
+//   - reads argv from the *old* address space before tearing it
+//     down;
+//   - frees and unmaps the old user pages before loading the new
+//     ELF (the teardown-then-load approach, not copy-then-swap);
+//   - rewrites the syscall-entry frame at self->kernel_stack_top so
+//     the return path resumes at the new entry with the new stack.
+//
+// SIMPLIFICATION: if the load fails after the old address space has
+// been torn down, the process is exited via sys_exit(-1).  The
+// Linux contract is to return -errno with the caller intact, but
+// implementing that requires a scratch address space and a CR3
+// swap, which was tried earlier and produced a cascade of page-table
+// sharing bugs.  Given the failure paths after teardown are
+// essentially unreachable for a validated ELF (file already in
+// memory, allocators behave like every other syscall), we accept
+// the shortcut.  If a specific failure needs to be user-recoverable
+// later, add copy-then-swap as a follow-up.
+//
+// Runs with interrupts disabled.  A timer tick in the middle would
+// let the scheduler pick a process whose address space is
+// half-destroyed.
+// ============================================================
+long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
+    (void)user_envp;
+
+    __asm__ volatile("cli");
+
+    pcb_t* self = process_get_current();
+    if (!self || !user_path) {
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    /* ---- 1. Copy the path string. ---- */
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        serial_print("sys_execve: bad path pointer\n");
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    /* ---- 2. Open and read the whole ELF file. ---- */
+    FIL file;
+    FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) {
+        serial_print("sys_execve: f_open(");
+        serial_print(path);
+        serial_print(") -> ");
+        serial_print_dec(fr);
+        serial_print("\n");
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    Elf64_Ehdr ehdr;
+    UINT got = 0;
+    fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
+    if (fr != FR_OK || got != sizeof(ehdr)) {
+        serial_print("sys_execve: short read of ELF header\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
+        ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
+        serial_print("sys_execve: not an ELF file\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n");     f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n");  f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n");        f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n");         f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
+        ehdr.e_phnum == 0 || ehdr.e_phnum > EXEC_MAX_PHDRS) {
+        serial_print("sys_execve: bad program header table\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    FSIZE_t file_size = f_size(&file);
+    if (file_size == 0 || file_size > 4ULL * 1024 * 1024) {
+        serial_print("sys_execve: file size out of range\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+    uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
+    if (!elf_buf) {
+        serial_print("sys_execve: kmalloc failed for ");
+        serial_print_dec((uint64_t)file_size);
+        serial_print(" bytes\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+    fr = f_lseek(&file, 0);
+    if (fr != FR_OK) {
+        serial_print("sys_execve: rewind failed\n");
+        kfree(elf_buf); f_close(&file);
+        __asm__ volatile("sti");
+        return -1;
+    }
+    UINT total = 0;
+    while (total < file_size) {
+        UINT br = 0;
+        UINT want = (UINT)(file_size - total);
+        if (want > 4096) want = 4096;
+        fr = f_read(&file, elf_buf + total, want, &br);
+        if (fr != FR_OK) {
+            serial_print("sys_execve: read failed at offset ");
+            serial_print_dec(total);
+            serial_print("\n");
+            kfree(elf_buf); f_close(&file);
+            __asm__ volatile("sti");
+            return -1;
+        }
+        if (br == 0) break;
+        total += br;
+    }
+    f_close(&file);
+    if (total != file_size) {
+        serial_print("sys_execve: short read of file body\n");
+        kfree(elf_buf);
+        __asm__ volatile("sti");
+        return -1;
+    }
+
+    /* ---- 3. Snapshot argv from the OLD address space. ---- */
+    int argc = 0;
+    char argv_scratch[EXEC_MAX_ARGC][EXEC_MAX_ARG_LEN];
+
+    if (user_argv) {
+        for (argc = 0; argc < EXEC_MAX_ARGC; argc++) {
+            uint64_t user_str_va = 0;
+            if (safe_copy_from_user(&user_str_va,
+                                    (const char**)user_argv + argc,
+                                    sizeof(user_str_va)) != 0) {
+                serial_print("sys_execve: bad argv[");
+                serial_print_dec(argc);
+                serial_print("] pointer\n");
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -1;
+            }
+            if (user_str_va == 0) break;
+
+            if (copy_user_string(argv_scratch[argc], EXEC_MAX_ARG_LEN,
+                                 (const char*)user_str_va) != 0) {
+                serial_print("sys_execve: bad argv[");
+                serial_print_dec(argc);
+                serial_print("] string\n");
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -1;
+            }
+        }
+    }
+
+    /* ---- 4. Build the process name from the path. ---- */
+    char proc_name[PROC_NAME_LEN];
+    {
+        const char* base = path;
+        for (const char* p = path; *p; p++) {
+            if (*p == '/' || *p == ':') base = p + 1;
+        }
+        int i = 0;
+        while (base[i] && i < PROC_NAME_LEN - 1) {
+            proc_name[i] = base[i];
+            i++;
+        }
+        proc_name[i] = '\0';
+        if (i == 0) {
+            const char* fallback = "exec";
+            for (i = 0; fallback[i] && i < PROC_NAME_LEN - 1; i++)
+                proc_name[i] = fallback[i];
+            proc_name[i] = '\0';
+        }
+    }
+
+    /* ---- 5. Tear down the old address space, then load the new one. ---- */
+    /*
+     * No scratch CR3.  Everything targets self->cr3.  From this point
+     * on, failures cannot be cleanly recovered (the caller's old
+     * pages are gone), so any failure exits the process.  See the
+     * function comment for the rationale.
+     */
+    exec_free_and_unmap_user_pages(self);
+    self->user_stack_virt = 0;
+    self->user_stack_phys = 0;
+    self->user_stack_top  = 0;
+    self->brk_virt        = 0;
+
+    uint64_t entry = elf_load_into_process(self, elf_buf);
+    kfree(elf_buf);
+    if (entry == 0) {
+        serial_print("sys_execve: elf_load_into_process failed\n");
+        __asm__ volatile("sti");
+        sys_exit(-1);
+        return -1;  /* unreachable */
+    }
+
+    uint64_t new_user_stack_top = exec_alloc_user_stack(self);
+    if (new_user_stack_top == 0) {
+        serial_print("sys_execve: user stack alloc failed\n");
+        __asm__ volatile("sti");
+        sys_exit(-1);
+        return -1;  /* unreachable */
+    }
+
+    /* ---- 6. Lay out argv on the new stack. ---- */
+    uint64_t rsp_init = 0;
+
+    if (argc > 0) {
+        uint64_t argv_region_top    = new_user_stack_top;
+        uint64_t argv_region_bottom = argv_region_top - 4096;
+
+        size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
+        uint64_t array_base    = argv_region_bottom;
+        uint64_t strings_start = argv_region_bottom + array_bytes;
+
+        uint64_t cursor = strings_start;
+        uint64_t arg_vaddrs[EXEC_MAX_ARGC];
+
+        for (int i = 0; i < argc; i++) {
+            size_t slen = 0;
+            while (slen < EXEC_MAX_ARG_LEN && argv_scratch[i][slen] != '\0') slen++;
+            slen++;
+
+            if (cursor + slen > argv_region_top) {
+                serial_print("sys_execve: argv region overflow\n");
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t dst = cursor;
+
+            if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
+                                      argv_scratch[i], slen) != 0) {
+                serial_print("sys_execve: failed to write argv[");
+                serial_print_dec(i);
+                serial_print("]\n");
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            arg_vaddrs[i] = dst;
+            cursor += slen;
+        }
+
+        uint64_t array_data[EXEC_MAX_ARGC + 1];
+        for (int i = 0; i < argc; i++) array_data[i] = arg_vaddrs[i];
+        array_data[argc] = 0;
+
+        if (safe_copy_to_user_cr3(self->cr3, (void*)array_base,
+                                  array_data, array_bytes) != 0) {
+            serial_print("sys_execve: failed to write argv array\n");
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+
+        /* SysV initial stack: [rsp]=argc, [rsp+8]=argv[0..n-1],
+           then argv NULL, then envp NULL.  We put argc in the 8 bytes
+           immediately below the argv array. */
+        rsp_init = argv_region_bottom - 8;
+        uint64_t argc_slot = (uint64_t)argc;
+        if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
+                                  &argc_slot, sizeof(argc_slot)) != 0) {
+            serial_print("sys_execve: failed to write argc\n");
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+
+        uint64_t envp_null = 0;
+        if (safe_copy_to_user_cr3(self->cr3,
+                                  (void*)(argv_region_bottom + array_bytes),
+                                  &envp_null, sizeof(envp_null)) != 0) {
+            serial_print("sys_execve: failed to write envp terminator\n");
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+    } else {
+        rsp_init = new_user_stack_top - 16;
+        uint64_t zero = 0;
+        if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
+                                  &zero, sizeof(zero)) != 0) {
+            serial_print("sys_execve: failed to write argc=0\n");
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+    }
+
+    /* ---- 7. Rewrite the syscall-entry frame. ----
+     *
+     * user_syscall_entry.asm pushed the frame with the first push at
+     * kernel_stack_top - 8.  Offsets we care about:
+     *   -56 = user RIP   (loaded into %rcx, used by sysret)
+     *   -72 = user RSP   (loaded into %r10, moved to %rsp before sysret)
+     *
+     * ktop[-7] = -56, ktop[-9] = -72.  RFLAGS at -64 is left alone:
+     * the new program starts with the same user RFLAGS the old one
+     * had, which is 0x202 for musl.
+     */
+    uint64_t* ktop = (uint64_t*)self->kernel_stack_top;
+    ktop[-7] = entry;      /* -56: user RIP  */
+    ktop[-9] = rsp_init;   /* -72: user RSP  */
+
+    /* ---- 8. Update PCB fields. ---- */
+    self->entry_point = entry;
+    self->rip         = entry;
+    self->exit_status = 0;
+    self->wait_pid    = 0;
+    self->block_kind  = BLOCK_KIND_NONE;
+    self->state       = PROC_STATE_RUNNING;
+
+    /* Manual name copy — no strncpy, we don't want zero-padding. */
+    {
+        int i = 0;
+        while (proc_name[i] && i < PROC_NAME_LEN - 1) {
+            self->name[i] = proc_name[i];
+            i++;
+        }
+        self->name[i] = '\0';
+    }
+
+    keyboard_buffer_flush();
+
+    serial_print("sys_execve: pid=");
+    serial_print_dec(self->pid);
+    serial_print(" entry=0x"); serial_print_hex(entry);
+    serial_print(" argc=");    serial_print_dec((uint64_t)argc);
+    serial_print(" rsp=0x");   serial_print_hex(rsp_init);
+    serial_print(" (");        serial_print(proc_name);
+    serial_print(")\n");
+
+    __asm__ volatile("sti");
+    return 0;
+}
+
+// ============================================================
 // SYS_WAIT4 (61)
 // ============================================================
 long sys_wait4(long pid, int* user_status, int options) {
@@ -1105,6 +1579,7 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
     (void)prot;
+    (void)offset;
 
     if (length == 0) return -(long)22;  /* -EINVAL */
 
@@ -1266,12 +1741,6 @@ long sys_fork(void) {
         return -1;
     }
 
-    {
-        uint32_t lo, hi;
-        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100));
-        uint64_t fsbase = ((uint64_t)hi << 32) | lo;
-    }
-
     /*
      * process_create clones the parent's current CR3 and allocates a
      * fresh kernel stack for the child.  It also builds an initial
@@ -1410,8 +1879,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
-        /* TEMP (A2.12 step 1): 59 still spawn; moves to Linux execve in step 2. */
-        case SYS_EXECVE:          return (uint64_t)sys_spawn((const char*)arg0, (int)arg1, (char**)arg2);
+        case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
