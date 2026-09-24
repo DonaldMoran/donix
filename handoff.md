@@ -110,7 +110,8 @@ the next):
    absence caused a `#GP`.  Real permission changes not implemented.
 10. `getrandom` = 318, `rseq` = 334 (stubs returning `-ENOSYS`) — complete
 11. `fork` = 57 — **complete at `20260924D`**
-12. `execve` = 59 — **next**
+12. `execve` = 59 — **step 1 complete at `20260924F`/`20260924H`;
+    step 2 (real in-place execve) next**
 13. `wait4` = 61
 14. `getdents64` = 217
 
@@ -208,6 +209,14 @@ Apply each only when a specific problem requires it.
   be left on the queue.  A process that is on the ready queue while
   BLOCKED will be picked ahead of runnable processes.
 
+- **`process_exit`'s empty-queue fallback must switch to idle, not
+  halt.**  When a user process exits and the ready queue is empty
+  (e.g. a forked child exits while the shell is blocked in `sys_read`
+  and off the queue), `process_exit` must switch to the idle process
+  (pid 1) rather than halting.  Idle `hlt`s until the next timer tick
+  or keyboard IRQ; the shell is then woken normally.  Fixed at
+  `20260924F`.  See "Resolved bugs" below.
+
 ### Syscall ABI
 
 - **`SYS_EXIT = 60` in `user_syscall_entry.asm`** — the only numeric
@@ -236,6 +245,13 @@ Apply each only when a specific problem requires it.
   child's frame.  If the assembly push order changes, that function's
   offsets must change with it.
 
+- **`SYS_DONIX_SPAWN` (507) is the newlib spawn number.**  The newlib
+  userland calls 507 for spawn semantics (`arc2/syscalls.c:spawn`).
+  Number 59 is reserved for the real Linux `execve` (A2.12 step 2).
+  In the current tree, 59 still dispatches to `sys_spawn` as a
+  placeholder — that is intentional and documented in
+  `include/syscall.h`.  Do not point newlib at 59.
+
 ### stdio / newlib
 
 - **If newlib `printf` breaks after a change, suspect the change, not
@@ -262,8 +278,52 @@ Apply each only when a specific problem requires it.
   hours.  Before each build, run `git status` (shows the file as
   modified) and a targeted `grep` on the changed function.  If
   either is unexpected, stop and fix the tree before building.
-  
+
+### Git hygiene (learned 2026-09-24, tag `20260924F`)
+
+- **Do not use `git add -A` when committing a single logical change.**
+  In this session, `git add -A` on the halt-fix commit staged *every*
+  modified file in the tree, including a separate in-flight rename of
+  the spawn syscall.  The commit message described only the halt fix,
+  but the commit actually contains the rename too.  The result was
+  tested green, so it was left in place rather than rewritten, but the
+  commit message is now misleading and the history can't be bisected
+  cleanly through that range.
+- **Use explicit `git add <file>...` for each commit**, listing only
+  the files that belong to that change.  Verify with `git diff --cached
+  --stat` before `git commit`.  If a file you didn't intend appears in
+  the staged set, `git restore --staged <file>` it before committing.
+
 ### Resolved bugs (kept for the record)
+
+- **Intermittent halt after a sequence with forking programs**
+  (resolved 2026-09-24, tag `20260924F`).  After running a sequence
+  like `hello`, `memtest`, `ls`, `cat`, `echo`, `musl_min`,
+  `musl_malloc`, `musl_fork`, the kernel *sometimes* halted with
+  `process_exit: no runnable process, halting`.
+
+  Root cause: a forked child exits while the shell is blocked in
+  `sys_read` (keyboard block, off the ready queue).  If the queue is
+  empty at that moment, `process_exit`'s fallback path took the halt
+  branch even though idle (pid 1) is a valid runnable process.  The
+  bug was nondeterministic because it depended on the interleaving of
+  the shell's block and the child's exit.
+
+  Diagnosis: two diagnostic prints (`EXIT:` at the top of
+  `process_exit`, `WAKE:`/`IRQ1-pre`/`IRQ1-post` around
+  `process_wake_all_blocked`) captured a run where the child exited
+  with `qhead=(empty)` and took the halt.  The same sequence on other
+  runs showed a non-empty queue, confirming the race.
+
+  Fix: in `process_exit`'s fallback path, if `idle` is a valid PCB
+  (pid 1 exists), switch to it via `context_switch(exiting, idle)`
+  instead of halting.  Idle `hlt`s until the next timer tick; the
+  next keyboard IRQ wakes the shell via `process_wake_all_blocked`,
+  and `timer_preempt_handler` picks it up on the following tick.
+
+  A secondary symptom — "shell prompt returns but keyboard goes
+  dead" — was reported but never reproduced.  It may be the same
+  race with a different interleaving.  If it reappears, reopen.
 
 - **Linux `brk` ABI vs. increment `sbrk`** (resolved 2026-09-24, tag
   `20260924B`).  The original symptom was misdiagnosed as a PMM
@@ -319,52 +379,25 @@ Apply each only when a specific problem requires it.
   `cat`, `echo`, `musl_min`, `musl_malloc`.
 
   **Must be resolved before Phase A3 (musl shell).**  Planned as the
-  first task after `fork`/`execve`/`wait4` are in, because a working
-  `execve` will let us run more musl test programs and narrow the
-  cause.  Do **not** attempt to fix this from the kernel side; the
-  kernel is behaving correctly.
+  first task after `execve`/`wait4` are in, because a working `execve`
+  will let us run more musl test programs and narrow the cause.  Do
+  **not** attempt to fix this from the kernel side; the kernel is
+  behaving correctly.
 
 ### Open issues
 
-- **Intermittent halt after a long command sequence with forking
-  programs** (found 2026-09-24, tag `20260924D`).  After running a
-  sequence like `hello`, `memtest`, `ls`, `cat`, `echo`, `musl_min`,
-  `musl_malloc`, `musl_fork_raw`, the kernel *sometimes* halts with
-  `process_exit: no runnable process, halting`.  The same sequence on
-  a fresh boot does not always halt — the bug is nondeterministic.
-
-  The halt happens when a forked child exits while the shell is
-  blocked in `sys_read` (keyboard block).  `process_exit`'s fallback
-  path finds the ready queue empty (the shell is BLOCKED on read, not
-  on the queue) and, because the exiting process is a user process,
-  takes the halt path instead of idling on pid 1.
-
-  The halt did not appear before we removed the diagnostic prints
-  from `scheduler.c` and `interrupts.c`.  Those prints included
-  `serial_lock` / `serial_unlock` (cli/sti) windows of ~5–15 ms each,
-  which changed the interleaving of the child's exit and the shell's
-  wake.  So this is a timing race that the prints were masking, not a
-  semantic change from the print removal.
-
-  Diagnostic prints have been left in `scheduler.c` at the top of
-  `process_exit` (`EXIT: pid=... state=... parent=... qhead=...`) and
-  before the halt message (`HALT: exiting pid=... name=...
-  entry=... parent=...`).  The next time the halt fires, capture the
-  log — those two lines will show which process exited and what the
-  queue looked like.
-
-  Likely fix: in `process_exit`'s fallback path, if the ready queue
-  is empty and the exiting process is a user process, pick the idle
-  process (pid 1) and switch to it instead of halting.  Idle is
-  BLOCKED on `hlt` and will be woken by the next timer tick; the
-  shell will be woken by the next keyboard IRQ.  This has not been
-  tested — verify with a reproduction first.
+- **None blocking.**  The intermittent halt was resolved at
+  `20260924F`.  See "Resolved bugs."  If the "prompt returns, keyboard
+  dead" symptom reappears, reopen it here.
 
 ### Cosmetic / housekeeping
 
 - `syscall.c:29` has an old stub `sys_brk` that shadows the real one in
   `user_syscall.c`. Not fatal, but confusing. Clean up later.
 - Shell line-editing has a backspace echo bug. Not on critical path.
+- `sys_spawn` still prints its serial trace with the prefix
+  `sys_execve:` (a string literal, not a symbol).  Cosmetic; rename
+  the literal to `sys_spawn:` at the next convenient edit.
 
 ## Testing harness
 
@@ -401,6 +434,8 @@ milestone. One change at a time so `git restore .` always works.
    scope.
 8. If a test fails, `git restore .` and diagnose. **Do not proceed
    with a broken milestone.**
+9. Commit with explicit `git add <file>...`, not `git add -A`.  Verify
+   `git diff --cached --stat` before committing.
 
 ## The one-line summary
 
@@ -413,49 +448,47 @@ musl lands.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-24 (evening, session 2)
-**Current tag / HEAD:** `20260924E`
-**Last known-good tag:** `20260924E`
+**Last updated:** 2026-09-24 (evening, session 3)
+**Current tag / HEAD:** `20260924H`
+**Last known-good tag:** `20260924H`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 12 — `execve` = 59.**  A2 item 11 (`fork`) is complete:
-`musl_fork` and `musl_fork_raw` both print `A`, `P`, `C` cleanly.
-The remaining blocker for the musl shell (A3) is Linux `execve`
-semantics: the current `sys_execve` is a *spawn* (creates a new
-process, returns its pid), and musl expects `execve` to replace the
-calling process's address space in place.
+**A2 item 12 — `execve` = 59.  Step 1 complete; step 2 next.**
 
-The fix that got `fork` working was in `user_syscall_entry.asm` and
-`process_fork_copy_frame`: the syscall entry/return frame now saves
-`%rdi`, `%rsi`, `%rdx`, `%r10` (in addition to the callee-saved set
-and `%r8`/`%r9`), the parent's return path restores `%rdi`/`%rsi`/
-`%rdx` and discards `%r10`, and the child's frame in
-`process_fork_copy_frame` is populated from those slots.  Without
-the parent-side restore, musl's fork wrapper faulted at RIP
-`0x401383` with CR2=0x98 because `%rdx` (cached TLS base) was
-clobbered by the syscall argument shuffle.
+Step 1 moved spawn semantics off number 59 and onto a donix-private
+number so that 59 is free for the real Linux `execve`.  The rename
+landed in `20260924F` (bundled with the halt fix — see "Git hygiene"
+in Part 1), and the header documentation for 59 was updated in
+`20260924H`.  `SYS_DONIX_SPAWN` is 507; `arc2/syscalls.c:spawn` calls
+507; the kernel dispatcher still routes 59 to `sys_spawn` as a
+placeholder.
 
-Three scheduler fixes were also needed and are now in:
-- `scheduler_ready_queue_add` is idempotent.
-- `process_wake_all_blocked` skips processes already on the queue.
-- `process_yield` removes a BLOCKED process from the ready queue.
+Step 2 replaces the placeholder with real in-place `execve`
+semantics: the calling process's address space is replaced, no new
+process is created, the resume frame's user RIP and RSP are rewritten
+to point at the new program, and the syscall returns 0 into the new
+program's entry.
 
-### Plan for `execve` (two commits)
+### Plan for step 2
 
-The newlib shell uses `spawn` via `arc2/syscalls.c` and depends on
-the current spawn semantics.  If we change syscall 59 to Linux
-`execve`, the newlib shell breaks.  Resolution:
+1. Paste `04_kernel_64bit/user_syscall_entry.asm` first — the resume
+   frame offsets in `process_fork_copy_frame`'s comment (`-56` user
+   RIP, `-72` user RSP) must be verified against the actual push order
+   in the assembly before writing any code.
+2. Design the in-place `execve`:
+   - Free the current process's old ELF pages and old user stack.
+   - Load the new ELF into the **same** CR3 (`current->cr3`).
+   - Write argv into the current process's user stack.
+   - Rewrite the current process's syscall-entry frame so the return
+     path resumes at the new program's entry with the new stack.
+3. The syscall must run with interrupts disabled (`cli`/`sti`), like
+   `sys_fork` does.
+4. Test with a musl `fork` + `execve` program; the newlib shell's
+   `spawn` path is unaffected because it now calls 507.
 
-1. Add `SYS_DONIX_SPAWN` (507) with the current spawn behavior,
-   rename `sys_execve` to `sys_spawn`, keep 59 pointing at spawn
-   for this commit, and change `arc2/syscalls.c`'s `spawn` to call
-   507.  Test: canary green.
-2. Change syscall 59 to Linux `execve`.  Test: canary green, plus
-   a `fork` + `execve` musl test binary.
-
-## Canary state (green as of `20260924E`)
+## Canary state (green as of `20260924H`)
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -466,7 +499,7 @@ the current spawn semantics.  If we change syscall 59 to Linux
 | memtest (newlib) | green | `[memtest] PASS` |
 | musl_min | green | prints `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
-| musl_fork | green | prints `A`, `P`, `C`; musl's fork wrapper, uses `arch_prctl(158)` to set FS base |
+| musl_fork | green | prints `A`, `P`, `C` |
 | musl_fork_raw | green | prints `A`, `P`, `C` |
 | musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
 | printnum | red | same root cause as `musl_printf`. |
@@ -476,46 +509,32 @@ the current spawn semantics.  If we change syscall 59 to Linux
 
 ## Next step (exactly this, then stop)
 
-**Two paths, decide at the start of the session:**
+**A2 item 12 step 2 — real in-place `execve`.**
 
-### Path A — fix the intermittent halt first
-
-1. Confirm the reproduction: boot fresh, run
-   `hello; memtest; ls; cat hello-world.txt; echo hi; musl_min;
-   musl_malloc; musl_fork_raw` in sequence.  Repeat the sequence a
-   few times if the halt does not fire on the first try.  The two
-   diagnostics in `process_exit` (`EXIT:` and `HALT:`) will show
-   which process exited and the queue state if the halt fires.
-2. If reproducible, the likely fix is in `process_exit`'s fallback
-   path: if the ready queue is empty and the exiting process is a
-   user process, switch to the idle process (pid 1) instead of
-   halting.  Idle will be woken by the next timer tick; the shell
-   will be woken by the next keyboard IRQ.
-3. Test: re-run the full command sequence several times.  No halt.
-4. Then move to Path B.
-
-### Path B — start A2 item 12 (`execve`)
-
-1. Confirm working tree clean: `git status` shows nothing modified.
-2. Start **A2 item 12 (`execve`)**.  Paste `handoff.md` plus these
-   files:
+1. Confirm working tree clean: `git status` shows nothing modified,
+   and HEAD is `20260924H` (or later if the handoff commit has been
+   made on top).
+2. Paste `handoff.md` plus these files:
+   - `04_kernel_64bit/user_syscall_entry.asm`
    - `04_kernel_64bit/process.c`
    - `04_kernel_64bit/include/process.h`
-   - `04_kernel_64bit/user_syscall.c` (the current `sys_execve` handler)
+   - `04_kernel_64bit/user_syscall.c` (the current `sys_spawn` handler
+     and dispatcher)
    - `04_kernel_64bit/elf.c`
+3. Say: "Continue from here.  Implement A2 item 12 step 2: the real
+   Linux `execve`.  The current `case SYS_EXECVE` in `user_syscall.c`
+   routes to `sys_spawn`, which creates a new process.  Replace it
+   with an in-place `execve` that replaces the calling process's
+   address space: free the old ELF pages and user stack, load the new
+   ELF into `current->cr3`, write argv onto the current user stack,
+   rewrite the current process's resume frame (user RIP and user RSP)
+   so the syscall return path resumes at the new program's entry, and
+   return 0.  The frame offsets in `process_fork_copy_frame` claim
+   `kernel_stack_top - 56` is user RIP and `- 72` is user RSP — verify
+   those against `user_syscall_entry.asm` before writing code."
 
-   Say: "Continue from here.  Implement A2 item 12 (execve).  The
-   current `sys_execve` is a spawn — it creates a new process and
-   returns its pid.  Linux `execve` replaces the calling process's
-   address space in place, without creating a new process.  Design
-   the replacement semantics with the fork work in mind: the caller
-   is a forked child, `sys_execve` should replace its CR3, load the
-   new ELF into it, reset the resume frame's RIP and RSP, and return
-   `0` from `sys_execve` to the caller's `main`."
-
-3. `musl_printf` / `printnum` are deferred to Phase A3/A4 — see
-   "Resolved bugs" in Part 1.  Do not spend time on them in this
-   session.
+`musl_printf` / `printnum` remain deferred — see "Resolved bugs" in
+Part 1.  Do not spend time on them in this session.
 
 ## State on disk
 
@@ -523,19 +542,14 @@ the current spawn semantics.  If we change syscall 59 to Linux
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
 - `/tmp/musl_*` — musl test binaries, rebuilt by
-  `build_musl_tests.sh` (now tracked in the repo).
-- `build_musl_tests.sh` — committed at `57a3f9e`.
+  `build_musl_tests.sh` (tracked in the repo, committed at `57a3f9e`).
 - `~/code/x` — snapshot of the pre-cleanup tree, kept for diffing.
-  Can be deleted once the halt is resolved.
+  Can be deleted; the halt it was being kept for is now resolved.
 
 ## Open items
 
-- **Intermittent halt after a long command sequence with forking
-  programs.**  See "Open issues" in Part 1 for details.  Two
-  diagnostics left in `scheduler.c` to capture the state if it fires
-  again.
-
-Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
+- **None blocking.**  Step 2 of `execve` is the next milestone.
+- Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
 ## How to use this file
 
