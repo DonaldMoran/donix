@@ -102,27 +102,46 @@ user_syscall_entry:
     mov rdi, rax                    ; num  -> rdi
 
     call syscall_dispatch
+    
     add rsp, 8                      ; discard stacked arg5
 
     cmp rbx, 60
     je .handle_exit
 
-    ; Pop the extra saved GPRs.  r10 is discarded: the exit path below
-    ; needs r10 as the user-RSP scratch, and the C ABI permits the
-    ; callee to clobber it, so the parent's compiler does not rely on
-    ; it surviving the syscall.  rdi/rsi/rdx ARE restored, because
-    ; compilers (notably musl's fork wrapper) do rely on those.
-    pop r10                         ; discard saved r10
+    ; Restore the extra saved GPRs.  The syscall ABI clobbers only
+    ; rax, rcx, r11; every other GPR must survive a syscall.  The
+    ; previous version discarded the saved r10 and reused r10 as a
+    ; scratch for the user RSP, which corrupted any value the caller
+    ; had live in r10 across the syscall.  musl's __stdio_write does
+    ; exactly that, which is why printf emitted garbage iov[1] values.
+    pop r10                         ; restore user r10
     pop rdx                         ; restore user rdx
     pop rsi                         ; restore user rsi
     pop rdi                         ; restore user rdi
 
     pop r9
     pop r8
-    pop r10                         ; user RSP -> r10 (sysret does not read r10)
-    pop r11                         ; user RFLAGS
-    pop rcx                         ; user RIP
 
+    ; At this point rsp points at the saved user RSP slot.  The
+    ; frame above it (higher addresses) is:
+    ;   [rsp + 0]  = user RSP
+    ;   [rsp + 8]  = user RFLAGS
+    ;   [rsp + 16] = user RIP
+    ;   [rsp + 24] = r15
+    ;   [rsp + 32] = r14
+    ;   [rsp + 40] = r13
+    ;   [rsp + 48] = r12
+    ;   [rsp + 56] = rbp
+    ;   [rsp + 64] = rbx
+    ;
+    ; Load RFLAGS and RIP first, then pop the callee-saved
+    ; registers, then load the user RSP LAST so no GPR has to hold
+    ; it.  rax is left untouched: it carries the syscall return
+    ; value that sysret hands back to the user.
+    mov r11, [rsp + 8]              ; user RFLAGS -> r11
+    mov rcx, [rsp + 16]             ; user RIP    -> rcx
+
+    add rsp, 24                     ; skip user RSP, RFLAGS, RIP slots
     pop r15
     pop r14
     pop r13
@@ -130,14 +149,11 @@ user_syscall_entry:
     pop rbp
     pop rbx
 
-    ; Diagnostic: record what we are about to load into the CPU's
-    ; user-mode RIP/RFLAGS/RSP, so the exception handler can dump it
-    ; if the sysret goes wrong.
-    mov [rel g_last_sysret_rcx], rcx
-    mov [rel g_last_sysret_r11], r11
-    mov [rel g_last_sysret_rsp], r10
+    ; rsp is now 72 bytes past the user RSP slot: 24 (skipped) +
+    ; 6*8 (the six pops).  Load the user RSP directly into rsp,
+    ; with no intermediate GPR.
+    mov rsp, [rsp - 72]
 
-    mov rsp, r10
     o64 sysret
 
 .handle_exit:

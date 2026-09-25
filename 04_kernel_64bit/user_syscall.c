@@ -36,6 +36,10 @@ static char g_write_bounce[WRITE_CHUNK];
  * ============================================================ */
 #define DEBUG_FIL 0
 
+/* Set DEBUG_WRITE_BOUNCE to 1 to detect reentrant console writes
+ * through the shared g_write_bounce buffer.  Diagnostic only. */
+#define DEBUG_WRITE_BOUNCE 0
+
 // ============================================================
 // FILE TABLE SLOT HEADER
 // ============================================================
@@ -1274,17 +1278,37 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (!self) return -1;
 
     if (fd == 1 || fd == 2) {
+#if DEBUG_WRITE_BOUNCE
+        static volatile int in_bounce = 0;
+        if (__sync_lock_test_and_set(&in_bounce, 1)) {
+            serial_print("[write] BOUNCE REENTRY pid=");
+            serial_print_dec((uint64_t)self->pid);
+            serial_print(" fd=");
+            serial_print_dec((uint64_t)fd);
+            serial_print(" count=");
+            serial_print_dec((uint64_t)count);
+            serial_print("\n");
+        }
+#endif
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
             size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
-            if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) return -1;
+            if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
+#if DEBUG_WRITE_BOUNCE
+                __sync_lock_release(&in_bounce);
+#endif
+                return -1;
+            }
             for (size_t i = 0; i < chunk; i++) {
                 char c = g_write_bounce[i];
                 serial_putc(c); vga_putc(c);
             }
             user_ptr += chunk; remaining -= chunk;
         }
+#if DEBUG_WRITE_BOUNCE
+        __sync_lock_release(&in_bounce);
+#endif
         return (long)count;
     }
 
@@ -1340,6 +1364,7 @@ struct iovec {
  * usage of the local copy.
  */
 #define WRITEV_MAX_IOVS 16
+#define DEBUG_WRITEV 0
 
 long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
     if (!user_iov || iovcnt <= 0) return 0;
@@ -1350,6 +1375,22 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
     if (safe_copy_from_user(local, user_iov, bytes) != 0) {
         return -14;  /* -EFAULT */
     }
+
+#if DEBUG_WRITEV
+    serial_print("[writev] fd=");
+    serial_print_dec((uint64_t)fd);
+    serial_print(" iovcnt=");
+    serial_print_dec((uint64_t)iovcnt);
+    for (int i = 0; i < iovcnt; i++) {
+        serial_print(" iov[");
+        serial_print_dec((uint64_t)i);
+        serial_print("] base=0x");
+        serial_print_hex((uint64_t)local[i].iov_base);
+        serial_print(" len=");
+        serial_print_dec((uint64_t)local[i].iov_len);
+    }
+    serial_print("\n");
+#endif
 
     long total = 0;
     for (int i = 0; i < iovcnt; i++) {

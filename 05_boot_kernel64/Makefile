@@ -30,6 +30,7 @@ MUSL_FORK_RAW := /tmp/musl_fork_raw
 MUSL_EXEC     := /tmp/musl_exec
 MUSL_WAIT     := /tmp/musl_wait
 MUSL_READDIR  := /tmp/musl_readdir
+MUSL_R10PROBE := /tmp/musl_r10probe
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -105,7 +106,8 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(BRKGROW)"       BRKGROW.ELF ; \
 	mcopy_one "$(MUSL_EXEC)"     MUSL_EXEC.ELF ; \
 	mcopy_one "$(MUSL_WAIT)"     MUSL_WAIT.ELF ; \
-	mcopy_one "$(MUSL_READDIR)"  MUSL_READDIR.ELF
+	mcopy_one "$(MUSL_READDIR)"  MUSL_READDIR.ELF ; \
+	mcopy_one "$(MUSL_R10PROBE)" MUSL_R10PROBE.ELF
 
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true

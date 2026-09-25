@@ -678,7 +678,72 @@ int main(void) {
 }
 EOF
 musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/brkgrow /tmp/brkgrow.c
+# -------------------------------------------------------------------
+# Test: R10 PROBE — is %r10 preserved across a writev syscall?
+#
+# The Linux x86_64 syscall ABI clobbers only %rax, %rcx, %r11.
+# Every other GPR must survive a syscall.  musl's __stdio_write
+# builds its iovec array in a way that can leave a live value in
+# %r10 across the raw writev syscall.  If the kernel's return path
+# clobbers %r10, musl stores a bad pointer into iov[1] and printf
+# emits garbage.
+#
+# This test sets %r10 to a recognisable sentinel, issues a raw
+# writev(2), and prints the value of %r10 afterwards.
+#
+# Expected (correct kernel): R10-AFTER=0xdeadbeefcafebabe
+# Broken kernel:             R10-AFTER=0x0000008xxxxxxxxx  (a user RSP)
+# -------------------------------------------------------------------
 
+cat > /tmp/musl_r10probe.c <<'EOF'
+#include <unistd.h>
+#include <stdint.h>
+#include <sys/uio.h>
+
+static void puthex64(uint64_t v) {
+    char b[24]; int n = 0;
+    b[n++]='R'; b[n++]='1'; b[n++]='0'; b[n++]='-';
+    b[n++]='A'; b[n++]='F'; b[n++]='T'; b[n++]='E'; b[n++]='R'; b[n++]='=';
+    b[n++]='0'; b[n++]='x';
+    for (int i = 15; i >= 0; i--) {
+        unsigned d = (v >> (i * 4)) & 0xf;
+        b[n++] = d < 10 ? ('0' + d) : ('a' + d - 10);
+    }
+    b[n++] = '\n';
+    write(1, b, n);
+}
+
+int main(void) {
+    struct iovec iov[2];
+    iov[0].iov_base = (void*)"ABC";
+    iov[0].iov_len  = 3;
+    iov[1].iov_base = (void*)"DEF\n";
+    iov[1].iov_len  = 4;
+
+    long ret;
+    register uint64_t r10_reg asm("r10") = 0xDEADBEEFCAFEBABEULL;
+
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret), "+r"(r10_reg)
+        : "a"(20L), "D"(1L), "S"(iov), "d"(2L)
+        : "rcx", "r11", "memory"
+    );
+
+    puthex64(r10_reg);
+    return (ret == 7) ? 0 : 1;
+}
+EOF
+
+echo "[BUILD] musl_r10probe"
+
+musl-gcc \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/musl_r10probe \
+    /tmp/musl_r10probe.c
 # -------------------------------------------------------------------
 # Verify outputs
 # -------------------------------------------------------------------
@@ -701,7 +766,8 @@ for f in \
     /tmp/printnum \
     /tmp/brk_verify \
     /tmp/brkraw \
-    /tmp/brkgrow
+    /tmp/brkgrow \
+    /tmp/musl_r10probe
 do
     if [[ -f "$f" ]]; then
         echo "[OK] $f"
