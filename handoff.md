@@ -113,10 +113,11 @@ the next):
 12. `execve` = 59 — **complete at `20260924I`** (both steps: spawn
     moved to 507, real in-place execve at 59).  Exercised by the new
     `musl_exec` test.
-13. `wait4` = 61 — **working at `20260924I`** (blocking wait, reap,
+13. `wait4` = 61 — **complete at `20260924J`** (blocking wait, reap,
     parent-pid preserved across execve — all exercised by
-    `musl_exec`).  Status-propagation and `WNOHANG` tests still to
-    be added; see Part 2 "Next step".
+    `musl_exec`; status propagation, `WNOHANG`, and `wait4(-1)` now
+    exercised by `musl_wait`).  Required the `"+m"(*status)` asm
+    fix in the test and Linux status-word encoding in `sys_wait4`.
 14. `getdents64` = 217 — **next**, currently a `-ENOSYS` stub
 
 Each of the remaining items is its own milestone. **Commit after each.**
@@ -260,6 +261,18 @@ Apply each only when a specific problem requires it.
   `sys_spawn` (507) still creates a new process; `sys_execve` (59)
   replaces the caller's address space in place.  Do not point newlib
   at 59.
+
+- **A raw-syscall test that reads a kernel-written buffer must declare
+  the buffer as an asm memory output — `"+m"(*ptr)`, not just
+  `"memory"`.**  A `"memory"` clobber is an aliasing/scheduling
+  barrier, not a per-location output; GCC does not treat it as "the
+  asm wrote through this specific pointer."  `musl_wait`'s
+  `raw_wait4` silently read a stale `status` (initialized to `-1`) on
+  the first `wait4(-1)` of a two-reap sequence until the constraint
+  became `"+m"(*status)`; the kernel was writing the correct value
+  (confirmed with a temporary serial print in `sys_wait4`).  Same
+  rule applies to any future test that passes `&local` to a raw
+  syscall and then reads `local` back.
 
 ### stdio / newlib
 
@@ -425,12 +438,23 @@ Apply each only when a specific problem requires it.
   **not** attempt to fix this from the kernel side; the kernel is
   behaving correctly.
 
+- **`musl_wait` read a stale status on the first `wait4(-1)`**
+  (resolved 2026-09-24, tag `20260924J`).  The test printed
+  `WAIT-ANY-1 255` while a temporary serial print in `sys_wait4`
+  showed the kernel copied `2816` (= `11 << 8`) to `&status`.  Root
+  cause: the test's `raw_wait4` inline asm declared only a
+  `"memory"` clobber, which GCC does not treat as writing the
+  location pointed to by `%rsi`.  GCC cached the pre-call value
+  (`-1`) across the syscall for the first reap.  Fix: declare
+  `"+m"(*status)` in the asm.  The kernel was correct; the test was
+  miscompiled.  See "Syscall ABI" above for the general rule.
+
 ### Open issues
 
-- **None blocking.**  `execve` (A2.12) and the initial `wait4` exercise
-  (A2.13) are complete at `20260924I`.  The next milestone is
-  `getdents64` (A2.14).  If the "prompt returns, keyboard dead"
-  symptom reappears, reopen it here.
+- **None blocking.**  `execve` (A2.12), `wait4` (A2.13) are complete
+  at `20260924I`/`20260924J`.  The next milestone is `getdents64`
+  (A2.14).  If the "prompt returns, keyboard dead" symptom reappears,
+  reopen it here.
 
 ### Cosmetic / housekeeping
 
@@ -454,10 +478,11 @@ Apply each only when a specific problem requires it.
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
 - **musl test binaries** are built by `build_musl_tests.sh` (tracked,
-  committed at `57a3f9e`, extended at `20260924I` with `musl_exec`).
-  Sources are heredoc'd into `/tmp/` and linked with `musl-gcc
-  -static -no-pie -O2 -mcmodel=large`.  The image build copies
-  `/tmp/musl_*` to `::/MUSL_*.ELF` on the FAT.
+  committed at `57a3f9e`, extended at `20260924I` with `musl_exec`
+  and at `20260924J` with `musl_wait`).  Sources are heredoc'd into
+  `/tmp/` and linked with `musl-gcc -static -no-pie -O2
+  -mcmodel=large`.  The image build copies `/tmp/musl_*` to
+  `::/MUSL_*.ELF` on the FAT.
 
 ## Recovery
 
@@ -499,27 +524,32 @@ musl lands.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-24 (late evening, session 3)
-**Current tag / HEAD:** `20260924I` (or the handoff commit on top of it)
-**Last known-good tag:** `20260924I`
+**Last updated:** 2026-09-24 (late evening, session 4)
+**Current tag / HEAD:** `20260924J` (commit `64cf2e7`)
+**Last known-good tag:** `20260924J`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 12 — `execve` = 59.  COMPLETE at `20260924I`.**
+**A2 item 13 — `wait4` = 61.  COMPLETE at `20260924J`.**
 
-Both steps are done:
-- Step 1 (`20260924F`/`20260924H`): spawn moved to `SYS_DONIX_SPAWN`
-  (507); 59 reserved for Linux execve.
-- Step 2 (`20260924I`): real in-place execve.  `sys_execve` replaces
-  the calling process's user address space (teardown-then-load into
-  `self->cr3`), lays out argv on a fresh user stack, rewrites the
-  syscall-entry frame, and returns 0 to the new program's entry.
-  Same pid, no new process.  Exercised by the new `musl_exec` test.
+All three behaviors now exercised by `musl_wait`:
+- Non-zero exit status propagation via `WEXITSTATUS` (child
+  `_exit(42)` → parent sees 42);
+- `WNOHANG` on a still-running child returns 0 immediately;
+- `wait4(-1, ...)` reaps any child.
 
-**A2 item 13 — `wait4` = 61.**  Working, exercised by `musl_exec`
-(blocking wait, reap, parent-pid preserved across execve).  Still
-needs a status-propagation + `WNOHANG` test — see "Next step" below.
+Two fixes landed at this tag:
+
+1. **Test-side:** `raw_wait4`'s inline asm now declares the status
+   pointer as `"+m"(*status)`.  Without it, GCC cached the pre-call
+   value across the syscall on the first of two back-to-back
+   `wait4(-1)` calls, so the test read a stale `-1` and printed
+   `WAIT-ANY-1 255` while the kernel was in fact writing `2816`.
+2. **Kernel-side:** `sys_wait4` now encodes the exit code as a Linux
+   wait-status word — `int status = (zombie->exit_status & 0xff) << 8;`
+   — before copying to userspace, so musl's `WIFEXITED` /
+   `WEXITSTATUS` macros work.
 
 **A2 item 14 — `getdents64` = 217.**  Next.  Currently a `-ENOSYS`
 stub in `sys_getdents64`.
@@ -527,12 +557,12 @@ stub in `sys_getdents64`.
 `musl_printf` / `printnum` remain deferred (musl-internal, see
 "Resolved bugs" in Part 1).
 
-## Canary state (green as of `20260924I`)
+## Canary state (green as of `20260924J`)
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | |
-| ls | green | lists 19 files |
+| ls | green | lists 20 files |
 | cat | green | reads HELLO-WORLD.TXT |
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
@@ -540,7 +570,8 @@ stub in `sys_getdents64`.
 | musl_malloc | green | `MALLOC-OK` and `SMALL-OK` |
 | musl_fork | green | prints `A`, `P`, `C` |
 | musl_fork_raw | green | prints `A`, `P`, `C` |
-| musl_exec | green | prints `EXEC-PARENT-START`, child execve's `MUSL_MIN.ELF` in place (pid preserved), `MUSL-START`, `EXEC-PARENT-DONE` |
+| musl_exec | green | `EXEC-PARENT-START`, child execve's `MUSL_MIN.ELF` in place (pid preserved), `MUSL-START`, `EXEC-PARENT-DONE` |
+| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`; required the `"+m"(*status)` asm fix in the test and Linux status-word encoding in `sys_wait4` |
 | musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
 | printnum | red | same root cause as `musl_printf`. |
 | brkraw | red | test binary needs re-run against the current kernel; `sys_brk` is now Linux-ABI |
@@ -549,51 +580,61 @@ stub in `sys_getdents64`.
 
 ## Next step (exactly this, then stop)
 
-**A2 item 13 — `wait4` = 61, add a status-propagation + `WNOHANG`
-test.**
+**A2 item 14 — `getdents64` = 217.**
 
-`sys_wait4` is already exercised by `musl_exec` (blocking wait, reap,
-parent-pid preserved across execve).  What's not yet tested:
+Currently a `-ENOSYS` stub in `sys_getdents64`.  Musl's `readdir`
+needs it.  The kernel already has `sys_readdir` (donix-private)
+returning a `dons_dirent_t`, but musl expects the Linux
+`struct linux_dirent64` layout:
 
-1. **Non-zero exit status propagation.**  A child `_exit(42)` should
-   give the parent `WEXITSTATUS(status) == 42`.
-2. **`WNOHANG` semantics.**  `wait4(pid, &status, WNOHANG)` on a
-   still-running child must return 0 immediately, not block.
-3. **`wait4(-1, ...)`.**  Wait for any child, not a specific pid.
+```c
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+```
 
 Plan:
 
-1. Confirm working tree clean and HEAD is `20260924I` (or the handoff
-   commit on top of it).
-2. Add a new test `musl_wait` to `build_musl_tests.sh` (same pattern
-   as `musl_exec`: heredoc into `/tmp/`, `musl-gcc -static -no-pie
-   -O2 -mcmodel=large`).  The test should:
-   - fork a child that `_exit(42)`; parent `wait4` and assert
-     `WEXITSTATUS(status) == 42`;
-   - fork a child that sleeps (`nanosleep` or a `for` loop with a
-     `write`); parent `wait4(pid, &status, WNOHANG)` before it exits
-     and assert the return is 0; then `wait4(pid, &status, 0)` to
-     reap it;
-   - fork two children that exit with different codes; parent calls
-     `wait4(-1, &status, 0)` twice and asserts both pids are reaped.
-3. Add the `mcopy /tmp/musl_wait -> ::/MUSL_WAIT.ELF` line to the
-   image build (next to the other `mcopy /tmp/musl_*` lines).
-4. Add `/tmp/musl_wait` to the verification loop at the bottom of
-   `build_musl_tests.sh`.
-5. Run `./build_musl_tests.sh`, `make kernel64`, boot QEMU, run
-   `musl_wait`, paste serial output.
+1. Confirm working tree clean and HEAD is `20260924J`.
+2. Implement `sys_getdents64(int fd, void* dirp, size_t count)` in
+   `user_syscall.c` by wrapping the existing `sys_readdir` machinery:
+   loop over `f_readdir`, pack entries into a small stack buffer in
+   `linux_dirent64` form, `safe_copy_to_user` into the user buffer,
+   and stop when the DIR is exhausted (return 0) or the next entry
+   would not fit in `count` (return bytes written so far).  The call
+   is `readdir`-shaped, not `getdents64`-shaped; musl handles the
+   partial case by advancing its buffer cursor.
+3. Open questions to settle before writing:
+   - **`d_ino`:** FAT has no inodes.  Musl and busybox mostly use
+     `d_ino` to detect `.` / `..` by name and don't require it to be
+     meaningful.  Use `d_ino = 0` for now, or synthesize from the
+     FAT directory entry offset.  Pick one and document it.
+   - **`d_off`:** Same — use the FAT directory entry index, or 0.
+   - **`d_type`:** `DT_REG` / `DT_DIR` / `DT_UNKNOWN`.  Map from
+     `fno.fattrib & AM_DIR` (need the `AM_DIR` constant; it's in
+     `ff.h`).
+4. Add a musl test (`musl_readdir`) that uses musl's
+   `opendir`/`readdir`/`closedir` to walk `0:/` and prints each
+   name.  `musl-gcc -static -no-pie -O2 -mcmodel=large`, same
+   pattern as the other tests.
+5. `mcopy /tmp/musl_readdir -> ::/MUSL_READDIR.ELF`, add
+   `/tmp/musl_readdir` to the verify loop.
+6. Run `./build_musl_tests.sh`, `make hdd-single.img`, boot QEMU,
+   run `musl_readdir`, paste serial output.
 
-If `sys_wait4` needs changes, they'll be small — the current
-implementation already has the `WNOHANG` branch and the
-`pid <= 0 → (uint64_t)-1` translation.  Possible gaps: whether
-`exit_status` is copied correctly (it is set in `sys_exit`, read in
-`sys_wait4`), and whether `wait4(-1)` correctly matches any child
-(the current loop does check `target != (uint64_t)-1`).  Expect
-green on the first run.
+`sys_getdents64` is currently a stub; expect the first attempt to be
+close, but the exact `linux_dirent64` packing (alignment, `d_reclen`
+computation, d_name NUL) is where bugs will land.  Verify each field
+with a raw-byte dump if musl's `readdir` misbehaves.
 
-After `musl_wait` is green, **A2 item 14 — `getdents64` = 217** is
-next.  Needed by musl's `readdir`, which the shell and `ls` will
-need once they're musl.
+After `musl_readdir` is green, **A3 — musl shell** is next, but
+`musl_printf` / `printnum` (musl-internal) must be resolved first;
+they will block a musl shell that prints prompts.  See "Resolved
+bugs" in Part 1 for the current state of that investigation.
 
 ## State on disk
 
@@ -602,8 +643,8 @@ need once they're musl.
   from the QEMU invocation in the Makefile.  Turn the flag back on
   only for a specific instruction-trace investigation.
 - `/tmp/musl_*` — musl test binaries, rebuilt by
-  `build_musl_tests.sh`.  `musl_exec` is new this session;
-  `musl_wait` will be added next.
+  `build_musl_tests.sh`.  `musl_wait` is new this session;
+  `musl_readdir` will be added next.
 - `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
@@ -617,8 +658,9 @@ need once they're musl.
 
 ## Open items
 
-- **None blocking.**  Next milestone is `wait4` status-propagation
-  test, then `getdents64` (A2.14), then A3 (musl shell).
+- **None blocking.**  Next milestone is `getdents64` (A2.14), then A3
+  (musl shell).  `musl_printf` / `printnum` (musl-internal) must be
+  resolved before A3.
 - Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
 ## How to use this file
