@@ -101,8 +101,8 @@ the next):
 6. `ioctl` = 16 (`TCGETS` for stdio, `-ENOTTY` otherwise) — **complete**
 7. `brk` = 12 — **complete at `20260924B`**, Linux absolute-address ABI
 8. **Test:** minimal musl program reaches `main` and `printf` works —
-   `musl_min` and `musl_printf` green (printf still red as a
-   musl-internal issue, see "Resolved bugs")
+   `musl_min` green; `musl_printf` still red as a musl-internal issue,
+   see "Resolved bugs"
 9. `mmap` = 9, `munmap` = 11 — **complete at `20260924B`** (minimal
    anonymous-private implementation)
 9.5. `mprotect` = 10 — **stub added at `20260924B`**, returns 0.
@@ -118,17 +118,28 @@ the next):
     `musl_exec`; status propagation, `WNOHANG`, and `wait4(-1)` now
     exercised by `musl_wait`).  Required the `"+m"(*status)` asm
     fix in the test and Linux status-word encoding in `sys_wait4`.
-14. `getdents64` = 217 — **next**, currently a `-ENOSYS` stub
+14. `getdents64` = 217 — **complete at `20260924K`**.  Exercised by
+    the new `musl_readdir` test (21 entries listed, count matches
+    the image build).  Required a companion change to `sys_open`:
+    musl's `opendir` goes through Linux `open(2)` with
+    `O_DIRECTORY`, not the donix-private `SYS_OPENDIR` (500), so
+    `sys_open` now falls back to `f_opendir` when `f_open` fails on
+    a directory.  See "Syscall ABI" gotcha below.
 
-Each of the remaining items is its own milestone. **Commit after each.**
-After each, newlib's `hello` / `memtest` / `ls` / `cat` / `echo` /
-`printf` / `malloc` must still work.
+**A2 complete at `20260924K`.**  Each item was its own commit.  After
+each, newlib's `hello` / `memtest` / `ls` / `cat` / `echo` /
+`printf` / `malloc` still worked.
 
 ### A3 — musl shell
 
 Minimal shell in musl: `fork` + `execve` + `wait4`. Replaces the newlib
 shell as default. Newlib shell stays as a fallback until musl's is
 proven.
+
+**Blocked on `musl_printf` / `printnum`.**  A shell prompt that cannot
+use stdio is not usable.  See "Resolved bugs" for the current state of
+that investigation — it is musl-internal, not a kernel bug.  The first
+task of any A3 session is to resolve `musl_printf`.
 
 ### A4 — migrate userland apps to musl
 
@@ -273,6 +284,24 @@ Apply each only when a specific problem requires it.
   (confirmed with a temporary serial print in `sys_wait4`).  Same
   rule applies to any future test that passes `&local` to a raw
   syscall and then reads `local` back.
+
+- **musl's POSIX wrappers do not always go through your donix-private
+  syscalls.**  musl's `opendir()` is `open(path, O_RDONLY|O_DIRECTORY)`
+  followed by `readdir()` which uses `getdents64(2)`.  It never calls
+  the donix-private `SYS_OPENDIR` (500) — that is a newlib-only
+  convenience.  `sys_open` had to grow a directory fallback (at
+  `20260924K`) because otherwise musl's `opendir` failed with
+  `FR_INVALID_NAME`.  When you add a syscall that has a donix-private
+  equivalent, check which one musl actually uses before assuming they
+  map 1:1.
+
+- **`getdents64` emits one record per call, deliberately.**  FatFs's
+  `f_readdir` advances an irreversible cursor.  If `sys_getdents64`
+  tried to pack multiple records into one call and one did not fit,
+  the entry would be consumed but not returned and musl's `readdir`
+  would skip it.  One record per call is obviously correct.  musl's
+  `readdir` passes a buffer big enough for one `linux_dirent64`, so
+  the fit check never fails in practice.
 
 ### stdio / newlib
 
@@ -432,11 +461,9 @@ Apply each only when a specific problem requires it.
   problem.  Every kernel canary is green: `hello`, `memtest`, `ls`,
   `cat`, `echo`, `musl_min`, `musl_malloc`.
 
-  **Must be resolved before Phase A3 (musl shell).**  Planned as the
-  first task after `execve`/`wait4` are in, because a working `execve`
-  will let us run more musl test programs and narrow the cause.  Do
-  **not** attempt to fix this from the kernel side; the kernel is
-  behaving correctly.
+  **This is now the first task of A3 (musl shell).**  A shell that
+  cannot print a prompt is not usable.  Do **not** attempt to fix
+  this from the kernel side; the kernel is behaving correctly.
 
 - **`musl_wait` read a stale status on the first `wait4(-1)`**
   (resolved 2026-09-24, tag `20260924J`).  The test printed
@@ -451,10 +478,17 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **None blocking.**  `execve` (A2.12), `wait4` (A2.13) are complete
-  at `20260924I`/`20260924J`.  The next milestone is `getdents64`
-  (A2.14).  If the "prompt returns, keyboard dead" symptom reappears,
-  reopen it here.
+- **`musl_printf` / `printnum` (musl-internal) block A3.**  See the
+  "Resolved bugs" entry above.  First task of the A3 session.
+- **`Unknown syscall: N` is printed for every unimplemented Linux
+  syscall musl touches** (`fcntl` = 72, `lseek` = 8, `pread64` = 17,
+  `rt_sigreturn` = 15, `poll` = 7, ...).  musl's stdio and dirent
+  internals call these and tolerate the `-1` return, so nothing
+  breaks, but the output is noisy in every musl test.  Gate the
+  print behind a debug flag or delete it; the return value is the
+  signal.
+- If the "prompt returns, keyboard dead" symptom reappears, reopen
+  the `20260924F` entry above.
 
 ### Cosmetic / housekeeping
 
@@ -468,6 +502,8 @@ Apply each only when a specific problem requires it.
   / `vmm.h` are unused (written for the abandoned copy-then-swap
   `execve`).  Kept for future copy-on-write work.  If still unused
   after A3, delete in a cleanup commit.
+- `Unknown syscall: N` print in `syscall_dispatch` — see "Open
+  issues" above.  Silence it in a cleanup commit.
 
 ## Testing harness
 
@@ -478,11 +514,11 @@ Apply each only when a specific problem requires it.
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
 - **musl test binaries** are built by `build_musl_tests.sh` (tracked,
-  committed at `57a3f9e`, extended at `20260924I` with `musl_exec`
-  and at `20260924J` with `musl_wait`).  Sources are heredoc'd into
-  `/tmp/` and linked with `musl-gcc -static -no-pie -O2
-  -mcmodel=large`.  The image build copies `/tmp/musl_*` to
-  `::/MUSL_*.ELF` on the FAT.
+  committed at `57a3f9e`, extended at `20260924I` with `musl_exec`,
+  `20260924J` with `musl_wait`, `20260924K` with `musl_readdir`).
+  Sources are heredoc'd into `/tmp/` and linked with `musl-gcc
+  -static -no-pie -O2 -mcmodel=large`.  The image build copies
+  `/tmp/musl_*` to `::/MUSL_*.ELF` on the FAT.
 
 ## Recovery
 
@@ -525,44 +561,40 @@ musl lands.**
 # Part 2 — Session Status
 
 **Last updated:** 2026-09-24 (late evening, session 4)
-**Current tag / HEAD:** `20260924J` (commit `64cf2e7`)
-**Last known-good tag:** `20260924J`
+**Current tag / HEAD:** `20260924K` (commit `f5b8fbb`)
+**Last known-good tag:** `20260924K`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 13 — `wait4` = 61.  COMPLETE at `20260924J`.**
+**A2 item 14 — `getdents64` = 217.  COMPLETE at `20260924K`.**
 
-All three behaviors now exercised by `musl_wait`:
-- Non-zero exit status propagation via `WEXITSTATUS` (child
-  `_exit(42)` → parent sees 42);
-- `WNOHANG` on a still-running child returns 0 immediately;
-- `wait4(-1, ...)` reaps any child.
+Two kernel changes, one test:
+1. `sys_getdents64` emits one `linux_dirent64` record per call,
+   wrapping the FatFs DIR machinery.  One record per call because
+   `f_readdir`'s cursor is irreversible.
+2. `sys_open` now falls back to `f_opendir` on a directory path or
+   when the caller passes `O_DIRECTORY`.  musl's `opendir` is
+   `open(path, O_RDONLY|O_DIRECTORY)` followed by `readdir()` →
+   `getdents64`; it never goes through the donix-private
+   `SYS_OPENDIR` (500).  Without this fallback, `opendir` failed with
+   `FR_INVALID_NAME`.
+3. New test `musl_readdir` uses musl's `opendir`/`readdir`/`closedir`
+   against `0:/` and prints each entry.  Green: 21 entries, count
+   matches the image build.
 
-Two fixes landed at this tag:
+**A2 is now complete.**  All 14 items landed across `20260924B` through
+`20260924K`.
 
-1. **Test-side:** `raw_wait4`'s inline asm now declares the status
-   pointer as `"+m"(*status)`.  Without it, GCC cached the pre-call
-   value across the syscall on the first of two back-to-back
-   `wait4(-1)` calls, so the test read a stale `-1` and printed
-   `WAIT-ANY-1 255` while the kernel was in fact writing `2816`.
-2. **Kernel-side:** `sys_wait4` now encodes the exit code as a Linux
-   wait-status word — `int status = (zombie->exit_status & 0xff) << 8;`
-   — before copying to userspace, so musl's `WIFEXITED` /
-   `WEXITSTATUS` macros work.
+`musl_printf` / `printnum` remain red (musl-internal, see Part 1).
+**They block A3.**
 
-**A2 item 14 — `getdents64` = 217.**  Next.  Currently a `-ENOSYS`
-stub in `sys_getdents64`.
-
-`musl_printf` / `printnum` remain deferred (musl-internal, see
-"Resolved bugs" in Part 1).
-
-## Canary state (green as of `20260924J`)
+## Canary state (green as of `20260924K`)
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | |
-| ls | green | lists 20 files |
+| ls | green | lists 21 files |
 | cat | green | reads HELLO-WORLD.TXT |
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
@@ -571,70 +603,68 @@ stub in `sys_getdents64`.
 | musl_fork | green | prints `A`, `P`, `C` |
 | musl_fork_raw | green | prints `A`, `P`, `C` |
 | musl_exec | green | `EXEC-PARENT-START`, child execve's `MUSL_MIN.ELF` in place (pid preserved), `MUSL-START`, `EXEC-PARENT-DONE` |
-| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`; required the `"+m"(*status)` asm fix in the test and Linux status-word encoding in `sys_wait4` |
-| musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug. |
+| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK` |
+| musl_readdir | green | 21 entries, `READDIR-DONE count=21` |
+| brk_verify | green | `p=0x8000200000`, `VERIFY-OK` (was red at `20260924J`; re-run at `20260924K`) |
+| brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct (was red at `20260924J`) |
+| brkgrow | green | `start=`, `64K got=`, `1M got=` correct (was red at `20260924J`) |
+| musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug.  **Blocks A3.** |
 | printnum | red | same root cause as `musl_printf`. |
-| brkraw | red | test binary needs re-run against the current kernel; `sys_brk` is now Linux-ABI |
-| brkgrow | red | same |
-| brk_verify | red | same |
 
 ## Next step (exactly this, then stop)
 
-**A2 item 14 — `getdents64` = 217.**
+**Resolve `musl_printf` / `printnum` before starting A3.**
 
-Currently a `-ENOSYS` stub in `sys_getdents64`.  Musl's `readdir`
-needs it.  The kernel already has `sys_readdir` (donix-private)
-returning a `dons_dirent_t`, but musl expects the Linux
-`struct linux_dirent64` layout:
+This is the first task.  It is musl-internal — the kernel is behaving
+correctly, and every kernel canary is green.
 
-```c
-struct linux_dirent64 {
-    uint64_t d_ino;
-    int64_t  d_off;
-    uint16_t d_reclen;
-    uint8_t  d_type;
-    char     d_name[];
-};
-```
+Starting point (from the `20260924C` investigation, reproduced here for
+convenience):
 
-Plan:
+A raw-byte dump of the user's iov array in `sys_writev` showed that
+musl itself writes a garbage `iov[1]`:
 
-1. Confirm working tree clean and HEAD is `20260924J`.
-2. Implement `sys_getdents64(int fd, void* dirp, size_t count)` in
-   `user_syscall.c` by wrapping the existing `sys_readdir` machinery:
-   loop over `f_readdir`, pack entries into a small stack buffer in
-   `linux_dirent64` form, `safe_copy_to_user` into the user buffer,
-   and stop when the DIR is exhausted (return 0) or the next entry
-   would not fit in `count` (return bytes written so far).  The call
-   is `readdir`-shaped, not `getdents64`-shaped; musl handles the
-   partial case by advancing its buffer cursor.
-3. Open questions to settle before writing:
-   - **`d_ino`:** FAT has no inodes.  Musl and busybox mostly use
-     `d_ino` to detect `.` / `..` by name and don't require it to be
-     meaningful.  Use `d_ino = 0` for now, or synthesize from the
-     FAT directory entry offset.  Pick one and document it.
-   - **`d_off`:** Same — use the FAT directory entry index, or 0.
-   - **`d_type`:** `DT_REG` / `DT_DIR` / `DT_UNKNOWN`.  Map from
-     `fno.fattrib & AM_DIR` (need the `AM_DIR` constant; it's in
-     `ff.h`).
-4. Add a musl test (`musl_readdir`) that uses musl's
-   `opendir`/`readdir`/`closedir` to walk `0:/` and prints each
-   name.  `musl-gcc -static -no-pie -O2 -mcmodel=large`, same
-   pattern as the other tests.
-5. `mcopy /tmp/musl_readdir -> ::/MUSL_READDIR.ELF`, add
-   `/tmp/musl_readdir` to the verify loop.
-6. Run `./build_musl_tests.sh`, `make hdd-single.img`, boot QEMU,
-   run `musl_readdir`, paste serial output.
+    [writev raw] 28 42 40 00 00 00 00 00   iov[0].base = 0x404228
+                 0b 00 00 00 00 00 00 00   iov[0].len  = 11
+                 57 ff 0f 00 80 00 00 00   iov[1].base = 0x80000FFF57
+                 20 ff 0f 00 80 00 00 00   iov[1].len  = 0x80000FFF20
 
-`sys_getdents64` is currently a stub; expect the first attempt to be
-close, but the exact `linux_dirent64` packing (alignment, `d_reclen`
-computation, d_name NUL) is where bugs will land.  Verify each field
-with a raw-byte dump if musl's `readdir` misbehaves.
+`iov[0]` is correct (`base = "MUSL-PRINTF\n"` in `.rodata`,
+`len = 11`).  `iov[1]` is two user-stack addresses — 0x80000FFF57 and
+0x80000FFF20 — where a musl-internal buffer pointer and its length
+should be.  The kernel copies what musl gives it; the bug is in
+`__stdio_write`'s stack frame.
 
-After `musl_readdir` is green, **A3 — musl shell** is next, but
-`musl_printf` / `printnum` (musl-internal) must be resolved first;
-they will block a musl shell that prints prompts.  See "Resolved
-bugs" in Part 1 for the current state of that investigation.
+Leading hypotheses to check, in order:
+
+1. **TLS base (`%fs`) correctness.**  `printf` reaches `__stdio_write`
+   through musl's `stdout` FILE object, which is in the TLS region
+   pointed to by `%fs`.  If `arch_prctl(ARCH_SET_FS, tp)` was set to
+   the wrong base (e.g. the raw `tp` address minus the TLS offset), the
+   FILE fields musl reads would land in wrong stack memory.  The
+   addresses `0x80000FFF57` / `0x80000FFF20` look exactly like
+   stack-adjacent TLS fields read through an off-by-`tp_offset` base.
+   Check `musl/src/env/__init_tls.c`: `tp` is set to
+   `(uintptr_t)(pthread_self())`, and `pthread_self()` returns
+   `__pthread_self()`, which is a `TP_ADJ(this)` call.  Verify donix's
+   `ARCH_SET_FS` handler stores exactly what musl passed and does not
+   adjust it.
+2. **`%fs`-relative `errno` or FILE access in `__stdio_write`.**  Same
+   class of bug; a raw byte dump of the `stdout` struct on entry to
+   `__stdio_write` (or a debug print from `sys_writev` of the fd's
+   FILE fields, if reachable) will show where the bad values come from.
+3. **Stack canary / `%fs:0x28` mismatch** on the first `printf` — would
+   not produce this exact symptom but is worth a one-line check.
+
+Do **not** attempt to fix this from the kernel side.  If a specific
+kernel syscall turns out to be returning a value musl misinterprets,
+that is one thing; but the current evidence says the kernel is correct.
+The work here is to build a minimal musl test that dumps `%fs`, dumps
+the `stdout` FILE object's fields, and compares them to what a
+working musl build produces — then trace the discrepancy into musl's
+init.
+
+Once `musl_printf` is green, **A3 — musl shell** is next.  See Part 1.
 
 ## State on disk
 
@@ -643,8 +673,7 @@ bugs" in Part 1 for the current state of that investigation.
   from the QEMU invocation in the Makefile.  Turn the flag back on
   only for a specific instruction-trace investigation.
 - `/tmp/musl_*` — musl test binaries, rebuilt by
-  `build_musl_tests.sh`.  `musl_wait` is new this session;
-  `musl_readdir` will be added next.
+  `build_musl_tests.sh`.  `musl_readdir` is new this session.
 - `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
@@ -658,9 +687,12 @@ bugs" in Part 1 for the current state of that investigation.
 
 ## Open items
 
-- **None blocking.**  Next milestone is `getdents64` (A2.14), then A3
-  (musl shell).  `musl_printf` / `printnum` (musl-internal) must be
+- **Blocking:** `musl_printf` / `printnum` (musl-internal) must be
   resolved before A3.
+- Next milestone after that: **A3 — musl shell** (fork + execve +
+  wait4).  Newlib shell stays as a fallback until musl's is proven.
+- `Unknown syscall: N` print in `syscall_dispatch` — noisy, should be
+  gated or removed in a cleanup commit (see "Open issues" in Part 1).
 - Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
 ## How to use this file
