@@ -1179,7 +1179,7 @@ long sys_wait4(long pid, int* user_status, int options) {
 
         if (zombie) {
             long reaped = (long)zombie->pid;
-            int status = zombie->exit_status;
+            int status = (zombie->exit_status & 0xff) << 8;
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
