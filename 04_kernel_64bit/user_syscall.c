@@ -270,21 +270,52 @@ long sys_open(const char* path, int flags) {
     }
 
     FRESULT r = f_open(file_obj, local_path, mode);
-    if (r != FR_OK) {
-        serial_print("sys_open: f_open FAIL path=");
-        serial_print(local_path);
-        serial_print(" r=");
-        serial_print_dec(r);
-        serial_print("\n");
-        kfree(file_obj);
-        kfree(slot);
-        self->file_table[fd] = NULL;
-        return -1;
+    if (r == FR_OK) {
+        slot->kind = FILE_KIND_FILE;
+        slot->obj  = file_obj;
+        return fd;
     }
 
-    slot->kind = FILE_KIND_FILE;
-    slot->obj  = file_obj;
-    return fd;
+    /*
+     * f_open failed.  Linux open(2) is also used to open directories
+     * — musl's opendir() calls open(path, O_RDONLY|O_DIRECTORY) and
+     * then readdir(), which uses getdents64(2).  Without this branch,
+     * a failed f_open on a directory path returns -1 and musl's
+     * opendir always fails.
+     *
+     * The newlib ls.elf never hit this because it uses the
+     * donix-private SYS_OPENDIR (500) directly.
+     *
+     * O_DIRECTORY is 0x10000 on Linux x86_64.  FR_INVALID_NAME (6)
+     * and FR_NO_FILE (4) are the FatFs codes f_open returns when
+     * asked to open a directory with file semantics.
+     */
+    #define O_DIRECTORY 0x10000
+    int wants_dir = (flags & O_DIRECTORY) != 0;
+
+    if (wants_dir || r == FR_INVALID_NAME || r == FR_NO_FILE) {
+        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
+        if (dir_obj) {
+            FRESULT dr = f_opendir(dir_obj, local_path);
+            if (dr == FR_OK) {
+                kfree(file_obj);
+                slot->kind = FILE_KIND_DIR;
+                slot->obj  = dir_obj;
+                return fd;
+            }
+            kfree(dir_obj);
+        }
+    }
+
+    serial_print("sys_open: f_open FAIL path=");
+    serial_print(local_path);
+    serial_print(" r=");
+    serial_print_dec(r);
+    serial_print("\n");
+    kfree(file_obj);
+    kfree(slot);
+    self->file_table[fd] = NULL;
+    return -1;
 }
 
 long sys_close(int fd) {
@@ -1691,14 +1722,82 @@ long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
 }
 
 /*
- * Linux x86_64 getdents64(2) — stub.  Return -ENOSYS.
- * Real implementation lands in A2.14; musl's readdir() will then
- * work.  For now, musl programs that need directory listing will
- * fail cleanly.
+ * Linux x86_64 getdents64(2) — syscall 217.
+ *
+ * Emits exactly one struct linux_dirent64 record per call:
+ *
+ *     struct linux_dirent64 {
+ *         uint64_t d_ino;       // inode number — 0 (FAT has none)
+ *         int64_t  d_off;       // offset to next entry — 0 (unused)
+ *         uint16_t d_reclen;    // record length, 8-byte aligned
+ *         uint8_t  d_type;      // DT_REG / DT_DIR / DT_UNKNOWN
+ *         char     d_name[];    // NUL-terminated, no padding
+ *     };
+ *
+ * The header is 19 bytes.  d_name is included in d_reclen, and
+ * d_reclen is rounded up to an 8-byte boundary as Linux does, so
+ * a caller iterating records can do `dirp += d_reclen` and stay
+ * aligned.
+ *
+ * One record per call keeps the implementation obviously correct:
+ * FatFs's f_readdir() advances its cursor irreversibly, so an
+ * attempt to pack multiple records into one call would consume
+ * an entry it couldn't fit and lose it.  musl's readdir() passes
+ * a buffer big enough for one record, so this is sufficient.
+ *
+ * Wraps the donix-private opendir/readdir/closedir (500/501/502)
+ * machinery: the fd is a file_slot_t of kind FILE_KIND_DIR, and
+ * f_readdir() supplies the entry.  Returns the record length on
+ * success, 0 at end of directory, or a negative errno.
  */
+#define DT_UNKNOWN 0
+#define DT_REG     8
+#define DT_DIR     4
+
+#define GETDENTS64_HDR 19
+#define GETDENTS64_MAXREC (GETDENTS64_HDR + 256)
+
 long sys_getdents64(int fd, void* dirp, size_t count) {
-    (void)fd; (void)dirp; (void)count;
-    return -(long)ENOSYS;
+    if (!dirp) return -(long)14;      /* -EFAULT */
+    if (count == 0) return -(long)22; /* -EINVAL */
+
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_DIR);
+    if (!slot) return -(long)9;       /* -EBADF */
+
+    FILINFO fno;
+    FRESULT r = f_readdir((DIR*)slot->obj, &fno);
+    if (r != FR_OK) return -(long)5;    /* -EIO */
+    if (fno.fname[0] == '\0') return 0; /* end of directory */
+
+    size_t nlen = 0;
+    while (nlen < 255 && fno.fname[nlen] != '\0') nlen++;
+    size_t reclen = GETDENTS64_HDR + nlen + 1;
+    reclen = (reclen + 7) & ~(size_t)7;
+
+    if (reclen > count) {
+        /*
+         * Caller's buffer cannot hold one record.  The entry was
+         * already consumed from FatFs; there is no seek-back.
+         * musl always passes a buffer large enough, so this is
+         * unreachable in practice.
+         */
+        return -(long)22; /* -EINVAL */
+    }
+
+    uint8_t entbuf[GETDENTS64_MAXREC];
+    uint8_t* p = entbuf;
+    *(uint64_t*)(p + 0)  = 0;                /* d_ino    */
+    *(int64_t*)(p + 8)   = 0;                /* d_off    */
+    *(uint16_t*)(p + 16) = (uint16_t)reclen; /* d_reclen */
+    p[18] = (fno.fattrib & AM_DIR) ? DT_DIR : DT_REG;
+    for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = fno.fname[i];
+    p[GETDENTS64_HDR + nlen] = '\0';
+    for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+
+    if (safe_copy_to_user(dirp, entbuf, reclen) != 0) {
+        return -(long)14;  /* -EFAULT */
+    }
+    return (long)reclen;
 }
 
 /*
