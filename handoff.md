@@ -101,8 +101,8 @@ the next):
 6. `ioctl` = 16 (`TCGETS` for stdio, `-ENOTTY` otherwise) — **complete**
 7. `brk` = 12 — **complete at `20260924B`**, Linux absolute-address ABI
 8. **Test:** minimal musl program reaches `main` and `printf` works —
-   `musl_min` green; `musl_printf` still red as a musl-internal issue,
-   see "Resolved bugs"
+   `musl_min` green; `musl_printf` red until `20260924L`, see
+   "Resolved bugs"
 9. `mmap` = 9, `munmap` = 11 — **complete at `20260924B`** (minimal
    anonymous-private implementation)
 9.5. `mprotect` = 10 — **stub added at `20260924B`**, returns 0.
@@ -136,10 +136,17 @@ Minimal shell in musl: `fork` + `execve` + `wait4`. Replaces the newlib
 shell as default. Newlib shell stays as a fallback until musl's is
 proven.
 
-**Blocked on `musl_printf` / `printnum`.**  A shell prompt that cannot
-use stdio is not usable.  See "Resolved bugs" for the current state of
-that investigation — it is musl-internal, not a kernel bug.  The first
-task of any A3 session is to resolve `musl_printf`.
+**Unblocked at `20260924L`.**  The blocker was `musl_printf` /
+`printnum`, which turned out to be a kernel bug in the syscall return
+path, not a musl-internal problem.  See "Resolved bugs" below.  All
+syscalls A3 needs (`fork`, `execve`, `wait4`, plus stdio) are green.
+
+**Design note for A3.**  The newlib shell does **not** `wait4` after
+spawning a child; the shell and the child run concurrently and their
+console output interleaves byte-by-byte.  This is visible in the
+`20260924L` capture as `] ABCDEF` on the spawn line.  A musl shell
+that calls `wait4` after `fork`/`execve` will naturally serialize
+parent and child output.  Adopt that pattern from the start.
 
 ### A4 — migrate userland apps to musl
 
@@ -240,21 +247,26 @@ Apply each only when a specific problem requires it.
 
 ### Syscall ABI
 
+- **The syscall return path must preserve every GPR except `%rax`,
+  `%rcx`, `%r11`.**  The Linux x86_64 syscall ABI clobbers exactly
+  those three.  Compilers rely on the rest surviving; musl's
+  `__stdio_write` keeps a live pointer in `%r10` across the `writev`
+  syscall.  **If the epilogue needs a scratch register for the user
+  RSP, do not sacrifice a GPR: load `%rsp` from the kernel stack frame
+  last, via `mov rsp, [rsp - 72]` after the other pops.**  This was
+  the fix at `20260924L`; see "Resolved bugs" below.
+
 - **`SYS_EXIT = 60` in `user_syscall_entry.asm`** — the only numeric
   syscall reference in assembly.
 - **`-mcmodel=large` is required for userland** (linked above 4 GB).
   `-mcmodel=small`/`medium` don't work. `-no-pie` is not needed.
 - **The syscall entry/return frame saves 16 slots, not 12.**  In
   addition to the callee-saved registers and the user RIP/RFLAGS/RSP,
-  `user_syscall_entry.asm` now pushes `%rdi`, `%rsi`, `%rdx`, `%r10`
-  before the argument shuffle.  The parent's return path restores
-  `%rdi`, `%rsi`, `%rdx` and discards `%r10` (the exit path uses `%r10`
-  as the user-RSP scratch).  This matches the Linux syscall ABI more
-  closely: only `%rax`, `%rcx`, `%r11` are architecturally clobbered.
-  Compilers *do* rely on `%rdi`, `%rsi`, `%rdx` surviving a syscall;
-  musl's fork wrapper caches the TLS base in `%rdx` before the raw
-  fork syscall and writes through it after the child resumes, and was
-  faulting at CR2=0x98 without the restore.
+  `user_syscall_entry.asm` pushes `%rdi`, `%rsi`, `%rdx`, `%r10`
+  before the argument shuffle.  On the return path, **all four are
+  restored** — `%r10` was previously discarded, which was wrong and
+  broke musl's `printf` until `20260924L`.  The user RSP is now loaded
+  from the frame at the very end, using no GPR.
 
   Frame layout, offsets from `parent->kernel_stack_top` (first push =
   offset `-8`):
@@ -265,6 +277,15 @@ Apply each only when a specific problem requires it.
   `process_fork_copy_frame` reads from those offsets to build a fork
   child's frame.  If the assembly push order changes, that function's
   offsets must change with it.
+
+- **The return-path epilogue loads the user RSP last, from memory.**
+  After popping `%r10`, `%rdx`, `%rsi`, `%rdi`, `%r9`, `%r8`, the
+  stack pointer is at the user RSP slot.  The epilogue loads `%r11`
+  (user RFLAGS) from `[rsp + 8]` and `%rcx` (user RIP) from
+  `[rsp + 16]`, then `add rsp, 24` and pops `%r15`/`%r14`/`%r13`/
+  `%r12`/`%rbp`/`%rbx`, then `mov rsp, [rsp - 72]` to load the user
+  RSP with no intermediate GPR.  `%rax` is never touched on this
+  path: it carries the syscall return value to `sysret`.
 
 - **`SYS_DONIX_SPAWN` (507) is the newlib spawn number.**  The newlib
   userland calls 507 for spawn semantics (`arc2/syscalls.c:spawn`).
@@ -284,6 +305,22 @@ Apply each only when a specific problem requires it.
   (confirmed with a temporary serial print in `sys_wait4`).  Same
   rule applies to any future test that passes `&local` to a raw
   syscall and then reads `local` back.
+
+- **To read a specific GPR after a raw `syscall`, pin it with a
+  register-bound local.**  The idiom that works:
+
+  ```c
+  register uint64_t r10_reg asm("r10") = SENTINEL;
+  __asm__ volatile ("syscall"
+      : "=a"(ret), "+r"(r10_reg)
+      : "a"(20L), "D"(1L), "S"(iov), "d"(2L)
+      : "rcx", "r11", "memory");
+  ```
+
+  The `asm("r10")` binding pins the value to `%r10`.  Using a plain
+  `"r"` operand lets GCC pick any register and defeats the test.
+  `musl_r10probe` uses this idiom to prove the syscall return path
+  preserves `%r10`.
 
 - **musl's POSIX wrappers do not always go through your donix-private
   syscalls.**  musl's `opendir()` is `open(path, O_RDONLY|O_DIRECTORY)`
@@ -438,32 +475,56 @@ Apply each only when a specific problem requires it.
   are currently unused but kept in the tree; they may be useful when
   `fork` needs real copy-on-write.
 
-- **`musl_printf` / `printnum` dump garbage — musl-internal, not
-  kernel** (investigated 2026-09-24, tag `20260924C`).  `printf` of a
-  literal or a `%d` value on musl/donix prints the correct bytes and
-  then dumps large chunks of the binary's own `.rodata` / `.eh_frame`.
-  The newline from `printf("MUSL-PRINTF\n")` is silently dropped.
+- **`musl_printf` / `printnum` dump garbage — kernel bug, fixed at
+  `20260924L`.**  This was previously misdiagnosed as a musl-internal
+  problem.  It was not.  It was a bug in the kernel's syscall return
+  path.
 
-  Diagnosis: a raw-byte dump of the user's iov array in `sys_writev`
-  showed that musl itself writes a garbage `iov[1]`:
+  Symptom: `printf` of a literal or a `%d` value on musl/donix
+  printed the correct bytes and then dumped large chunks of the
+  binary's own `.rodata` / `.eh_frame`.  The newline from
+  `printf("MUSL-PRINTF\n")` was silently dropped.  `ls` looped
+  forever printing `FILE     (0 bytes)`.
+
+  Raw-byte dump of the user's iov array in `sys_writev`:
 
       [writev raw] 28 42 40 00 00 00 00 00   iov[0].base = 0x404228
                    0b 00 00 00 00 00 00 00   iov[0].len  = 11
                    57 ff 0f 00 80 00 00 00   iov[1].base = 0x80000FFF57
                    20 ff 0f 00 80 00 00 00   iov[1].len  = 0x80000FFF20
 
-  The kernel faithfully copies what musl wrote; the corruption is in
-  musl's `__stdio_write` stack frame on donix.  Two user-stack
-  addresses appear where `iov[1].base` / `iov[1].len` should be.
+  `iov[0]` is correct (`base = "MUSL-PRINTF\n"` in `.rodata`,
+  `len = 11`).  `iov[1]` contains two user-stack addresses where a
+  musl-internal buffer pointer and its length should be.  The kernel
+  faithfully copied what musl wrote; musl wrote garbage because the
+  kernel had corrupted a register musl was relying on.
 
-  This is a userland porting problem (a musl assumption about the
-  runtime or ABI that donix does not satisfy), not a syscall-layer
-  problem.  Every kernel canary is green: `hello`, `memtest`, `ls`,
-  `cat`, `echo`, `musl_min`, `musl_malloc`.
+  Root cause: the syscall return path in `user_syscall_entry.asm`
+  discarded the saved `%r10` and reused `%r10` as a scratch for the
+  user RSP.  The Linux x86_64 syscall ABI clobbers only `%rax`,
+  `%rcx`, `%r11`; every other GPR survives a syscall.  musl's
+  `__stdio_write` keeps a live pointer in `%r10` across the `writev`
+  syscall; after the syscall, `%r10` held the user RSP instead, so
+  musl stored a stack address into `iov[1]`.  `sys_write` then tried
+  to write 4 GB from the user stack.
 
-  **This is now the first task of A3 (musl shell).**  A shell that
-  cannot print a prompt is not usable.  Do **not** attempt to fix
-  this from the kernel side; the kernel is behaving correctly.
+  Confirmation: `musl_r10probe` set `%r10` to `0xDEADBEEFCAFEBABE`,
+  issued a raw `writev`, and printed `%r10` afterward.  Before the
+  fix: `R10-AFTER=0x00000080000fff60` (a user RSP).  After the fix:
+  `R10-AFTER=0xdeadbeefcafebabe`.
+
+  First attempt at the fix (wrong): used `pop rax` to stash the user
+  RSP.  That destroyed `%rax`, the syscall return value.  `ls`
+  looped forever on a positive-but-meaningless `readdir` return;
+  `printnum` printed `x=42` then NUL bytes.
+
+  Corrected fix: restore `%r10` with `pop r10`, do not touch `%rax`
+  on the return path, and load the user RSP from the kernel stack
+  frame last via `mov rsp, [rsp - 72]`, using no GPR.  Frame layout
+  and `process_fork_copy_frame` offsets unchanged.
+
+  New test: `musl_r10probe` (`build_musl_tests.sh`, image Makefile).
+  `musl_printf`, `printnum`, and `ls` are all green after the fix.
 
 - **`musl_wait` read a stale status on the first `wait4(-1)`**
   (resolved 2026-09-24, tag `20260924J`).  The test printed
@@ -478,8 +539,6 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`musl_printf` / `printnum` (musl-internal) block A3.**  See the
-  "Resolved bugs" entry above.  First task of the A3 session.
 - **`Unknown syscall: N` is printed for every unimplemented Linux
   syscall musl touches** (`fcntl` = 72, `lseek` = 8, `pread64` = 17,
   `rt_sigreturn` = 15, `poll` = 7, ...).  musl's stdio and dirent
@@ -504,6 +563,11 @@ Apply each only when a specific problem requires it.
   after A3, delete in a cleanup commit.
 - `Unknown syscall: N` print in `syscall_dispatch` — see "Open
   issues" above.  Silence it in a cleanup commit.
+- `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is currently `0` (gated,
+  inert).  It was added at `20260924L` to test a shared-bounce-buffer
+  theory for the `printnum` NUL bytes; the theory was wrong, the flag
+  never fired.  Keep it gated for now as a diagnostic in case the
+  symptom reappears; delete in a cleanup commit if still unused.
 
 ## Testing harness
 
@@ -515,7 +579,8 @@ Apply each only when a specific problem requires it.
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
 - **musl test binaries** are built by `build_musl_tests.sh` (tracked,
   committed at `57a3f9e`, extended at `20260924I` with `musl_exec`,
-  `20260924J` with `musl_wait`, `20260924K` with `musl_readdir`).
+  `20260924J` with `musl_wait`, `20260924K` with `musl_readdir`,
+  `20260924L` with `musl_r10probe`).
   Sources are heredoc'd into `/tmp/` and linked with `musl-gcc
   -static -no-pie -O2 -mcmodel=large`.  The image build copies
   `/tmp/musl_*` to `::/MUSL_*.ELF` on the FAT.
@@ -560,41 +625,49 @@ musl lands.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-24 (late evening, session 4)
-**Current tag / HEAD:** `20260924K` (commit `f5b8fbb`)
-**Last known-good tag:** `20260924K`
+**Last updated:** 2026-09-24 (late evening, session 5)
+**Current tag / HEAD:** `20260924L`
+**Last known-good tag:** `20260924L`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A2 item 14 — `getdents64` = 217.  COMPLETE at `20260924K`.**
+**`musl_printf` / `printnum` fixed.  A3 unblocked at `20260924L`.**
 
-Two kernel changes, one test:
-1. `sys_getdents64` emits one `linux_dirent64` record per call,
-   wrapping the FatFs DIR machinery.  One record per call because
-   `f_readdir`'s cursor is irreversible.
-2. `sys_open` now falls back to `f_opendir` on a directory path or
-   when the caller passes `O_DIRECTORY`.  musl's `opendir` is
-   `open(path, O_RDONLY|O_DIRECTORY)` followed by `readdir()` →
-   `getdents64`; it never goes through the donix-private
-   `SYS_OPENDIR` (500).  Without this fallback, `opendir` failed with
-   `FR_INVALID_NAME`.
-3. New test `musl_readdir` uses musl's `opendir`/`readdir`/`closedir`
-   against `0:/` and prints each entry.  Green: 21 entries, count
-   matches the image build.
+Root cause: the syscall return path in `user_syscall_entry.asm`
+discarded the saved `%r10` and reused `%r10` as a scratch for the
+user RSP.  The Linux x86_64 syscall ABI clobbers only `%rax`, `%rcx`,
+`%r11`; every other GPR survives a syscall.  musl's `__stdio_write`
+keeps a live pointer in `%r10` across the `writev` syscall, so
+`printf` emitted garbage `iov[1]` values (user-stack addresses)
+instead of the buffered data.
 
-**A2 is now complete.**  All 14 items landed across `20260924B` through
-`20260924K`.
+Fix:
+1. `pop r10` on the normal return path now **restores** the user's
+   `%r10` instead of discarding it.
+2. `%rax` is never touched on the return path — it carries the
+   syscall return value to `sysret`.
+3. The user RSP is loaded last, from the kernel stack frame, via
+   `mov rsp, [rsp - 72]`, using no GPR.
+4. The `g_last_sysret_*` diagnostic writes were dropped from the
+   return path (they required a scratch register that did not exist).
 
-`musl_printf` / `printnum` remain red (musl-internal, see Part 1).
-**They block A3.**
+New test: `musl_r10probe` sets `%r10` to a sentinel
+(`0xDEADBEEFCAFEBABE`), issues a raw `writev`, and prints `%r10`
+afterward.  Before the fix it read `0x00000080000fff60` (a user
+RSP); after, `0xdeadbeefcafebabe`.
 
-## Canary state (green as of `20260924K`)
+The first attempt at the fix used `pop rax` to stash the user RSP,
+which destroyed the syscall return value.  `ls` looped forever on a
+positive-but-meaningless `readdir` return and `printnum` printed
+NUL bytes.  The corrected version is described above.
+
+## Canary state (all green as of `20260924L`)
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | |
-| ls | green | lists 21 files |
+| ls | green | lists 22 files |
 | cat | green | reads HELLO-WORLD.TXT |
 | echo | green | |
 | memtest (newlib) | green | `[memtest] PASS` |
@@ -604,67 +677,40 @@ Two kernel changes, one test:
 | musl_fork_raw | green | prints `A`, `P`, `C` |
 | musl_exec | green | `EXEC-PARENT-START`, child execve's `MUSL_MIN.ELF` in place (pid preserved), `MUSL-START`, `EXEC-PARENT-DONE` |
 | musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK` |
-| musl_readdir | green | 21 entries, `READDIR-DONE count=21` |
-| brk_verify | green | `p=0x8000200000`, `VERIFY-OK` (was red at `20260924J`; re-run at `20260924K`) |
-| brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct (was red at `20260924J`) |
-| brkgrow | green | `start=`, `64K got=`, `1M got=` correct (was red at `20260924J`) |
-| musl_printf | red | musl-internal.  `printf("literal\n")` drops the newline; a garbage `iov[1]` appears in musl's `__stdio_write`.  Not a syscall bug.  **Blocks A3.** |
-| printnum | red | same root cause as `musl_printf`. |
+| musl_readdir | green | 22 entries, `READDIR-DONE count=22` |
+| brk_verify | green | `p=0x8000200000`, `VERIFY-OK` |
+| brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct |
+| brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
+| **musl_printf** | **green** | prints `MUSL-PRINTF` with newline, exits cleanly |
+| **printnum** | **green** | prints `x=42` with newline, exits cleanly |
+| **musl_r10probe** | **green** | `R10-AFTER=0xdeadbeefcafebabe` |
 
 ## Next step (exactly this, then stop)
 
-**Resolve `musl_printf` / `printnum` before starting A3.**
+**Start A3 — the musl shell.**
 
-This is the first task.  It is musl-internal — the kernel is behaving
-correctly, and every kernel canary is green.
+All syscalls it needs (`fork`, `execve`, `wait4`, `writev` via stdio)
+are green.  Build a minimal musl shell that:
+1. Reads a line from stdin.
+2. Forks.
+3. In the child, execve's the named binary.
+4. In the parent, `wait4`s the child.
+5. Loops.
 
-Starting point (from the `20260924C` investigation, reproduced here for
-convenience):
+Keep the newlib shell as a fallback until the musl shell is proven.
 
-A raw-byte dump of the user's iov array in `sys_writev` showed that
-musl itself writes a garbage `iov[1]`:
+One design note, from the `20260924L` capture: the newlib shell does
+not `wait4` after spawning, so parent and child console output
+interleaves byte-by-byte.  The musl shell's `wait4` naturally
+serializes it.  That is the correct pattern; do not copy the newlib
+behavior.
 
-    [writev raw] 28 42 40 00 00 00 00 00   iov[0].base = 0x404228
-                 0b 00 00 00 00 00 00 00   iov[0].len  = 11
-                 57 ff 0f 00 80 00 00 00   iov[1].base = 0x80000FFF57
-                 20 ff 0f 00 80 00 00 00   iov[1].len  = 0x80000FFF20
-
-`iov[0]` is correct (`base = "MUSL-PRINTF\n"` in `.rodata`,
-`len = 11`).  `iov[1]` is two user-stack addresses — 0x80000FFF57 and
-0x80000FFF20 — where a musl-internal buffer pointer and its length
-should be.  The kernel copies what musl gives it; the bug is in
-`__stdio_write`'s stack frame.
-
-Leading hypotheses to check, in order:
-
-1. **TLS base (`%fs`) correctness.**  `printf` reaches `__stdio_write`
-   through musl's `stdout` FILE object, which is in the TLS region
-   pointed to by `%fs`.  If `arch_prctl(ARCH_SET_FS, tp)` was set to
-   the wrong base (e.g. the raw `tp` address minus the TLS offset), the
-   FILE fields musl reads would land in wrong stack memory.  The
-   addresses `0x80000FFF57` / `0x80000FFF20` look exactly like
-   stack-adjacent TLS fields read through an off-by-`tp_offset` base.
-   Check `musl/src/env/__init_tls.c`: `tp` is set to
-   `(uintptr_t)(pthread_self())`, and `pthread_self()` returns
-   `__pthread_self()`, which is a `TP_ADJ(this)` call.  Verify donix's
-   `ARCH_SET_FS` handler stores exactly what musl passed and does not
-   adjust it.
-2. **`%fs`-relative `errno` or FILE access in `__stdio_write`.**  Same
-   class of bug; a raw byte dump of the `stdout` struct on entry to
-   `__stdio_write` (or a debug print from `sys_writev` of the fd's
-   FILE fields, if reachable) will show where the bad values come from.
-3. **Stack canary / `%fs:0x28` mismatch** on the first `printf` — would
-   not produce this exact symptom but is worth a one-line check.
-
-Do **not** attempt to fix this from the kernel side.  If a specific
-kernel syscall turns out to be returning a value musl misinterprets,
-that is one thing; but the current evidence says the kernel is correct.
-The work here is to build a minimal musl test that dumps `%fs`, dumps
-the `stdout` FILE object's fields, and compares them to what a
-working musl build produces — then trace the discrepancy into musl's
-init.
-
-Once `musl_printf` is green, **A3 — musl shell** is next.  See Part 1.
+Before building the shell, decide whether to bootstrap it with the
+`musl_*` test binary plumbing (heredoc into `/tmp/`, `musl-gcc
+-static -no-pie -O2 -mcmodel=large`) or to give it a proper home in
+the musl build.  The handoff's "musl build" section says to keep
+musl's build out of the main build until A3; this is A3, so the
+shell can now be added to the main image build.
 
 ## State on disk
 
@@ -673,7 +719,7 @@ Once `musl_printf` is green, **A3 — musl shell** is next.  See Part 1.
   from the QEMU invocation in the Makefile.  Turn the flag back on
   only for a specific instruction-trace investigation.
 - `/tmp/musl_*` — musl test binaries, rebuilt by
-  `build_musl_tests.sh`.  `musl_readdir` is new this session.
+  `build_musl_tests.sh`.  `musl_r10probe` is new at `20260924L`.
 - `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
@@ -684,15 +730,18 @@ Once `musl_printf` is green, **A3 — musl shell** is next.  See Part 1.
   copy-then-swap `execve`).  Leave them; they may be useful when
   `fork` needs real copy-on-write.  If still unused after A3, delete
   in a cleanup commit.
+- `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is `0` (gated, inert).
+  Safe to delete; kept for one more session in case the `printnum`
+  NUL symptom reappears.
 
 ## Open items
 
-- **Blocking:** `musl_printf` / `printnum` (musl-internal) must be
-  resolved before A3.
-- Next milestone after that: **A3 — musl shell** (fork + execve +
-  wait4).  Newlib shell stays as a fallback until musl's is proven.
+- **Next milestone: A3 — musl shell** (fork + execve + wait4).
+  Newlib shell stays as a fallback until musl's is proven.
 - `Unknown syscall: N` print in `syscall_dispatch` — noisy, should be
   gated or removed in a cleanup commit (see "Open issues" in Part 1).
+- `DEBUG_WRITE_BOUNCE` in `user_syscall.c` — gated at `0`, safe to
+  delete in a cleanup commit.
 - Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
 
 ## How to use this file
