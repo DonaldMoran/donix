@@ -1,4 +1,4 @@
-# donix — Handoff
+# donix â€” Handoff
 
 This file is both the project strategy and the current session status.
 Read it top to bottom when starting a new session. Update the "Session
@@ -6,7 +6,7 @@ Status" section at the end of every session.
 
 ---
 
-# Part 1 — Project Strategy
+# Part 1 â€” Project Strategy
 
 ## What donix is
 
@@ -27,18 +27,18 @@ intact as the recovery point.
 
 ## Strategy: two phases
 
-### Phase A — Linux syscall ABI, then static musl binaries
+### Phase A â€” Linux syscall ABI, then static musl binaries
 
 Make the kernel speak Linux x86_64 syscalls and run a static musl
 binary. Newlib's existing userland stays as a **passive regression
 canary**: after every kernel change, `hello` / `memtest` / `ls` / `cat` /
 `echo` / `printf` / `malloc` must still work.
 
-Do **not** add new features to the newlib userland — no `fork`, no
+Do **not** add new features to the newlib userland â€” no `fork`, no
 `execve`, no `getdents64` wrappers. That work would be thrown away when
 musl arrives.
 
-### Phase B — busybox / coreutils against musl
+### Phase B â€” busybox / coreutils against musl
 
 Static-link busybox against musl and try running it.
 
@@ -54,7 +54,7 @@ them.
 
 Unless a specific tested problem requires it:
 
-- `process.c` — especially `process_copy_kernel_frame`
+- `process.c` â€” especially `process_copy_kernel_frame`
 - `scheduler.c`
 - `context_switch.asm`
 - `interrupts.c`
@@ -69,56 +69,56 @@ previous session damaged.
 
 ## Phase A milestones
 
-### A1 — pure syscall renumbering
+### A1 â€” pure syscall renumbering
 
 Change syscall numbers to Linux x86_64. **No semantics change. No new
 syscalls.**
 
 Files: `include/syscall.h`, `user_syscall_entry.asm` (the single
-`cmp rbx, 2 → cmp rbx, 60` reference), `user_syscall.c` (`case N:`
+`cmp rbx, 2 â†’ cmp rbx, 60` reference), `user_syscall.c` (`case N:`
 labels only), `arc2/syscalls.c` (`#define SYS_*` numbers only). Four
 files, mechanical.
 
 **Test:** `hello`, `memtest`, `ls`, `cat`, `echo`, `printf`, `malloc`
-— all still work.
+â€” all still work.
 
 **Status: complete at tag `20260922H`.**
 
-### A2 — add the syscalls musl needs, one at a time
+### A2 â€” add the syscalls musl needs, one at a time
 
 Add each to the **kernel** and test with a **tiny static musl binary**.
-Newlib's existing userland is the regression canary after each — but do
+Newlib's existing userland is the regression canary after each â€” but do
 not add new wrappers to it.
 
 Order (musl's `__libc_start_main` calls these in sequence; each blocks
 the next):
 
-1. `arch_prctl(ARCH_SET_FS)` = 158 — **complete**
-2. `set_tid_address` = 218 — **complete**
-3. `rt_sigaction` = 13 (stub, return 0) — **complete**
-4. `rt_sigprocmask` = 14 (return 0) — **complete**
-5. `set_robust_list` = 273 (return 0) — **complete**
-6. `ioctl` = 16 (`TCGETS` for stdio, `-ENOTTY` otherwise) — **complete**
-7. `brk` = 12 — **complete at `20260924B`**, Linux absolute-address ABI
-8. **Test:** minimal musl program reaches `main` and `printf` works —
+1. `arch_prctl(ARCH_SET_FS)` = 158 â€” **complete**
+2. `set_tid_address` = 218 â€” **complete**
+3. `rt_sigaction` = 13 (stub, return 0) â€” **complete**
+4. `rt_sigprocmask` = 14 (return 0) â€” **complete**
+5. `set_robust_list` = 273 (return 0) â€” **complete**
+6. `ioctl` = 16 (`TCGETS` for stdio, `-ENOTTY` otherwise) â€” **complete**
+7. `brk` = 12 â€” **complete at `20260924B`**, Linux absolute-address ABI
+8. **Test:** minimal musl program reaches `main` and `printf` works â€”
    `musl_min` green; `musl_printf` red until `20260924L`, see
    "Resolved bugs"
-9. `mmap` = 9, `munmap` = 11 — **complete at `20260924B`** (minimal
+9. `mmap` = 9, `munmap` = 11 â€” **complete at `20260924B`** (minimal
    anonymous-private implementation)
-9.5. `mprotect` = 10 — **stub added at `20260924B`**, returns 0.
+9.5. `mprotect` = 10 â€” **stub added at `20260924B`**, returns 0.
    Not on the original list; musl calls it after `mmap` and its
    absence caused a `#GP`.  Real permission changes not implemented.
-10. `getrandom` = 318, `rseq` = 334 (stubs returning `-ENOSYS`) — complete
-11. `fork` = 57 — **complete at `20260924D`**
-12. `execve` = 59 — **complete at `20260924I`** (both steps: spawn
+10. `getrandom` = 318, `rseq` = 334 (stubs returning `-ENOSYS`) â€” complete
+11. `fork` = 57 â€” **complete at `20260924D`**
+12. `execve` = 59 â€” **complete at `20260924I`** (both steps: spawn
     moved to 507, real in-place execve at 59).  Exercised by the new
     `musl_exec` test.
-13. `wait4` = 61 — **complete at `20260924J`** (blocking wait, reap,
-    parent-pid preserved across execve — all exercised by
+13. `wait4` = 61 â€” **complete at `20260924J`** (blocking wait, reap,
+    parent-pid preserved across execve â€” all exercised by
     `musl_exec`; status propagation, `WNOHANG`, and `wait4(-1)` now
     exercised by `musl_wait`).  Required the `"+m"(*status)` asm
     fix in the test and Linux status-word encoding in `sys_wait4`.
-14. `getdents64` = 217 — **complete at `20260924K`**.  Exercised by
+14. `getdents64` = 217 â€” **complete at `20260924K`**.  Exercised by
     the new `musl_readdir` test (21 entries listed, count matches
     the image build).  Required a companion change to `sys_open`:
     musl's `opendir` goes through Linux `open(2)` with
@@ -130,7 +130,7 @@ the next):
 each, newlib's `hello` / `memtest` / `ls` / `cat` / `echo` /
 `printf` / `malloc` still worked.
 
-### A3 — musl shell
+### A3 â€” musl shell
 
 Minimal shell in musl: `fork` + `execve` + `wait4`. Replaces the newlib
 shell as default. Newlib shell stays as a fallback until musl's is
@@ -156,20 +156,31 @@ prompt) and takes over the console.  It does `fork` + `execve` +
 `wait4` and the `wait4` correctly serializes parent and child output.
 It reads a line byte-at-a-time and echoes as typed.  Command paths
 must be fully qualified (`0:/NAME.ELF`); it does not yet do the
-newlib shell's `0:/` + `.ELF` normalization.
+newlib shell's `0:/` + `.ELF` normalization.  It does not tokenize
+its command line; the whole line is passed as `argv[0]` and as the
+`execve` path.
 
-**A3 is currently BLOCKED on a kernel bug.**  A single `execve` from
-`musl_sh` works.  A **second** `execve` from the same `musl_sh`
-process causes a fatal page fault in the kernel.  See "Open issues"
-below and the "OPEN" entry under "Resolved bugs".  This is a kernel
-bug, not a shell bug, and it must be fixed before A3 can proceed.
+**Unblocked at `20260926E`.**  The second-`execve` fatal fault was
+**not** page-table corruption, as the previous session suspected.
+It was `MSR_FS_BASE` not being part of the process context.  See
+"Resolved bugs" below.  `musl_sh` now runs commands repeatedly from
+a fresh boot.
 
-### A4 — migrate userland apps to musl
+**Remaining A3 work.**
+- Tokenize `musl_sh`'s command line so `cat.elf file.txt` passes
+  `argv[1]` through to the child.  Currently the whole line is
+  treated as one path.
+- Add `0:/` + `.ELF` path normalization so bare `hello` resolves to
+  `0:/HELLO.ELF`, matching the newlib shell's behavior.
+- Make `musl_sh` the default boot shell, keeping the newlib shell
+  reachable as a fallback binary.
 
-`hello`, `ls`, `cat`, `echo`, `memtest` — rebuild each against musl.
+### A4 â€” migrate userland apps to musl
+
+`hello`, `ls`, `cat`, `echo`, `memtest` â€” rebuild each against musl.
 **One at a time.** Test each.
 
-### A5 — retire newlib
+### A5 â€” retire newlib
 
 Remove the newlib userland, build rules, and libraries. Safe because
 nothing uses them.
@@ -177,7 +188,7 @@ nothing uses them.
 ## musl build
 
 Clone `git://git.musl-libc.org/musl`, configure for `x86_64-linux-musl`
-with the cross toolchain, `make install` → `libc.a`, `crt1.o`,
+with the cross toolchain, `make install` â†’ `libc.a`, `crt1.o`,
 `crti.o`, `crtn.o`. Link static test programs against those. Keep musl's
 build out of the main build until Phase A3.
 
@@ -202,7 +213,7 @@ Apply each only when a specific problem requires it.
 
 - **`process_fork_copy_frame` must preserve the registers that the
   parent's syscall-return path preserves.**  That is: the
-  callee-saved set (`%rbx`, `%rbp`, `%r12`–`%r15`) **plus `%r8` and
+  callee-saved set (`%rbx`, `%rbp`, `%r12`â€“`%r15`) **plus `%r8` and
   `%r9`**.  The syscall entry code (`user_syscall_entry.asm`) pushes
   `%r8` and `%r9` before the argument shuffle and pops them on return,
   so the parent's `%r8`/`%r9` survive across a syscall, and the
@@ -220,6 +231,13 @@ Apply each only when a specific problem requires it.
   writes clobber the child.  Walk
   `[user_stack_virt, user_stack_top)`, allocate fresh pages with
   `pmm_alloc_page_for_elf`, copy, remap child PTEs.
+
+- **`fork` must inherit the parent's `fs_base`.**  `MSR_FS_BASE` is
+  per-process, and musl's `__post_Fork` reads `%fs:0x0` on the child's
+  first instruction after `_Fork` returns.  Without
+  `child->fs_base = parent->fs_base;` in `sys_fork`, the child runs
+  with `MSR_FS_BASE = 0` and faults at `CR2 = 0`.  Fixed at
+  `20260926E`; see "Resolved bugs" below.
 
 - **`execve` must update the syscall-entry frame's RIP and RSP**, not
   just the PCB.  The return path (`user_syscall_entry.asm`'s `sysret`)
@@ -261,6 +279,35 @@ Apply each only when a specific problem requires it.
   or keyboard IRQ; the shell is then woken normally.  Fixed at
   `20260924F`.  See "Resolved bugs" below.
 
+### Context switch
+
+- **`MSR_FS_BASE` (0xC0000100) must be saved and restored per process.**
+  It is set once by `arch_prctl(ARCH_SET_FS)` at musl startup and is
+  read on the child's very first user instruction after `fork`
+  (musl's `__post_Fork` → `__get_tp` → `mov %fs:0x0, %rdx`).  The
+  kernel must therefore:
+  - record it in `sys_arch_set_fs` and
+    `sys_arch_prctl(ARCH_SET_FS)` (`self->fs_base = addr`),
+  - inherit it in `sys_fork`
+    (`child->fs_base = parent->fs_base;`),
+  - save/restore around every context switch — both the preemptive
+    path in `timer_preempt_handler` (which switches CR3 directly,
+    not through `context_switch`) and the three `context_switch`
+    call sites in `scheduler.c`.
+
+  Without save/restore, the MSR is effectively per-CPU and a second
+  musl process clobbers the first one's TLS base.  Without
+  inheritance, a fork child runs with `%fs = 0`.  Both failure modes
+  are `#PF` in user mode at near-null addresses (`CR2 = 0x34` for the
+  clobber case, `CR2 = 0` for the inheritance case).  Fixed at
+  `20260926E`.
+
+  `fs_base` is appended after `file_table` in `pcb_t` so
+  `context_switch.asm`'s hardcoded offsets (which stop at
+  `block_kind = 0x158`) are unchanged.  Any future field added to
+  `pcb_t` must also be appended after `block_kind` for the same
+  reason.
+
 ### Syscall ABI
 
 - **The syscall return path must preserve every GPR except `%rax`,
@@ -280,10 +327,10 @@ Apply each only when a specific problem requires it.
   shell reads 1 byte at a time, `count == 1`) but broke musl's
   `read(0, buf, 255)`: it waited for 255 keystrokes before returning.
   Fixed at `20260926A`.  This is the same *class* of bug as the
-  `%r10` clobber — the kernel's ABI did not match Linux's, and
+  `%r10` clobber â€” the kernel's ABI did not match Linux's, and
   newlib's usage never exercised the difference.  Musl did.
 
-- **`SYS_EXIT = 60` in `user_syscall_entry.asm`** — the only numeric
+- **`SYS_EXIT = 60` in `user_syscall_entry.asm`** â€” the only numeric
   syscall reference in assembly.
 - **`-mcmodel=large` is required for userland** (linked above 4 GB).
   `-mcmodel=small`/`medium` don't work. `-no-pie` is not needed.
@@ -291,7 +338,7 @@ Apply each only when a specific problem requires it.
   addition to the callee-saved registers and the user RIP/RFLAGS/RSP,
   `user_syscall_entry.asm` pushes `%rdi`, `%rsi`, `%rdx`, `%r10`
   before the argument shuffle.  On the return path, **all four are
-  restored** — `%r10` was previously discarded, which was wrong and
+  restored** â€” `%r10` was previously discarded, which was wrong and
   broke musl's `printf` until `20260924L`.  The user RSP is now loaded
   from the frame at the very end, using no GPR.
 
@@ -322,7 +369,7 @@ Apply each only when a specific problem requires it.
   at 59.
 
 - **A raw-syscall test that reads a kernel-written buffer must declare
-  the buffer as an asm memory output — `"+m"(*ptr)`, not just
+  the buffer as an asm memory output â€” `"+m"(*ptr)`, not just
   `"memory"`.**  A `"memory"` clobber is an aliasing/scheduling
   barrier, not a per-location output; GCC does not treat it as "the
   asm wrote through this specific pointer."  `musl_wait`'s
@@ -352,7 +399,7 @@ Apply each only when a specific problem requires it.
 - **musl's POSIX wrappers do not always go through your donix-private
   syscalls.**  musl's `opendir()` is `open(path, O_RDONLY|O_DIRECTORY)`
   followed by `readdir()` which uses `getdents64(2)`.  It never calls
-  the donix-private `SYS_OPENDIR` (500) — that is a newlib-only
+  the donix-private `SYS_OPENDIR` (500) â€” that is a newlib-only
   convenience.  `sys_open` had to grow a directory fallback (at
   `20260924K`) because otherwise musl's `opendir` failed with
   `FR_INVALID_NAME`.  When you add a syscall that has a donix-private
@@ -394,7 +441,7 @@ Apply each only when a specific problem requires it.
   modified) and a targeted `grep` on the changed function.  If
   either is unexpected, stop and fix the tree before building.
 - **QEMU `-d in_asm,cpu -D /tmp/qemu-log.txt` makes everything run
-  ~1000× slower.**  It's fine for one-off instruction traces, but if
+  ~1000Ă— slower.**  It's fine for one-off instruction traces, but if
   left on, a loop of a few hundred thousand iterations looks like a
   hang.  Turn it off for normal testing; turn it back on only for a
   specific investigation.  The normal `./run` path does not set this
@@ -443,8 +490,8 @@ Apply each only when a specific problem requires it.
   next keyboard IRQ wakes the shell via `process_wake_all_blocked`,
   and `timer_preempt_handler` picks it up on the following tick.
 
-  A secondary symptom — "shell prompt returns but keyboard goes
-  dead" — was reported but never reproduced.  It may be the same
+  A secondary symptom â€” "shell prompt returns but keyboard goes
+  dead" â€” was reported but never reproduced.  It may be the same
   race with a different interleaving.  If it reappears, reopen.
   (See also the `20260926` entry below, which turned out *not* to be
   this.)
@@ -506,7 +553,7 @@ Apply each only when a specific problem requires it.
   are currently unused but kept in the tree; they may be useful when
   `fork` needs real copy-on-write.
 
-- **`musl_printf` / `printnum` dump garbage — kernel bug, fixed at
+- **`musl_printf` / `printnum` dump garbage â€” kernel bug, fixed at
   `20260924L`.**  This was previously misdiagnosed as a musl-internal
   problem.  It was not.  It was a bug in the kernel's syscall return
   path.
@@ -598,92 +645,83 @@ Apply each only when a specific problem requires it.
   Symptom was a fatal `#PF` at `CR2=0x28`, `RIP=0x40097B`, with
   `PTE PRESENT, phys 0x28`.
 
-  Fix: `char b[24]` → `char b[32]` at the `musl_r10probe` `puthex64`
+  Fix: `char b[24]` â†’ `char b[32]` at the `musl_r10probe` `puthex64`
   in `build_musl_tests.sh`.  One line.
 
   **NOTE: this fix did not, on its own, make the test reliable.**
-  See the OPEN entry below — the page fault that first exposed this
-  overflow is actually a *separate* kernel bug, and the `b[32]` fix
-  only removed one of the ways it could manifest.
+  The page fault that first exposed this overflow turned out to be
+  a *separate* kernel bug â€” the `MSR_FS_BASE` issue fixed at
+  `20260926E`.  The `b[32]` fix only removed one of the ways the
+  symptom could manifest.
+
+- **Second `execve` from the same `musl_sh` faulted fatally**
+  (resolved 2026-09-26, tag `20260926E`).  The previous session's
+  diagnosis â€” page-table corruption in `vmm_clone_page_table` or
+  in `sys_execve`'s teardown â€” was **wrong**.  Reading
+  `vmm_clone_page_table`, `vmm_free_user_page_tables`, and
+  `sys_execve`'s `exec_free_and_unmap_user_pages` side by side
+  showed that the teardown frees only data pages listed in
+  `pcb->elf_page_list`, never page-table structures, and the child's
+  `elf_page_list` is populated only with its own fresh stack pages
+  by `process_create`.  No shared page-table page is freed.  The
+  "freed page-table page" reading of `PTE = 0x3` was also wrong:
+  `0x3` is the identity-map PTE for the low 2 MB, present but
+  supervisor-only, and `CR2 = 0x34` is a near-null user dereference.
+
+  The actual bug: `MSR_FS_BASE` (0xC0000100) is set once by
+  `arch_prctl(ARCH_SET_FS)` and was never saved or restored across
+  context switches, making it effectively per-CPU instead of
+  per-process.  After the first child ran `arch_prctl` with its own
+  TLS base, the parent `musl_sh`'s TLS base was clobbered.  On the
+  parent's next `fork`, musl's `fork` wrapper loaded `errno`
+  through `%fs`, got a null/stale pointer, and faulted at
+  `CR2 = 0x34`, `RIP = 0x4009BD` (the `mov (%rax), %eax` after
+  `__errno_location`; disassembly confirmed `0x4009BD` is that
+  exact instruction).
+
+  Fix, part 1: add `uint64_t fs_base;` to `pcb_t` (appended after
+  `file_table`, past `block_kind = 0x158`, so `context_switch.asm`'s
+  hardcoded offsets are unchanged), record it in `sys_arch_set_fs`
+  and `sys_arch_prctl(ARCH_SET_FS)`, and save/restore around every
+  context switch: the preemptive CR3 switch in
+  `timer_preempt_handler` (which does not go through
+  `context_switch`) and all three `context_switch` call sites in
+  `scheduler.c`.
+
+  Fix, part 2: the first fix unmasked a second bug.  `sys_fork` did
+  not inherit the parent's `fs_base`, so the child ran with
+  `MSR_FS_BASE = 0`.  musl's `__post_Fork` reads `%fs:0x0` on the
+  child's first instruction after `_Fork` returns â€” before any
+  syscall â€” and faulted at `CR2 = 0`, `RIP = 0x4014D5`.  Disassembly
+  confirmed `0x4014D5` is `mov %fs:0x0, %rdx` inside `__get_tp`,
+  called from `__post_Fork`.  Adding
+  `child->fs_base = parent->fs_base;` in `sys_fork` closed it.
+
+  Both parts landed in the same commit because they were discovered
+  together: part 1 is not correct on its own (it introduces a new
+  failure mode on the child's first instruction), and part 2 is only
+  meaningful once `fs_base` exists.
+
+  Files changed: `04_kernel_64bit/include/process.h` (new field),
+  `user_syscall.c` (record at `arch_prctl`, inherit in `sys_fork`),
+  `interrupts.c` (save/restore in `timer_preempt_handler`),
+  `scheduler.c` (save/restore at the three `context_switch` call
+  sites).  `context_switch.asm` was not touched.  The newlib canary
+  never calls `arch_prctl`, so its `fs_base` stays 0 and every
+  `wrmsr(0xC0000100, 0)` on switch is a harmless no-op.
 
 ### Open issues
 
-- **OPEN: the second `execve` from the same process corrupts page
-  tables and faults fatally.**  This is the current A3 blocker.
-
-  Reproducer (deterministic, two boots):
-
-  - **Green:** fresh boot, `musl_sh.elf` from the newlib shell, then
-    `0:/musl_r10probe.elf` as the *first* command.  Prints
-    `ABCDEF` and `R10-AFTER=0xdeadbeefcafebabe`, exits cleanly,
-    prompt returns.
-  - **Fatal:** fresh boot, same, but run `0:/musl_r10probe.elf`
-    **twice**.  First run green.  Second run fatally page-faults.
-
-  Fault dump from the second run (`20260926`, ~10:00):
-
-      === PAGE FAULT (#PF) ===
-        CR2 (Bad Address) : 0x0000000000000034
-        Faulting RIP      : 0x00000000004009BD
-        Raw Error Code    : 0x0000000000000005
-        CS                : 0x0000000000000033
-        RSP               : 0x00000080000FFD90
-        CR3               : 0x000000000030F000
-        Walk indices: pml4=0 pdpt=0 pd=0 pt=0
-        pml4e             : 0x0000000000310027
-        pdpte             : 0x0000000000311027
-        pde               : 0x0000000000312027
-        pte               : 0x0000000000000003
-        PTE PRESENT, phys 0x0000000000000034
-
-  The fault is fatal — the console is dead afterward, no prompt
-  returns, no further input accepted.  QEMU must be killed.
-
-  The fault address and RIP vary between runs (`CR2=0x28` /
-  `RIP=0x40097B` in one run, `CR2=0x34` / `RIP=0x4009BD` in
-  another), confirming page-table corruption rather than a fixed
-  bad pointer.  `PTE PRESENT, phys 0x28..0x34` is a PTE mapping a
-  nonsense physical address — a freed and reused page-table page
-  being read as if valid.
-
-  Mechanism hypothesis: `musl_sh`'s loop is `fork` → child
-  `execve`s → parent `wait4`s.  `vmm_clone_page_table` (used by
-  `fork`) shares leaf physical pages between parent and child but
-  is supposed to create *fresh* page-table structures (PT/PD/PDPT/
-  PML4).  The child's `execve` then tears down "its" address space.
-  If the teardown frees page-table pages that are actually shared
-  with the parent, the parent's page tables are corrupted.  The
-  parent then forks again, and the new child inherits the corrupted
-  state and faults.
-
-  Suspects, in order:
-  1. `sys_execve`'s teardown — is it freeing page-table pages it
-     does not own, or freeing shared kernel-half page tables?
-     Compare against the handoff note in the `20260924I` entry:
-     "no shared page tables" was the *goal* of the abandoned
-     copy-then-swap design; verify that goal actually holds in the
-     shipped teardown.
-  2. `vmm_clone_page_table` — does it clone page-table *structure*
-     (fresh PT/PD/PDPT) or does it share them?  If it shares, the
-     child's execve teardown will free the parent's tables.
-  3. `vmm_free_user_page_tables` in `vmm.c` — currently unused per
-     the "Cosmetic / housekeeping" section, but it was written for
-     exactly this kind of teardown.  If `sys_execve` is open-coding
-     the teardown instead of calling it, the open-coded version may
-     be missing a "don't free shared structures" guard.
-
-  Do **not** guess.  Read `sys_execve`'s teardown path and
-  `vmm_clone_page_table` first, side by side, and identify the
-  ownership rule.  Add a diagnostic print in the teardown if
-  necessary (`pmm_free_page(phys)` calls with the phys address and
-  which table level).  The previous session's copy-then-swap
-  attempts failed precisely because "narrowing the shared state"
-  was done by guess; the working `execve` was reached by
-  abandoning shared state entirely.  This bug is the opposite
-  shape: a path where shared state *survives* the teardown it
-  should not.
-
-  **A3 is blocked on this.**  A shell must run commands repeatedly.
+- **`isr14_handler` halts on user-mode faults.**  The `#PF` handler
+  checks only `g_expect_fault`; it does not look at `error_code & 4`
+  to distinguish a user-mode fault from a kernel-mode one.  Any
+  unexpected user-mode fault kills the console instead of
+  terminating the faulting process.  Not blocking A3, but it will
+  bite the next time a user program faults unexpectedly.  Fix: in
+  `isr14_handler`, if `(error_code & 4)` and
+  `g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
+  process instead of halting.  Deferred until after A3's
+  default-shell work.
 
 - **`Unknown syscall: N` at `user_syscall.c:2044` is present but
   currently does not fire.**  The earlier handoff text claimed it
@@ -697,11 +735,9 @@ Apply each only when a specific problem requires it.
   does not.
 
 - If the "prompt returns, keyboard dead" symptom reappears, check
-  whether the cause is the `20260924F` idle-fallback race or the
-  new second-`execve` page-table corruption above.  The two
-  symptoms differ: `20260924F` leaves the console alive (idle `hlt`s,
-  next key wakes the shell); the second-`execve` bug kills the
-  console entirely.
+  whether the cause is the `20260924F` idle-fallback race.  The
+  second-`execve` bug that previously shared this symptom space is
+  now resolved (see `20260926E` above).
 
 ### Cosmetic / housekeeping
 
@@ -709,7 +745,7 @@ Apply each only when a specific problem requires it.
   `user_syscall.c`. `syscall.o` is **not** in `OBJS` in the kernel
   Makefile, so `syscall.c` is not linked at all. Not fatal, but
   confusing. Clean up later (delete the file in its own commit,
-  after the second-`execve` bug is fixed).
+  after A3's default-shell work).
 - `build_musl_tests.sh` has duplicate `# Test 4:` and `# Test 7:`
   comments (copy-paste artifacts from `musl_twommap` and the
   `brkraw`/`brkgrow` tests).  Cosmetic.
@@ -722,33 +758,29 @@ Apply each only when a specific problem requires it.
   the literal to `sys_spawn:` at the next convenient edit.
 - `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in `vmm.c`
   / `vmm.h` are unused (written for the abandoned copy-then-swap
-  `execve`).  Kept for future copy-on-write work, and possibly
-  relevant to the open second-`execve` bug — see "Open issues".
-  If still unused after A3, delete in a cleanup commit.
+  `execve`).  Kept for future copy-on-write work.  If still unused
+  after A3, delete in a cleanup commit.
 - `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is currently `0` (gated,
   inert).  It was added at `20260924L` to test a shared-bounce-buffer
   theory for the `printnum` NUL bytes; the theory was wrong, the flag
   never fired.  Keep it gated for now as a diagnostic in case the
   symptom reappears; delete in a cleanup commit if still unused.
-- `musl_sh` does not do the newlib shell's command-name
-  normalization.  The newlib shell accepts `hello` and resolves it
-  to `0:/HELLO.ELF`; `musl_sh` passes the line verbatim to
-  `execve`, so the user must type `0:/HELLO.ELF`.  Add the
-  normalization in the shell source (prepend `0:/`, append `.ELF`
-  if missing) once the open second-`execve` bug is fixed and A3 is
-  unblocked.
+- `musl_sh` does not tokenize its command line (the whole line is
+  passed as `argv[0]` and as the `execve` path) and does not do the
+  newlib shell's `0:/` + `.ELF` normalization.  Both are A3 work
+  items, not cleanup.
 
 ## Testing harness
 
 - **Kernel shell:** `k` at boot prompt
   (`proclist`, `schstat`, `heapstat`, `selftest`, `fatls`).
-- **User shell:** default — don't press `k`. Runs `0:/NAME.ELF`.
+- **User shell:** default â€” don't press `k`. Runs `0:/NAME.ELF`.
 - **QEMU:** `make runkernel64-kvm-single` (fast),
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
   The normal `./run` script uses
   `make clean && make FAT_CONFIG=single && make -C
   05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64
-  run-single > capture.txt` — single-drive, TCG, clean rebuild
+  run-single > capture.txt` â€” single-drive, TCG, clean rebuild
   every time, QEMU output teed to `capture.txt`.  It does **not**
   set the `-d in_asm,cpu` flag; that only appears in the
   `run-debug-log` target.
@@ -766,7 +798,7 @@ Apply each only when a specific problem requires it.
   `MUSL_*.ELF` files are missing from a boot, run
   `./build_musl_tests.sh` first.  A missing `/tmp/musl_*` produces
   a `WARN: ... not found` line during `hdd-single.img` build but
-  does **not** fail the build — the image is silently missing those
+  does **not** fail the build â€” the image is silently missing those
   ELFs.
 
 ## Recovery
@@ -782,7 +814,7 @@ milestone. One change at a time so `git restore .` always works.
 2. Apply A1 only: four files, numbers only. No `crt0.S`, no linker
    script, no semantics, no new syscalls.
 3. Test. Commit if it works. Revert and diagnose if it doesn't.
-4. Then A2 items 1–14, one at a time, each tested with a tiny musl
+4. Then A2 items 1â€“14, one at a time, each tested with a tiny musl
    program. Newlib's existing userland is the regression canary after
    each.
 5. Do not add `fork`/`execve`/`getdents64` wrappers to the newlib
@@ -807,41 +839,37 @@ musl lands.**
 
 ---
 
-# Part 2 — Session Status
+# Part 2 â€” Session Status
 
-**Last updated:** 2026-09-26 (session 6)
-**Current HEAD:** untagged commit after `20260926D` (this handoff
-update)
-**Last known-good tag:** `20260926D`
+**Last updated:** 2026-09-26 (session 7)
+**Current HEAD:** `20260926E`
+**Last known-good tag:** `20260926E`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A3 shell exists and works for a *single* command from a fresh
-boot.  A3 is BLOCKED on a kernel bug that makes the *second* `execve`
-from the same `musl_sh` process fault fatally.**
+**A3 is unblocked.  `musl_sh` runs commands repeatedly from a fresh
+boot.**  The blocker was a kernel bug: `MSR_FS_BASE` was not part of
+the process context.  Fixed at `20260926E`.
 
 Today's commits, in order, one change each:
 
 | Tag | Commit | What |
 |-----|--------|------|
-| `20260926A` | `sys_read: fd 0 returns on first byte, not on count (POSIX short read)` | Kernel fix. `continue` → `break` in `sys_read`'s fd-0 branch. Unblocks musl's `read(0, buf, N)` for N > 1. |
+| `20260926A` | `sys_read: fd 0 returns on first byte, not on count (POSIX short read)` | Kernel fix. `continue` â†’ `break` in `sys_read`'s fd-0 branch. Unblocks musl's `read(0, buf, N)` for N > 1. |
 | `20260926B` | `A3: add minimal musl shell, wired into image build` | `musl_sh` heredoc + build block in `build_musl_tests.sh`; `MUSL_SH := /tmp/musl_sh` + `mcopy_one` in `05_boot_kernel64/Makefile`. |
 | `20260926C` | `A3: musl_sh reads a line byte-at-a-time, echoes as typed` | `musl_sh`'s read loop changed from one big `read` to a nested byte-at-a-time loop that echoes and breaks on `\n`. |
-| `20260926D` | `musl_r10probe: fix stack buffer overflow in puthex64 (b[24] -> b[32])` | One-line test fix. Did *not* resolve the fault on its own — see "Open issues". |
+| `20260926D` | `musl_r10probe: fix stack buffer overflow in puthex64 (b[24] -> b[32])` | One-line test fix. Did *not* resolve the fault on its own. |
+| `20260926E` | `Save/restore MSR_FS_BASE per process across context switches` | Adds `fs_base` to `pcb_t`, records it at `arch_prctl`, inherits it in `sys_fork`, save/restore at every context-switch site. Fixes the second-`execve` fatal `#PF`. |
 
 The `sys_read` fix (`20260926A`) was the actual reason `musl_sh`
-appeared to ignore input when first tested.  `musl_sh`'s
-`read(0, line, 255)` was consuming each keystroke into its buffer
-but the kernel never returned because it was waiting for 255 bytes.
-Typing 256 characters into the frozen shell produced a belated
-`EXEC-FAILED`, confirming the diagnosis.
+appeared to ignore input when first tested.  The `b[32]` fix
+(`20260926D`) removed a genuine buffer overflow but did not
+eliminate the page fault.  The `MSR_FS_BASE` fix (`20260926E`) is
+what actually closed the A3 blocker; the previous session's
+page-table-corruption diagnosis was wrong.
 
-The `b[32]` fix (`20260926D`) removed a genuine buffer overflow but
-did not eliminate the page fault.  The fault is a *separate* kernel
-bug.  See "Open issues" in Part 1.
-
-## Canary state (all green as of `20260926D`)
+## Canary state (all green as of `20260926E`)
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -862,99 +890,96 @@ bug.  See "Open issues" in Part 1.
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
 | musl_printf | green | prints `MUSL-PRINTF` with newline, exits cleanly |
 | printnum | green | prints `x=42` with newline, exits cleanly |
-| musl_r10probe | green (single run) | `R10-AFTER=0xdeadbeefcafebabe`.  **Run it *once* per boot.**  The second run faults — see "Open issues" in Part 1. |
-| **musl_sh** | **green (single command)** | Shell starts, echoes input, runs `0:/HELLO.ELF` cleanly, `wait4` serializes output, prompt returns.  **A second command faults fatally.** |
+| musl_r10probe | green (multi-run) | `R10-AFTER=0xdeadbeefcafebabe`.  Multiple consecutive runs in the same boot are now safe. |
+| **musl_sh** | **green (multi-command)** | Two consecutive `0:/musl_r10probe.elf` runs both clean, plus `0:/hello.elf`, `0:/ls.elf`, `0:/memtest.elf`.  Bare `hello` (no prefix) fails with `f_open FR_NO_FILE` â€” path normalization is the next A3 item, not a bug.  `0:/cat.elf file.txt` also fails because `musl_sh` does not tokenize; argument splitting is a separate follow-up. |
 
 ## Next step (exactly this, then stop)
 
-**Diagnose and fix the second-`execve` page-table corruption.**
-This is not a shell bug.  It is a kernel bug in the `execve` teardown
-path or in `vmm_clone_page_table`'s page-table-structure ownership.
-It blocks all of A3, because a shell must run commands repeatedly.
+**A3 continues: tokenize `musl_sh`'s command line and pass the
+token array to `execve`.**
 
-Do **not** start by reading `sys_execve`.  Start by reading the
-**ownership rule**: which page-table pages does `fork` share with
-the parent, and which does it make fresh?  Then check whether
-`sys_execve`'s teardown respects that rule.
+Currently `musl_sh` passes the entire typed line as `argv[0]` and
+as the `execve` path:
 
-Order of investigation:
+```c
+argv[0] = line;
+argv[1] = (char*)0;
+execve(line, argv, (char**)0);
+```
 
-1. `vmm_clone_page_table` in `vmm.c` — does it allocate fresh
-   PT/PD/PDPT/PML4 structures for the child, or does it share them?
-   (If it shares, the child's `execve` frees the parent's tables.
-   That would explain everything.)
-2. `sys_execve`'s teardown in `user_syscall.c` — what does it
-   actually free?  Does it walk page-table pages and call
-   `pmm_free_page` on each, including intermediate levels?  Does it
-   check whether a page-table page is shared before freeing?
-3. `vmm_free_user_page_tables` in `vmm.c` / `vmm.h` — unused per the
-   handoff, but written for exactly this.  Compare its logic against
-   what `sys_execve` open-codes.
+So `0:/cat.elf 0:/HELLO-WORLD.TXT` is passed as a single path
+string, `f_open` rejects it (`FR_NO_FILE` or `FR_INVALID_NAME`),
+and the shell prints `EXEC-FAILED`.  The kernel's argv pipeline
+is already correct â€” `sys_execve` snapshots argv from the old
+address space and lays it out on the new stack, and `cat.elf`
+already reads `argc`/`argv` from the frame.  The shell is the
+missing piece.
 
-Only after the ownership rule is clear should a fix be attempted.
-The previous session's copy-then-swap attempts failed because
-narrowing shared state was done by guess.  Read first.
+The change is one file: `build_musl_tests.sh`'s `musl_sh` heredoc.
+Add a whitespace tokenizer that fills `char* argv[MAX_ARGS]` with
+pointers into `line`, then call `execve(argv[0], argv, (char**)0)`.
+Test with `0:/cat.elf 0:/HELLO-WORLD.TXT` (expect the file
+contents printed).
 
-**When the fix is in and one `./run` shows two consecutive
-`0:/musl_r10probe.elf` runs both green, tag `20260926E`.**  Then A3
-proceeds: path normalization in `musl_sh`, then make `musl_sh` the
-default boot shell.
+**Then, as a separate change:** path normalization.  For each
+token that has no `:/`, prepend `0:/` and append `.ELF` if the
+token has no `.` extension.  Test with bare `hello` (no prefix).
 
-**Do not** do anything else before this bug is fixed: no `syscall.c`
-deletion, no shell path normalization, no default-shell swap, no
-further test additions.  One change at a time, and this is the one
-that matters.
+**Do not combine the two changes.**  Tokenization first, test,
+commit.  Then normalization, test, commit.  If both land in one
+commit and something breaks, you will not know which caused it.
+
+**After both are green:** make `musl_sh` the default boot shell,
+keeping the newlib shell reachable as a fallback binary.
 
 ## State on disk
 
-- `/tmp/musl_*` — musl test binaries, rebuilt by
+- `/tmp/musl_*` â€” musl test binaries, rebuilt by
   `build_musl_tests.sh`.  Present as of this session.
   **`/tmp` is not persistent across reboots on Fedora.**  If the
   `MUSL_*.ELF` files are missing from a boot, run
   `./build_musl_tests.sh` first.  The image build does **not** fail
-  if they are missing — it prints `WARN: ... not found` and
+  if they are missing â€” it prints `WARN: ... not found` and
   proceeds, producing an image without those ELFs.  If a musl test
   reports "file not found," check `/tmp` before assuming a kernel
   regression.
-- `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
+- `/tmp/20260923A-working-tree.patch` (614 lines) â€” plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
-- `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
-- `~/code/x` — snapshot of the pre-cleanup tree, kept for diffing.
+- `/tmp/memtest2.c.bak` (524 bytes) â€” backup of an untracked test.
+- `~/code/x` â€” snapshot of the pre-cleanup tree, kept for diffing.
   Can be deleted; the halt it was being kept for is now resolved.
 - `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in
   `vmm.c` / `vmm.h` are currently unused (written for the abandoned
-  copy-then-swap `execve`).  **They may be directly relevant to the
-  open second-`execve` bug** — read them during diagnosis rather
-  than deferring them.
+  copy-then-swap `execve`).  Kept for future copy-on-write work.
 - `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is `0` (gated, inert).
   Safe to delete; kept for one more session in case the `printnum`
   NUL symptom reappears.
 
 ## Open items
 
-- **BLOCKER: second `execve` from the same process corrupts page
-  tables and faults fatally.**  See "Open issues" in Part 1 and
-  "Next step" above.  Everything else is deferred until this is
-  fixed.
-- **After the blocker:** A3 continues.
-  - Add `0:/` + `.ELF` normalization to `musl_sh`'s `execve`
-    argument, so it is a drop-in for the newlib shell's command
-    syntax.
-  - Make `musl_sh` the default boot shell, keep the newlib shell
+- **A3 continues.**
+  - Tokenize `musl_sh`'s command line so `cat.elf file.txt` passes
+    `argv[1]` through to the child.  Currently the whole line is
+    treated as one path.
+  - Add `0:/` + `.ELF` normalization so bare `hello` resolves to
+    `0:/HELLO.ELF`, matching the newlib shell's behavior.
+  - Make `musl_sh` the default boot shell, keeping the newlib shell
     reachable as a fallback binary.
 - **Deferred cleanups** (one commit each, after A3's default-shell
   work):
-  - Delete `syscall.c` (dead — `syscall.o` is not in `OBJS`; it
+  - Fix `isr14_handler` to distinguish user-mode faults (see "Open
+    issues" in Part 1): user faults should terminate the faulting
+    process, not halt the kernel.
+  - Delete `syscall.c` (dead â€” `syscall.o` is not in `OBJS`; it
     holds a stub `sys_brk` that shadows the real one).
   - Silence `syscall_dispatch`'s `Unknown syscall: N` print if it
-    ever starts firing (see corrected "Open issues" in Part 1).
+    ever starts firing.
   - Rename `sys_spawn`'s serial trace prefix from `sys_execve:` to
     `sys_spawn:` (string literal, cosmetic).
   - Delete `DEBUG_WRITE_BOUNCE` from `user_syscall.c`.
-  - `musl_r10probe`'s `puthex64` is fixed; audit the other
-    `puthex`/`put_dec` helpers in `build_musl_tests.sh` for
-    similar tight margins.  They fit as of this session, but the
-    margins are small.
+  - Audit the other `puthex`/`put_dec` helpers in
+    `build_musl_tests.sh` for similar tight margins.  They fit as
+    of this session, but the margins are small.
   - Duplicate `# Test N:` comments and `musl_min`'s missing
     `-no-pie` in `build_musl_tests.sh`.
 - Cosmetic items remain (see "Cosmetic / housekeeping" in Part 1).
