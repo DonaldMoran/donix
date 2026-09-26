@@ -616,9 +616,25 @@ long sys_spawn(const char* user_path, int argc, char** user_argv) {
         uint64_t argv_region_top    = child->user_stack_top;
         uint64_t argv_region_bottom = argv_region_top - 4096;
 
+        /*
+         * Layout on the argv region, low to high:
+         *
+         *   argv_region_bottom + 0               argv[0]
+         *   argv_region_bottom + 8               argv[1]
+         *   ...
+         *   argv_region_bottom + 8*argc          argv NULL terminator
+         *   argv_region_bottom + 8*(argc+1)      envp NULL terminator
+         *   argv_region_bottom + 8*(argc+2)      first argument string
+         *
+         * array_bytes = 8*(argc+1) covers the argv slots plus the
+         * argv NULL terminator.  The envp NULL terminator needs one
+         * MORE slot, at argv_region_bottom + array_bytes.  Strings
+         * must therefore start at argv_region_bottom + array_bytes
+         * + 8, not at argv_region_bottom + array_bytes.
+         */
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
         uint64_t array_base    = argv_region_bottom;
-        uint64_t strings_start = argv_region_bottom + array_bytes;
+        uint64_t strings_start = argv_region_bottom + array_bytes + 8;
 
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
@@ -1059,9 +1075,35 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         uint64_t argv_region_top    = new_user_stack_top;
         uint64_t argv_region_bottom = argv_region_top - 4096;
 
+        /*
+         * Layout on the argv region, low to high:
+         *
+         *   argv_region_bottom + 0               argv[0]
+         *   argv_region_bottom + 8               argv[1]
+         *   ...
+         *   argv_region_bottom + 8*argc          argv NULL terminator
+         *   argv_region_bottom + 8*(argc+1)      envp NULL terminator
+         *   argv_region_bottom + 8*(argc+2)      first argument string
+         *
+         * array_bytes = 8*(argc+1) covers the argv slots plus the
+         * argv NULL terminator.  The envp NULL terminator needs one
+         * MORE slot, at argv_region_bottom + array_bytes.  Strings
+         * must therefore start at argv_region_bottom + array_bytes
+         * + 8, not at argv_region_bottom + array_bytes.
+         *
+         * The previous code put strings_start at
+         * argv_region_bottom + array_bytes, the same address as the
+         * envp NULL write, so the envp NULL zeroed the first 8
+         * bytes of argv[0]'s string.  When argv[0] was long (e.g.
+         * "0:/cat.elf") the collateral damage stopped short of
+         * argv[1]'s string and nothing visible broke.  When argv[0]
+         * was short (e.g. "cat", "echo"), argv[1]'s string began
+         * inside the 8-byte zeroing window and was clobbered — the
+         * child saw an empty argv[1] and silently did nothing.
+         */
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
         uint64_t array_base    = argv_region_bottom;
-        uint64_t strings_start = argv_region_bottom + array_bytes;
+        uint64_t strings_start = argv_region_bottom + array_bytes + 8;
 
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
