@@ -200,7 +200,7 @@ Target list and current status:
 | `hello` | **done (parallel)** | `20260926L` | `HELLO_MUSL.ELF` on FAT; newlib `HELLO.ELF` intact. Straight port; only `printf`. |
 | `echo` | **done (parallel)** | `20260926M` | `ECHO_MUSL.ELF` on FAT; newlib `ECHO.ELF` intact. Straight port; only `write` + argv. |
 | `cat` | **done (parallel)** | `20260926N` | `CAT_MUSL.ELF` on FAT; newlib `CAT.ELF` intact. Straight port; `open`/`read`/`close`/`write` + argv. |
-| `ls` | **blocked** | — | Not a port. Newlib `ls` uses `struct dons_dirent` + `SYS_OPENDIR`/`SYS_READDIR`/`SYS_CLOSEDIR` (500-range), none of which musl has. A musl `ls` needs `opendir`/`readdir` (already green via `getdents64`) **plus `stat`/`fstat`/`newfstatat` for sizes**, and the FAT directory attribute has to come from `d_type` in `getdents64` (which is already set correctly from `fno.fattrib & AM_DIR`). The missing piece is the kernel `stat` family.  `sys_fstat` (5) is now implemented at `20260926R`; `sys_stat` (4) and `sys_newfstatat` (262) are still stubs.  See "musl `fstatat` routing" under "Syscall ABI" for what musl actually calls. |
+| `ls` | **unblocked, next** | — | Not a straight port. `sys_fstat` (5) and `sys_stat` (4) are both implemented and tested (`20260926R`, `20260926T`). `readdir`/`getdents64` have been green since `20260924K`. The port needs: `opendir("0:/")` + `readdir` for the entry list; `d_type` from `struct dirent` for `DT_DIR` vs `DT_REG` (already correctly set by `sys_getdents64` from `fno.fattrib & AM_DIR`); `stat("0:/NAME", &st)` per entry for `st_size`. No further kernel work is needed for `ls_musl` — `sys_newfstatat` (262) is not on its path. |
 | `memtest` | **not started** | — | Read the source first. If it is pure `malloc`/`free`/`write`, it is a straight port. If it calls donix-private heap stats, the test's meaning changes and it becomes a decision, not a port. |
 
 **Parallel-then-cut-over pattern.**  Each app is first built as a
@@ -289,8 +289,10 @@ against the project-local musl headers (the output is recorded in
 session 7's log).  The kernel's `sys_fstat` / `sys_stat` /
 `sys_newfstatat` must write this layout **byte-for-byte**.  Any field
 out of place means `ls` prints garbage or the caller faults.
-`sys_fstat` (`20260926R`) writes it correctly — `musl_stat` proves
-`st_size = 180` and `st_mode = 0x81a4` for `0:/HELLO-WORLD.TXT`.
+`sys_fstat` (`20260926R`) and `sys_stat` (`20260926T`) both write it
+correctly — `musl_stat` proves `st_size = 180` and `st_mode = 0x81a4`
+for `0:/HELLO-WORLD.TXT` via both `fstat(fd, &st)` and
+`stat(path, &st)`.
 
 **Minimal musl test:**
 
@@ -578,17 +580,17 @@ Apply each only when a specific problem requires it.
 
   Consequences for donix:
   - `sys_fstat` (5) is what `fstat` calls.  **Implemented at
-    `20260926R`.**  Tested by `musl_stat` (which calls `fstat`
-    directly) — green.
+    `20260926R`.**  Tested by `musl_stat` — green.
   - `sys_stat` (4) is what `stat` calls when the path is absolute
-    or `AT_FDCWD` is the fd.  **Not yet implemented.**  Required
-    for `ls_musl`, because a musl `ls` will build `0:/NAME` paths
-    and call `stat()` on them.  Next commit.
+    or `AT_FDCWD` is the fd.  **Implemented at `20260926T`.**
+    Tested by `musl_stat`'s second half (`stat("0:/HELLO-WORLD.TXT",
+    &st)`) — green.  This was the last kernel blocker for `ls_musl`,
+    which builds `0:/NAME` paths and calls `stat()` on them.
   - `sys_newfstatat` (262) is what `fstatat(fd, path, st, flags)`
     calls when the fd is not `AT_FDCWD` and the path is not
     absolute.  **Not yet implemented.**  Not needed by `ls_musl`
     (which uses absolute `0:/` paths), but needed for general
-    correctness.  Later commit.
+    correctness.  Deferred commit; nothing in A4 depends on it.
   - `sys_statx` (332) is not reached on x86_64 because the
     `sizeof(st_atime_sec) < sizeof(time_t)` guard is false.  No
     implementation needed.
@@ -596,6 +598,14 @@ Apply each only when a specific problem requires it.
     `AT_SYMLINK_NOFOLLOW`.  Nothing in A4 needs it.  Not
     implemented; if something calls it, it will print
     `Unknown syscall: 6`.
+
+- **`sys_stat` and `sys_fstat` share `fill_kstat_from_filinfo`.**
+  Both construct a FatFs `FILINFO` (from an open `FIL` for `fstat`,
+  from `f_stat(path, &fno)` for `stat`) and then call the shared
+  helper to populate `kernel_stat_t` and copy it out via
+  `safe_copy_to_user`.  If a third caller ever needs the same layout
+  (e.g. `sys_newfstatat`), it should use the same helper, not
+  duplicate the fill logic.
 
 - **`getdents64` emits one record per call, deliberately.**  FatFs's
   `f_readdir` advances an irreversible cursor.  If `sys_getdents64`
@@ -626,6 +636,14 @@ Apply each only when a specific problem requires it.
   the shell to pass a full path for a file argument — `musl_sh`
   normalizes only `argv[0]`.  This is the single most likely source
   of silent failure in an A4 port that takes a filename.
+
+- **A4 ports that enumerate a directory should take a bare directory
+  name on `argv[1]` and prepend `0:/`, same as `cat`/`echo`.**  A
+  future `ls_musl` will need this.  The newlib `ls` hardcodes
+  `opendir("0:/")` and takes no argument; the musl port should
+  accept an optional `argv[1]`, normalize it to `0:/NAME` if it has
+  no `:/`, and pass it to `opendir`.  That keeps `musl_sh`'s
+  bare-filename convention intact for both files and directories.
 
 ### stdio / newlib
 
@@ -996,18 +1014,18 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_stat` (4) and `sys_newfstatat` (262) are not implemented.**
-  `sys_fstat` (5) is done (`20260926R`) and tested (`musl_stat`
-  green).  See "musl `fstatat` routing" under "Syscall ABI" for
-  the exact paths musl takes.  `sys_stat` is the next commit;
-  `sys_newfstatat` follows.  `ls_musl` needs `sys_stat`, because
-  it will build `0:/NAME` paths and call `stat()` on them; that
-  routes to `SYS_stat` (4) via `fstatat_kstat`'s
-  `(fd == AT_FDCWD || *path == '/') && !flag` branch.  The
-  directory-vs-file distinction does **not** need `stat`: `d_type`
-  in `getdents64` (already correctly set from
-  `fno.fattrib & AM_DIR`) carries it.  `stat` is needed only for
-  the sizes.
+- **`sys_newfstatat` (262) is not implemented.**  `sys_fstat` (5)
+  and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
+  routing" under "Syscall ABI" for the exact paths musl takes.
+  `sys_newfstatat` is what `fstatat(fd, path, st, flags)` calls when
+  the fd is not `AT_FDCWD` and the path is not absolute — nothing in
+  A4 needs it, so it is a "for general correctness" commit that can
+  wait until either a test exercises it or the A4 backlog is being
+  cleared.  Implementing it is a straight port of `sys_stat` with
+  the fd and flags handled: for the common case (`AT_FDCWD`, empty
+  flags, or absolute path), it can delegate to `sys_stat`; for the
+  general case, it needs to resolve `fd` + relative `path` to a
+  full `0:/...` path before calling `f_stat`.
 - **Newlib shell's line editor mishandles backspaces; a malformed
   line can leave FatFs in a bad state.**  Reproduced at
   `20260926J`.  The clean sequence works:
@@ -1064,7 +1082,7 @@ Apply each only when a specific problem requires it.
 - **`musl_readdir` under `musl_sh` prints `Unknown syscall: N`
   between entries.**  Numbers seen at `20260926J` and unchanged
   after the toolchain switch at `20260926P`: 6, 7, 8, 15, 17, 72.
-  The `readdir` loop still returns the correct count (26), so the
+  The `readdir` loop still returns the correct count (27), so the
   test is green, but the noise is real and we do not yet know which
   musl libc call is generating it.  Some of these may now be
   answered by the `fstatat` routing read: `SYS_lstat` (6) is
@@ -1160,7 +1178,8 @@ Apply each only when a specific problem requires it.
   `musl_sh` argv[0] normalization, `20260926L` with `hello_musl`,
   `20260926M` with `echo_musl`, `20260926N` with `cat_musl`,
   `20260926P` with the `MUSL_GCC` variable and switch to
-  `./toolchain/musl-gcc.sh`, `20260926R` with `musl_stat`).
+  `./toolchain/musl-gcc.sh`, `20260926R` with `musl_stat` (fstat
+  half), `20260926T` with the `stat` half of `musl_stat`).
   Sources are heredoc'd into `/tmp/` and linked with
   `"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large`, where `$MUSL_GCC`
   defaults to `./toolchain/musl-gcc.sh`.  The image build
@@ -1225,18 +1244,20 @@ musl lands.**
 # Part 2 — Session Status
 
 **Last updated:** 2026-09-26 (session 7, A4 in progress)
-**Current HEAD:** `20260926R` (commit `9b912b8`); this handoff
-commit will be `20260926S`
-**Last known-good tag:** `20260926R`
+**Current HEAD:** `20260926T` (the `sys_stat` commit); this handoff
+commit will be `20260926U`
+**Last known-good tag:** `20260926T`
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
 **A4 in progress.**  Three of the five A4 apps are done as parallel
-`*_MUSL.ELF` binaries (`hello`, `echo`, `cat`); the newlib originals
-are intact and green.  The `ls` port is partially unblocked:
-`sys_fstat` (5) is implemented and tested.  `sys_stat` (4) is next;
-`sys_newfstatat` (262) follows.  `memtest` not yet assessed.
+`*_MUSL.ELF` binaries (`hello`, `echo`, `cat`).  `ls` is now
+**fully unblocked**: both `sys_fstat` (5) and `sys_stat` (4) are
+implemented and tested; `readdir`/`getdents64` have been green since
+`20260924K`.  `ls_musl` is next.  `sys_newfstatat` (262) remains
+unimplemented and is not needed by `ls_musl`.  `memtest` not yet
+assessed.
 
 ## Session 7 commits, in order
 
@@ -1259,14 +1280,16 @@ are intact and green.  The `ls` port is partially unblocked:
 | `20260926O` | `handoff: A4 hello/echo/cat done; ls blocked on kernel stat` | Handoff update.  No code change. |
 | `20260926P` | `build: use project-local musl 1.2.5 from source (toolchain/musl-gcc.sh)` | Adds `toolchain/install_musl.sh` and `toolchain/musl-gcc.sh`; adds `third_party/` to `.gitignore`; switches `build_musl_tests.sh` from bare `musl-gcc` to `"$MUSL_GCC"` (defaulting to `./toolchain/musl-gcc.sh`).  Rebuilds and reruns the full canary: all green.  `*_MUSL.ELF` shrink noticeably (upstream musl `libc.a` is 2.75 MB vs Fedora's 11.4 MB).  Fedora's `/usr/bin/musl-gcc` remains as a reference via `MUSL_GCC=/usr/bin/musl-gcc`. |
 | `20260926Q` | `handoff: A4 progress; musl is project-local; stat is next` | Handoff update.  No code change. |
-| `20260926R` | `sys_fstat: implement Linux fstat(2) for A4 ls` | Adds `SYS_STAT` (4), `SYS_FSTAT` (5), `SYS_NEWFSTATAT` (262) defines and `long sys_fstat(int, void*)` prototype to `syscall.h`.  Adds `kernel_stat_t` (144-byte layout matching musl 1.2.5 x86_64), `KSTAT_IFREG`/`KSTAT_IFDIR` constants, `sys_fstat` implementation, and `case SYS_FSTAT:` to `user_syscall.c`.  Adds `musl_stat` test to `build_musl_tests.sh` (opens `0:/HELLO-WORLD.TXT`, `fstat`s, asserts `st_size == 180` and `S_IFREG`, prints `STAT-OK`).  Adds `MUSL_STAT := /tmp/musl_stat` and an `mcopy_one` line to `05_boot_kernel64/Makefile`.  Tested: `musl_stat` prints `STAT-FR 0`, `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK`; full canary re-run green.  Read the musl source while debugging and confirmed the routing: `fstat` → `__fstatat(fd, "", st, AT_EMPTY_PATH)` → `SYS_fstat = 5`.  `stat`/`lstat` route through the `fstatat_kstat` fallback to `SYS_stat = 4` and `SYS_lstat = 6`.  Full routing recorded in Part 1. |
-| `20260926S` | `handoff: sys_fstat green; sys_stat and fstatat routing recorded` | This commit.  Handoff update.  No code change. |
+| `20260926R` | `sys_fstat: implement Linux fstat(2) for A4 ls` | Adds `SYS_STAT` (4), `SYS_FSTAT` (5), `SYS_NEWFSTATAT` (262) defines and `long sys_fstat(int, void*)` prototype to `syscall.h`.  Adds `kernel_stat_t` (144-byte layout matching musl 1.2.5 x86_64), `KSTAT_IFREG`/`KSTAT_IFDIR` constants, `sys_fstat` implementation, and `case SYS_FSTAT:` to `user_syscall.c`.  Adds `musl_stat` test to `build_musl_tests.sh` (opens `0:/HELLO-WORLD.TXT`, `fstat`s, asserts `st_size == 180` and `S_IFREG`, prints `STAT-OK`).  Adds `MUSL_STAT := /tmp/musl_stat` and an `mcopy_one` line to `05_boot_kernel64/Makefile`.  Tested: `musl_stat` prints `STAT-FR 0`, `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK`.  Read the musl source while debugging and confirmed the routing: `fstat` → `__fstatat(fd, "", st, AT_EMPTY_PATH)` → `SYS_fstat = 5`.  `stat`/`lstat` route through the `fstatat_kstat` fallback to `SYS_stat = 4` and `SYS_lstat = 6`.  Full routing recorded in Part 1. |
+| `20260926S` | `handoff: sys_fstat green; sys_stat and fstatat routing recorded` | Handoff update.  No code change. |
+| `20260926T` | `sys_stat: implement Linux stat(2) for A4 ls` | Adds `long sys_stat(const char*, void*)` prototype to `syscall.h`.  Factors the kstat fill into `static void fill_kstat_from_filinfo(kernel_stat_t*, const FILINFO*)`, refactors `sys_fstat` to use it, adds `sys_stat` (path-based, uses `f_stat`) and `case SYS_STAT:` to `user_syscall.c`.  Extends the `musl_stat` test in `build_musl_tests.sh` with a second half that calls `stat("0:/HELLO-WORLD.TXT", &st)` and prints `STAT2-*` markers.  Tested: `musl_stat` prints `STAT-FR 0`, `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK`, `STAT2-SR 0`, `STAT2-SIZE 180`, `STAT2-MODE 0x81a4`, `STAT2-OK`.  Full canary re-run green.  `MUSL_STAT.ELF` grew from 32728 to 32776 bytes (the second half links a bit more of libc). |
+| `20260926U` | `handoff: sys_stat green; ls_musl is next` | This commit.  Handoff update.  No code change. |
 
-## Canary state (all green as of `20260926R`)
+## Canary state (all green as of `20260926T`)
 
 Boot-time shell is `musl_sh`; the canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
-**27** entries (was 26 before `MUSL_STAT.ELF` was added).
+**27** entries.
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -1278,7 +1301,7 @@ Boot-time shell is `musl_sh`; the canaries below were run from its
 | echo_musl hi | green | `hi` |
 | cat hello-world.txt | green | file contents printed |
 | cat_musl hello-world.txt | green | file contents printed; identical output to newlib |
-| musl_stat | green | `STAT-FR 0`, `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK` |
+| musl_stat | green | `STAT-FR 0`, `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK`, `STAT2-SR 0`, `STAT2-SIZE 180`, `STAT2-MODE 0x81a4`, `STAT2-OK` |
 | printnum | green | `x=42` |
 | musl_min | green | `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK`, `SMALL-OK` |
@@ -1296,7 +1319,7 @@ Boot-time shell is `musl_sh`; the canaries below were run from its
 
 Current `*_MUSL.ELF` sizes on the FAT (project-local musl):
 `HELLO_MUSL.ELF` 18752, `ECHO_MUSL.ELF` 12864, `CAT_MUSL.ELF` 13032,
-`MUSL_STAT.ELF` 32728 (larger because it links `printf`),
+`MUSL_STAT.ELF` 32776 (larger because it links `printf`),
 `MUSL_MIN.ELF` 12792, `MUSL_PRINTF.ELF` 18752, `MUSL_MALLOC.ELF` 28280,
 `MUSL_FORK.ELF` 20016, `MUSL_FORK_RAW.ELF` 12408, `PRINTNUM.ELF` 27816,
 `BRK_VERIFY.ELF` 17544, `BRKRAW.ELF` 12824, `BRKGROW.ELF` 12824,
@@ -1306,65 +1329,55 @@ unchanged.
 
 ## Next step (exactly this, then stop)
 
-**A4 item 4, step 2: implement `sys_stat` (4).**
+**A4 item 4: port `ls` to musl as a parallel `LS_MUSL.ELF`.**
 
-`sys_fstat` is done.  `sys_stat` is next.  The musl source read at
-`20260926R` shows that `stat(path, st)` → `fstatat(AT_FDCWD, path,
-st, 0)` → `fstatat_kstat` → `(fd == AT_FDCWD || *path == '/') &&
-!flag` → `__syscall(SYS_stat, path, &kst)` = **syscall 4**.  So
-`sys_stat` is what a musl `stat()` on a `0:/NAME` path actually
-issues, and `ls_musl` will need it.
+Now that `sys_fstat`, `sys_stat`, and `getdents64`/`readdir` are all
+green, `ls_musl` is a straight userland port.  No kernel work
+needed.  Follow the parallel-then-cut-over pattern used for
+`hello`/`echo`/`cat`.
 
-The kernel-side `sys_stat` is:
+The `ls_musl` source:
 
-1. Takes a user path pointer and a user `struct stat` pointer.
-2. `copy_user_string` the path into a kernel scratch (same
-   `USER_PATH_MAX` helper `sys_unlink`/`sys_open` already use).
-3. `f_stat(path, &fno)` — FatFs's path-based stat.  If it fails,
-   return `-1`.  (Consider whether the path needs any `0:/`
-   normalization; see below.)
-4. Fill `kernel_stat_t` from `fno`:
-   - `st_mode` = `KSTAT_IFREG | 0644` if `!(fno.fattrib & AM_DIR)`,
-     else `KSTAT_IFDIR | 0755`.
-   - `st_size` = `fno.fsize` for regular files, `0` for dirs.
-   - `st_nlink` = 1.
-   - `st_blksize` = 512, `st_blocks` = `(st_size + 511) / 512`.
-   - Everything else zero.
-5. `safe_copy_to_user` the 144-byte struct out.
-6. Return 0 on success, `-1` on failure.
+- `opendir(path)` where `path = "0:/" + argv[1]` if `argv[1]` has no
+  `:/`, else `argv[1]` verbatim, else `"0:/"` if `argc < 2`.  This
+  matches `musl_sh`'s bare-filename convention (see the "A4 ports
+  that enumerate a directory" entry in Part 1).
+- `readdir(d)` loop.  For each entry `e`:
+  - Build `entry_path = path + e->d_name` (careful with the trailing
+    slash — FatFs accepts both `0:/NAME` and `0:/NAME`, so a
+    straightforward concatenation is fine).
+  - `struct stat st; stat(entry_path, &st);`
+  - If `S_ISDIR(st.st_mode)`: print `<DIR>  NAME`.
+  - Else: print `FILE   NAME  (SIZE bytes)` where `SIZE` is
+    `st.st_size`.
+  - Note: `e->d_type` from `dirent` also carries the DIR/REG bit and
+    is set correctly by `sys_getdents64`.  Either `d_type` or the
+    `stat` call can distinguish directories.  Using `stat` gives us
+    the size in the same call, so prefer `stat`; `d_type` is a
+    fallback if a later `stat` ever fails on an entry.
+- `closedir(d)`.
+- Print the summary `N file(s), M directory(ies)` matching the
+  newlib `ls` format.
+- Exit 0 on success, 1 on `opendir` failure, 2 on `readdir` error.
 
-The kernel-side code is close to `sys_fstat`'s; factor the
-fill-out into a small helper if it makes the diff cleaner (e.g.
-`static void fill_kstat_from_filinfo(kernel_stat_t* st, const
-FILINFO* fno)`).  Not required, but if `sys_fstat` and `sys_stat`
-end up sharing 80% of their body, a helper is the right shape.
+Add `/tmp/ls_musl` to `build_musl_tests.sh` (a `[BUILD] ls_musl`
+block after `cat_musl`).  Add `LS_MUSL := /tmp/ls_musl` and an
+`mcopy_one "$(LS_MUSL)" LS_MUSL.ELF` line to
+`05_boot_kernel64/Makefile`, parallel to `LS.ELF`, not overwriting
+it.
 
-Add `case SYS_STAT: return (uint64_t)sys_stat((const char*)arg0,
-(void*)arg1);` to `syscall_dispatch`.
+Test from `musl_sh`:
+- `ls_musl` — expect the 27-entry listing, same names as newlib
+  `ls`.
+- `ls` (newlib) — must still print 27 entries.  Canary.
+- Compare the two listings.  File sizes should match; the `<DIR>` /
+  `FILE` distinction should match for every entry (all entries on
+  the FAT are files, so no `<DIR>` lines expected).
 
-Test: add a `musl_stat`-style probe (either extend `musl_stat` or
-add a sibling `musl_stat_path`) that calls `stat("0:/HELLO-WORLD.TXT",
-&st)` and prints `STAT-SIZE 180`, `STAT-MODE 0x81a4`, `STAT-OK`.
-Commit as `20260926T` with the corresponding handoff update as
-`20260926U`.
+Then run the full canary.  Commit as `20260926V`.  Handoff update
+as `20260926W`.
 
-**Do not** attempt `sys_newfstatat` in the same commit.  One
-syscall per commit.  `sys_newfstatat` is the next commit after
-`sys_stat`, and `ls_musl` is the one after that.
-
-**Path handling question before you write the code:** does FatFs's
-`f_stat` accept `"0:/HELLO-WORLD.TXT"` directly, or does it need
-`"0:HELLO-WORLD.TXT"` or `"HELLO-WORLD.TXT"`?  `sys_open` passes
-paths straight through to `f_open` and it works with `0:/...`, so
-`f_stat` almost certainly does too.  But verify by looking at the
-first few lines of `04_kernel_64bit/fatfs/ff.c`'s `f_stat` (or
-just test it — if `sys_stat` fails and `sys_fstat` worked on the
-same file, path handling is the difference).  If `f_stat` needs a
-different path form, the normalization is a one-liner in
-`sys_stat`.
-
-`memtest` comes after `ls`, or before if `stat` turns into a larger
-project than expected.
+`memtest` comes after `ls`.
 
 ## State on disk
 
@@ -1394,12 +1407,12 @@ project than expected.
 
 ## Open items
 
-- **A4 continues.  Next: `sys_stat` (4), then `sys_newfstatat`
-  (262), then `ls_musl`.**  See "Next step" above.  `sys_fstat`
-  (5) is done.  `ls_musl` needs `sys_stat` because a musl `ls`
-  will `stat("0:/NAME")` each entry.  `sys_newfstatat` is needed
-  for general correctness but not by `ls_musl`.  `memtest`
-  follows (or is assessed first if `stat` balloons).
+- **A4 continues.  Next: `ls_musl`.**  See "Next step" above.
+  `sys_fstat` (5) and `sys_stat` (4) are both done.  `ls_musl`
+  needs no further kernel work.  `sys_newfstatat` (262) remains
+  unimplemented but is not on `ls_musl`'s path; it is a "for
+  general correctness" commit that can wait.  `memtest` follows
+  `ls`.
 - **Cut-over commits pending.**  Each `*_MUSL.ELF` binary currently
   exists *alongside* the newlib version.  After all five A4 apps
   are green as parallel files, a separate cut-over commit per app
@@ -1415,11 +1428,11 @@ project than expected.
     (cosmetic; the stored line and the argv are correct).
   - `Unknown syscall: N` fires during `musl_readdir` (numbers 6,
     7, 8, 15, 17, 72; unchanged after the toolchain switch).  The
-    readdir loop is still correct; the noise is real.
+    readdir loop is still correct; the noise is real.  None of
+    these are on the `ls_musl` path (which uses `opendir`,
+    `getdents64`, `stat`, and `write`).
   - `isr14_handler` still halts on user-mode faults; should
-    terminate the faulting process instead.  Will matter when
-    `stat` lands, because a malformed `struct stat` layout produces
-    exactly this.
+    terminate the faulting process instead.
 - **Deferred cleanups** (one commit each, when convenient):
   - Delete `syscall.c` (dead — `syscall.o` is not in `OBJS`).
   - Rename `sys_spawn`'s serial trace prefix from `sys_execve:`
