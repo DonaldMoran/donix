@@ -22,6 +22,7 @@ HELLO_MUSL    := /tmp/hello_musl
 ECHO_MUSL     := /tmp/echo_musl
 CAT_MUSL      := /tmp/cat_musl
 LS_MUSL       := /tmp/ls_musl
+MEMTEST_MUSL  := /tmp/memtest_musl
 MUSL_STAT     := /tmp/musl_stat
 MUSL_MIN      := /tmp/musl_min
 MUSL_PRINTF   := /tmp/musl_printf
@@ -98,6 +99,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(ECHO_MUSL)"     ECHO_MUSL.ELF ; \
 	mcopy_one "$(CAT_MUSL)"      CAT_MUSL.ELF ; \
 	mcopy_one "$(LS_MUSL)"       LS_MUSL.ELF ; \
+	mcopy_one "$(MEMTEST_MUSL)"  MEMTEST_MUSL.ELF ; \
 	mcopy_one "$(MUSL_STAT)"     MUSL_STAT.ELF ; \
 	mcopy_one "$(MEMTEST_ELF)"   MEMTEST.ELF ; \
 	mcopy_one "$(FSTEST_ELF)"    FSTEST.ELF ; \

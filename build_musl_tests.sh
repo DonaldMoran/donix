@@ -310,6 +310,94 @@ echo "[BUILD] ls_musl"
     /tmp/ls_musl.c
 
 # -------------------------------------------------------------------
+# Test: MEMTEST_MUSL — A4 item 5.  Copy of the newlib memtest.c
+# source, linked against musl.  Parallel to the newlib MEMTEST.ELF,
+# not a replacement: the canary suite still needs MEMTEST.ELF.
+#
+# The source only uses stdlib malloc/free and stdio printf — no
+# donix-private calls, no FatFs.  So this is a straight port.  The
+# addresses printed for %p will differ between newlib and musl
+# (different allocators, different heap layout); the point of the
+# test is the readback PASS/FAIL, not the specific addresses.
+#
+# The original newlib source says "via the dons-os sbrk path" in a
+# comment, but the source itself never calls sbrk/brk — musl's
+# malloc will use mmap for these allocations (already green from
+# musl_malloc).  Keep the same source; the comment is historical.
+# -------------------------------------------------------------------
+
+cat > /tmp/memtest_musl.c <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("[memtest] musl malloc/free via mmap\n");
+
+    size_t N = 4096;
+    unsigned char *buf = (unsigned char *)malloc(N);
+    if (!buf) {
+        printf("[memtest] FAIL: malloc(%lu) returned NULL\n",
+               (unsigned long)N);
+        return 1;
+    }
+    printf("  malloc(%lu) = %p\n", (unsigned long)N, (void *)buf);
+
+    for (size_t i = 0; i < N; i++) {
+        buf[i] = (unsigned char)(i & 0xFF);
+    }
+    printf("  wrote %lu bytes\n", (unsigned long)N);
+
+    for (size_t i = 0; i < N; i++) {
+        if (buf[i] != (unsigned char)(i & 0xFF)) {
+            printf("  MISMATCH at %lu: got 0x%02x, expected 0x%02x\n",
+                   (unsigned long)i, buf[i],
+                   (unsigned char)(i & 0xFF));
+            printf("[memtest] FAIL: readback mismatch\n");
+            free(buf);
+            return 1;
+        }
+    }
+    printf("  readback OK\n");
+
+    free(buf);
+    printf("  free() returned\n");
+
+    size_t M = 8192;
+    unsigned char *buf2 = (unsigned char *)malloc(M);
+    if (!buf2) {
+        printf("  second malloc(%lu) returned NULL\n",
+               (unsigned long)M);
+        printf("[memtest] FAIL: second malloc\n");
+        return 1;
+    }
+    printf("  second malloc(%lu) = %p\n",
+           (unsigned long)M, (void *)buf2);
+    for (size_t i = 0; i < M; i++) {
+        buf2[i] = 0xAA;
+    }
+    printf("  wrote %lu bytes to second buffer\n",
+           (unsigned long)M);
+    free(buf2);
+
+    printf("[memtest] PASS\n");
+    return 0;
+}
+EOF
+
+echo "[BUILD] memtest_musl"
+
+"$MUSL_GCC" \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/memtest_musl \
+    /tmp/memtest_musl.c
+
+# -------------------------------------------------------------------
 # Test: MUSL_STAT — exercises fstat(2) at syscall 5.
 #
 # Opens 0:/HELLO-WORLD.TXT (known to be 180 bytes from the image
@@ -1302,6 +1390,7 @@ for f in \
     /tmp/echo_musl \
     /tmp/cat_musl \
     /tmp/ls_musl \
+    /tmp/memtest_musl \
     /tmp/musl_stat \
     /tmp/musl_min \
     /tmp/musl_printf \
