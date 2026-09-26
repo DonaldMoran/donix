@@ -744,6 +744,86 @@ musl-gcc \
     -mcmodel=large \
     -o /tmp/musl_r10probe \
     /tmp/musl_r10probe.c
+    
+# -------------------------------------------------------------------
+# Test: MUSL SH — minimal shell (fork + execve + wait4)
+#
+# Reads a line from stdin, forks, child execve()s the named binary,
+# parent wait4()s the child before reading the next line.  The
+# wait4 is the whole point: without it, parent and child console
+# output interleaves byte-by-byte, which is what the newlib shell
+# currently does (see capture.txt around the `echo` and `printnum`
+# lines in the 20260924L session).
+#
+# The binary path must be absolute (`0:/HELLO.ELF`), matching the
+# newlib shell's convention.  Empty line = ignore.  `exit` quits.
+#
+# Uses raw write() for the prompt so that musl's stdio is not on
+# the critical path of the first A3 milestone.
+# -------------------------------------------------------------------
+
+cat > /tmp/musl_sh.c <<'EOF'
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+
+static void puts_raw(const char* s, unsigned long n) {
+    __asm__ volatile("syscall"
+                     :
+                     : "a"(1L), "D"(1L), "S"(s), "d"(n)
+                     : "rcx", "r11", "memory");
+}
+
+int main(void) {
+    char line[256];
+
+    for (;;) {
+        puts_raw("donix> ", 7);
+
+        int n = read(0, line, sizeof line - 1);
+        if (n <= 0) continue;
+
+        /* strip trailing newline */
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) n--;
+        line[n] = 0;
+
+        if (n == 0) continue;
+
+        if (n == 4 && memcmp(line, "exit", 4) == 0) {
+            puts_raw("bye\n", 4);
+            return 0;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            puts_raw("FORK-FAILED\n", 12);
+            continue;
+        }
+
+        if (pid == 0) {
+            char* argv[2];
+            argv[0] = line;
+            argv[1] = (char*)0;
+            execve(line, argv, (char**)0);
+            puts_raw("EXEC-FAILED\n", 12);
+            _exit(127);
+        }
+
+        int status = 0;
+        wait4(pid, &status, 0, (void*)0);
+    }
+}
+EOF
+
+echo "[BUILD] musl_sh"
+
+musl-gcc \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/musl_sh \
+    /tmp/musl_sh.c
 # -------------------------------------------------------------------
 # Verify outputs
 # -------------------------------------------------------------------
@@ -767,7 +847,8 @@ for f in \
     /tmp/brk_verify \
     /tmp/brkraw \
     /tmp/brkgrow \
-    /tmp/musl_r10probe
+    /tmp/musl_r10probe \
+    /tmp/musl_sh
 do
     if [[ -f "$f" ]]; then
         echo "[OK] $f"
