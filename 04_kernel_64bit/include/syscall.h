@@ -22,6 +22,8 @@
 #define SYS_WRITE           1
 #define SYS_OPEN            2
 #define SYS_CLOSE           3
+#define SYS_STAT            4
+#define SYS_FSTAT           5
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -40,6 +42,7 @@
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_EXIT_GROUP      231
+#define SYS_NEWFSTATAT      262
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GETRANDOM       318
 #define SYS_RSEQ            334
@@ -131,6 +134,7 @@ void sys_arch_set_fs(void* base);
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
 long sys_unlink(const char* path);
+long sys_fstat(int fd, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_opendir(const char* path);
 long sys_readdir(int dirfd, void* user_dirent);

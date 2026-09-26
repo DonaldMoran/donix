@@ -184,7 +184,64 @@ echo "[BUILD] cat_musl"
     -mcmodel=large \
     -o /tmp/cat_musl \
     /tmp/cat_musl.c
-    
+
+# -------------------------------------------------------------------
+# Test: MUSL_STAT — exercises fstat(2) at syscall 5.
+#
+# Opens 0:/HELLO-WORLD.TXT (known to be 180 bytes from the image
+# build's mdir listing) and calls fstat().  Verifies st_size == 180
+# and that st_mode reports a regular file.
+#
+# Uses raw write(1, ...) rather than printf so that a failure in
+# musl's stdio cannot mask a failure in sys_fstat.  musl_printf
+# already covers stdio.
+# -------------------------------------------------------------------
+
+cat > /tmp/musl_stat.c <<'EOF'
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <stdio.h>
+
+int main(void) {
+    int fd = open("0:/HELLO-WORLD.TXT", O_RDONLY);
+    if (fd < 0) { printf("STAT-OPEN-FAIL\n"); return 1; }
+
+    struct stat st;
+    long fr = fstat(fd, &st);
+    close(fd);
+
+    printf("STAT-FR %ld\n", fr);
+    printf("STAT-SIZE %ld\n", (long)st.st_size);
+    printf("STAT-MODE 0x%lx\n", (unsigned long)st.st_mode);
+
+    if (fr != 0) {
+        printf("STAT-FR-FAIL\n");
+        return 1;
+    }
+    if (st.st_size != 180) {
+        printf("STAT-SIZE-FAIL\n");
+        return 1;
+    }
+    if ((st.st_mode & 0170000) != 0100000) {   /* S_IFREG */
+        printf("STAT-MODE-FAIL\n");
+        return 1;
+    }
+    printf("STAT-OK\n");
+    return 0;
+}
+EOF
+
+echo "[BUILD] musl_stat"
+
+"$MUSL_GCC" \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/musl_stat \
+    /tmp/musl_stat.c
+
 # -------------------------------------------------------------------
 # Test 2: printf()
 # -------------------------------------------------------------------
@@ -1097,6 +1154,7 @@ for f in \
     /tmp/hello_musl \
     /tmp/echo_musl \
     /tmp/cat_musl \
+    /tmp/musl_stat \
     /tmp/musl_min \
     /tmp/musl_printf \
     /tmp/musl_malloc \

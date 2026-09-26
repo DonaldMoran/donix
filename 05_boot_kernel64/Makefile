@@ -21,6 +21,7 @@ ECHO_ELF      := $(USERLAND_DIR)/apps/echo.elf
 HELLO_MUSL    := /tmp/hello_musl
 ECHO_MUSL     := /tmp/echo_musl
 CAT_MUSL      := /tmp/cat_musl
+MUSL_STAT     := /tmp/musl_stat
 MUSL_MIN      := /tmp/musl_min
 MUSL_PRINTF   := /tmp/musl_printf
 MUSL_MALLOC   := /tmp/musl_malloc
@@ -95,6 +96,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(HELLO_MUSL)"    HELLO_MUSL.ELF ; \
 	mcopy_one "$(ECHO_MUSL)"     ECHO_MUSL.ELF ; \
 	mcopy_one "$(CAT_MUSL)"      CAT_MUSL.ELF ; \
+	mcopy_one "$(MUSL_STAT)"     MUSL_STAT.ELF ; \
 	mcopy_one "$(MEMTEST_ELF)"   MEMTEST.ELF ; \
 	mcopy_one "$(FSTEST_ELF)"    FSTEST.ELF ; \
 	mcopy_one "$(MULTITEST_ELF)" MULTITEST.ELF ; \

@@ -88,6 +88,64 @@ typedef struct {
     uint8_t  _pad[7];
 } dons_dirent_t;
 
+
+/*
+ * Linux x86_64 struct stat, matching musl 1.2.5's layout exactly.
+ *
+ * Size 144 bytes on x86_64, field offsets verified by compiling
+ * an offsetof()-based probe against the project-local musl headers
+ * (third_party/musl-install/include/bits/stat.h).  Do NOT reorder,
+ * resize, or add fields here without re-running that probe and
+ * updating the offsets.  musl writes into this buffer directly from
+ * userland; any mismatch means `ls` prints garbage or the caller
+ * faults on an unaligned read.
+ *
+ *     offset  size  field
+ *       0      8    st_dev
+ *       8      8    st_ino
+ *      16      8    st_nlink
+ *      24      4    st_mode
+ *      28      4    st_uid
+ *      32      4    st_gid
+ *      36      4    __pad0
+ *      40      8    st_rdev
+ *      48      8    st_size
+ *      56      8    st_blksize
+ *      64      8    st_blocks
+ *      72     16    st_atim  (timespec: int64 tv_sec, int64 tv_nsec)
+ *      88     16    st_mtim
+ *     104     16    st_ctim
+ *     120     24    __unused[3]
+ *     144          total
+ *
+ * The natural C alignment of uint64_t / int64_t / uint32_t produces
+ * exactly these offsets on x86_64 SysV, so the struct is written in
+ * natural order with no explicit padding beyond __pad0.
+ */
+typedef struct {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } st_atim, st_mtim, st_ctim;
+    int64_t  __unused[3];
+} kernel_stat_t;
+
+/* st_mode bits (POSIX).  Only the ones we need for FAT. */
+#define KSTAT_IFMT   0170000
+#define KSTAT_IFREG  0100000
+#define KSTAT_IFDIR  0040000
+
 // ============================================================
 // SAFE COPY OPERATIONS
 // ============================================================
@@ -354,6 +412,63 @@ long sys_unlink(const char* path) {
         serial_print(local_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
+        return -1;
+    }
+    return 0;
+}
+
+
+/*
+ * Linux x86_64 fstat(2) — syscall 5.
+ *
+ * Fills a `struct stat` in the caller's address space from a fd
+ * previously returned by sys_open (2).  The caller-supplied buffer
+ * must be 144 bytes on x86_64, matching musl 1.2.5's layout; see
+ * kernel_stat_t above.
+ *
+ * For a file: st_size from FatFs's f_size(), st_mode = S_IFREG|0644,
+ * st_nlink = 1, everything else zero.  FatFs doesn't expose a
+ * device number or inode, so st_dev and st_ino are 0.
+ *
+ * For a directory: st_mode = S_IFDIR|0755, st_size = 0 (FatFs
+ * doesn't report directory sizes).  This is what `ls` needs to
+ * distinguish subdirectories in a readdir loop.
+ *
+ * Returns 0 on success, -1 on error.  A future cleanup could return
+ * proper negative errno (-EBADF, -EFAULT), but nothing in the A4
+ * test suite needs that yet and adding it now would be a change
+ * with no test.
+ */
+long sys_fstat(int fd, void* user_stat) {
+    if (!user_stat) return -1;
+
+    file_slot_t* slot = get_file_slot(fd, 0);
+    if (!slot) return -1;
+
+    kernel_stat_t st;
+    for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
+
+    st.st_nlink = 1;
+
+    if (slot->kind == FILE_KIND_FILE) {
+        FIL* f = (FIL*)slot->obj;
+        st.st_mode  = KSTAT_IFREG | 0644;
+        st.st_size  = (int64_t)f_size(f);
+        st.st_blksize = 512;
+        /* Round up to 512-byte sectors, matching what Linux reports
+         * for a FAT-backed file on a 512-byte-block device.  Only
+         * informational; nothing in the A4 test suite reads it. */
+        st.st_blocks = (st.st_size + 511) / 512;
+    } else if (slot->kind == FILE_KIND_DIR) {
+        st.st_mode  = KSTAT_IFDIR | 0755;
+        st.st_size  = 0;
+        st.st_blksize = 512;
+        st.st_blocks = 0;
+    } else {
+        return -1;
+    }
+
+    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
         return -1;
     }
     return 0;
@@ -2112,6 +2227,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
+        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
