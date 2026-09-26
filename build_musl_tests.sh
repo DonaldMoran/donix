@@ -701,7 +701,7 @@ cat > /tmp/musl_r10probe.c <<'EOF'
 #include <sys/uio.h>
 
 static void puthex64(uint64_t v) {
-    char b[24]; int n = 0;
+    char b[32]; int n = 0;
     b[n++]='R'; b[n++]='1'; b[n++]='0'; b[n++]='-';
     b[n++]='A'; b[n++]='F'; b[n++]='T'; b[n++]='E'; b[n++]='R'; b[n++]='=';
     b[n++]='0'; b[n++]='x';
