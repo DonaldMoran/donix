@@ -419,26 +419,38 @@ long sys_unlink(const char* path) {
 
 
 /*
- * Linux x86_64 fstat(2) — syscall 5.
+ * Fill a kernel_stat_t from a FatFs FILINFO.
  *
- * Fills a `struct stat` in the caller's address space from a fd
- * previously returned by sys_open (2).  The caller-supplied buffer
- * must be 144 bytes on x86_64, matching musl 1.2.5's layout; see
- * kernel_stat_t above.
+ * Shared by sys_fstat (which derives the FILINFO from an open FIL)
+ * and sys_stat (which derives it from a path via f_stat).  FatFs
+ * reports the FAT attribute byte in `fattrib`; the AM_DIR bit
+ * distinguishes directories from files.  Nothing else in the
+ * FILINFO is used for the layout musl reads.
  *
- * For a file: st_size from FatFs's f_size(), st_mode = S_IFREG|0644,
- * st_nlink = 1, everything else zero.  FatFs doesn't expose a
- * device number or inode, so st_dev and st_ino are 0.
- *
- * For a directory: st_mode = S_IFDIR|0755, st_size = 0 (FatFs
- * doesn't report directory sizes).  This is what `ls` needs to
- * distinguish subdirectories in a readdir loop.
- *
- * Returns 0 on success, -1 on error.  A future cleanup could return
- * proper negative errno (-EBADF, -EFAULT), but nothing in the A4
- * test suite needs that yet and adding it now would be a change
- * with no test.
+ * Sizes are reported from `fsize` for files and left 0 for
+ * directories (FatFs does not carry a directory size).  st_blksize
+ * is set to 512 because that is the block size of the FAT volume
+ * produced by the image build; st_blocks is rounded up
+ * accordingly.  Neither value is read by the A4 test suite; they
+ * are set for informational correctness.
  */
+static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+
+    if (fno->fattrib & AM_DIR) {
+        st->st_mode   = KSTAT_IFDIR | 0755;
+        st->st_size   = 0;
+        st->st_blocks = 0;
+    } else {
+        st->st_mode   = KSTAT_IFREG | 0644;
+        st->st_size   = (int64_t)fno->fsize;
+        st->st_blocks = (st->st_size + 511) / 512;
+    }
+}
+
 long sys_fstat(int fd, void* user_stat) {
     if (!user_stat) return -1;
 
@@ -446,27 +458,65 @@ long sys_fstat(int fd, void* user_stat) {
     if (!slot) return -1;
 
     kernel_stat_t st;
-    for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
-
-    st.st_nlink = 1;
+    FILINFO fno;
+    for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
 
     if (slot->kind == FILE_KIND_FILE) {
         FIL* f = (FIL*)slot->obj;
-        st.st_mode  = KSTAT_IFREG | 0644;
-        st.st_size  = (int64_t)f_size(f);
-        st.st_blksize = 512;
-        /* Round up to 512-byte sectors, matching what Linux reports
-         * for a FAT-backed file on a 512-byte-block device.  Only
-         * informational; nothing in the A4 test suite reads it. */
-        st.st_blocks = (st.st_size + 511) / 512;
+        /*
+         * FatFs does not expose an f_stat-on-an-open-FIL.  The
+         * information we need is available directly from the FIL:
+         * f_size() for the byte size, and the file is by definition
+         * not a directory.  Fill the FILINFO fields we use and let
+         * fill_kstat_from_filinfo do the rest.
+         */
+        fno.fsize   = (FSIZE_t)f_size(f);
+        fno.fattrib = 0;   /* not AM_DIR */
     } else if (slot->kind == FILE_KIND_DIR) {
-        st.st_mode  = KSTAT_IFDIR | 0755;
-        st.st_size  = 0;
-        st.st_blksize = 512;
-        st.st_blocks = 0;
+        fno.fattrib = AM_DIR;
+        fno.fsize   = 0;
     } else {
         return -1;
     }
+
+    fill_kstat_from_filinfo(&st, &fno);
+
+    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 stat(2) — syscall 4.
+ *
+ * Path-based sibling of sys_fstat.  musl's stat(path, st) routes
+ * through fstatat(AT_FDCWD, path, st, 0) → fstatat_kstat →
+ * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
+ *
+ * The path is passed straight through to FatFs's f_stat, which
+ * accepts the same "0:/NAME" form as f_open.  No normalization
+ * needed; sys_open does the same and works.
+ *
+ * Returns 0 on success, -1 on failure.  Like sys_fstat, proper
+ * negative errno is deferred until a caller actually inspects it.
+ */
+long sys_stat(const char* user_path, void* user_stat) {
+    if (!user_path || !user_stat) return -1;
+
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        return -1;
+    }
+
+    FILINFO fno;
+    FRESULT r = f_stat(path, &fno);
+    if (r != FR_OK) {
+        return -1;
+    }
+
+    kernel_stat_t st;
+    fill_kstat_from_filinfo(&st, &fno);
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
         return -1;
@@ -2227,6 +2277,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
+        case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);

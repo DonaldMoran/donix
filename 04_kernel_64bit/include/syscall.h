@@ -135,6 +135,7 @@ long sys_open(const char* path, int flags);
 long sys_close(int fd);
 long sys_unlink(const char* path);
 long sys_fstat(int fd, void* user_stat);
+long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_opendir(const char* path);
 long sys_readdir(int dirfd, void* user_dirent);
