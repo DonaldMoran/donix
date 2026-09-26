@@ -52,6 +52,42 @@ musl-gcc \
     -mcmodel=large \
     -o /tmp/hello_musl \
     /tmp/hello_musl.c
+
+
+# -------------------------------------------------------------------
+# Test: ECHO_MUSL — A4 item 2.  Copy of the newlib echo.c source,
+# linked against musl.  Parallel to the newlib ECHO.ELF, not a
+# replacement: the canary suite still needs ECHO.ELF.
+#
+# Uses write(2) directly, not printf, so this test does not depend
+# on musl's stdio.  musl_printf already covers that path.
+# -------------------------------------------------------------------
+
+cat > /tmp/echo_musl.c <<'EOF'
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) write(1, " ", 1);
+        const char *s = argv[i];
+        size_t len = 0;
+        while (s[len]) len++;
+        write(1, s, len);
+    }
+    write(1, "\n", 1);
+    return 0;
+}
+EOF
+
+echo "[BUILD] echo_musl"
+
+musl-gcc \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/echo_musl \
+    /tmp/echo_musl.c
     
 # -------------------------------------------------------------------
 # Test 2: printf()
@@ -963,6 +999,7 @@ echo "=================================================================="
 
 for f in \
     /tmp/hello_musl \
+    /tmp/echo_musl \
     /tmp/musl_min \
     /tmp/musl_printf \
     /tmp/musl_malloc \
