@@ -1053,6 +1053,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 6. Lay out argv on the new stack. ---- */
     uint64_t rsp_init = 0;
+    uint64_t argv_array_base = 0;   /* for %rsi below; 0 when argc == 0 */
 
     if (argc > 0) {
         uint64_t argv_region_top    = new_user_stack_top;
@@ -1103,6 +1104,8 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             return -1;  /* unreachable */
         }
 
+        argv_array_base = array_base;
+
         /* SysV initial stack: [rsp]=argc, [rsp+8]=argv[0..n-1],
            then argv NULL, then envp NULL.  We put argc in the 8 bytes
            immediately below the argv array. */
@@ -1151,6 +1154,35 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     uint64_t* ktop = (uint64_t*)self->kernel_stack_top;
     ktop[-7] = entry;      /* -56: user RIP  */
     ktop[-9] = rsp_init;   /* -72: user RSP  */
+
+    /*
+     * Also pass argc/argv in %rdi/%rsi.
+     *
+     * musl's _start reads the SysV stack layout above and ignores
+     * %rdi/%rsi on entry.  donix's newlib crt0.S (arc2/crt0.S) reads
+     * %rdi/%rsi and ignores the stack layout:
+     *
+     *     mov [rip + argc_saved], rdi
+     *     mov [rip + argv_saved], rsi
+     *
+     * sys_spawn (507) already passes argc/argv in %rdi/%rsi via
+     * frame[9]/frame[10] of the child's initial resume frame.
+     * sys_execve was missing it, so a newlib binary launched via
+     * execve ran with %rdi/%rsi holding the execve call's own
+     * arguments — pointers into the old, torn-down address space.
+     * cat.elf read argv[1] from there, got NULL, and tried to open
+     * "0:/(null)".
+     *
+     * Setting both is harmless for musl (it ignores the registers)
+     * and makes execve work for either kind of binary, which matters
+     * because the newlib userland is still the regression canary and
+     * is launched from musl_sh via execve.
+     *
+     * Frame slots per user_syscall_entry.asm's push order:
+     *   -96 = %rdi, -104 = %rsi.
+     */
+    ktop[-12] = (uint64_t)argc;       /* -96: rdi */
+    ktop[-13] = argv_array_base;      /* -104: rsi */
 
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
