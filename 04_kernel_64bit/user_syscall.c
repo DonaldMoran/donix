@@ -1941,7 +1941,18 @@ long sys_fork(void) {
             elf_add_page_to_pcb(child, new_phys);
         }
     }
-
+    /*
+     * Child inherits the parent's FS base.
+     *
+     * musl's TLS pointer lives in MSR_FS_BASE and is read on the
+     * very first instruction after _Fork returns in the child
+     * (__post_Fork calls __get_tp, which is `mov %fs:0, %rdx`).
+     * Without this, the child runs with MSR_FS_BASE = 0 and
+     * __get_tp faults at CR2 = 0.
+     *
+     * See the fs_base comment in process.h.
+     */
+    child->fs_base = parent->fs_base;
     /*
      * Build the child's iretq-resume frame from the parent's current
      * syscall-entry frame.  This sets the child's %rax to 0, which is
@@ -1977,6 +1988,8 @@ void sys_exit(int status) {
 void sys_arch_set_fs(void* base) {
     uint64_t addr = (uint64_t)base;
     wrmsr(0xC0000100, addr);
+    pcb_t* self = process_get_current();
+    if (self) self->fs_base = addr;
 }
 
 /*
@@ -1999,6 +2012,8 @@ void sys_arch_set_fs(void* base) {
 long sys_arch_prctl(int code, void* addr) {
     if (code == ARCH_SET_FS) {
         wrmsr(0xC0000100, (uint64_t)addr);
+        pcb_t* self = process_get_current();
+        if (self) self->fs_base = (uint64_t)addr;
         return 0;
     }
     return -1;

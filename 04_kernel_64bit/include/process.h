@@ -98,6 +98,21 @@ typedef struct pcb {
 
     // Per-Process File Descriptor Tracking Array (Pointer maps to index)
     void* file_table[MAX_PROCESS_FILES];
+    /*
+     * FS base (MSR 0xC0000100), per-process.
+     *
+     * Set by arch_prctl(ARCH_SET_FS) at musl startup.  Restored on
+     * every context switch, because the MSR is a CPU register: without
+     * per-process save/restore, the second musl process to run clobbers
+     * the first one's TLS base, and the first one's next %fs-relative
+     * access (e.g. the errno load in musl's fork wrapper at 0x4009BD)
+     * dereferences a stale or null pointer.
+     *
+     * Kernel-mode processes leave this at 0; they do not use %fs-
+     * relative addressing.  Placed AFTER file_table so no offset that
+     * context_switch.asm reads (which stops at block_kind, 0x158) moves.
+     */
+    uint64_t fs_base;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

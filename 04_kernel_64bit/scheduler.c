@@ -1,6 +1,7 @@
 #include "include/scheduler.h"
 #include "include/serial.h"
 #include "include/vga.h"
+#include "include/user_msr.h"
 
 #define KERNEL_BASE 0xFFFFFFFF80000000ULL
 
@@ -238,6 +239,12 @@ void __attribute__((noreturn)) process_exit(void) {
             idle->state = PROC_STATE_RUNNING;
             idle->total_ticks++;
 
+            /* MSR_FS_BASE is per-process; save the outgoing FS base
+               and install the incoming one before the CR3 switch.
+               See the fs_base comment in process.h. */
+            exiting->fs_base = rdmsr(0xC0000100);
+            wrmsr(0xC0000100, idle->fs_base);
+
             context_switch(exiting, idle);
             /* Not reached. */
         }
@@ -268,6 +275,12 @@ void __attribute__((noreturn)) process_exit(void) {
     extern void tss_set_syscall_stack(uint64_t stack);
     tss_set_kernel_stack(next->kernel_stack_top);
     tss_set_syscall_stack(next->kernel_stack_top);
+
+    /* MSR_FS_BASE is per-process; save the outgoing FS base and
+       install the incoming one before the CR3 switch.  See the
+       fs_base comment in process.h. */
+    exiting->fs_base = rdmsr(0xC0000100);
+    wrmsr(0xC0000100, next->fs_base);
 
     context_switch(exiting, next);
 
@@ -307,6 +320,14 @@ void scheduler_switch_to(pcb_t* next) {
     extern void tss_set_syscall_stack(uint64_t stack);
     tss_set_kernel_stack(next->kernel_stack_top);
     tss_set_syscall_stack(next->kernel_stack_top);
+
+    /* MSR_FS_BASE is per-process; save the outgoing FS base and
+       install the incoming one before the CR3 switch.  prev may be
+       NULL on the very first dispatch (idle has no predecessor);
+       context_switch.asm tolerates that, and we match it here.
+       See the fs_base comment in process.h. */
+    if (prev) prev->fs_base = rdmsr(0xC0000100);
+    wrmsr(0xC0000100, next->fs_base);
 
     context_switch(prev, next);
 }

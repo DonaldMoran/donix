@@ -5,6 +5,7 @@
 #include "include/serial.h"
 #include "include/process.h"
 #include "include/scheduler.h"
+#include "include/user_msr.h"
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -312,6 +313,22 @@ timer_preempt_handler(uint64_t stack_pointer) {
         extern void tss_set_syscall_stack(uint64_t stack);
         tss_set_kernel_stack(next->kernel_stack_top);
         tss_set_syscall_stack(next->kernel_stack_top);
+
+        /*
+         * MSR_FS_BASE is per-process, not per-CPU.  musl sets it once
+         * at startup via arch_prctl(ARCH_SET_FS) to its TLS base; if
+         * we do not save/restore across context switches, the next
+         * musl process to run clobbers the previous one's FS base, and
+         * the previous one's next %fs-relative access (the errno load
+         * in musl's fork wrapper) dereferences a stale or null pointer.
+         * Observed as a user-mode #PF at CR2=0x34 inside fork() on the
+         * second musl run from the same shell.
+         *
+         * Kernel processes have fs_base == 0 and do not use %fs-
+         * relative addressing, so writing 0 is harmless for them.
+         */
+        current->fs_base = rdmsr(0xC0000100);
+        wrmsr(0xC0000100, next->fs_base);
 
         __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3));
 
