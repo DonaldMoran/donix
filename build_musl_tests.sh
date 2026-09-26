@@ -2,8 +2,25 @@
 
 set -euo pipefail
 
+# -------------------------------------------------------------------
+# Compiler: project-local musl-gcc by default.
+#
+# The wrapper at toolchain/musl-gcc.sh points gcc at the musl 1.2.5
+# tree built by toolchain/install_musl.sh into
+# third_party/musl-install/.  If you want to fall back to Fedora's
+# system musl-gcc for a comparison run, override:
+#
+#     MUSL_GCC=/usr/bin/musl-gcc ./build_musl_tests.sh
+# -------------------------------------------------------------------
+MUSL_GCC="${MUSL_GCC:-./toolchain/musl-gcc.sh}"
+if [ ! -x "$MUSL_GCC" ]; then
+    echo "ERROR: $MUSL_GCC not found or not executable." >&2
+    echo "Run ./toolchain/install_musl.sh first, or set MUSL_GCC." >&2
+    exit 1
+fi
+
 echo "=================================================================="
-echo "Building musl test binaries"
+echo "Building musl test binaries with: $MUSL_GCC"
 echo "=================================================================="
 
 # -------------------------------------------------------------------
@@ -21,7 +38,7 @@ EOF
 
 echo "[BUILD] musl_min"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -O2 \
     -o /tmp/musl_min \
@@ -45,7 +62,7 @@ EOF
 
 echo "[BUILD] hello_musl"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -81,7 +98,7 @@ EOF
 
 echo "[BUILD] echo_musl"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -160,7 +177,7 @@ EOF
 
 echo "[BUILD] cat_musl"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -182,7 +199,7 @@ EOF
 
 echo "[BUILD] musl_printf"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -231,7 +248,7 @@ EOF
 
 echo "[BUILD] musl_malloc"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -267,7 +284,7 @@ EOF
 
 echo "[BUILD] musl_fork"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -307,7 +324,7 @@ EOF
 
 echo "[BUILD] musl_fork_raw"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -404,7 +421,7 @@ EOF
 
 echo "[BUILD] musl_exec"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -550,7 +567,7 @@ EOF
 
 echo "[BUILD] musl_wait"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -616,7 +633,7 @@ EOF
 
 echo "[BUILD] musl_readdir"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -653,7 +670,7 @@ int main(void) {
 }
 EOF
 
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/musl_twommap /tmp/musl_twommap.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/musl_twommap /tmp/musl_twommap.c
 
 # -------------------------------------------------------------------
 # Test 4: MUSL_TWOMMAP()
@@ -680,7 +697,7 @@ int main(void) {
 }
 EOF
 
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/musl_twommap2 /tmp/musl_twommap2.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/musl_twommap2 /tmp/musl_twommap2.c
 
 # -------------------------------------------------------------------
 # Test 5: PRINTNUM()
@@ -695,7 +712,7 @@ int main(void) {
 }
 EOF
 
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/printnum /tmp/printnum.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/printnum /tmp/printnum.c
 
 # -------------------------------------------------------------------
 # Test 6: BRK_VERIFY()
@@ -738,7 +755,7 @@ int main(void) {
 }
 EOF
 
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/brk_verify /tmp/brk_verify.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/brk_verify /tmp/brk_verify.c
 
 # -------------------------------------------------------------------
 # Test 7: BRKRAW()
@@ -776,7 +793,7 @@ int main(void) {
     return 0;
 }
 EOF
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/brkraw /tmp/brkraw.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/brkraw /tmp/brkraw.c
 
 # -------------------------------------------------------------------
 # Test 7: BRKRAW()
@@ -818,7 +835,7 @@ int main(void) {
     return 0;
 }
 EOF
-musl-gcc -static -no-pie -O2 -mcmodel=large -o /tmp/brkgrow /tmp/brkgrow.c
+"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large -o /tmp/brkgrow /tmp/brkgrow.c
 # -------------------------------------------------------------------
 # Test: R10 PROBE — is %r10 preserved across a writev syscall?
 #
@@ -878,7 +895,7 @@ EOF
 
 echo "[BUILD] musl_r10probe"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \
@@ -1060,7 +1077,7 @@ EOF
 
 echo "[BUILD] musl_sh"
 
-musl-gcc \
+"$MUSL_GCC" \
     -static \
     -no-pie \
     -O2 \

@@ -45,3 +45,4 @@ capture.txt
 
 # FatFs workaround backup (from the f_unlink debugging)
 04_kernel_64bit/fatfs/ff.cold
+third_party/
