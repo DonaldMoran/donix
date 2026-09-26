@@ -780,11 +780,36 @@ int main(void) {
     for (;;) {
         puts_raw("donix> ", 7);
 
-        int n = read(0, line, sizeof line - 1);
-        if (n <= 0) continue;
-
-        /* strip trailing newline */
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) n--;
+        /*
+         * Read one byte at a time until newline.
+         *
+         * sys_read on fd 0 now returns on the first available byte
+         * (POSIX short read), so a single read() is not a line.
+         * Loop here, like the newlib shell does.  Byte-at-a-time
+         * also lets us echo each character immediately, which is
+         * what a terminal user expects.
+         */
+        int n = 0;
+        for (;;) {
+            char c;
+            int r = read(0, &c, 1);
+            if (r <= 0) continue;
+            if (c == '\r' || c == '\n') {
+                puts_raw("\n", 1);
+                break;
+            }
+            if (c == '\b' || c == 0x7f) {
+                if (n > 0) {
+                    n--;
+                    puts_raw("\b \b", 3);
+                }
+                continue;
+            }
+            if (c < 0x20 || c > 0x7e) continue;
+            if (n >= (int)sizeof(line) - 1) continue;
+            line[n++] = c;
+            puts_raw(&c, 1);
+        }
         line[n] = 0;
 
         if (n == 0) continue;
