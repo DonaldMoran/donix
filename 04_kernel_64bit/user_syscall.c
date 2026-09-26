@@ -1416,7 +1416,21 @@ long sys_read(int fd, void* buf, size_t count) {
                 __asm__ volatile("sti");
                 if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
                 else return -1;
-                continue;
+                /*
+                 * Return as soon as at least one byte has been copied.
+                 *
+                 * POSIX read(2) on a terminal returns when at least
+                 * one byte is available; it does not block until
+                 * count bytes have been accumulated.  The previous
+                 * behavior (loop until bytes_read == count) made
+                 * musl's read(0, line, 255) wait for 255 keystrokes
+                 * before returning, which is not how any Unix
+                 * program expects stdin to behave.  The newlib
+                 * shell never noticed because it reads 1 byte at a
+                 * time (count == 1), so the loop exited on the
+                 * first byte anyway.
+                 */
+                break;
             }
             if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
             self->state = PROC_STATE_BLOCKED;
