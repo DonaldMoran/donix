@@ -27,6 +27,32 @@ musl-gcc \
     -o /tmp/musl_min \
     /tmp/musl_min.c
 
+
+# -------------------------------------------------------------------
+# Test: HELLO_MUSL — A4 first item.  Copy of the newlib hello.c
+# source, linked against musl.  Parallel to the newlib HELLO.ELF,
+# not a replacement: the canary suite still needs HELLO.ELF.
+# -------------------------------------------------------------------
+
+cat > /tmp/hello_musl.c <<'EOF'
+#include <stdio.h>
+
+int main(void) {
+    printf("hello from donix (musl)\n");
+    return 0;
+}
+EOF
+
+echo "[BUILD] hello_musl"
+
+musl-gcc \
+    -static \
+    -no-pie \
+    -O2 \
+    -mcmodel=large \
+    -o /tmp/hello_musl \
+    /tmp/hello_musl.c
+    
 # -------------------------------------------------------------------
 # Test 2: printf()
 # -------------------------------------------------------------------
@@ -936,6 +962,7 @@ echo "Build results"
 echo "=================================================================="
 
 for f in \
+    /tmp/hello_musl \
     /tmp/musl_min \
     /tmp/musl_printf \
     /tmp/musl_malloc \
