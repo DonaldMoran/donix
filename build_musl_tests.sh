@@ -755,8 +755,16 @@ musl-gcc \
 # currently does (see capture.txt around the `echo` and `printnum`
 # lines in the 20260924L session).
 #
-# The binary path must be absolute (`0:/HELLO.ELF`), matching the
-# newlib shell's convention.  Empty line = ignore.  `exit` quits.
+# Convention (matches the newlib shell, user_shell.c:run_external):
+#   - The user types a bare command name (`cat`, `hello`), optionally
+#     followed by whitespace-separated arguments.
+#   - argv[0] is normalized to `0:/NAME.ELF`.  If argv[0] already
+#     contains `:/`, it is used as-is (so `0:/musl_r10probe.elf`
+#     still works).
+#   - argv[1..n] are passed verbatim.  The newlib cat/echo expect
+#     bare filenames and prepend `0:/` themselves.
+#
+# Empty line = ignore.  `exit` quits.
 #
 # Uses raw write() for the prompt so that musl's stdio is not on
 # the critical path of the first A3 milestone.
@@ -851,7 +859,54 @@ int main(void) {
 
             if (argc == 0) _exit(0);   /* should not happen: n>0 checked above */
 
-            execve(argv[0], argv, (char**)0);
+            /*
+             * Resolve argv[0] to a full path, matching the newlib
+             * shell's convention (user_shell.c:run_external):
+             *
+             *     snprintf(path, sizeof(path), "0:/%s.ELF", argv[0]);
+             *
+             * The user types a bare command name (`cat`, `hello`);
+             * the shell turns it into `0:/NAME.ELF`.  If the token
+             * already contains `:/` (the user typed a full path
+             * like `0:/musl_r10probe.elf`), leave it alone.
+             *
+             * argv[1..n] are passed verbatim, exactly as the newlib
+             * shell does.  The newlib cat/echo expect bare
+             * filenames and prepend `0:/` themselves.
+             */
+            char path[128];
+            {
+                const char* tok = argv[0];
+                int has_prefix = 0;
+                for (const char* q = tok; *q; q++) {
+                    if (q[0] == ':' && q[1] == '/') { has_prefix = 1; break; }
+                }
+                if (has_prefix) {
+                    int i = 0;
+                    while (tok[i] && i < (int)sizeof(path) - 1) {
+                        path[i] = tok[i];
+                        i++;
+                    }
+                    path[i] = 0;
+                } else {
+                    int i = 0;
+                    path[i++] = '0';
+                    path[i++] = ':';
+                    path[i++] = '/';
+                    for (const char* q = tok; *q && i < (int)sizeof(path) - 1; q++) {
+                        path[i++] = *q;
+                    }
+                    if (i < (int)sizeof(path) - 5) {
+                        path[i++] = '.';
+                        path[i++] = 'E';
+                        path[i++] = 'L';
+                        path[i++] = 'F';
+                    }
+                    path[i] = 0;
+                }
+            }
+
+            execve(path, argv, (char**)0);
             puts_raw("EXEC-FAILED\n", 12);
             _exit(127);
         }
