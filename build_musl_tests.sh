@@ -826,10 +826,32 @@ int main(void) {
         }
 
         if (pid == 0) {
-            char* argv[2];
-            argv[0] = line;
-            argv[1] = (char*)0;
-            execve(line, argv, (char**)0);
+            /*
+             * Tokenize `line` in place on whitespace.  `line` is a
+             * local in the child's copy of the address space after
+             * fork, so mutating it is safe.
+             *
+             * MAX_ARGS is a compile-time cap; a longer command line
+             * is truncated to the first MAX_ARGS-1 tokens, with the
+             * final slot left NULL-terminated.
+             */
+            enum { MAX_ARGS = 16 };
+            char* argv[MAX_ARGS];
+            int argc = 0;
+
+            char* p = line;
+            while (*p && argc < MAX_ARGS - 1) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p) break;
+                argv[argc++] = p;
+                while (*p && *p != ' ' && *p != '\t') p++;
+                if (*p) *p++ = 0;
+            }
+            argv[argc] = (char*)0;
+
+            if (argc == 0) _exit(0);   /* should not happen: n>0 checked above */
+
+            execve(argv[0], argv, (char**)0);
             puts_raw("EXEC-FAILED\n", 12);
             _exit(127);
         }
