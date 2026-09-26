@@ -221,6 +221,10 @@ static int test_ata(void);
 static int test_fat_mount(void);
 static int test_fat_ls(void);
 
+/* Forward declaration: defined below kmain_shell_loop, called from
+ * handle_command (the usershell and elfload commands) and kmain. */
+static uint64_t load_elf_into_user_process(pcb_t* pcb, const void* elf_data);
+
 /* =====================================================================
  * GDT validation.
  *
@@ -1000,14 +1004,11 @@ static void handle_command(const char *cmd) {
         if (test_program_len == 0) { vga_print("Binary missing.\n> "); return; }
         pcb_t* proc = process_create("elf_prog", 0x8000000000ULL, 0);
         if (proc) {
-            extern uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data);
-            scheduler_ready_queue_remove(proc);
             uint64_t old_cr3; __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
             __asm__ volatile("mov %0, %%cr3" : : "r"(proc->cr3));
-            uint64_t entry = elf_load_into_process(proc, test_program);
+            uint64_t entry = load_elf_into_user_process(proc, test_program);
             __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3));
             if (entry != 0) {
-                proc->entry_point = entry;
                 keyboard_buffer_flush();
                 scheduler_ready_queue_add(proc);
                 suspend_self_for_diagnostic();
@@ -1053,11 +1054,9 @@ static void handle_command(const char *cmd) {
         if (build_user_shell_elf_len == 0) { vga_print("Shell unmapped.\n> "); return; }
         pcb_t* shell_proc = process_create("usershell", 0x8000000000ULL, 0);
         if (shell_proc) {
-            extern uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data);
-            scheduler_ready_queue_remove(shell_proc);
-            uint64_t user_entry = elf_load_into_process(shell_proc, build_user_shell_elf);
+            uint64_t user_entry =
+                load_elf_into_user_process(shell_proc, build_user_shell_elf);
             if (user_entry != 0) {
-                shell_proc->entry_point = user_entry;
                 keyboard_buffer_flush();
                 scheduler_ready_queue_add(shell_proc);
                 suspend_self_for_diagnostic();
@@ -1189,6 +1188,101 @@ __attribute__((noreturn)) void kmain_shell_loop(void) {
     }
 }
 
+/*
+ * Load an ELF file from the FAT into a freshly kmalloc'd buffer and
+ * return it.  Caller frees.  Returns NULL on any failure (open, read,
+ * size out of range, kmalloc).
+ *
+ * This duplicates the read-a-file-into-a-buffer logic from sys_spawn
+ * in user_syscall.c.  It is intentionally not factored out yet; when a
+ * third caller needs it, move it to a shared helper.
+ */
+static uint8_t* load_file_to_buffer(const char* path, size_t* out_size) {
+    FIL file;
+    if (f_open(&file, path, FA_READ | FA_OPEN_EXISTING) != FR_OK) return NULL;
+    FSIZE_t sz = f_size(&file);
+    if (sz == 0 || sz > 4ULL * 1024 * 1024) { f_close(&file); return NULL; }
+    uint8_t* buf = (uint8_t*)kmalloc((size_t)sz);
+    if (!buf) { f_close(&file); return NULL; }
+    UINT total = 0;
+    while (total < sz) {
+        UINT br = 0;
+        UINT want = (UINT)(sz - total);
+        if (want > 4096) want = 4096;
+        if (f_read(&file, buf + total, want, &br) != FR_OK) {
+            kfree(buf); f_close(&file); return NULL;
+        }
+        if (br == 0) break;
+        total += br;
+    }
+    f_close(&file);
+    if (total != sz) { kfree(buf); return NULL; }
+    *out_size = (size_t)sz;
+    return buf;
+}
+
+/*
+ * Load an ELF into a user process and repair the resume frame.
+ *
+ * process_create bakes its `entry_point` argument into the resume
+ * frame that context_switch.asm restores; elf_load_into_process does
+ * not touch that frame, it only maps the ELF's segments and returns
+ * e_entry.  If the caller passed anything other than the ELF's real
+ * entry to process_create, the scheduler resumes the process at the
+ * wrong RIP and it #PFs on a page that was never mapped.
+ *
+ * This was invisible while the only caller was the embedded newlib
+ * shell, which is linked at exactly 0x8000000000 — the same value
+ * kmain passed as entry_point, so the stale frame slot was already
+ * correct by coincidence.  musl_sh is linked at 0x400000, and the
+ * coincidence no longer holds.
+ *
+ * The frame layout is whatever process_create builds (20 slots, first
+ * push = highest address):
+ *
+ *   [rsp + 0x00] r15    [rsp + 0x08] r14
+ *   [rsp + 0x10] r13    [rsp + 0x18] r12
+ *   [rsp + 0x20] r11    [rsp + 0x28] r10
+ *   [rsp + 0x30] r9     [rsp + 0x38] r8
+ *   [rsp + 0x40] rbp    [rsp + 0x48] rdi
+ *   [rsp + 0x50] rsi    [rsp + 0x58] rdx
+ *   [rsp + 0x60] rcx    [rsp + 0x68] rbx
+ *   [rsp + 0x70] rax    [rsp + 0x78] RIP
+ *   [rsp + 0x80] CS     [rsp + 0x88] RFLAGS
+ *   [rsp + 0x90] RSP    [rsp + 0x98] SS
+ *
+ * This is not the syscall-entry frame that sys_execve rewrites (that
+ * one is 16 slots and uses ktop[-7] / ktop[-9]).  Both frames are 20
+ * slots here because context_switch.asm's .pop_frame path pops
+ * exactly 20, and this is the layout it consumes.
+ *
+ * Returns 0 on failure, or the ELF's entry point on success.  The
+ * process is left off the ready queue on success; the caller decides
+ * when to enqueue.  (process_create enqueues it immediately, so the
+ * helper removes it first.)
+ */
+static uint64_t load_elf_into_user_process(pcb_t* pcb, const void* elf_data) {
+    if (!pcb || !elf_data) return 0;
+
+    scheduler_ready_queue_remove(pcb);
+
+    uint64_t entry = elf_load_into_process(pcb, elf_data);
+    if (entry == 0) return 0;
+
+    pcb->entry_point = entry;
+    pcb->rip         = entry;
+
+    /*
+     * Rewrite the resume frame's RIP slot.  RSP at [rsp + 0x90] is
+     * already pcb->user_stack_top for a user-mode entry_point, which
+     * is what the ELF was loaded against; no change needed there.
+     */
+    uint64_t* frame = (uint64_t*)pcb->rsp;
+    frame[0x78 / 8] = entry;
+
+    return entry;
+}
+
 void kmain(BootInfo *info) {
     g_bootinfo = info;
     vga_clear();
@@ -1263,23 +1357,54 @@ void kmain(BootInfo *info) {
         }
     }
 
+    /*
+     * Default boot shell: musl_sh, loaded from the FAT as
+     * 0:/MUSL_SH.ELF.  Fallback: the embedded newlib shell
+     * (build_user_shell_elf), used if the FAT read fails, the file
+     * is missing, or the ELF load fails.
+     *
+     * The fallback keeps a working console even if the FAT image is
+     * misbuilt or the FAT mount failed earlier in kmain; the newlib
+     * shell is still embedded in the kernel for exactly this reason
+     * (see A3 in handoff.md).  Retiring it is A5 work.
+     */
+    extern uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data);
+
+    const void* shell_elf = build_user_shell_elf;
+    uint8_t*    shell_elf_buf = NULL;
+
     if (build_user_shell_elf_len == 0) {
-        serial_print("PANIC: shell missing\n"); while (1) asm volatile("hlt");
+        serial_print("WARN: embedded shell missing, relying on FAT shell\n");
     }
+
+    {
+        size_t fat_len = 0;
+        uint8_t* fat_buf = load_file_to_buffer("0:/MUSL_SH.ELF", &fat_len);
+        if (fat_buf) {
+            shell_elf     = fat_buf;
+            shell_elf_buf = fat_buf;
+            serial_print("Shell: booting musl_sh from FAT\n");
+        } else {
+            if (build_user_shell_elf_len == 0) {
+                serial_print("PANIC: no shell available\n");
+                while (1) asm volatile("hlt");
+            }
+            serial_print("Shell: musl_sh unavailable, using embedded newlib shell\n");
+        }
+    }
+
     pcb_t* shell = process_create("usershell", 0x8000000000ULL, 0);
     if (!shell) {
         serial_print("PANIC: no shell PCB\n"); while (1) asm volatile("hlt");
     }
 
-    scheduler_ready_queue_remove(shell);
-    extern uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data);
-
-    uint64_t shell_entry = elf_load_into_process(shell, build_user_shell_elf);
+    uint64_t shell_entry = load_elf_into_user_process(shell, shell_elf);
+    if (shell_elf_buf) { kfree(shell_elf_buf); }
 
     if (shell_entry == 0) {
         serial_print("PANIC: shell load failed\n"); while (1) asm volatile("hlt");
     }
-    shell->entry_point = shell_entry;
+
     scheduler_ready_queue_add(shell);
     kernel_idle_loop();
 }
