@@ -41,6 +41,7 @@
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
 #define SYS_FCNTL           72
+#define SYS_GETCWD          79
 #define SYS_UNLINK          87
 #define SYS_SETSID          107
 #define SYS_GETPPID         110
@@ -97,5 +98,6 @@ long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_getppid(void);
+long sys_getcwd(char* buf, unsigned long size);
 
 #endif

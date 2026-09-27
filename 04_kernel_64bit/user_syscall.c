@@ -1721,6 +1721,37 @@ long sys_setsid(void) {
 }
 
 /*
+ * Linux x86_64 getcwd(2) — syscall 79.
+ *
+ * Return the current working directory as an absolute path.  donix
+ * has a single flat FAT root and no notion of a per-process cwd
+ * that changes, so the answer is always "/".
+ *
+ * Linux ABI: getcwd(buf, size) copies the NUL-terminated path into
+ * buf and returns buf (a pointer, which for our int64 return
+ * convention is the buf address).  If the path does not fit in
+ * size bytes, return -ERANGE.  If buf is NULL, Linux returns a
+ * freshly malloc'd buffer for the GNU extension; donix does not
+ * support that, so -EINVAL.
+ *
+ * busybox ash calls getcwd at startup and uses the result as $PWD.
+ * The path is not dereferenced afterwards on our single-directory
+ * filesystem, so "/" is safe and correct.
+ *
+ * 34 is ERANGE on Linux x86_64.  22 is EINVAL.
+ */
+long sys_getcwd(char* buf, unsigned long size) {
+    if (!buf) return -(long)22;         /* -EINVAL */
+    if (size < 2) return -(long)34;     /* -ERANGE: need "/" + NUL */
+
+    const char path[] = "/";
+    if (safe_copy_to_user(buf, path, sizeof(path)) != 0) {
+        return -(long)14;               /* -EFAULT */
+    }
+    return (long)(uint64_t)buf;
+}
+
+/*
  * Linux x86_64 set_tid_address(2).
  *
  * musl's __libc_start_main calls this during init and uses the
@@ -2192,6 +2223,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
