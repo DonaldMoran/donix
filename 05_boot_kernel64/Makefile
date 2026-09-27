@@ -43,6 +43,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/brkraw.elf \
 	$(USERLAND_BIN)/brkgrow.elf \
 	$(USERLAND_BIN)/musl_exec.elf \
+	$(USERLAND_BIN)/musl_exec2.elf \
 	$(USERLAND_BIN)/musl_wait.elf \
 	$(USERLAND_BIN)/musl_dup2.elf \
 	$(USERLAND_BIN)/musl_dupfd.elf \
@@ -111,6 +112,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec2.elf"     MUSL_EXEC2.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_dupfd.elf"     MUSL_DUPFD.ELF ; \

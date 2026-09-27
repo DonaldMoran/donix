@@ -926,6 +926,75 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
     return top;
 }
 
+/*
+ * Resolve an execve path to a FatFs-acceptable form.
+ *
+ * `ash` (busybox sh) calls execve with bare names — "ls", "echo" —
+ * or with a PATH-style absolute path like "/usr/bin/ls".  Neither
+ * is a valid FatFs path.  musl_sh, by contrast, already prepends
+ * "0:/" and appends ".ELF" before calling execve, and those paths
+ * go straight through.
+ *
+ * The rule is:
+ *   - If `in` already contains a ':' (drive prefix) or the caller
+ *     asked for a path that clearly has a FatFs form, leave it
+ *     alone.  f_open will handle it or not.
+ *   - If `in` is a bare name (no '/', no ':'), build "0:/NAME.ELF"
+ *     with NAME uppercased to match the FAT layout.
+ *   - If `in` starts with '/', take the last path component (after
+ *     the final '/'), and build "0:/NAME.ELF" the same way.
+ *
+ * Returns 0 on success, -1 if the resolved path would overflow
+ * `out_cap`.
+ */
+static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
+    /* Pick the base name: the substring after the last '/', or the
+     * whole string if there is no '/'. */
+    const char* base = in;
+    for (const char* p = in; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+
+    if (*base == '\0') return -1;   /* path was just "/" or "" */
+
+    /* If the base already ends in ".ELF" (case-insensitive), don't
+     * append it again. */
+    size_t blen = 0;
+    while (base[blen]) blen++;
+    int have_suffix = 0;
+    if (blen >= 4) {
+        char c0 = base[blen - 4];
+        char c1 = base[blen - 3];
+        char c2 = base[blen - 2];
+        char c3 = base[blen - 1];
+        if ((c0 == '.' && (c1 == 'E' || c1 == 'e') &&
+             (c2 == 'L' || c2 == 'l') && (c3 == 'F' || c3 == 'f'))) {
+            have_suffix = 1;
+        }
+    }
+
+    size_t need = 3 /* "0:/" */ + blen + (have_suffix ? 0 : 4) + 1;
+    if (need > out_cap) return -1;
+
+    out[0] = '0';
+    out[1] = ':';
+    out[2] = '/';
+    size_t o = 3;
+    for (size_t i = 0; i < blen; i++) {
+        char c = base[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[o++] = c;
+    }
+    if (!have_suffix) {
+        out[o++] = '.';
+        out[o++] = 'E';
+        out[o++] = 'L';
+        out[o++] = 'F';
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 // ============================================================
 // SYS_EXECVE (59) — Linux execve, in-place
 //
@@ -978,9 +1047,40 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -1;
     }
 
-    /* ---- 2. Open and read the whole ELF file. ---- */
+    /* ---- 2. Open and read the whole ELF file. ----
+     *
+     * First try the path exactly as the caller supplied it.  If
+     * f_open fails, and the path is a bare name or a leading-/
+     * path (i.e. has no ':' anywhere), try the resolved form
+     * "0:/NAME.ELF" with NAME uppercased to match the FAT layout.
+     *
+     * This is the retry that makes busybox ash's execve("ls",...)
+     * work: musl_sh already normalizes before calling execve, but
+     * ash does not, and there is no PATH and no shell rc file that
+     * could do it for us.
+     */
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) {
+        int has_drive = 0;
+        for (const char* p = path; *p; p++) {
+            if (*p == ':') { has_drive = 1; break; }
+        }
+
+        char resolved[USER_PATH_MAX];
+        int can_retry = !has_drive &&
+                        exec_resolve_bare_name(path, resolved,
+                                               sizeof(resolved)) == 0;
+
+        if (can_retry) {
+            FRESULT fr2 = f_open(&file, resolved, FA_READ | FA_OPEN_EXISTING);
+            if (fr2 == FR_OK) {
+                /* Retry succeeded.  Fall through with `file` open. */
+                fr = FR_OK;
+            }
+        }
+    }
+
     if (fr != FR_OK) {
         serial_print("sys_execve: f_open(");
         serial_print(path);
