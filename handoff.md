@@ -218,6 +218,17 @@ Apply each only when a specific problem requires it.
   `pcb_t` must also be appended after `block_kind` for the same
   reason.
 
+  **New failure mode, seen in session 22 (`CR2 = 0x20`).**  After a
+  fork child (busybox `ash` -> `ls`) exits, the *parent* `ash` faults
+  at `RIP = 0x40BF96` with `CR2 = 0x20`.  `0x20` is the offset of
+  musl's `errno` from the thread pointer, so this is the signature of
+  `MSR_FS_BASE = 0` in the parent after the child's exit.  Either the
+  parent's `fs_base` was zeroed in its PCB, or the exit-path context
+  switch (from `process_exit` to the next ready process) does not
+  restore `MSR_FS_BASE` for the resumed process the way the preemptive
+  and voluntary-yield paths do.  This is the top open issue; see
+  Part 2.
+
 ### Syscall ABI
 
 - **The syscall return path must preserve every GPR except `%rax`,
@@ -474,6 +485,38 @@ Apply each only when a specific problem requires it.
   `user_syscall.c`).  This is what made `busybox sh`'s error message
   change from "Operation not permitted" to "not found".
 
+- **`busybox ash`'s PATH probe needs `sys_access` (21), not just
+  `sys_stat` (added 2026-09-27, session 22).**  `ash`'s command
+  search uses busybox's `find_execable()`, which on Linux is
+  `access(path, X_OK)`.  Without `sys_access` in the dispatch table,
+  the probe returned `-ENOSYS` and `ash` concluded *every* external
+  command was "not found" before it ever reached `stat` or `execve`.
+  `sys_access` and `sys_faccessat` are now implemented as thin
+  `f_stat`-with-retry wrappers that ignore the mode bits (FAT has
+  no permissions).  See `sys_access` in `user_syscall.c`.
+
+- **`busybox ash`'s PATH candidates are `sbin/ls`, `usr/bin/ls`,
+  etc., not `ls` (added 2026-09-27, session 22).**  The default
+  `PATH` is `/sbin:/usr/sbin:/bin:/usr/bin`, and `ash` builds
+  `<dir>/<cmd>` for each entry.  `strip_dot_prefix` peels the
+  leading `/`, leaving `sbin/ls`.  `f_stat("sbin/ls")` fails with
+  **`FR_NO_PATH` (5)**, not `FR_NO_FILE` (4) or `FR_INVALID_NAME`
+  (6) -- FatFs treats the path as having a directory component it
+  cannot find.  The retry guard in `f_stat_with_retry` must
+  therefore include `FR_NO_PATH` alongside `FR_INVALID_NAME` and
+  `FR_NO_FILE`.  Missing that case was the entire reason `busybox
+  sh`'s external commands did not run even after `sys_stat` grew a
+  retry.  `sys_execve`'s inline retry already fires on *any* non-OK
+  `FRESULT`, so it never had this bug.
+
+- **The `f_stat_with_retry` helper is shared by `sys_stat` and
+  `sys_access` (added 2026-09-27, session 22).**  Both call the same
+  function to stat a path with the bare-name retry.  Any future
+  syscall that needs a "does this path exist" check (e.g.
+  `sys_newfstatat`, or a real `sys_execve` probe) should route
+  through it rather than reimplementing the retry.  The helper is
+  defined above `sys_stat` in `user_syscall.c`.
+
 ### Build system
 
 - **After every patch, verify the edit actually landed in the
@@ -553,37 +596,50 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_stat` does not retry bare names (added session 21).**
-  `busybox sh` calls `stat("/usr/local/sbin/ls")`, or whatever its
-  default PATH entries resolve to, to probe for the command before
-  calling `execve`.  FatFs rejects all of those paths with
-  `FR_INVALID_NAME`, so `sys_stat` returns `-ENOENT` (correctly, now
-  that session 21 fixed the errno mapping), and `ash` reports
-  `sh: ls: not found` and never calls `execve`.  The fix is the same
-  shape as session 19's `execve` retry: if `f_stat(path)` fails with
-  `FR_INVALID_NAME` or `FR_NO_FILE` and the path has no `:`, call
-  `exec_resolve_bare_name(path, resolved, ...)` and retry
-  `f_stat(resolved)`.  **Next change.**
+- **`#PF` in the parent `ash` after a forked child exits (added
+  session 22).**  `busybox ash` runs `ls`, `ls` exits cleanly, and
+  then *`ash` itself* faults at `RIP = 0x40BF96` with
+  `CR2 = 0x20`.  `0x20` is the offset of musl's `errno` from the
+  thread pointer, so the fault is the signature of
+  `MSR_FS_BASE = 0` in the parent.  The fault is deterministic, not
+  a race.  Suspicion: either the parent's `fs_base` field in its
+  PCB is zeroed somewhere during the child's `fork`/`execve`/`exit`
+  lifecycle, or the context switch performed by `process_exit` (to
+  hand control to the next ready process) does not restore
+  `MSR_FS_BASE` the way `timer_preempt_handler` and the voluntary
+  `process_yield` path do.  **This is the top blocker for
+  interactive `busybox sh`.**  Next step: read `process.c`'s
+  `process_exit` and `process_create`, and `scheduler.c`'s three
+  `context_switch` call sites, and confirm whether the exit path
+  writes `MSR_FS_BASE` before resuming the next process.
+
 - **`sys_ioctl` returns `-ENOTTY` for every request, including
   `TCGETS`.**  `ash` uses the failure of `ioctl(0, TCGETS, ...)` to
   decide stdin is not a tty; as a result it does not echo typed input
   and does not print a prompt.  Implementing `TCGETS` (with a plausible
   termios struct -- ICANON, ECHO, ISIG, etc.) would make `sh` behave
   like an interactive shell.  Same for the corresponding `TCSETS`/
-  `TCSETSW`/`TCSETSF`, which can be accepted and ignored.
+  `TCSETSW`/`TCSETSF`, which can be accepted and ignored.  **Second
+  priority after the `#PF` above; cannot be tested until `ash`
+  survives running a command.**
+
 - **`sys_newfstatat` (262) is not implemented.**  `sys_fstat` (5)
   and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
   routing" under "Syscall ABI".  Not on any current test's path.
   Phase B (busybox) may exercise it.
+
 - **`sys_munmap` is a stub returning 0.**  busybox will eventually
   call it and expect real unmapping.
+
 - **`sys_brk` uses a fixed `heap_base = 0x8000200000`.**  Same
   class of latent bug as the old `sys_mmap` had; no per-process
   state, no awareness of other allocations.  It hasn't collided
   with anything yet.
+
 - **The mmap window is a fixed 4 MB** (`0x8010000000`-
   `0x8010400000`).  If busybox fills it, the next step is a
   per-process bump pointer, not a fixed base.
+
 - **`sys_open` accepts non-directories when called with
   `O_DIRECTORY`.**  `ls 0:/hello-world.txt` prints
   `0 file(s), 0 directory(ies)` and exits 0, instead of failing with
@@ -593,25 +649,46 @@ Apply each only when a specific problem requires it.
   target is actually a directory.  Fix (deferred): after `f_opendir`
   succeeds, check the entry's `fattrib & AM_DIR`; if not set,
   close and return `-ENOTDIR`.
+
 - **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
   seen: 7, 8, 15, 17.  `6` is now implemented as `sys_lstat`;
-  `72` as `fcntl`.  The remaining four (`7` mkdir, `8` creat,
-  `15` rt_sigreturn, `17` pread64) have not been traced to a
-  caller yet.  The `readdir` loop still returns the correct
-  count, so the test is green, but the noise is real.
+  `72` as `fcntl`; `21`/`269` as `access`/`faccessat`.  The
+  remaining four (`7` mkdir, `8` creat, `15` rt_sigreturn,
+  `17` pread64) have not been traced to a caller yet.  The
+  `readdir` loop still returns the correct count, so the test is
+  green, but the noise is real.
+
 - **`isr14_handler` halts on user-mode faults.**  The `#PF` handler
   checks only `g_expect_fault`; it does not look at `error_code & 4`
   to distinguish a user-mode fault from a kernel-mode one.  Any
   unexpected user-mode fault kills the console instead of
-  terminating the faulting process.  Fix: in `isr14_handler`, if
-  `(error_code & 4)` and `g_expect_fault != 0x0E`, call
-  `sys_exit(-1)` for the faulting process instead of halting.
+  terminating the faulting process.  This is what makes the session-22
+  `#PF` end the boot instead of killing `ash` and returning to
+  `musl_sh`.  Fix: in `isr14_handler`, if `(error_code & 4)` and
+  `g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
+  process instead of halting.
+
 - **`musl_sh` echoes garbage when the typed line contains
   backspaces.**  The kernel trace shows the argv that actually
   reached `sys_execve` is correct, but the echoed input line is
-  scrambled.  Cosmetic.  Fix, if wanted: emit `"\b \b"` only when
-  stdout is a real tty, or drop the erase-on-backspace entirely
-  and just decrement `n`.
+  scrambled.  This also appears to leave stale bytes in the kernel
+  keyboard buffer, which the *next* program to read stdin can
+  consume -- that is the likely cause of the transient
+  `sh: syntax error: unexpected ";"` seen on the first
+  `busybox sh` invocation in an earlier capture.  Cosmetic, but
+  with a real side effect.  Fix, if wanted: emit `"\b \b"` only
+  when stdout is a real tty, or drop the erase-on-backspace
+  entirely and just decrement `n`.
+
+- **`f_stat_with_retry` collapses path components for nonexistent
+  directories (theoretical, added session 22).**  For a path like
+  `SUB/missing`, `f_stat` returns `FR_NO_PATH`, the retry fires,
+  and `exec_resolve_bare_name` resolves to `0:/MISSING.ELF` --
+  dropping the `SUB/` component.  Today the FAT root is flat, so no
+  path has a real directory component, and this cannot produce a
+  wrong result.  If subdirectories ever appear on the FAT, revisit:
+  the retry should only strip path components that do not exist as
+  directories, not blindly take the last component.
 
 ### Cosmetic / housekeeping
 
@@ -628,6 +705,11 @@ Apply each only when a specific problem requires it.
   (syscall 169).  Not blocking anything.
 - `PMM_ALLOC_DIAG` in `pmm.c` is gated diagnostic code from the
   `brk` investigation; harmless, can be deleted at leisure.
+- `musl_wait`'s `WNOHANG` loop spins through hundreds of timer
+  ticks before it succeeds (visible in the session-22 capture as a
+  long run of `.` characters).  The semantics are correct --
+  `WAIT-WNOHANG-OK` eventually prints -- but the loop is slow.
+  Cosmetic.
 
 ## Testing harness
 
@@ -714,8 +796,9 @@ is the record.  Sessions 13 and 14 used `20260927-01` through
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
 Sessions 18 through 21 used `20260927-08`, `-09`, `-10` and the
 session-21 tag below; their commit tables in Part 2 are the record.
-Working tags are deleted after their session is consolidated; the
-SHA in the table is what survives.
+Session 22 used `20260927-11`; its commit table in Part 2 is the
+record.  Working tags are deleted after their session is
+consolidated; the SHA in the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -734,20 +817,22 @@ tags pushed to the remote.  Do not push working tags.
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Phase B: busybox runs, its banner prints, and
-`dup2`, `F_DUPFD`, `setsid`, `getppid`, `getcwd`, `execve`-retry,
-errno-mapping, and file_slot_t refcounting are green; `busybox sh`
-runs, its builtins work, and its external-command error messages are
-now accurate ("not found").  Next: the same bare-name retry inside
-`sys_stat`, then `ioctl TCGETS`.**
+`userland/musl/`.  Phase B: busybox runs, its banner prints, `dup2`,
+`F_DUPFD`, `setsid`, `getppid`, `getcwd`, `execve`-retry,
+errno-mapping, and file_slot_t refcounting are green, and
+`busybox ash` now finds and runs external commands -- `ls` prints
+the full 27-entry directory listing from inside `busybox ash`.
+Next: fix the parent-`ash` `#PF` after a forked child exits
+(`CR2 = 0x20`, suspected `MSR_FS_BASE` not restored on the exit-path
+context switch), then `ioctl TCGETS` for the interactive prompt.**
 
 ---
 
 # Part 2 -- Session Status
 
-**Last updated:** 2026-09-27 (session 21, proper errnos from file syscalls)
-**Current HEAD:** `e8ce6d8` (tag `20260927-10`), on branch `dev`,
-seventeen commits ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 22, busybox ash runs external commands)
+**Current HEAD:** `20260927-11` on branch `dev`, eighteen commits
+ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -758,32 +843,38 @@ handling), `20260927-02` (build: busybox integration), `20260927-03`
 `20260927-07` (kernel: setsid + getppid),
 `20260927-08` (kernel: getcwd),
 `20260927-09` (kernel: execve bare-name retry),
-`20260927-10` (kernel: proper errnos from file syscalls).  All
-working tags are local-only.
+`20260927-10` (kernel: proper errnos from file syscalls),
+`20260927-11` (kernel: sys_access/faccessat + FR_NO_PATH in stat
+retry -- busybox sh runs external commands).  All working tags are
+local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Phase B is underway.  busybox runs, the banner prints, and
+**Phase B is well underway.  busybox runs, the banner prints, and
 `busybox ls` / `cat` / `echo` work.  `dup2`, `F_DUPFD`, `setsid`,
 `getppid`, `getcwd`, and file_slot_t refcounting are green.
-`sys_execve` retries bare names, and `musl_exec2` proves it.
-Every file syscall now returns a proper negative errno on failure.
-`busybox sh` runs its command loop, executes builtins, and reports
-accurate error messages ("not found") for external commands.**
+`sys_execve` retries bare names, every file syscall returns a proper
+negative errno on failure, and `busybox ash` now finds and runs
+external commands -- `ls` prints the full directory listing from
+inside `busybox ash`.**
 
-The next functional milestone is `busybox sh` being fully
-interactive.  Three problems remain, in the order they need
-solving:
+Three things stand between the current state and an interactive
+`busybox sh`:
 
-1. `sys_stat` does not retry bare names, so `ash`'s PATH probe
-   fails for every candidate and it never calls `execve`.
-2. `ioctl TCGETS` returning `-ENOTTY` makes `ash` treat stdin as
-   non-interactive (no prompt, no echo).
+1. **`#PF` in the parent `ash` after a forked child exits.**  `ls`
+   runs and exits cleanly, then `ash` itself faults at
+   `CR2 = 0x20` (musl `errno` offset from a null thread pointer).
+   Suspected cause: `MSR_FS_BASE` is not restored on the exit-path
+   context switch that `process_exit` performs to hand control to
+   the next ready process.  **This is the top blocker.**
+2. **`ioctl TCGETS` returns `-ENOTTY`**, so `ash` treats stdin as
+   non-interactive (no prompt, no echo).  Cannot be tested until
+   (1) is fixed.
 3. Neither of the above has been proven to be the last blocker;
-   once they are fixed, `busybox sh` will either run external
-   commands or expose the next problem.
+   once they are fixed, `busybox sh` will either be interactive or
+   expose the next problem.
 
 **State of the tree:**
 
@@ -794,6 +885,15 @@ solving:
   busybox is invoked from it, not in place of it.
 - The existing canary (hello, echo, cat, ls, memtest, musl_* tests)
   still passes.
+
+## Session 22 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-11` | `7b62c99` | kernel: sys_access/faccessat + FR_NO_PATH in stat retry -- busybox sh runs external commands. |
+
+The tag is a working tag (local-only).  The commit message has the
+full narrative.
 
 ## Session 21 commits, in order
 
@@ -897,7 +997,7 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (all green as of `20260927-10`)
+## Canary state (all green as of `20260927-11`)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
@@ -932,7 +1032,7 @@ Sessions 13-21 additions:
 
 | Test | State | Notes |
 |------|-------|-------|
-| musl_dup2 | green | `DUP2-OK`.  No heap warnings.  (Before the refcount fix landed in the same commit, this test produced two `HEAP: kfree called on already freed block!` lines at exit -- the test leaves the aliased fd open, and `close_all_files` double-freed.  That is the bug the refcount fix closed.) |
+| musl_dup2 | green | `DUP2-OK`.  No heap warnings. |
 | musl_dupfd | green | `DUPFD-OK`.  No heap warnings.  Exercises fcntl(fd, F_DUPFD, min) for min=3 (return >= 3, read works), min=3 again (distinct fd), min=99 (-EINVAL), min=0 (clamped to >= 3). |
 | musl_ids | green | `IDS-OK sid= 22`, `IDS-OK ppid= 2`.  setsid returns the calling pid; getppid returns the parent's pid; setsid is idempotent.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`; noted under Cosmetic.) |
 | musl_getcwd | green | `GETCWD-OK /`.  Exercises getcwd(buf, 64) (returns buf, writes "/\0"), getcwd(buf, 1) (-ERANGE), getcwd(NULL, 0) (-EINVAL). |
@@ -942,8 +1042,10 @@ Sessions 13-21 additions:
 | busybox ls 0:/HELLO-WORLD.TXT | green | prints `0:/HELLO-WORLD.TXT`. |
 | busybox cat 0:/HELLO-WORLD.TXT | green | file contents. |
 | busybox echo hi | green | `hi`. |
-| busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`).  `CONFIG_BUSYBOX` is now on.  No `Unknown syscall: 33`. |
-| busybox sh (partial) | in progress | Reaches a command loop.  Executes builtins (`exit` returns to `musl_sh`).  Typed external commands now report `sh: <cmd>: not found` (was `Operation not permitted` before session 21 fixed the errno mapping).  The underlying cause is that `sys_stat` does not retry bare names, so `ash`'s PATH probe fails for every candidate and it never calls `execve`.  Typed input is still not echoed and no prompt is printed (ioctl TCGETS, below). |
+| busybox echo Donald | green | `Donald`. |
+| busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`). |
+| busybox ash -> ls | green | `busybox ash` starts; at its prompt, `ls` forks, resolves via `sys_stat` retry (`sbin/ls` -> `0:/LS.ELF`), execs, prints the full 27-entry listing, exits cleanly.  **This is the session-22 milestone.** |
+| busybox sh (partial) | in progress | Reaches a command loop.  Runs builtins.  Runs external commands (`ls` works from inside `busybox ash`).  After a child exits, the parent `ash` faults at `CR2 = 0x20` (see Part 1 open issue).  Typed input is still not echoed and no prompt is printed (ioctl TCGETS). |
 
 The `Unknown syscall: 72` line that used to appear on every `ls` and
 `musl_readdir` is gone -- `fcntl` is now implemented.  The
@@ -953,6 +1055,8 @@ The `Unknown syscall: 33` line that used to appear on `busybox`
 `Unknown syscall: 107`, `Unknown syscall: 110`, and
 `Unknown syscall: 79` lines that used to appear on `busybox sh`
 startup are gone -- `setsid`, `getppid`, and `getcwd` are now
+implemented.  The `Unknown syscall: 21` line that used to appear
+during `ash`'s PATH probe is gone -- `sys_access` is now
 implemented.
 
 ## State on disk
@@ -985,23 +1089,25 @@ implemented.
 
 ## Next step (exactly this, then stop)
 
-**Session 22 continues Phase B.**
+**Session 23 continues Phase B.**
 
 In priority order:
 
-1. **Add the bare-name retry to `sys_stat`.**  Mirror the session-19
-   change in `sys_execve`: if `f_stat(path)` fails with
-   `FR_INVALID_NAME` or `FR_NO_FILE` and the path has no `:`, call
-   `exec_resolve_bare_name(path, resolved, ...)` and retry
-   `f_stat(resolved)`.  If that succeeds, fill the `kernel_stat_t`
-   from the resolved entry and return 0.  This is the next change,
-   and it is small -- one function, using the helper that already
-   exists.
+1. **Fix the `#PF` in the parent `ash` after a forked child exits.**
+   This is the top blocker: `busybox ash` runs `ls` correctly, `ls`
+   exits, and then `ash` faults at `CR2 = 0x20`.  The fault address
+   is the offset of musl's `errno` from a null thread pointer, so
+   the parent's `MSR_FS_BASE` is zero at the fault.  Read the three
+   files named in the handoff's "Files that must not be touched"
+   rule (`process.c`, `scheduler.c`, `context_switch.asm`) --
+   reading them to *understand* the exit-path context switch is
+   fine; changing them needs a specific tested reason.  Confirm
+   whether `process_exit` writes `MSR_FS_BASE` for the next process
+   before resuming it, the way `timer_preempt_handler` and the
+   voluntary `process_yield` path do.
 
-2. **Re-test `busybox sh`.**  If the `sys_stat` retry works, `ash`'s
-   PATH probe should succeed and it should call `execve` (whose own
-   retry resolves the path), and `ls` should run.  If it still does
-   not, we take the next diagnostic step.
+2. **Re-test `busybox ash`.**  With the `#PF` fixed, `busybox ash`
+   should survive running multiple external commands in sequence.
 
 3. **Implement `ioctl(0, TCGETS, ...)`.**  Return a termios struct
    with `ICANON | ECHO | ISIG | IEXTEN` (and the usual input/output
@@ -1009,13 +1115,13 @@ In priority order:
    `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes `ash` echo typed input
    and print a prompt.
 
-4. **Then cut the milestone tag.**  Once external commands run and
-   `sh` is interactive, that is the natural point for `v0.6.2` or
-   `v0.7.0`.
+4. **Then cut the milestone tag.**  Once external commands run
+   repeatedly and `sh` is interactive, that is the natural point
+   for `v0.6.2` or `v0.7.0`.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `sys_stat` bare-name retry -- next.
+1. Parent-`ash` `#PF` after a forked child exits -- next.
 2. `ioctl TCGETS` -- the other half of interactive `sh`.
 3. `sys_newfstatat` (262) -- busybox may route through it once more
    applets are enabled.
@@ -1031,7 +1137,7 @@ In priority order:
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now seventeen commits
+**Do not push without a plan.**  `dev` is now eighteen commits
 ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
 merged to `main` at the next milestone, or is pushed immediately is
 a separate decision.  Milestone tags go on the published side; the
@@ -1043,7 +1149,7 @@ same principle applies to Phase B.
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `sys_stat` bare-name retry -- next.
+  - Parent-`ash` `#PF` after a forked child exits -- next.
   - `ioctl TCGETS`.
   - `sys_newfstatat` (262) -- three-way delegation.
   - `isr14_handler` user-mode fault handling.
@@ -1052,8 +1158,12 @@ same principle applies to Phase B.
     bases.
   - `sys_open` `O_DIRECTORY` fix.
   - The `Unknown syscall: N` cluster in `musl_readdir`.
-  - `musl_sh` backspace echo (cosmetic).
+  - `musl_sh` backspace echo (cosmetic; also leaves stale bytes in
+    the keyboard buffer).
   - `musl_ids` `put_dec` space (cosmetic).
+  - `musl_wait` `WNOHANG` loop spin (cosmetic).
+  - `f_stat_with_retry` path-component collapse (theoretical;
+    matters only if the FAT gains subdirectories).
 - **Deferred cleanups:**
   - Audit `puthex`/`put_dec` helpers in `userland/musl/tests/`.
   - `PMM_ALLOC_DIAG` removal from `pmm.c`.
