@@ -1848,13 +1848,6 @@ void sys_exit(int status) {
     process_exit();
 }
 
-void sys_arch_set_fs(void* base) {
-    uint64_t addr = (uint64_t)base;
-    wrmsr(0xC0000100, addr);
-    pcb_t* self = process_get_current();
-    if (self) self->fs_base = addr;
-}
-
 /*
  * Linux x86_64 arch_prctl(2).
  *
@@ -1865,11 +1858,8 @@ void sys_arch_set_fs(void* base) {
  * codes return -1 for now; -EINVAL and the remaining subcodes
  * (ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS) come later if a specific
  * musl or busybox path needs them.
- *
- * Distinct syscall from SYS_ARCH_SET_FS (504), which takes only the
- * base address and is what the newlib userland uses.  Case 504 stays
- * in place so the regression canary keeps working.
  */
+
 #define ARCH_SET_FS 0x1002
 
 long sys_arch_prctl(int code, void* addr) {
@@ -1927,7 +1917,6 @@ uint64_t syscall_dispatch(uint64_t num,
 
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
-        case SYS_ARCH_SET_FS:     sys_arch_set_fs((void*)arg0); return 0;
         case SYS_DONIX_SBRK:      return (uint64_t)sys_sbrk((long)arg0);
 
         default:

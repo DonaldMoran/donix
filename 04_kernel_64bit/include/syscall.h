@@ -48,7 +48,6 @@
 
 /* --- donix-private numbers (500+) --- */
 #define SYS_REBOOT      503
-#define SYS_ARCH_SET_FS 504
 #define SYS_DONIX_SBRK  505
 
 /*
@@ -83,7 +82,6 @@ long sys_read(int fd, void* buf, size_t count);
 long sys_mprotect(void* addr, size_t len, int prot);
 void* sys_brk(void* addr);
 void* sys_sbrk(long inc);
-void sys_arch_set_fs(void* base);
 
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
