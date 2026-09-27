@@ -22,9 +22,6 @@ XXD     := xxd
 # See LLD_BUG_REPORT.md for the full history of both issues.
 FATFS_CC := /opt/cross/bin/x86_64-elf-gcc
 
-# Userland directory - only newlib now
-USERLAND_DIR := userland/newlib
-
 # Disk layout configuration. Selects which drive FatFs talks to and
 # which image layout the boot chain expects.
 #
@@ -61,11 +58,6 @@ FATFS_CFLAGS := -ffreestanding -O2 -Wall -Wextra \
 	-mno-avx -mno-mmx -Iinclude -Ifatfs $(FAT_CFLAGS) \
 	-MMD -MP
 
-# User-space CFLAGS (for kernel-side objects that need to embed user data)
-USER_CFLAGS := -target x86_64-unknown-elf -ffreestanding -O0 -Wall -Wextra \
-	-fno-pic -mno-red-zone -mno-sse -mno-sse2 -mno-avx -mno-mmx \
-	-mcmodel=large -fno-builtin -fno-common -Iinclude
-
 LDFLAGS := -nostdlib
 
 # Two limits apply to kernel.bin:
@@ -88,14 +80,10 @@ LDFLAGS := -nostdlib
 KERNEL_STAGING_LIMIT := 458752
 KERNEL_DISK_LIMIT    := 983040
 
-.PHONY: all clean userland
+.PHONY: all clean
 
-# Build both kernel and userland
-all: userland kernel.bin
-
-# Build userland - now directly calls newlib Makefile
-userland:
-	$(MAKE) -C $(USERLAND_DIR)
+# Build the kernel image.
+all: kernel.bin
 
 # ============================================================
 # KERNEL OBJECTS
@@ -227,7 +215,6 @@ user_syscall.o: user_syscall.c
 clean:
 	rm -f *.o *.bin *.elf *.d test_program test_program.bin test_program_data.c
 	rm -f fatfs/*.o fatfs/*.d
-	$(MAKE) -C $(USERLAND_DIR) clean
 
 # ============================================================
 # HEADER DEPENDENCY TRACKING
