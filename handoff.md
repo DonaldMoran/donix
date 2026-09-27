@@ -1090,7 +1090,7 @@ Newlib is gone.  Phase B is busybox.**
 # Part 2 — Session Status
 
 **Last updated:** 2026-09-26 (session 9, A5 complete)
-**Current HEAD:** `20260926-09` (this handoff)
+**Current HEAD:** `28b0d60` (LLD_BUG_REPORT update; doc pass — no code change)
 **Last known-good code tag:** `20260926-08` (A5 step 8)
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
