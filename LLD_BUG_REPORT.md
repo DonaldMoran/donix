@@ -7,6 +7,12 @@ worked around by compiling that one file (and `ffunicode.c`) with
 all three, and for the earlier LLD 22.1.8 issue that was filed
 upstream.
 
+The bugs affect `fatfs/ff.c` in dons-os and in donix alike — the
+FatFs source and the cross-GCC workaround carried forward unchanged
+through the fork. The only file-local change since the fork is the
+syscall number for `unlink` (see Bug 2); the underlying issue is
+identical.
+
 ---
 
 ## Bug 1 — LLD 22.1.8 truncates instructions in linked kernel binary
@@ -159,16 +165,6 @@ in LLD and the report is correct as filed. If both produce the same
 broken output, the bug is elsewhere (compiler, assembler, or the way
 objects are being produced).
 
-### Where the faulting build's source tree is
-
-A copy of the project was made at the time of filing:
-
-    <PASTE THE PATH TO THE COPY HERE>
-
-That copy is in the faulting state (no GCC override in
-`04_kernel_64bit/Makefile`), so re-running `make clean && make
-FAT_CONFIG=single` there should reproduce the bug.
-
 ---
 
 ## Bug 2 — Clang 22.1.8 hangs `f_unlink` at `-O1`
@@ -177,15 +173,24 @@ Discovered 2026-09-20 after filing the LLD bug.
 
 ### Symptom
 
-With `fatfs/ff.c` compiled at `-O1`, `SYS_UNLINK` hangs — the CPU is
-stuck in `f_unlink` or `remove_chain` and never returns. No exception
-is raised; the machine simply stops executing after printing
-"deleting 3 file(s)...".
+With `fatfs/ff.c` compiled at `-O1`, the `unlink` code path hangs —
+the CPU is stuck in `f_unlink` or `remove_chain` and never returns.
+No exception is raised; the machine simply stops executing after
+printing "deleting 3 file(s)...".
 
 Adding diagnostic `serial_print` calls to `f_unlink` and
 `remove_chain` at `-O1` also makes the hang go away, which is
 characteristic of a compiler code-generation bug that depends on
 register allocation and instruction scheduling.
+
+### Syscall number
+
+In dons-os the calling path was `SYS_UNLINK` = 7. In donix it was
+renumbered to Linux `unlink` = 87 during the A1 renumbering (see
+[`handoff.md`](handoff.md)), and the dons-os-private number was
+retired. The FatFs code path itself is unchanged, so the workaround
+below is identical in both trees. Only the number the userland calls
+differs.
 
 ### Not filed
 
@@ -279,7 +284,7 @@ identical. There is no linker-level distinction between a GCC `.o`
 and a Clang `.o`.
 
 The kernel builds, boots, mounts the FAT volume, shows long filenames
-correctly, and runs `SYS_UNLINK` without hanging.
+correctly, and runs `unlink` without hanging.
 
 ### Sanity check
 
@@ -311,6 +316,10 @@ Clang default rule. Until then, `FATFS_CC` stays.
   update or a source change to `ff.c`), the disassembly check is:
   `/opt/cross/bin/x86_64-elf-objdump -d kernel.elf | grep -B2 -A2 "\.byte"`
   If any `.byte` shows up in `.text`, the LLD truncation is back.
-- The Makefile now tracks header dependencies (`-MMD -MP`).  It did
-  not when the LLD bug was filed.  Header changes now trigger the
-  correct rebuilds automatically.
+- The Makefile tracks header dependencies (`-MMD -MP`).  It did
+  not when the LLD bug was first filed.  Header changes now trigger
+  the correct rebuilds automatically.
+- The bugs are toolchain-specific, not project-specific. They will
+  affect any project that (a) targets `x86_64-unknown-elf` with
+  Clang/LLD 22.1.8, and (b) compiles FatFs R0.16 or a similar
+  source file with comparable register pressure.
