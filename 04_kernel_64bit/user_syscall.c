@@ -131,6 +131,83 @@ typedef struct {
 #define KSTAT_IFREG  0100000
 #define KSTAT_IFDIR  0040000
 
+/*
+ * True if `p` names the FAT root directory.
+ *
+ * FatFs's f_stat() does not accept ".", "/", "0:", or "0:/" — it
+ * returns FR_INVALID_NAME for all of them, because it treats the
+ * path as a file name and the root has no file-name form.  musl
+ * and busybox both hand these strings to stat(2):
+ *
+ *   - busybox's `ls` with no argument does stat(".").
+ *   - busybox's `ls /`        does stat("/").
+ *   - busybox's `ls 0:/`      does stat("0:/").
+ *
+ * All four forms denote the same thing on donix, so we synthesize
+ * a directory stat for them instead of calling f_stat.
+ */
+static int path_is_root(const char* p) {
+    if (!p || !*p) return 0;
+    if ((p[0] == '.' || p[0] == '/') && p[1] == '\0') return 1;
+    if (p[0] == '0' && p[1] == ':') {
+        if (p[2] == '\0') return 1;
+        if ((p[2] == '/' || p[2] == '\\') && p[3] == '\0') return 1;
+    }
+    return 0;
+}
+
+/*
+ * Strip leading "./" and "/" components from a FatFs path, in place.
+ *
+ * FatFs accepts "0:/NAME", "0:NAME", and bare "NAME", but rejects
+ * any leading "." or "/".  musl's lstat()/stat() and busybox's
+ * `ls` hand us "./NAME" when the argument is a directory entry
+ * under the current directory, e.g.:
+ *
+ *     ls: ./HELLO-WORLD.TXT: Operation not permitted
+ *
+ * This helper peels off the leading "./" (and repeated "./") and
+ * a leading "/" if present, and leaves the rest alone.  It does
+ * NOT rewrite bare names to "0:/NAME" — the existing code already
+ * handles those, and we deliberately change one thing at a time.
+ *
+ * If the whole path was "." or "./" or "/" or a run of "./"
+ * components, the stripped result is empty; we leave the string
+ * as "." so path_is_root() still recognizes it as the root.
+ */
+static void strip_dot_prefix(char* p) {
+    if (!p || !*p) return;
+
+    char* src = p;
+    while (*src) {
+        if (src[0] == '.' && src[1] == '/') { src += 2; continue; }
+        if (src[0] == '/')                  { src += 1; continue; }
+        break;
+    }
+
+    /* Entire path was "." components — treat as root. */
+    if (*src == '\0') {
+        p[0] = '.';
+        p[1] = '\0';
+        return;
+    }
+
+    /* src >= p always, so an in-place move is safe. */
+    char* dst = p;
+    while (*src) *dst++ = *src++;
+    *dst = '\0';
+}
+
+/* Fill a kernel_stat_t describing the FAT root as a directory. */
+static void fill_kstat_as_root(kernel_stat_t* st) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFDIR | 0755;
+    st->st_size    = 0;
+    st->st_blocks  = 0;
+}
+
 // ============================================================
 // SAFE COPY OPERATIONS
 // ============================================================
@@ -278,6 +355,47 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
     return slot;
 }
 
+
+/*
+ * Linux x86_64 fcntl(2) — syscall 72.
+ *
+ * musl's opendir() calls
+ *     fcntl(fd, F_SETFD, FD_CLOEXEC)
+ * after opening the directory, and treats a failure as fatal: it
+ * closes the fd, frees the DIR, and returns NULL.  busybox's `ls`
+ * then unwinds through its own error path and, in the build we
+ * have, hits a musl a_crash() (an `hlt` in user mode -> #GP).
+ *
+ * We don't implement fd flags.  Return 0 for the query/set-flags
+ * requests musl actually issues, so opendir succeeds.  Everything
+ * else returns -EINVAL.
+ *
+ * F_DUPFD is not implemented.  If a later busybox applet needs it
+ * (shell redirection, pipes), implement it as a real dup of the
+ * file_slot_t here.
+ */
+#define F_DUPFD  0
+#define F_GETFD  1
+#define F_SETFD  2
+#define F_GETFL  3
+#define F_SETFL  4
+#define EINVAL_  22
+
+long sys_fcntl(int fd, int cmd, unsigned long arg) {
+    (void)arg;
+
+    file_slot_t* slot = get_file_slot(fd, 0);
+    if (!slot) return -(long)9;   /* -EBADF */
+
+    switch (cmd) {
+        case F_GETFD:  return 0;              /* no FD_CLOEXEC set */
+        case F_SETFD:  return 0;              /* ignore the flag   */
+        case F_GETFL:  return 0;              /* O_RDONLY          */
+        case F_SETFL:  return 0;              /* ignore            */
+        default:       return -(long)EINVAL_;
+    }
+}
+
 // ============================================================
 // FILE SYSCALLS
 // ============================================================
@@ -287,6 +405,7 @@ long sys_open(const char* path, int flags) {
 
     char local_path[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    strip_dot_prefix(local_path);
 
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
@@ -311,6 +430,61 @@ long sys_open(const char* path, int flags) {
 
     if (flags & 0x0008) mode |= FA_OPEN_APPEND;
 
+    /*
+     * Linux open(2) is also used to open directories — musl's
+     * opendir() calls open(path, O_RDONLY|O_DIRECTORY) and then
+     * readdir(), which uses getdents64(2).
+     *
+     * FatFs's f_open is not usable for this in two cases:
+     *
+     *   1. The path is a root alias (".", "/", "0:", "0:/").
+     *      f_open returns FR_INVALID_NAME for "." and friends,
+     *      and for "0:/" it can return FR_OK with a FIL that is
+     *      not usable because the root is not a file.
+     *
+     *   2. The caller explicitly asked for a directory with
+     *      O_DIRECTORY, and the path is a real directory.  f_open
+     *      returns FR_INVALID_NAME or FR_NO_FILE, which the old
+     *      fallback then recovered from by calling f_opendir — but
+     *      it did so only after trying f_open first, and the "0:/"
+     *      case above bypassed the fallback entirely because
+     *      f_open returned FR_OK.
+     *
+     * The fix is to route every directory request to f_opendir up
+     * front, and to normalize root aliases to "0:/" (the only form
+     * f_opendir reliably accepts for the root).
+     *
+     * O_DIRECTORY is 0x10000 on Linux x86_64.
+     */
+    #define O_DIRECTORY 0x10000
+    int wants_dir = (flags & O_DIRECTORY) != 0;
+    int is_root   = path_is_root(local_path);
+
+    if (wants_dir || is_root) {
+        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
+        if (!dir_obj) {
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -1;
+        }
+        const char* dir_path = is_root ? "0:/" : local_path;
+        FRESULT dr = f_opendir(dir_obj, dir_path);
+        if (dr == FR_OK) {
+            slot->kind = FILE_KIND_DIR;
+            slot->obj  = dir_obj;
+            return fd;
+        }
+        kfree(dir_obj);
+        serial_print("sys_open: f_opendir FAIL path=");
+        serial_print(dir_path);
+        serial_print(" dr=");
+        serial_print_dec(dr);
+        serial_print("\n");
+        kfree(slot);
+        self->file_table[fd] = NULL;
+        return -1;
+    }
+
     FIL* file_obj = (FIL*)kmalloc(sizeof(FIL));
     if (!file_obj) {
         kfree(slot);
@@ -326,23 +500,14 @@ long sys_open(const char* path, int flags) {
     }
 
     /*
-     * f_open failed.  Linux open(2) is also used to open directories
-     * — musl's opendir() calls open(path, O_RDONLY|O_DIRECTORY) and
-     * then readdir(), which uses getdents64(2).  Without this branch,
-     * a failed f_open on a directory path returns -1 and musl's
-     * opendir always fails.
-     *
-     * The newlib ls.elf never hit this because it used the
-     * donix-private opendir syscall, which has since been removed.
-     *
-     * O_DIRECTORY is 0x10000 on Linux x86_64.  FR_INVALID_NAME (6)
-     * and FR_NO_FILE (4) are the FatFs codes f_open returns when
-     * asked to open a directory with file semantics.
+     * f_open failed and the caller did not ask for a directory.
+     * Last-resort fallback: the path might be a directory the
+     * caller opened without O_DIRECTORY.  Try f_opendir; if it
+     * works, hand back a directory slot.  FR_INVALID_NAME (6) and
+     * FR_NO_FILE (4) are what FatFs returns when f_open is asked
+     * to open a directory with file semantics.
      */
-    #define O_DIRECTORY 0x10000
-    int wants_dir = (flags & O_DIRECTORY) != 0;
-
-    if (wants_dir || r == FR_INVALID_NAME || r == FR_NO_FILE) {
+    if (r == FR_INVALID_NAME || r == FR_NO_FILE) {
         DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
         if (dir_obj) {
             FRESULT dr = f_opendir(dir_obj, local_path);
@@ -392,6 +557,7 @@ long sys_unlink(const char* path) {
 
     char local_path[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    strip_dot_prefix(local_path);
 
     FRESULT r = f_unlink(local_path);
     if (r != FR_OK) {
@@ -482,8 +648,9 @@ long sys_fstat(int fd, void* user_stat) {
  * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
  *
  * The path is passed straight through to FatFs's f_stat, which
- * accepts the same "0:/NAME" form as f_open.  No normalization
- * needed; sys_open does the same and works.
+ * accepts the same "0:/NAME" form as f_open, after strip_dot_prefix
+ * has removed any leading "./" that musl's lstat()/stat() would
+ * otherwise hand us.
  *
  * Returns 0 on success, -1 on failure.  Like sys_fstat, proper
  * negative errno is deferred until a caller actually inspects it.
@@ -494,6 +661,18 @@ long sys_stat(const char* user_path, void* user_stat) {
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -1;
+    }
+    strip_dot_prefix(path);
+
+    /* ".", "/", "0:", "0:/" — synthesize a root-directory stat.
+     * f_stat would return FR_INVALID_NAME for all of them. */
+    if (path_is_root(path)) {
+        kernel_stat_t st;
+        fill_kstat_as_root(&st);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -1;
+        }
+        return 0;
     }
 
     FILINFO fno;
@@ -509,6 +688,19 @@ long sys_stat(const char* user_path, void* user_stat) {
         return -1;
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 lstat(2) — syscall 6.
+ *
+ * FAT has no symlinks, so lstat and stat are identical.  musl's
+ * lstat() routes to fstatat(AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW)
+ * which, on x86_64, dispatches to __syscall(SYS_lstat, path, &kst).
+ * Without this, busybox falls back and prints the "Unknown syscall:
+ * 6" line we saw during musl_readdir.
+ */
+long sys_lstat(const char* user_path, void* user_stat) {
+    return sys_stat(user_path, user_stat);
 }
 
 // ============================================================
@@ -1430,6 +1622,30 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
     return -(long)ENOTTY;
 }
 
+#define MMAP_BASE 0x8010000000ULL
+#define MMAP_END  0x8010400000ULL   /* 4 MB window, per exec_free_and_unmap_user_pages */
+
+/* Find `rounded` bytes of free VA space in the mmap window.
+ * Returns 0 on failure. */
+static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
+    if (rounded == 0 || rounded > (MMAP_END - MMAP_BASE)) return 0;
+
+    for (uint64_t candidate = MMAP_BASE;
+         candidate + rounded <= MMAP_END;
+         candidate += 0x1000) {
+
+        int all_free = 1;
+        for (uint64_t off = 0; off < rounded; off += 0x1000) {
+            if (vmm_get_phys_from_cr3(self->cr3, candidate + off) != 0) {
+                all_free = 0;
+                break;
+            }
+        }
+        if (all_free) return candidate;
+    }
+    return 0;
+}
+
 /*
  * Linux x86_64 mmap(2) — minimal anonymous implementation.
  *
@@ -1444,7 +1660,6 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
  * MMAP_BASE is 0x8010000000.
  */
 #define ENOMEM 12
-#define MMAP_BASE 0x8010000000ULL
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED     0x10
 
@@ -1462,13 +1677,15 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
     pcb_t* self = process_get_current();
     if (!self) return -(long)ENOMEM;
 
+    uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
+
     uint64_t base;
     if (flags & MAP_FIXED) {
         base = (uint64_t)addr & ~0xFFFULL;
     } else {
-        base = MMAP_BASE;
+        base = mmap_find_free_slot(self, rounded);
+        if (base == 0) return -(long)ENOMEM;
     }
-    uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
 
     for (uint64_t v = base; v < base + rounded; v += 0x1000) {
         uint64_t phys = pmm_alloc_page_for_elf();
@@ -1814,7 +2031,9 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
+        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
+        case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);

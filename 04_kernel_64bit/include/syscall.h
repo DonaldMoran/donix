@@ -25,6 +25,7 @@
 #define SYS_CLOSE           3
 #define SYS_STAT            4
 #define SYS_FSTAT           5
+#define SYS_LSTAT           6
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -38,6 +39,7 @@
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
+#define SYS_FCNTL           72
 #define SYS_UNLINK          87
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
