@@ -54,7 +54,8 @@ Static-link busybox against musl and try running it.
 **Phase A is complete as of `v0.6.0`.**  The kernel speaks Linux
 x86_64 syscalls, the shell is musl, the userland apps are musl,
 newlib has been fully retired from the tree, and the musl userland
-lives in a tracked source tree at `userland/musl/`.  Phase B is next.
+lives in a tracked source tree at `userland/musl/`.  Phase B is
+underway; see Part 2 for the current state.
 
 ## The one critical rule
 
@@ -371,8 +372,43 @@ Apply each only when a specific problem requires it.
     `sizeof(st_atime_sec) < sizeof(time_t)` guard is false.  No
     implementation needed.
   - `SYS_lstat` (6) is only reached via `lstat()` with
-    `AT_SYMLINK_NOFOLLOW`.  Not implemented; if something calls it,
-    it will print `Unknown syscall: 6`.
+    `AT_SYMLINK_NOFOLLOW`.  Now implemented as an alias of
+    `sys_stat`; see below.
+
+- **`sys_stat` / `sys_lstat` must synthesize a stat for the FAT
+  root.**  `f_stat("0:/")`, `f_stat("/")`, and `f_stat(".")` all
+  return `FR_INVALID_NAME`.  musl's `stat()` reaches them via paths
+  of `"0:/"`, `"/"`, `"."`, and busybox's `ls` reaches them via
+  `"."`.  Return a synthetic `S_IFDIR | 0755` stat via
+  `fill_kstat_as_root`.  `sys_lstat` is an alias of `sys_stat`;
+  FAT has no symlinks.
+
+- **User paths need a leading `"./"` stripped before FatFs sees
+  them.**  FatFs accepts `"0:/NAME"`, `"0:NAME"`, and bare
+  `"NAME"`, but rejects `"./NAME"`.  busybox's `ls` builds
+  `"./NAME"` for each directory entry.  `strip_dot_prefix()`
+  peels leading `"./"` and `"/"` in `sys_open`, `sys_stat`, and
+  `sys_unlink`.
+
+- **`sys_open` must route directory requests through `f_opendir`
+  up front.**  `f_open("0:/")` returns `FR_OK` with a `FIL`
+  that is not usable for read or write.  The fix is to check
+  `wants_dir || is_root` before calling `f_open`, not after.
+
+- **`fcntl(2)` is required for `opendir` to succeed.**  musl's
+  `opendir` calls `fcntl(fd, F_SETFD, FD_CLOEXEC)` and treats a
+  failure as fatal.  Without `sys_fcntl`, busybox unwinds into
+  musl's `a_crash()` (a user-mode `hlt`, which raises `#GP`).
+  The minimum viable implementation returns 0 for
+  `F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL` and `-EINVAL` for
+  everything else.
+
+- **`sys_mmap` must not return the same VA for two anonymous
+  mappings.**  The old code returned `MMAP_BASE` unconditionally
+  when `addr == 0`, so a second `mmap` overwrote the first.  The
+  symptom is musl's stdio `FILE` table going inconsistent and
+  `a_crash()` firing on the next lock attempt.  The fix scans
+  the mmap window for a free run of pages.
 
 - **`sys_stat` and `sys_fstat` share `fill_kstat_from_filinfo`.**
   Both construct a FatFs `FILINFO` (from an open `FIL` for `fstat`,
@@ -419,6 +455,13 @@ Apply each only when a specific problem requires it.
   specific investigation.  The normal `./run` path does not set this
   flag; only the `run-debug-log` target does, and that is not on the
   default path.
+- **Busybox is built from `third_party/busybox/` and staged by
+  `userland/musl/Makefile`.**  `third_party/busybox/` is
+  gitignored, like `musl-src/`.  The build is driven by a stamp
+  file (`build/.busybox.stamp`) that has
+  `third_party/busybox/.config` as its only prerequisite, so
+  `make clean` forces a rebuild and a config change forces a
+  rebuild.  See "Musl userland tree" in this file.
 
 ### Musl userland tree (added 2026-09-27, A6)
 
@@ -462,6 +505,21 @@ Apply each only when a specific problem requires it.
   and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
   routing" under "Syscall ABI".  Not on any current test's path.
   Phase B (busybox) may exercise it.
+- **`CONFIG_BUSYBOX` is off** in `third_party/busybox/.config`.
+  Bare `busybox` says "applet not found" instead of printing the
+  applet list.  Fix: enable `CONFIG_BUSYBOX` in that config.
+- **`fcntl` handles only the flags cases.**  `F_DUPFD` returns
+  `-EINVAL`.  busybox `sh` redirection and pipes will need a real
+  dup.
+- **`sys_munmap` is a stub returning 0.**  busybox will eventually
+  call it and expect real unmapping.
+- **`sys_brk` uses a fixed `heap_base = 0x8000200000`.**  Same
+  class of latent bug as the old `sys_mmap` had; no per-process
+  state, no awareness of other allocations.  It hasn't collided
+  with anything yet.
+- **The mmap window is a fixed 4 MB** (`0x8010000000`–
+  `0x8010400000`).  If busybox fills it, the next step is a
+  per-process bump pointer, not a fixed base.
 - **`sys_open` accepts non-directories when called with
   `O_DIRECTORY`.**  `ls 0:/hello-world.txt` prints
   `0 file(s), 0 directory(ies)` and exits 0, instead of failing with
@@ -471,19 +529,12 @@ Apply each only when a specific problem requires it.
   target is actually a directory.  Fix (deferred): after `f_opendir`
   succeeds, check the entry's `fattrib & AM_DIR`; if not set,
   close and return `-ENOTDIR`.
-- **`fcntl` (72) is called by musl's `opendir`.**  musl's `opendir`
-  does `open(path, O_RDONLY|O_DIRECTORY)` then
-  `fcntl(fd, F_SETFD, FD_CLOEXEC)`.  `sys_fcntl` is unimplemented,
-  so the kernel prints `Unknown syscall: 72` and returns `-1`;
-  musl ignores the failure.  Implementing `fcntl` as a minimal
-  stub (return 0 for `F_SETFD`/`F_GETFD`, `-1` for others) would
-  remove the noise.  Deferred.
 - **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
-  seen: 6, 7, 8, 15, 17, 72.  `72` is traced to musl's `opendir`
-  calling `fcntl`.  The others (`6` lstat, `7` mkdir, `8` creat,
-  `15` rt_sigreturn, `17` pread64) have not been traced to a
-  caller yet.  The `readdir` loop still returns the correct count,
-  so the test is green, but the noise is real.
+  seen: 6, 7, 8, 15, 17, 72.  `72` is now implemented as `fcntl`;
+  `6` is now implemented as `sys_lstat`.  The others (`7` mkdir,
+  `8` creat, `15` rt_sigreturn, `17` pread64) have not been traced
+  to a caller yet.  The `readdir` loop still returns the correct
+  count, so the test is green, but the noise is real.
 - **`isr14_handler` halts on user-mode faults.**  The `#PF` handler
   checks only `g_expect_fault`; it does not look at `error_code & 4`
   to distinguish a user-mode fault from a kernel-mode one.  Any
@@ -574,6 +625,7 @@ own date.  Examples:
     20260926-02
     ...
     20260927-01
+    20260927-02
 
 The two-digit zero-padding is required so lexical sort order matches
 chronological order.
@@ -587,7 +639,8 @@ repo once the session's work is consolidated.  Their names and
 commit SHAs are recorded in `migration-tags.txt` (for A1–A5) so the
 mapping survives after the tags are gone.  The A6 working tags were
 deleted without being recorded; the session-11 commit table in Part 2
-is the record.
+is the record.  Session 13's working tags (`20260927-01`,
+`20260927-02`) are recorded in the session 13 commit table below.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, …) are the only tags pushed
 to the remote.  Do not push working tags.
@@ -606,69 +659,55 @@ to the remote.  Do not push working tags.
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Phase B is busybox.**
+`userland/musl/`.  Phase B: busybox `ls` works; `busybox sh` is
+next.**
 
 ---
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-27 (session 12, docs restructure + v0.6.0)
-**Current HEAD:** the docs-restructure commit, on branch `dev`, ahead
-of `origin/dev` by one commit (uncommitted at time of writing).  The
-`v0.6.0` milestone tag is on the previous commit, already published.
-**Last known-good code tag:** `v0.6.0` (published).
+**Last updated:** 2026-09-27 (session 13, Phase B first contact)
+**Current HEAD:** `6ef2bea` (tag `20260927-02`), on branch `dev`,
+two commits ahead of `origin/dev` and three ahead of `v0.6.0`.
+**Last known-good code tag:** `v0.6.0` (published).  Two working
+tags since, both local-only: `20260927-01` (kernel: fcntl, mmap,
+path handling) and `20260927-02` (build: busybox integration).
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Session 12 complete: docs restructure.**
+**Phase B is underway.  busybox runs and `busybox ls` works.**
 
-The five root-level docs have been consolidated to reduce maintenance
-burden.  Historical material moved to `docs/`; the handoff is now the
-only file that changes per session.
+The kernel speaks enough Linux x86_64 syscalls to run a static
+musl busybox through a directory listing, a single-file `ls`, and
+`cat`/`echo`.  The next functional milestone is `busybox sh`.
 
-**Kernel and userland state is functionally identical to `v0.6.0`:**
+**State of the tree:**
 
-- Only Linux x86_64 syscalls plus `SYS_REBOOT` (503) in
-  `syscall_dispatch`.
-- The FAT has 21 entries; every one is a musl build.
-- The boot shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`.  No
-  newlib fallback.
-- `make` produces `kernel.bin` and `userland/musl/build/*.elf`
-  (the latter invoked as a prerequisite of the image).
+- Kernel: Linux x86_64 syscalls plus `SYS_REBOOT` (503).
+- The FAT has **22** entries: the 21 musl builds from A6 plus
+  `BUSYBOX.ELF`.
+- The boot shell is still `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
+  busybox is invoked from it, not in place of it.
+- The existing canary (hello, echo, cat, ls, memtest, musl_* tests)
+  still passes.
 
-The only thing that changed this session is where the documentation
-lives.  No code changed.
+## Session 13 commits, in order
 
-**Next milestone: Phase B (busybox).**  See Part 1's "Phase B"
-section and the "Next step" below.
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-01` | `3ec535f` | kernel: fcntl(2), distinct anonymous mmap VAs, root/`./` path handling. |
+| `20260927-02` | `6ef2bea` | build: busybox integrated into the userland build. |
 
-## Documentation layout (as of this session)
+Both tags are working tags (local-only).  The commit messages have
+the full narrative.
 
-```
-README.md                     project overview, build/run, getting started
-ROADMAP.md                    future work only
-handoff.md                    ← this file; live state, session log
-docs/
-  migration-history.md        A1–A6 narrative, musl build, resolved bugs
-  dons-os-history.md          pre-fork version-by-version story (frozen)
-  CHECKLIST.md                capability list (frozen at v0.6.0)
-  MAINTENANCE.md              known debt (frozen at v0.6.0)
-  LLD_BUG_REPORT.md           Clang/LLD toolchain bugs (live)
-migration-tags.txt            A1–A5 working tag → commit map
-```
-
-The rule going forward: **current state goes in this file; history
-goes in `docs/`.**  When a section of this file becomes historical
-(the way A1–A5 and the resolved bugs just did), move it to the
-appropriate `docs/` file and leave a pointer.
-
-## Session 12 commits, in order
+## Session 12 commits (retained for reference)
 
 | Commit | What |
 |--------|------|
-| *(this commit)* | Docs restructure. README rewritten; ROADMAP trimmed to future-only; `docs/{migration-history,dons-os-history}.md` created; `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` moved from root; handoff trimmed. |
+| `1e98ef6` | Docs restructure.  README rewritten; ROADMAP trimmed to future-only; `docs/{migration-history,dons-os-history}.md` created; `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` moved from root; handoff trimmed. |
 
 ## Session 11 commits (retained for reference)
 
@@ -680,15 +719,23 @@ appropriate `docs/` file and leave a pointer.
 | `20260927-03` | `c346ba0` | A6.24: delete `build_musl_tests.sh`. |
 | `v0.6.0` | `883c4ae` | v0.6.0: version bump and A6 documentation pass. |
 
+Note: the working-tag numbers `20260927-01`/`-02`/`-03` were used
+in session 11 and then reset for session 13.  The names are reused
+because the session-11 tags were deleted.  This is fine for local
+working tags, but the session-11 commit SHAs above are the only
+record of that mapping.
+
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (all green as of `v0.6.0`)
+## Canary state (all green as of `20260927-02`)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
-**21** entries.  All binaries are built from `userland/musl/build/`
+**22** entries.  All binaries are built from `userland/musl/build/`
 with nothing in `/tmp`.
+
+The 19 rows below were already green at `v0.6.0` and remain green:
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -696,7 +743,7 @@ with nothing in `/tmp`.
 | echo hi | green | `hi` |
 | echo a b c d e | green | `a b c d e` |
 | cat hello-world.txt | green | file contents printed |
-| ls | green | 21 files; sizes match the FAT listing; `Unknown syscall: 72` once |
+| ls | green | 22 files; sizes match the FAT listing |
 | memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_stat | green | `STAT-OK` and `STAT2-OK` (both `fstat` and `stat`) |
 | musl_min | green | `MUSL-START` |
@@ -712,16 +759,33 @@ with nothing in `/tmp`.
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
 | musl_sh (boot) | green | appears automatically at `donix> ` after `Shell: booting musl_sh from FAT` |
 
-The pids assigned during the canary depend on the exact sequence of
-commands, since each `sys_execve` in `musl_sh`'s `fork`ed child
-consumes a pid.  The test logic is pid-independent; only the
-`s=`/`r=` values in `musl_wait` are load-bearing, and they match.
+Session 13 additions:
+
+| Test | State | Notes |
+|------|-------|-------|
+| busybox ls | green | 22 entries.  No `Unknown syscall`, no fault. |
+| busybox ls 0:/ | green | same output. |
+| busybox ls 0:/HELLO-WORLD.TXT | green | prints `0:/HELLO-WORLD.TXT`. |
+| busybox cat 0:/HELLO-WORLD.TXT | green | file contents. |
+| busybox echo hi | green | `hi`. |
+| busybox (no args) | **red** | `busybox: applet not found`.  `CONFIG_BUSYBOX` is off in the busybox config, so the bare `busybox` invocation has no banner applet to dispatch to.  Fix: enable `CONFIG_BUSYBOX` in `third_party/busybox/.config`. |
+
+The `Unknown syscall: 72` line that used to appear on every `ls` and
+`musl_readdir` is gone — `fcntl` is now implemented.  The
+`Unknown syscall: 6` line is gone — `sys_lstat` is now implemented.
 
 ## State on disk
 
 - `userland/musl/` — the musl userland source tree (tracked).
   `Makefile`, `apps/*.c` (6), `tests/*.c` (14).  `build/` is
   gitignored.
+- `third_party/busybox/` — the busybox source tree and its
+  `.config`.  Gitignored.  Built from source by
+  `userland/musl/Makefile` on demand; the resulting binary is
+  copied into `userland/musl/build/busybox.elf`.
+- `third_party/busybox-install/` — the busybox `make install`
+  prefix.  Gitignored.  Not used by the build; `userland/musl`
+  copies the binary directly from `third_party/busybox/busybox`.
 - `third_party/musl-src/` and `third_party/musl-install/` — the
   musl source and install trees.  Gitignored.  Rebuild with
   `./toolchain/install_musl.sh`.  Requires network access for the
@@ -736,57 +800,60 @@ consumes a pid.  The test logic is pid-independent; only the
 
 ## Next step (exactly this, then stop)
 
-**Session 13 starts Phase B (busybox).**
+**Session 14 continues Phase B.**
 
-The first Phase B commit is scoped as: **add busybox alongside the
-existing apps, do not touch them.**  Concretely:
+In priority order:
 
-1. Clone busybox into `third_party/busybox/` (gitignored, like
-   `musl-src/`).  Configure with `CONFIG_STATIC=y`, `CC` pointing
-   at `toolchain/musl-gcc.sh`, and `CONFIG_PREFIX` in
-   `third_party/busybox-install/` (also gitignored).
-2. Build.  The result is a static musl-linked `busybox` ELF.
-3. Stage it: copy to `userland/musl/build/busybox.elf`, add that
-   path to `USERLAND_ELFS` in `05_boot_kernel64/Makefile`, and add
-   a matching `mcopy_one` line producing `BUSYBOX.ELF` on the FAT.
-4. `./run`, then from `musl_sh`: `busybox` (no args, to see the
-   usage banner), then `busybox ls` and note the
-   `Unknown syscall: N` output.
+1. **Enable `CONFIG_BUSYBOX`** in `third_party/busybox/.config` so
+   bare `busybox` prints the applet banner.  One-line config
+   change, one build.
 
-Do **not** rename or replace the existing `ls`/`echo`/`cat` yet.
-They are the current canary, and the whole point of this first
-commit is to see what busybox needs without disturbing anything
-that already works.  Naming/dispatch decisions come after busybox
-runs once.
+2. **Try `busybox sh`.**  This is the next functional milestone.
+   It will exercise `fork`, `execve`, `wait4`, pipes, redirection,
+   and `F_DUPFD` (which `sys_fcntl` currently returns `-EINVAL`
+   for).  Expect the first `busybox sh` attempt to need at least
+   `F_DUPFD`.
+
+3. **Add more applets** to the busybox config once `sh` works.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `fcntl` (72) — busybox will call it for `F_SETFD`/`F_GETFD`/
-   `F_DUPFD`.  A minimal stub is ~30 minutes.
-2. `sys_newfstatat` (262) — busybox's `stat` may route through it.
+1. `F_DUPFD` in `fcntl` (72) — busybox `sh` redirection and pipes
+   need a real dup.
+2. `sys_newfstatat` (262) — busybox may route through it once more
+   applets are enabled.
 3. `isr14_handler` — a user-mode `#PF` currently halts the console;
    busybox's first segfault will end the session instead of
    terminating the process.
-4. `sys_open` accepting `O_DIRECTORY` on non-directories.
-5. The `Unknown syscall: N` cluster in `musl_readdir`.
+4. `sys_munmap` — a stub returning 0; busybox will eventually call
+   it and expect real unmapping.
+5. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window — both
+   are latent collisions waiting to happen.
+6. `sys_open` accepting `O_DIRECTORY` on non-directories.
+7. The `Unknown syscall: N` cluster in `musl_readdir`.
 
 See the "Open issues" section in Part 1 for the full list.
 
 **Do not push without a plan.**  `dev` currently carries the A6
-work plus `v0.6.0` plus the docs restructure.  Whether Phase B lands
-on `dev` only, gets merged to `main` at the next milestone, or is
-pushed immediately is a separate decision.  Milestone tags go on
-the published side; the same principle applies to Phase B.
+work plus `v0.6.0` plus the docs restructure plus the two session-13
+Phase B commits.  Whether Phase B lands on `dev` only, gets merged
+to `main` at the next milestone, or is pushed immediately is a
+separate decision.  Milestone tags go on the published side; the
+same principle applies to Phase B.
 
 ## Open items
 
-- **Phase B (busybox):** the next milestone.  See Part 1's
+- **Phase B (busybox):** the current milestone.  See Part 1's
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `fcntl` (72) — minimal stub.
+  - `F_DUPFD` in `fcntl`.
+  - `CONFIG_BUSYBOX` in the busybox config.
   - `sys_newfstatat` (262) — three-way delegation.
   - `isr14_handler` user-mode fault handling.
+  - `sys_munmap` real implementation.
+  - `sys_brk` and the mmap window — per-process state, not fixed
+    bases.
   - `sys_open` `O_DIRECTORY` fix.
   - The `Unknown syscall: N` cluster in `musl_readdir`.
   - `musl_sh` backspace echo (cosmetic).
