@@ -79,17 +79,6 @@ static void dump_fil(const char* tag, FIL* f) {
 #endif
 
 /*
- * Mirrored with apps/include/donsdos.h.  Keep both in sync.
- */
-typedef struct {
-    char     name[256];
-    uint64_t size;
-    uint8_t  attrib;
-    uint8_t  _pad[7];
-} dons_dirent_t;
-
-
-/*
  * Linux x86_64 struct stat, matching musl 1.2.5's layout exactly.
  *
  * Size 144 bytes on x86_64, field offsets verified by compiling
@@ -347,8 +336,8 @@ long sys_open(const char* path, int flags) {
      * a failed f_open on a directory path returns -1 and musl's
      * opendir always fails.
      *
-     * The newlib ls.elf never hit this because it uses the
-     * donix-private SYS_OPENDIR (500) directly.
+     * The newlib ls.elf never hit this because it used the
+     * donix-private opendir syscall, which has since been removed.
      *
      * O_DIRECTORY is 0x10000 on Linux x86_64.  FR_INVALID_NAME (6)
      * and FR_NO_FILE (4) are the FatFs codes f_open returns when
@@ -523,80 +512,6 @@ long sys_stat(const char* user_path, void* user_stat) {
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
         return -1;
     }
-    return 0;
-}
-
-// ============================================================
-// DIRECTORY SYSCALLS (donix-private, 500-range)
-// ============================================================
-long sys_opendir(const char* path) {
-    pcb_t* self = process_get_current();
-    if (!self || !path) return -1;
-
-    char local_path[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
-
-    file_slot_t* slot = NULL;
-    int fd = alloc_file_slot(&slot);
-    if (fd == -1) return -1;
-
-    DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
-    if (!dir_obj) {
-        kfree(slot);
-        self->file_table[fd] = NULL;
-        return -1;
-    }
-
-    FRESULT r = f_opendir(dir_obj, local_path);
-    if (r != FR_OK) {
-        serial_print("sys_opendir: f_opendir FAIL path=");
-        serial_print(local_path);
-        serial_print(" r="); serial_print_dec(r);
-        serial_print("\n");
-        kfree(dir_obj);
-        kfree(slot);
-        self->file_table[fd] = NULL;
-        return -1;
-    }
-
-    slot->kind = FILE_KIND_DIR;
-    slot->obj  = dir_obj;
-    return fd;
-}
-
-long sys_readdir(int dirfd, void* user_dirent) {
-    file_slot_t* slot = get_file_slot(dirfd, FILE_KIND_DIR);
-    if (!slot || !user_dirent) return -1;
-
-    FILINFO fno;
-    FRESULT r = f_readdir((DIR*)slot->obj, &fno);
-    if (r != FR_OK) return -1;
-    if (fno.fname[0] == '\0') return 0;
-
-    dons_dirent_t ent;
-    int i = 0;
-    for (; i < (int)sizeof(ent.name) - 1 && fno.fname[i] != '\0'; i++) {
-        ent.name[i] = fno.fname[i];
-    }
-    ent.name[i] = '\0';
-    ent.size   = (uint64_t)fno.fsize;
-    ent.attrib = (uint8_t)fno.fattrib;
-    for (int j = 0; j < 7; j++) ent._pad[j] = 0;
-
-    if (safe_copy_to_user(user_dirent, &ent, sizeof(ent)) != 0) return -1;
-    return 1;
-}
-
-long sys_closedir(int dirfd) {
-    file_slot_t* slot = get_file_slot(dirfd, FILE_KIND_DIR);
-    if (!slot) return -1;
-
-    f_closedir((DIR*)slot->obj);
-    kfree(slot->obj);
-
-    pcb_t* self = process_get_current();
-    self->file_table[dirfd] = NULL;
-    kfree(slot);
     return 0;
 }
 
@@ -2011,9 +1926,6 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
 
         /* --- donix-private numbers (500+) --- */
-        case SYS_OPENDIR:         return (uint64_t)sys_opendir((const char*)arg0);
-        case SYS_READDIR:         return (uint64_t)sys_readdir((int)arg0, (void*)arg1);
-        case SYS_CLOSEDIR:        return (uint64_t)sys_closedir((int)arg0);
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
         case SYS_ARCH_SET_FS:     sys_arch_set_fs((void*)arg0); return 0;
         case SYS_DONIX_SBRK:      return (uint64_t)sys_sbrk((long)arg0);

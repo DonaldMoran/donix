@@ -11,10 +11,9 @@
  * with a Linux syscall musl uses is at that Linux number.
  *
  * Numbers 500+ are donix-private.  They are for syscalls that
- * exist only in donix and have no Linux equivalent: directory
- * streaming (opendir/readdir/closedir), the reboot hook, and
- * the newlib-only arch_set_fs.  musl never calls these; only
- * the newlib userland (arc2/syscalls.c) does.
+ * exist only in donix and have no Linux equivalent: the reboot
+ * hook and the newlib-only arch_set_fs.  musl never calls these;
+ * only the newlib userland (arc2/syscalls.c) does.
  * ============================================================ */
 
 /* --- Linux x86_64 numbers, implemented --- */
@@ -48,24 +47,9 @@
 #define SYS_RSEQ            334
 
 /* --- donix-private numbers (500+) --- */
-#define SYS_OPENDIR     500
-#define SYS_READDIR     501
-#define SYS_CLOSEDIR    502
 #define SYS_REBOOT      503
 #define SYS_ARCH_SET_FS 504
 #define SYS_DONIX_SBRK  505
-
-/* ============================================================
- * Argument conventions for the donix-private syscalls
- *
- *   sys_opendir(path)          -> handle (>= 3), or -1
- *   sys_readdir(h, dirent)     -> 1 on entry, 0 on end, -1 on error
- *   sys_closedir(h)            -> 0 on success, -1 on error
- *
- * struct dons_dirent is defined in apps/include/donsdos.h on the
- * userland side, and mirrored in user_syscall.c so the kernel can
- * size the safe_copy_to_user.  Keep the two definitions in sync.
- * ============================================================ */
 
 /*
  * SYS_EXECVE (59) — Linux execve.
@@ -107,8 +91,5 @@ long sys_unlink(const char* path);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
-long sys_opendir(const char* path);
-long sys_readdir(int dirfd, void* user_dirent);
-long sys_closedir(int dirfd);
 
 #endif
