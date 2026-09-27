@@ -104,7 +104,7 @@ OBJS = entry.o ring3_entry.o kmain.o pmm.o vmm.o heap.o idt.o interrupts.o \
 	idt_load.o isr.o vga.o keyboard.o serial.o tss.o gdt.o \
 	elf.o test_program_data.o \
 	user_syscall.o user_syscall_entry.o process.o string.o scheduler.o \
-	context_switch.o user_shell_data.o ata.o \
+	context_switch.o ata.o \
 	fatfs/ff.o fatfs/ffunicode.o fatfs/diskio.o
 
 kernel.elf: $(OBJS)
@@ -157,14 +157,6 @@ test_program: test_program.o user_linker.ld
 
 test_program.o: test_program.asm
 	$(AS) -f elf64 test_program.asm -o test_program.o
-
-# ============================================================
-# USER SHELL (embedded ELF blob)
-# ============================================================
-user_shell_data.o: user_shell_data.c
-	sed -i 's/unsigned char build_user_shell_elf/__attribute__((section(".userelf"))) unsigned char build_user_shell_elf/' user_shell_data.c
-	sed -i 's/unsigned int build_user_shell_elf_len/const unsigned int build_user_shell_elf_len/' user_shell_data.c
-	$(CC) $(USER_CFLAGS) -c user_shell_data.c -o user_shell_data.o
 
 # ============================================================
 # ASSEMBLY RULES
@@ -234,8 +226,6 @@ user_syscall.o: user_syscall.c
 # ============================================================
 clean:
 	rm -f *.o *.bin *.elf *.d test_program test_program.bin test_program_data.c
-	rm -f user_shell.elf user_shell_data.c
-	rm -f user_shell.bin
 	rm -f fatfs/*.o fatfs/*.d
 	$(MAKE) -C $(USERLAND_DIR) clean
 

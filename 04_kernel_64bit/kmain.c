@@ -25,8 +25,6 @@
 extern void pit_init(uint32_t freq);
 extern unsigned char test_program[];
 extern unsigned int test_program_len;
-extern unsigned char build_user_shell_elf[];
-extern unsigned int build_user_shell_elf_len;
 
 static BootInfo *g_bootinfo = NULL;
 
@@ -222,7 +220,7 @@ static int test_fat_mount(void);
 static int test_fat_ls(void);
 
 /* Forward declaration: defined below kmain_shell_loop, called from
- * handle_command (the usershell and elfload commands) and kmain. */
+ * handle_command (the elfload command) and kmain. */
 static uint64_t load_elf_into_user_process(pcb_t* pcb, const void* elf_data);
 
 /* =====================================================================
@@ -918,7 +916,7 @@ static void handle_command(const char *cmd) {
     }
 
     if (strcmp(cmd, "help") == 0) {
-        vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield, usershell,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
+        vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
         vga_clear(); vga_print("DonsDOS v0.5.4\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
@@ -1048,20 +1046,6 @@ static void handle_command(const char *cmd) {
             PRINT_BOTH("  Status   : FAILED\n");
             if (p1) process_destroy(p1);
             if (p2) process_destroy(p2);
-        }
-        vga_print("> ");
-    } else if (strcmp(cmd, "usershell") == 0) {
-        if (build_user_shell_elf_len == 0) { vga_print("Shell unmapped.\n> "); return; }
-        pcb_t* shell_proc = process_create("usershell", 0x8000000000ULL, 0);
-        if (shell_proc) {
-            uint64_t user_entry =
-                load_elf_into_user_process(shell_proc, build_user_shell_elf);
-            if (user_entry != 0) {
-                keyboard_buffer_flush();
-                scheduler_ready_queue_add(shell_proc);
-                suspend_self_for_diagnostic();
-                scheduler_switch_to(shell_proc);
-            } else { process_destroy(shell_proc); }
         }
         vga_print("> ");
     } else if (strcmp(cmd, "gdtdump") == 0) {
@@ -1359,52 +1343,41 @@ void kmain(BootInfo *info) {
 
     /*
      * Default boot shell: musl_sh, loaded from the FAT as
-     * 0:/MUSL_SH.ELF.  Fallback: the embedded newlib shell
-     * (build_user_shell_elf), used if the FAT read fails, the file
-     * is missing, or the ELF load fails.
+     * 0:/MUSL_SH.ELF.
      *
-     * The fallback keeps a working console even if the FAT image is
-     * misbuilt or the FAT mount failed earlier in kmain; the newlib
-     * shell is still embedded in the kernel for exactly this reason
-     * (see A3 in handoff.md).  Retiring it is A5 work.
+     * The embedded newlib shell fallback was removed at A5 step 6.
+     * If the FAT read fails, the file is missing, or the ELF load
+     * fails, there is no second shell to fall back to; the kernel
+     * panics with a clear message instead of dropping to a console
+     * that cannot accept commands.
      */
-    extern uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data);
-
-    const void* shell_elf = build_user_shell_elf;
-    uint8_t*    shell_elf_buf = NULL;
-
-    if (build_user_shell_elf_len == 0) {
-        serial_print("WARN: embedded shell missing, relying on FAT shell\n");
-    }
-
     {
         size_t fat_len = 0;
         uint8_t* fat_buf = load_file_to_buffer("0:/MUSL_SH.ELF", &fat_len);
-        if (fat_buf) {
-            shell_elf     = fat_buf;
-            shell_elf_buf = fat_buf;
-            serial_print("Shell: booting musl_sh from FAT\n");
-        } else {
-            if (build_user_shell_elf_len == 0) {
-                serial_print("PANIC: no shell available\n");
-                while (1) asm volatile("hlt");
-            }
-            serial_print("Shell: musl_sh unavailable, using embedded newlib shell\n");
+        if (!fat_buf) {
+            serial_print("PANIC: 0:/MUSL_SH.ELF not loadable; no shell available\n");
+            while (1) asm volatile("hlt");
         }
+
+        serial_print("Shell: booting musl_sh from FAT\n");
+
+        pcb_t* shell = process_create("musl_sh", 0x400000ULL, 0);
+        if (!shell) {
+            serial_print("PANIC: no shell PCB\n");
+            kfree(fat_buf);
+            while (1) asm volatile("hlt");
+        }
+
+        uint64_t shell_entry = load_elf_into_user_process(shell, fat_buf);
+        kfree(fat_buf);
+
+        if (shell_entry == 0) {
+            serial_print("PANIC: musl_sh ELF load failed\n");
+            while (1) asm volatile("hlt");
+        }
+
+        scheduler_ready_queue_add(shell);
     }
 
-    pcb_t* shell = process_create("usershell", 0x8000000000ULL, 0);
-    if (!shell) {
-        serial_print("PANIC: no shell PCB\n"); while (1) asm volatile("hlt");
-    }
-
-    uint64_t shell_entry = load_elf_into_user_process(shell, shell_elf);
-    if (shell_elf_buf) { kfree(shell_elf_buf); }
-
-    if (shell_entry == 0) {
-        serial_print("PANIC: shell load failed\n"); while (1) asm volatile("hlt");
-    }
-
-    scheduler_ready_queue_add(shell);
     kernel_idle_loop();
 }
