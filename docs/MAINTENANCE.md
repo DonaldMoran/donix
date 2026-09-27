@@ -1,10 +1,16 @@
+> **Frozen at v0.6.0.** This is the historical record of known debt,
+> latent bugs, and maintenance work as it stood at the end of the musl
+> migration. The still-open items have been lifted into
+> [`../handoff.md`](../handoff.md), which is the live document. Do not
+> edit this file; file new debt in the handoff.
+
 # MAINTENANCE
 ### donix (x86_64) — Known Debt, Latent Bugs, and Maintenance Work
 
 This document lists everything that is *known to be unfinished, fragile,
 or debt-laden* in the current codebase, but which is not a feature. It is
 the counterpart to `ROADMAP.md` (which lists features) and
-`OSDev_Checklist.md` (which tracks capability). If a thing is wrong, or
+`CHECKLIST.md` (which tracks capability). If a thing is wrong, or
 fragile, or will bite later, it belongs here.
 
 Items are ordered by priority: do the ones at the top first. Effort is a
@@ -23,7 +29,7 @@ or removed during the musl migration (A1–A5). See
 ## 0. donix — musl migration open items
 
 The A1–A6 migration (see [`ROADMAP.md`](ROADMAP.md) §0 and
-[`OSDev_Checklist.md`](OSDev_Checklist.md) §0) fixed the six bugs it
+[`CHECKLIST.md`](CHECKLIST.md) §0) fixed the six bugs it
 surfaced (see §7 below for the record). The items in this section are
 the loose ends the migration left behind, or the small syscall gaps
 that the next milestone (busybox, Phase B) will hit.
@@ -534,7 +540,7 @@ natural companion to the fix, not a prerequisite — the fix is done and
 verified, the ELF-loader change is a separate, optional enhancement.
 
 **Claims in the other docs.**  `README.md`, `ROADMAP.md`, and
-`OSDev_Checklist.md` describe NX as supported.  With `enable_nx()` in
+`CHECKLIST.md` describe NX as supported.  With `enable_nx()` in
 place, that is now accurate at the hardware level, not just at the
 software level.
 
@@ -935,7 +941,7 @@ a NULL, then `envp[]`, then a NULL, then strings), and set the initial
 `rsp` to point at `argc` rather than at `user_stack_top`.~~
 
 **What actually happened:** this item was resolved as a side effect of
-the musl migration. Item A7.5 in [`OSDev_Checklist.md`](OSDev_Checklist.md)
+the musl migration. Item A7.5 in [`CHECKLIST.md`](CHECKLIST.md)
 records the `%rdi`/`%rsi` write; item A7.6 records the argv layout
 correction. See §0.6 for the follow-up (removing the now-unnecessary
 `%rdi`/`%rsi` writes).
@@ -1536,7 +1542,7 @@ truth.
 | `execve`'s argv layout zeroed `argv[1]` | `20260926H` | The envp NULL terminator's slot was on top of `argv[0]`'s string. Fixed by putting `strings_start` 8 bytes higher. |
 
 See [`handoff.md`](handoff.md) "Resolved bugs" for the full entries
-and [`OSDev_Checklist.md`](OSDev_Checklist.md) §0.7 for the itemized
+and [`CHECKLIST.md`](CHECKLIST.md) §0.7 for the itemized
 list.
 
 ---
@@ -1558,7 +1564,7 @@ If you find a new problem, add it here with the same format. The point
 is to keep the list of "things we know we're wrong about" honest and short.
 
 Feature work goes in `ROADMAP.md`. Capability tracking goes in
-`OSDev_Checklist.md`. Debt and maintenance go here.
+`CHECKLIST.md`. Debt and maintenance go here.
 
 *Last Updated: September 2026 (donix v0.6.0)*
 
