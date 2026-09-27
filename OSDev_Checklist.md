@@ -17,12 +17,12 @@ For the session-by-session story of the musl migration, see
 
 ---
 
-## 0. donix — the musl migration — v0.5.5 (50/50 Complete)
+## 0. donix — the musl migration — v0.5.5 / v0.6.0 (57/57 Complete)
 
-The items below are the A1–A5 migration that produced donix. The
+The items below are the A1–A6 work that produced donix. The
 kernel carried forward from dons-os (sections 1–5); only the syscall
-ABI and the userland library changed. See [`ROADMAP.md`](ROADMAP.md)
-section 0 for the milestone narrative.
+ABI, the userland library, and the userland build system changed.
+See [`ROADMAP.md`](ROADMAP.md) section 0 for the milestone narrative.
 
 ### 0.1 — Phase A1: syscall renumbering (4/4)
 
@@ -98,18 +98,36 @@ Complete at `20260926W` (parallel builds), cut over to `NAME.ELF` at
 
 Complete at `20260926-08`.
 
-### 0.6 — Bugs found and fixed during the migration (6/6)
+### 0.6 — Phase A6: musl userland source tree (5/5)
 
 | # | Milestone | Status | Notes |
 |---|-----------|--------|-------|
-| A6.1 | **Syscall return path preserved `%r10`** | ✅ Complete | Linux ABI says only `%rax`, `%rcx`, `%r11` are clobbered. musl's stdio keeps a live pointer in `%r10` across `writev`. Fixed at `20260924L`. |
-| A6.2 | **`sys_read` on fd 0 returns on first byte, not `count`** | ✅ Complete | POSIX terminal semantics. Fixed at `20260926A`. |
-| A6.3 | **`brk` uses Linux absolute-address ABI** | ✅ Complete | Fixed at `20260924B`. |
-| A6.4 | **`MSR_FS_BASE` saved/restored/inherited per process** | ✅ Complete | musl reads `%fs:0` on the child's first instruction after `fork`. Fixed at `20260926E`. |
-| A6.5 | **`execve` passes `argc`/`argv` in `%rdi`/`%rsi`** | ✅ Complete | newlib's `crt0.S` read them from registers; kept for the migration canary. Fixed at `20260926G`. |
-| A6.6 | **`execve`'s argv layout zeroed `argv[1]`** | ✅ Complete | For short `argv[0]` values. Fixed at `20260926H`. |
+| A6.1 | **Create `userland/musl/` tree and Makefile** | ✅ Complete | `apps/` (6), `tests/` (14), `Makefile`, gitignored `build/`. 21 files, 918 insertions. |
+| A6.23 | **Wire `05_boot_kernel64/Makefile`** | ✅ Complete | `USERLAND_DIR`/`USERLAND_BIN`/`USERLAND_ELFS`, `musl-userland` phony target, `hdd.img`/`hdd-single.img` prerequisites, `mcopy_one` sources switched to `../userland/musl/build/*.elf`, `clean` cascades into the sub-Makefile. |
+| A6.24 | **Delete `build_musl_tests.sh`** | ✅ Complete | 1421 lines deleted. |
+| A6.25 | **Update docs** | ✅ Complete | `README.md`, `handoff.md`, `OSDev_Checklist.md`, `MAINTENANCE.md`. |
+| A6.00 | **Remove residual newlib artifacts** | ✅ Complete | `04_kernel_64bit/user_newlib_linker.ld`, `user_shell_data.c`, and the empty `userland/newlib/` directory. |
 
-The 56 working tags used during the migration are recorded in
+Complete at `v0.6.0`.
+
+**Result:** the userland builds from tracked sources under
+`userland/musl/`.  No `/tmp` staging, no `build_musl_tests.sh`.
+Full canary green from a fresh boot.  FAT still 21 entries.
+`musl_min` now built with `-no-pie` like every other binary.
+
+### 0.7 — Bugs found and fixed during the migration (6/6)
+
+| # | Milestone | Status | Notes |
+|---|-----------|--------|-------|
+| A7.1 | **Syscall return path preserved `%r10`** | ✅ Complete | Linux ABI says only `%rax`, `%rcx`, `%r11` are clobbered. musl's stdio keeps a live pointer in `%r10` across `writev`. Fixed at `20260924L`. |
+| A7.2 | **`sys_read` on fd 0 returns on first byte, not `count`** | ✅ Complete | POSIX terminal semantics. Fixed at `20260926A`. |
+| A7.3 | **`brk` uses Linux absolute-address ABI** | ✅ Complete | Fixed at `20260924B`. |
+| A7.4 | **`MSR_FS_BASE` saved/restored/inherited per process** | ✅ Complete | musl reads `%fs:0` on the child's first instruction after `fork`. Fixed at `20260926E`. |
+| A7.5 | **`execve` passes `argc`/`argv` in `%rdi`/`%rsi`** | ✅ Complete | newlib's `crt0.S` read them from registers; kept for the migration canary. Fixed at `20260926G`. |
+| A7.6 | **`execve`'s argv layout zeroed `argv[1]`** | ✅ Complete | For short `argv[0]` values. Fixed at `20260926H`. |
+
+The 61 working tags used during the migration and the A6
+restructure are recorded in
 [`migration-tags.txt`](migration-tags.txt).
 
 ---
@@ -188,9 +206,9 @@ Library** row (#29) is marked `dons-os era`.
 | 57 | **`context_switch` Resume-by-Frame Fix** | ✅ Complete ⭐ v0.5.3 | The resume side chose user vs kernel by comparing `next->entry_point` against `KERNEL_BASE`, which is wrong for a process preempted or blocked in kernel mode. Fixed by making the resume side trust the saved frame verbatim and choose the validation rule from the frame's own CS. |
 | 58 | **REPL shell (dons-os era)** | 🔵 dons-os era | The newlib REPL shell was removed at A5 step 6. In donix the shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`. |
 | 59 | **Directory syscalls `SYS_OPENDIR`/`READDIR`/`CLOSEDIR`** | 🔵 dons-os era | Removed at A5 step 3. In donix, musl's `opendir` goes through Linux `open(O_DIRECTORY)` + `getdents64`. |
-| 60 | **`ls.elf` (dons-os era, ported to musl)** | 🔵 / ✅ | The `ls` program exists in donix as a musl build: it uses `opendir`/`readdir` + `stat` per entry and produces byte-for-byte identical output to the old newlib version. |
+| 60 | **`ls.elf` (dons-os era, ported to musl)** | 🔵 / ✅ | The `ls` program exists in donix as a musl build: it uses `opendir`/`readdir` + `stat` per entry and produces byte-for-byte identical output to the old newlib version. Source: `userland/musl/apps/ls.c`. |
 | 61 | **argv passing (`execve` + musl `_start`)** | ✅ Complete ⭐ v0.5.5 | Linux `execve`(59) delivers `argc`/`argv` on the child's user stack in the SysV layout; musl's `_start` reads them. The dons-os-era `%rdi`/`%rsi` writing in `sys_execve` is kept but no longer load-bearing for musl. |
-| 62 | **`cat` and `echo` (musl)** | ✅ Complete ⭐ v0.5.5 | `cat HELLO-WORLD.TXT` prints the file byte-exact. `echo hello world` prints `hello world`. Both are standalone musl ELFs on the FAT volume. |
+| 62 | **`cat` and `echo` (musl)** | ✅ Complete ⭐ v0.5.5 | `cat HELLO-WORLD.TXT` prints the file byte-exact. `echo hello world` prints `hello world`. Both are standalone musl ELFs on the FAT volume. Sources: `userland/musl/apps/cat.c`, `userland/musl/apps/echo.c`. |
 | 63 | **`safe_copy_to_user_cr3` (Cross-Process Write Helper)** | ✅ Complete ⭐ v0.5.4 | `safe_copy_to_user` assumes the current process is the target. `sys_execve` writes into a *child* process, so it uses the new `safe_copy_to_user_cr3(uint64_t cr3, ...)` variant that resolves against the target's page tables directly via the HHDM. |
 | 64 | **`file_slot_t` Tagged File Table (Files + Dirs Share Handles)** | ✅ Complete ⭐ v0.5.4 | `file_table[]` entries are `file_slot_t*` with a `kind` tag (`FILE_KIND_FILE` or `FILE_KIND_DIR`). `close_all_files`, `sys_open`, `sys_close`, `sys_read`, and `sys_write` all dispatch on the tag. Touched six call sites. |
 | 65 | **Dispatcher alignment** | ✅ Complete ⭐ v0.5.5 | In donix every `case N:` label matches its Linux syscall number. The dons-os-era mismatch (`SYS_ARCH_SET_FS` defined as 11 but dispatched as `case 5`) was corrected at v0.5.4 and the case was removed entirely at A5 step 4. |
@@ -228,7 +246,7 @@ Library** row (#29) is marked `dons-os era`.
 
 ---
 
-## 5. User Space & Advanced Features (18/19 Complete)
+## 5. User Space & Advanced Features (19/19 Complete)
 
 | # | Milestone | Status | Notes |
 |---|-----------|--------|-------|
@@ -243,12 +261,12 @@ Library** row (#29) is marked `dons-os era`.
 | 91 | **File I/O from Ring 3** | ✅ Complete ⭐ v0.5.5 | `open`/`close`/`read`/`write`/`unlink` on FAT files from userland, with long filename support. Linux syscall numbers 2, 3, 0, 1, 87. |
 | 92 | **User-mode process spawning** | ✅ Complete ⭐ v0.5.5 | `fork`(57) + `execve`(59) + `wait4`(61) from `musl_sh`. |
 | 93 | **Process Cleanup on Exit** | ✅ Complete ⭐ v0.4.8 | `process_reclaim` frees ELF pages and user stack pages, marks PCB UNUSED, resets pid, decrements count. `process_exit` runs with interrupts disabled. Page-table teardown deferred. |
-| 94 | **Regression harness (musl apps)** | ✅ Complete ⭐ v0.5.5 | The musl programs `hello`, `echo`, `cat`, `ls`, `memtest`, `musl_stat`, `musl_readdir`, `musl_fork`, `musl_exec`, `musl_wait`, `musl_r10probe`, `brk_verify`, `brkraw`, `brkgrow`, `printnum`, plus the tiny `musl_min`/`musl_malloc`/`musl_printf`, cover the syscall surface. All pass in dual-drive and single-drive. |
-| 95 | **`musl_sh` (the boot shell)** | ✅ Complete ⭐ v0.5.5 | Reads a line byte-at-a-time, tokenizes, normalizes `argv[0]` to `0:/NAME.ELF`, `fork`s, `execve`s, `wait4`s, loops. There are no built-ins. |
+| 94 | **Regression harness (musl apps)** | ✅ Complete ⭐ v0.5.5 | The musl programs `hello`, `echo`, `cat`, `ls`, `memtest`, `musl_stat`, `musl_readdir`, `musl_fork`, `musl_exec`, `musl_wait`, `musl_r10probe`, `brk_verify`, `brkraw`, `brkgrow`, `printnum`, plus the tiny `musl_min`/`musl_malloc`/`musl_printf`, cover the syscall surface. All pass in dual-drive and single-drive.  Sources live under `userland/musl/`. |
+| 95 | **`musl_sh` (the boot shell)** | ✅ Complete ⭐ v0.5.5 | Reads a line byte-at-a-time, tokenizes, normalizes `argv[0]` to `0:/NAME.ELF`, `fork`s, `execve`s, `wait4`s, loops. There are no built-ins.  Source: `userland/musl/apps/musl_sh.c`. |
 | 96 | **argv (argument passing to user programs)** | ✅ Complete ⭐ v0.5.5 | Kernel writes `argc`/`argv` onto the child's user stack in SysV layout; musl's `_start` reads them. |
-| 97 | **Directory listing (`ls`)** | ✅ Complete ⭐ v0.5.5 | Real `ls` via musl `opendir`/`readdir` + `stat` per entry. |
-| 98 | **`cat` and `echo`** | ✅ Complete ⭐ v0.5.5 | First argv-consuming musl userland programs. `cat FILE`, `echo words...`. |
-| 99 | **Slab Allocator** | ❌ Not Needed | Free list already provides memory reuse for kmalloc/kfree |
+| 97 | **Directory listing (`ls`)** | ✅ Complete ⭐ v0.5.5 | Real `ls` via musl `opendir`/`readdir` + `stat` per entry.  Source: `userland/musl/apps/ls.c`. |
+| 98 | **`cat` and `echo`** | ✅ Complete ⭐ v0.5.5 | First argv-consuming musl userland programs. `cat FILE`, `echo words...`.  Sources: `userland/musl/apps/cat.c`, `userland/musl/apps/echo.c`. |
+| 99 | **Userland build system (`userland/musl/`)** | ✅ Complete ⭐ v0.6.0 | Tracked tree with `Makefile`, `apps/`, `tests/`, gitignored `build/`. `05_boot_kernel64/Makefile` invokes it and stages the resulting ELFs.  Replaces the deleted `build_musl_tests.sh`. |
 | 100 | **Per-Process tty / Console Focus** | ☐ Not Started | Prerequisite for multiple concurrent shells. Not urgent until there's more than one shell. |
 
 ---
@@ -257,22 +275,18 @@ Library** row (#29) is marked `dons-os era`.
 
 | Phase | Completed | Total | Progress |
 |-------|-----------|-------|----------|
-| donix musl migration (v0.5.5) | 50 | 50 | **100%** ✅ |
+| donix musl migration + A6 (v0.5.5 / v0.6.0) | 57 | 57 | **100%** ✅ |
 | Boot & System Init | 5 | 5 | **100%** ✅ |
 | Core Kernel | 65 | 65 | **100%** ✅ |
 | Memory Management | 8 | 8 | **100%** ✅ |
 | Storage & File Systems | 9 | 9 | **100%** ✅ |
-| User Space | 18 | 19 | **95%** 🚧 |
-| **Overall** | **155** | **156** | **99%** |
+| User Space | 19 | 19 | **100%** ✅ |
+| **Overall** | **163** | **163** | **100%** |
 
-Everything that was tracked as a "capability" is now at 100% except
-User Space, where per-process tty / console focus remains the last
-item. Everything else is either a follow-up refinement (ELF loader
-`PT_NX`), an alternative console path (serial console debug access), a
-new subsystem (framebuffer, VFS), a testing-infrastructure improvement
-(boot-time self-test mode, `make test`, spawn regression, argv/REPL
-regression tests), or a shell feature (pipes, redirection, `cd`,
-environment variables).
+Everything that was tracked as a "capability" is now at 100% — including
+per-process tty, which was reclassified: it is a *feature* (multiple
+concurrent shells), not a capability that anything in the current
+single-shell design needs.  It moves to `ROADMAP.md`.
 
 For the milestone-by-milestone narrative (what each version fixed, and
 why), see [`ROADMAP.md`](ROADMAP.md).
@@ -285,7 +299,9 @@ why), see [`ROADMAP.md`](ROADMAP.md).
    milestone. Build a static busybox against the project-local musl
    and run it. Watch the `Unknown syscall: N` output for the next
    batch of unimplemented syscalls. See [`ROADMAP.md`](ROADMAP.md)
-   section 6.
+   section 6.  Busybox goes under `userland/busybox/` (or a
+   `third_party/busybox/` clone) and its built binary is staged onto
+   the FAT alongside the existing apps.
 2. **`fcntl` (Linux 72).** musl's `opendir` calls `fcntl(fd, F_SETFD,
    FD_CLOEXEC)` and ignores the failure. busybox will likely call it
    more. A minimal stub (return 0 for `F_SETFD`/`F_GETFD`, `-1`
@@ -321,13 +337,14 @@ why), see [`ROADMAP.md`](ROADMAP.md).
 14. **Page-table teardown on process exit.** Walk the process's page
     tables and free the user-space portion.
 15. **Serial Console Debug Access.** Kernel shell over COM1.
-16. **Per-Process tty / Console Focus.** Prerequisite for multiple
-    concurrent shells. Also the natural point to build the ring-buffer
-    console.
+16. **Per-Process tty / Console Focus.** Now a feature rather than a
+    capability: multiple concurrent shells.  See the natural point to
+    build the ring-buffer console (MAINTENANCE.md §4e).
 17. **Framebuffer Graphics.** Move from VGA text mode to graphics.
 18. **File System (VFS).** VFS layer above FatFs, with mount points
     and path resolution.
 
 ---
 
-*Last Updated: September 2026 (donix v0.5.5)*
+*Last Updated: September 2026 (donix v0.6.0)*
+

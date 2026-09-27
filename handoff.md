@@ -1,5 +1,3 @@
-# donix — Handoff
-
 This file is both the project strategy and the current session status.
 Read it top to bottom when starting a new session. Update the "Session
 Status" section at the end of every session.
@@ -42,9 +40,10 @@ musl arrives.
 
 Static-link busybox against musl and try running it.
 
-**Phase A is complete as of `20260926-08`.**  The kernel speaks Linux
-x86_64 syscalls, the shell is musl, the userland apps are musl, and
-newlib has been fully retired from the tree.  Phase B is next.
+**Phase A is complete as of `v0.6.0`.**  The kernel speaks Linux
+x86_64 syscalls, the shell is musl, the userland apps are musl,
+newlib has been fully retired from the tree, and the musl userland
+lives in a tracked source tree at `userland/musl/`.  Phase B is next.
 
 ## The one critical rule
 
@@ -159,16 +158,15 @@ that calls `wait4` after `fork`/`execve` will naturally serialize
 parent and child output.  Adopt that pattern from the start.
 
 **Progress at `20260926D`.**  A minimal musl shell (`musl_sh`) now
-exists, bootstrapped through `build_musl_tests.sh` and wired into
-the image build (see "musl test binaries" under Testing harness).  It
-is launched manually from the newlib shell (`musl_sh.elf` at the `] `
-prompt) and takes over the console.  It does `fork` + `execve` +
-`wait4` and the `wait4` correctly serializes parent and child output.
-It reads a line byte-at-a-time and echoes as typed.  Command paths
-must be fully qualified (`0:/NAME.ELF`); it does not yet do the
-newlib shell's `0:/` + `.ELF` normalization.  It does not tokenize
-its command line; the whole line is passed as `argv[0]` and as the
-`execve` path.
+exists, bootstrapped through the (now-deleted) heredoc build script and
+wired into the image build.  It is launched manually from the newlib
+shell (`musl_sh.elf` at the `] ` prompt) and takes over the console.
+It does `fork` + `execve` + `wait4` and the `wait4` correctly
+serializes parent and child output.  It reads a line byte-at-a-time
+and echoes as typed.  Command paths must be fully qualified
+(`0:/NAME.ELF`); it does not yet do the newlib shell's `0:/` + `.ELF`
+normalization.  It does not tokenize its command line; the whole line
+is passed as `argv[0]` and as the `execve` path.
 
 **Unblocked at `20260926E`.**  The second-`execve` fatal fault was
 **not** page-table corruption, as the previous session suspected.
@@ -289,6 +287,47 @@ green after every step.
 - The only boot shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
 - `make` produces `kernel.bin` only.  No recursive userland build.
 
+### A6 — musl userland source tree (complete at `v0.6.0`)
+
+Move the musl userland out of the heredoc-based build script and
+into a tracked source tree at `userland/musl/`.  This is a pure
+restructure: the C sources do not change, and the binaries on the
+FAT behave identically to before.
+
+**Why it was needed.**  Every musl ELF was previously a heredoc
+inside a single ~1400-line shell script.  The script wrote each
+source to `/tmp/*.c`, compiled it to `/tmp/*.elf`, and the image
+Makefile copied the results onto the FAT.  That worked for the
+migration but does not scale: adding a program meant another
+50-line heredoc, and the sources were never tracked as real files.
+Phase B (busybox) needs a real source tree.
+
+**What changed.**  See Part 2's session 11 notes.  In summary:
+
+- A new tracked tree at `userland/musl/` with `apps/`, `tests/`,
+  `Makefile`, and a gitignored `build/` output directory.
+- `userland/musl/Makefile` builds every `.c` into `build/*.elf`
+  with `-static -no-pie -O2 -mcmodel=large`.
+- `05_boot_kernel64/Makefile` invokes `make -C ../userland/musl`
+  before staging the FAT, and copies `../userland/musl/build/*.elf`
+  onto it.  No `/tmp` staging, no separate build script.
+- The old heredoc build script is deleted.
+- Residual newlib artifacts in `04_kernel_64bit/`
+  (`user_newlib_linker.ld`, `user_shell_data.c`, the empty
+  `userland/newlib/` directory) removed in a separate cleanup
+  commit.
+
+**Verified.**  The full canary runs green from a fresh boot with
+nothing in `/tmp`, from the new pipeline.  The FAT still has 21
+entries, all musl builds, all correct sizes.
+
+**`musl_min` note.**  The old script built `musl_min` without the
+explicit `-no-pie` flag (an inconsistency documented in the old
+"Cosmetic" section).  The new Makefile builds it uniformly with
+`-no-pie`, like every other binary.  `readelf -h` confirms
+`Type: EXEC` and `Entry point 0x40022b` for the new build; the FAT
+copy runs `MUSL-START` cleanly.  The inconsistency is resolved.
+
 ## musl build
 
 **donix builds against a project-local musl 1.2.5, built from source.**
@@ -326,11 +365,11 @@ Two tracked scripts build and use it:
   cloned anywhere.  Note **`lib/`**, not `lib64/` — upstream musl's
   install layout uses `lib/`; Fedora's package uses `lib64/`.
 
-`build_musl_tests.sh` calls `"$MUSL_GCC"` everywhere.  The default is
-`./toolchain/musl-gcc.sh`.  To fall back to Fedora's system toolchain
-for a comparison run:
+`userland/musl/Makefile` calls `../../toolchain/musl-gcc.sh`
+everywhere.  To fall back to Fedora's system toolchain for a
+comparison run, override `MUSL_GCC`:
 
-    MUSL_GCC=/usr/bin/musl-gcc ./build_musl_tests.sh
+    make -C userland/musl MUSL_GCC=/usr/bin/musl-gcc
 
 **Fedora's system musl remains installed and working** at
 `/usr/bin/musl-gcc` and `/usr/x86_64-linux-musl/`, as a reference and
@@ -525,6 +564,10 @@ Apply each only when a specific problem requires it.
   syscall reference in assembly.
 - **`-mcmodel=large` is required for userland** (linked above 4 GB).
   `-mcmodel=small`/`medium` don't work. `-no-pie` is not needed.
+  *(Superseded by A6: the musl userland now links at `0x400000`
+  (below 4 GB) and uses `-no-pie` uniformly.  `-mcmodel=large` is
+  kept in the flags for consistency but is not load-bearing for
+  musl binaries.  See A6 notes.)*
 - **The syscall entry/return frame saves 16 slots, not 12.**  In
   addition to the callee-saved registers and the user RIP/RFLAGS/RSP,
   `user_syscall_entry.asm` pushes `%rdi`, `%rsi`, `%rdx`, `%r10`
@@ -684,12 +727,12 @@ Apply each only when a specific problem requires it.
   Added at `20260926I`.  This convention shapes the A4 ports: a musl
   `cat`/`echo`/`ls` port must take a bare filename on `argv[1]` and
   prepend `0:/` itself, or the `musl_sh`-to-binary interface breaks.
-  `cat_musl` (`20260926N`), `echo_musl` (`20260926M`), and `ls_musl`
+  `cat` (`20260926N`), `echo` (`20260926M`), and `ls`
   (`20260926V`) all do this.  Any future port that reads a filename
   argument must do the same.
 
 - **A4 ports that enumerate a directory take a bare directory name
-  on `argv[1]` and prepend `0:/`.**  The `ls_musl` port
+  on `argv[1]` and prepend `0:/`.**  The `ls` port
   (`20260926V`) does this.  The musl port accepts an optional
   `argv[1]`, normalizes it to `0:/NAME` if it has no `:/`, and passes
   it to `opendir`.
@@ -698,9 +741,12 @@ Apply each only when a specific problem requires it.
 
 - **Always confirm the .elf is relinked** after touching a source:
   `ls -l apps/NAME.elf` should be newer than the `.o` files.  A stale
-  link can hide a real fix for an entire session.  *(Applies to any
-  future build with `.o` files that need relink; the newlib userland
-  Makefile this referred to is gone.)*
+  link can hide a real fix for an entire session.  *(Superseded by
+  A6: the musl userland build is one-shot `.c → .elf` per file; there
+  are no `.o` intermediates.  A `make -C userland/musl` always
+  reflects the current source.  If a stale binary is ever suspected,
+  `make -C userland/musl clean && make -C userland/musl` rebuilds
+  from scratch.)*
 - **After every patch, verify the edit actually landed in the
   tree you are building.**  A session was lost to editing the wrong
   project directory: the kernel was built from a stale file, and
@@ -746,6 +792,33 @@ Apply each only when a specific problem requires it.
   does `git clone https://git.musl-libc.org/git/musl`.  No offline
   path exists today; if that becomes a requirement, add a source
   tarball to the repo (the *source*, not the install tree).
+
+### Musl userland tree (added 2026-09-27, A6)
+
+- **The tree is `userland/musl/`, at the repo root, not under
+  `04_kernel_64bit/`.**  Kernel and userland are distinct layers.
+  The kernel build no longer reaches into the userland tree at all;
+  the image build invokes `make -C ../userland/musl` as a
+  prerequisite.
+- **`userland/musl/build/` is gitignored.**  It holds the `.elf`
+  outputs.  If it is ever accidentally committed, remove it with
+  `git rm -r --cached userland/musl/build` and add the ignore rule.
+- **One Makefile, two directories.**  `apps/` and `tests/` share the
+  same uniform build rule; the split is documentation, not build
+  mechanics.  Adding a program is: create the `.c` file, add its
+  output path to `USERLAND_ELFS` in `05_boot_kernel64/Makefile`,
+  and add a matching `mcopy_one` line.  Nothing else.
+- **`USERLAND_ELFS` is an explicit list, not `$(wildcard)`.**  If
+  a source is added but the corresponding `.elf` is left out of
+  `USERLAND_ELFS`, `make` will fail with "No rule to make target"
+  rather than silently omitting the file from the FAT.  That is the
+  intended behavior: the failure mode from the old `/tmp` staging
+  ("WARN: ... not found" and continue) is gone.
+- **`musl_min` is built with `-no-pie` like every other binary.**
+  The old heredoc build script built it without the flag (a
+  documented inconsistency).  The new Makefile unifies the flags.
+  Verified by `readelf -h`: `Type: EXEC`, `Entry point 0x40022b`.
+  Runs `MUSL-START` cleanly on the FAT.
 
 ### Git hygiene (learned 2026-09-24, tag `20260924F`)
 
@@ -935,7 +1008,7 @@ Apply each only when a specific problem requires it.
   routing" under "Syscall ABI".  Not on any current test's path.
   Phase B (busybox) may exercise it.
 - **`sys_open` accepts non-directories when called with
-  `O_DIRECTORY`.**  Observed at `20260926V`: `ls_musl
+  `O_DIRECTORY`.**  Observed at `20260926V`: `ls
   0:/hello-world.txt` prints `0 file(s), 0 directory(ies)` and
   exits 0, instead of failing with "not a directory."  FatFs's
   `f_opendir` accepts a file path and yields a `DIR` whose
@@ -974,14 +1047,12 @@ Apply each only when a specific problem requires it.
 
 ### Cosmetic / housekeeping
 
-- `build_musl_tests.sh` has duplicate `# Test 4:` and `# Test 7:`
-  comments (copy-paste artifacts from `musl_twommap` and the
-  `brkraw`/`brkgrow` tests).  Cosmetic.
-- `musl_min` is built without `-no-pie` while every other musl test
-  uses it.  `musl_min` works, but for consistency at some point it
-  should match.  Cosmetic.
+- `musl_min` used to be built without `-no-pie` in the old heredoc
+  build script.  **Resolved at A6**: the new Makefile builds it with
+  `-no-pie` like every other binary.  Verified by `readelf -h`
+  (`Type: EXEC`) and by running it in the canary.
 - Audit the other `puthex`/`put_dec` helpers in
-  `build_musl_tests.sh` for tight margins, same as the
+  `userland/musl/tests/` for tight margins, same as the
   `musl_r10probe` `puthex64` bug fixed at `20260926D`.  Cosmetic
   unless a test starts faulting.
 - `SYS_REBOOT` (503) is the only 500+ syscall in
@@ -996,8 +1067,7 @@ Apply each only when a specific problem requires it.
 
 ## Testing harness
 
-- **Kernel shell:** `k` at boot prompt
-  (`proclist`, `schstat`, `heapstat`, `selftest`, `fatls`,
+- **Kernel shell:** `k` at boot prompt  (`proclist`, `schstat`, `heapstat`, `selftest`, `fatls`,
   `elfload`).  (`usershell` was removed at A5 step 6.)
 - **User shell:** `musl_sh`, launched automatically from the FAT
   as `0:/MUSL_SH.ELF` at boot.  Do not press `k` to get it.  There
@@ -1013,30 +1083,26 @@ Apply each only when a specific problem requires it.
   set the `-d in_asm,cpu` flag; that only appears in the
   `run-debug-log` target.
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
-- **musl test binaries** are built by `build_musl_tests.sh`
-  (tracked, committed at `57a3f9e`, extended through A5 with
-  `musl_exec`, `musl_wait`, `musl_readdir`, `musl_r10probe`,
-  `musl_sh`, `hello_musl`, `echo_musl`, `cat_musl`, `ls_musl`,
-  `memtest_musl`, and `musl_stat`).
-  Sources are heredoc'd into `/tmp/` and linked with
-  `"$MUSL_GCC" -static -no-pie -O2 -mcmodel=large`, where `$MUSL_GCC`
-  defaults to `./toolchain/musl-gcc.sh`.  The image build
-  (`05_boot_kernel64/Makefile`) copies `/tmp/musl_*` and
-  `/tmp/*_musl` to `::/*.ELF` on the FAT via `mcopy_one`.
-  **`/tmp` is not persistent across reboots** on Fedora.  If the
-  `MUSL_*.ELF` files are missing from a boot, run
-  `./build_musl_tests.sh` first.  A missing `/tmp/musl_*` produces
-  a `WARN: ... not found` line during `hdd-single.img` build but
-  does **not** fail the build — the image is silently missing those
-  ELFs.
+- **musl userland build.**  The musl userland is built by
+  `make -C userland/musl` (or implicitly, as a prerequisite of
+  `hdd-single.img` / `hdd.img`).  Sources are ordinary `.c` files
+  under `userland/musl/apps/` and `userland/musl/tests/`; the
+  Makefile compiles each into `userland/musl/build/*.elf` with
+  `../../toolchain/musl-gcc.sh -static -no-pie -O2 -mcmodel=large`.
+  The image build (`05_boot_kernel64/Makefile`) copies those ELFs
+  to `::/*.ELF` on the FAT via `mcopy_one`.
+  **No `/tmp` staging, no external build script.**  To add a
+  program: create the source, add its ELF path to `USERLAND_ELFS`
+  in `05_boot_kernel64/Makefile`, add the matching `mcopy_one`
+  line.  A missing ELF is a hard `make` failure, not a warning.
 - **Canary run pattern.**  Boot `musl_sh`, run each test in the
   Part 2 canary table in order, compare against the expected
   output.  Tedious but is what "one change at a time" costs.
   Automating it (a `musl_sh` script-mode that reads commands from
   a file, plus a QEMU wrapper that boots and greps `capture.txt`)
   was considered at `20260926N` and deferred.  Revisit when the
-  manual cost grows past the patch cost; A5 was done manually and
-  stayed manageable.
+  manual cost grows past the patch cost; A5 and A6 were done
+  manually and stayed manageable.
 
 ## Recovery
 
@@ -1070,6 +1136,17 @@ chronological order.
 Do not renumber or retag existing tags.  The single-letter history
 stays as it is; the new scheme applies only to new tags.
 
+**Working tags vs milestone tags.**  The `YYYYMMDD-NN` tags are
+*working tags*: local-only, one per commit, deleted from the local
+repo once the session's work is consolidated.  Their names and
+commit SHAs are recorded in `migration-tags.txt` (for A1–A5) so the
+mapping survives after the tags are gone.  The A6 working tags were
+deleted without being recorded; the session-11 commit table in Part 2
+is the record.
+
+*Milestone tags* (`v0.5.5`, `v0.6.0`, …) are the only tags pushed
+to the remote.  Do not push working tags.
+
 ## Summary for any session
 
 1. Confirm donix baseline works: boot to `musl_sh`, run the canary
@@ -1083,50 +1160,58 @@ stays as it is; the new scheme applies only to new tags.
 ## The one-line summary
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
-Newlib is gone.  Phase B is busybox.**
+Newlib is gone.  The userland is a tracked source tree at
+`userland/musl/`.  Phase B is busybox.**
 
 ---
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-26 (session 10, doc pass and initial publish)
-**Current HEAD:** `2980852` (tag `v0.5.5`); published to
-https://github.com/DonaldMoran/donix
-**Last known-good code tag:** `20260926-08` (A5 step 8) — the
-`20260926-NN` and `20260926A`–`Z` working tags were deleted locally
-after the doc pass; their commit mapping is preserved in
-`migration-tags.txt`.
+**Last updated:** 2026-09-27 (session 11, A6 musl userland tree)
+**Current HEAD:** the `v0.6.0` version-bump commit, on branch `dev`.
+**Last known-good code tag:** `v0.6.0` (published).
 **Disaster preserved at:** branch `disaster-20260923A`
-(commit `47262a9`, local only)
+(commit `47262a9`, local only).
 
 ## Current milestone
 
-**Session 10 complete: doc pass, version bump, initial publish.**
+**Session 11 complete: A6 — musl userland source tree.**
 
-The `v0.5.5` release tag marks the end of the musl migration and the
-start of the published donix project.  The repository is at
-https://github.com/DonaldMoran/donix.
+The musl userland has been moved out of the heredoc build script and
+into a tracked `userland/musl/` tree.  The full canary runs green
+from a fresh boot with nothing in `/tmp`.
 
-The kernel and userland state is unchanged from `20260926-08` (A5
-step 8):
+**Kernel and userland state is functionally identical to
+`v0.5.5`:**
 
 - Only Linux x86_64 syscalls plus `SYS_REBOOT` (503) in
   `syscall_dispatch`.
 - The FAT has 21 entries; every one is a musl build.
 - The boot shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`.  No
   newlib fallback.
-- `make` produces `kernel.bin` only.  No recursive userland build.
-- `kernel.bin` shrank by ~88 KB from removing the embedded newlib
-  shell blob.
+- `make` produces `kernel.bin` and `userland/musl/build/*.elf`
+  (the latter invoked as a prerequisite of the image).
+- File sizes on the FAT are unchanged from `v0.5.5` (18752 for
+  `HELLO.ELF`, 20144 for `MUSL_SH.ELF`, etc.).
 
-The three version banners in `kmain.c` now read `donix v0.5.5`
-(previously `DonsDOS v0.5.5`).
+The only thing that changed is *where* the userland source lives
+and *how* it is built.
 
-**Next milestone: A6 (musl userland tree), then Phase B (busybox).**
-A6 is a bounded restructure that gives the userland a proper source
-tree and makes Phase B (busybox) cleaner.  See the A6 plan below.
+**Next milestone: Phase B (busybox).**  See Part 1's "Phase B"
+section.  Before starting Phase B, consider the open issues below;
+`fcntl` and `isr14_handler` will bite busybox first.
 
-## Session 10 commits, in order
+## Session 11 commits, in order
+
+| Tag (deleted) | Commit | What |
+|-----|--------|------|
+| `20260927-00` | `91f2fb4` | `cleanup: remove residual newlib artifacts from 04_kernel_64bit` — deleted `04_kernel_64bit/user_newlib_linker.ld` (git-tracked) and the untracked `user_shell_data.c`; removed the residual empty `04_kernel_64bit/userland/newlib/` directory. |
+| `20260927-01` | `f4769c7` | `A6.1: userland/musl tree, Makefile, and all sources` — created `userland/musl/{Makefile,apps/*,tests/*}`. 21 files, 918 insertions, all new. |
+| `20260927-02` | `d74bf97` | `A6.23: build and stage musl userland from userland/musl` — patched `05_boot_kernel64/Makefile` to invoke `make -C ../userland/musl` and copy from `../userland/musl/build/`. 70 insertions, 44 deletions. |
+| `20260927-03` | `c346ba0` | `A6.24: delete build_musl_tests.sh (superseded by userland/musl)` — 1421 deletions. |
+| *(no tag)* | *(this commit)* | `v0.6.0: bump version banners, update ROADMAP/checklist/handoff` — `kmain.c` version banners set to `donix v0.6.0`; ROADMAP, OSDev_Checklist, and handoff updated for the new tree. Tagged `v0.6.0`. |
+
+## Session 10 commits (retained for history)
 
 | Commit | What |
 |--------|------|
@@ -1140,10 +1225,9 @@ tree and makes Phase B (busybox) cleaner.  See the A6 plan below.
 | `b08061c` | `handoff.md` — update Current HEAD to the doc-pass tip. |
 | `2980852` | `kmain` — rename `DonsDOS` to `donix` in the three version banners.  Tagged `v0.5.5`. |
 | `ef4b263` | `handoff.md` — session-10 status update (previous handoff rewrite). |
-| *(this commit)* | `handoff.md` — add the A6 plan (musl userland tree). |
 
-Publishing: `git push -u origin main` (1795 objects, 5.19 MiB) and
-`git push origin --tags` (35 tags) to
+Publishing (session 10): `git push -u origin main` (1795 objects,
+5.19 MiB) and `git push origin --tags` (35 tags) to
 `git@github.com:DonaldMoran/donix.git`.
 
 ## Session 9 commits (A5 — retained for history)
@@ -1159,11 +1243,12 @@ Publishing: `git push -u origin main` (1795 objects, 5.19 MiB) and
 | `20260926-07` | `A5 step 7: delete the newlib userland tree` | Removed `userland/newlib/` whole, the `userland` phony target, `USERLAND_DIR`, `USER_CFLAGS`, and the `all: userland kernel.bin` prerequisite. |
 | `20260926-08` | `A5 step 8: remove dead code` | Deleted `syscall.c`, `DEBUG_WRITE_BOUNCE`, the dead CR3 switch in `kmain.c`'s `elfload`, and the unused `vmm_clone_kernel_half` / `vmm_free_user_page_tables`. |
 
-## Canary state (all green as of `20260926-08`; unchanged by the doc pass)
+## Canary state (all green as of `20260927-03`; unchanged by A6)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
-**21** entries.
+**21** entries.  **All binaries are now built from
+`userland/musl/build/` with nothing in `/tmp`.**
 
 | Test | State | Notes |
 |------|-------|-------|
@@ -1174,7 +1259,7 @@ Boot-time shell is `musl_sh`.  The canaries below were run from its
 | ls | green | 21 files; sizes match the FAT listing; `Unknown syscall: 72` once |
 | memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_stat | green | `STAT-OK` and `STAT2-OK` (both `fstat` and `stat`) |
-| musl_min | green | `MUSL-START` |
+| musl_min | green | `MUSL-START` (built with `-no-pie` for the first time; `readelf -h` confirms `Type: EXEC`, entry `0x40022b`) |
 | musl_malloc | green | `MALLOC-OK`, `SMALL-OK` |
 | musl_printf | green | `MUSL-PRINTF` |
 | musl_fork | green | `A`, `P`, `C` |
@@ -1194,10 +1279,9 @@ consumes a pid.  The test logic is pid-independent; only the
 
 ## State on disk
 
-- `/tmp/musl_*` and `/tmp/*_musl` — musl test binaries, rebuilt by
-  `build_musl_tests.sh`.  **`/tmp` is not persistent across reboots
-  on Fedora.**  If the `MUSL_*.ELF` files are missing from a boot,
-  run `./build_musl_tests.sh` first.
+- `userland/musl/` — **the musl userland source tree (tracked)**.
+  `Makefile`, `apps/*.c` (6), `tests/*.c` (14).  `build/` is
+  gitignored and holds the `.elf` outputs.
 - `third_party/musl-src/` and `third_party/musl-install/` — the
   musl source and install trees.  **Gitignored.**  Rebuild with
   `./toolchain/install_musl.sh`.  Requires network access for the
@@ -1213,341 +1297,88 @@ consumes a pid.  The test logic is pid-independent; only the
 - `04_kernel_64bit/kmain.c` has the two helpers,
   `load_file_to_buffer` and `load_elf_into_user_process`.
 
+**No longer on disk:**
+- `build_musl_tests.sh` — deleted at A6.24.
+- `04_kernel_64bit/user_newlib_linker.ld` — deleted in the A6
+  cleanup commit.
+- `04_kernel_64bit/user_shell_data.c` — deleted in the A6 cleanup
+  commit (was untracked).
+- `04_kernel_64bit/userland/` — the residual empty directory was
+  removed in the A6 cleanup commit (was untracked).
+- `/tmp/musl_*` and `/tmp/*_musl` — no longer produced or used by
+  anything.  `/tmp` non-persistence is no longer a concern.
+
 ## Next step (exactly this, then stop)
 
-**A6 is next: give the musl userland a proper source tree.**
+**Session 12 starts Phase B (busybox).**
 
-Today, every musl ELF in the tree — the six apps (`hello`, `echo`,
-`cat`, `ls`, `memtest`, `musl_sh`) and the ~14 diagnostic test
-binaries (`musl_min`, `musl_malloc`, `musl_printf`, `musl_fork`,
-`musl_fork_raw`, `musl_exec`, `musl_wait`, `musl_readdir`,
-`musl_r10probe`, `musl_stat`, `printnum`, `brk_verify`, `brkraw`,
-`brkgrow`) — is a heredoc inside `build_musl_tests.sh`.  The script
-writes them to `/tmp/*.c`, compiles each with
-`toolchain/musl-gcc.sh` into `/tmp/*.elf`, and the image Makefile
-copies them to the FAT.
+The first Phase B commit is scoped as: **add busybox alongside the
+existing apps, do not touch them.**  Concretely:
 
-That worked for the migration and the A4 ports.  It does not scale
-to busybox or to any future userland project: adding a program means
-adding another ~50-line heredoc to an already ~1000-line shell
-script, and the sources are never in a form git tracks as files.
+1. Clone busybox into `third_party/busybox/` (gitignored, like
+   `musl-src/`).  Configure with `CONFIG_STATIC=y`, `CC` pointing
+   at `toolchain/musl-gcc.sh`, and `CONFIG_PREFIX` in
+   `third_party/busybox-install/` (also gitignored).
+2. Build.  The result is a static musl-linked `busybox` ELF.
+3. Stage it: copy to `userland/musl/build/busybox.elf`, add that
+   path to `USERLAND_ELFS` in `05_boot_kernel64/Makefile`, and add
+   a matching `mcopy_one` line producing `BUSYBOX.ELF` on the FAT.
+4. `./run`, then from `musl_sh`: `busybox` (no args, to see the
+   usage banner), then `busybox ls` and note the
+   `Unknown syscall: N` output.
 
-A6 restructures this into a tracked `userland/musl/` tree that
-mirrors the (now deleted) `userland/newlib/` structure.
+Do **not** rename or replace the existing `ls`/`echo`/`cat` yet.
+They are the current canary, and the whole point of this first
+commit is to see what busybox needs without disturbing anything
+that already works.  Naming/dispatch decisions come after busybox
+runs once.
 
-### A6 — musl userland tree (recommended before Phase B)
+**Open issues that will surface during Phase B, in priority order:**
 
-**Effort:** ~2–3 hours, mostly mechanical.
-**Risk:** low.  The ELFs and their contents do not change; only
-where the source lives and how it is built.
-**Commit policy:** one commit per app or per group of related
-files.  Mirror A4's parallel-then-cut-over pattern: move the
-source, build it, verify the produced ELF is byte-identical (or at
-least functionally identical), then commit.  Do not move
-everything in one commit.
+1. `fcntl` (72) — busybox will call it for `F_SETFD`/`F_GETFD`/
+   `F_DUPFD`.  A minimal stub is ~30 minutes.
+2. `sys_newfstatat` (262) — busybox's `stat` may route through it.
+3. `isr14_handler` — a user-mode `#PF` currently halts the console;
+   busybox's first segfault will end the session instead of
+   terminating the process.
+4. `sys_open` accepting `O_DIRECTORY` on non-directories.
+5. The `Unknown syscall: N` cluster in `musl_readdir`.
 
-#### Target layout
+See `MAINTENANCE.md` §0 for the full list with effort estimates.
 
-    userland/musl/
-    ├── Makefile
-    ├── apps/
-    │   ├── hello.c
-    │   ├── echo.c
-    │   ├── cat.c
-    │   ├── ls.c
-    │   ├── memtest.c
-    │   └── musl_sh.c
-    ├── tests/
-    │   ├── musl_min.c
-    │   ├── musl_malloc.c
-    │   ├── musl_printf.c
-    │   ├── musl_fork.c
-    │   ├── musl_fork_raw.c
-    │   ├── musl_exec.c
-    │   ├── musl_wait.c
-    │   ├── musl_readdir.c
-    │   ├── musl_r10probe.c
-    │   ├── musl_stat.c
-    │   ├── printnum.c
-    │   ├── brk_verify.c
-    │   ├── brkraw.c
-    │   └── brkgrow.c
-    └── build/            (gitignored; contains *.o and *.elf)
-
-The split between `apps/` and `tests/` mirrors the intent: `apps/`
-are the real userland programs the OS ships, `tests/` are
-diagnostic binaries used only to exercise specific kernel paths.
-The distinction is documentation, not build mechanics — the
-Makefile treats both the same.
-
-#### Where A6 goes in the tree
-
-`userland/musl/` at the repo root, **not** under
-`04_kernel_64bit/`.  Rationale: `04_kernel_64bit/` is the kernel
-source tree; userland is a distinct layer.  The old
-`userland/newlib/` lived under `04_kernel_64bit/` for historical
-reasons, but the kernel build no longer reaches into that tree at
-all (A5 step 7 removed the `userland` target and the recursive
-`make`).  Keeping `userland/musl/` at the root makes the layer
-boundary explicit.
-
-If a future OS component (a libc shim, a `crt0.S`, a shared
-`syscall.h`) is added, it goes in `userland/musl/` alongside the
-apps.  The kernel tree does not import anything from userland.
-
-#### The Makefile
-
-The Makefile's job:
-
-1. Build each `apps/*.c` and `tests/*.c` into `build/*.elf` using
-   `../toolchain/musl-gcc.sh` (path relative to
-   `userland/musl/`).
-2. Use the same flags the current `build_musl_tests.sh` uses:
-   `-static -no-pie -O2 -mcmodel=large`.
-3. Emit a `build/` directory that the image Makefile copies from.
-4. Have a `clean` target that removes `build/`.
-
-Sketch (the exact wording is a session-1 detail; this is enough to
-make the shape concrete):
-
-    MUSL_GCC := ../toolchain/musl-gcc.sh
-    CFLAGS   := -static -no-pie -O2 -mcmodel=large
-
-    APPS  := $(patsubst apps/%.c, build/%.elf, $(wildcard apps/*.c))
-    TESTS := $(patsubst tests/%.c, build/%.elf, $(wildcard tests/*.c))
-    ALL   := $(APPS) $(TESTS)
-
-    all: $(ALL)
-
-    build/%.elf: apps/%.c | build
-    	$(MUSL_GCC) $(CFLAGS) -o $@ $<
-    build/%.elf: tests/%.c | build
-    	$(MUSL_GCC) $(CFLAGS) -o $@ $<
-
-    build:
-    	mkdir -p build
-
-    clean:
-    	rm -rf build
-
-    .PHONY: all clean
-
-The `musl_min` special case: the current `build_musl_tests.sh`
-builds `musl_min` **without** `-no-pie` (a documented inconsistency
-in the "Cosmetic / housekeeping" section).  Preserve that during
-A6 unless you want to fix it as part of the restructure — the
-two are separable.  If you preserve, add an explicit rule:
-
-    build/musl_min.elf: tests/musl_min.c | build
-    	$(MUSL_GCC) -static -O2 -mcmodel=large -o $@ $<
-
-#### What `build_musl_tests.sh` becomes
-
-Three options, in order of preference:
-
-1. **Delete it.**  `userland/musl/Makefile` is the build recipe.
-   The image Makefile invokes `make -C userland/musl` (or `make -C
-   ../../userland/musl all` from `05_boot_kernel64/`) instead of the
-   shell script.  Simplest; no redundant tooling.
-2. **Shrink it to a three-line wrapper.**  `build_musl_tests.sh`
-   becomes `#!/bin/sh` + `exec make -C userland/musl "$@"`.  Keeps
-   the entry point name (any muscle memory or docs that reference
-   it still work) but the logic lives in the Makefile.
-3. **Leave it, ignore it.**  Technically possible but leaves two
-   build systems; the heredoc-based script and the Makefile would
-   drift.  Not recommended.
-
-Recommendation: **option 1** (delete the script).  The Makefile is
-the build recipe; a shell wrapper adds nothing.
-
-If you keep the wrapper (option 2), it goes away in a later
-cleanup commit.
-
-#### What the image Makefile changes to
-
-`05_boot_kernel64/Makefile` currently has `mcopy_one` lines that
-source `/tmp/musl_*` and `/tmp/*_musl`:
-
-    mcopy_one "$(MUSL_MIN)"       MUSL_MIN.ELF
-    mcopy_one "$(HELLO_MUSL)"     HELLO.ELF
-    ...
-
-After A6, they source from `../userland/musl/build/`:
-
-    MUSL_DIR := ../userland/musl
-    ...
-    mcopy_one "$(MUSL_DIR)/build/musl_min.elf"   MUSL_MIN.ELF
-    mcopy_one "$(MUSL_DIR)/build/hello.elf"      HELLO.ELF
-    ...
-
-The `hdd-single.img` rule gains a prerequisite on a new phony
-target:
-
-    musl-userland:
-    	$(MAKE) -C $(MUSL_DIR)
-
-    hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland
-    	...
-
-(and the same for `hdd.img` if you want dual-drive support to
-stay parallel; not strictly needed since the default is
-single-drive).
-
-Also: the `05_boot_kernel64/Makefile`'s `clean` target should
-invoke `$(MAKE) -C $(MUSL_DIR) clean`.
-
-#### Where the source comes from
-
-Each heredoc in `build_musl_tests.sh` becomes a `.c` file.  The
-mechanical procedure for one heredoc:
-
-1. Locate the heredoc in `build_musl_tests.sh` (e.g. `cat > /tmp/hello_musl.c <<'EOF' ... EOF`).
-2. Copy the body verbatim into `userland/musl/apps/hello.c` (or
-   `tests/`, per the split above).
-3. Add a short file-header comment noting what it is (`/* hello.c —
-   musl port of the dons-os hello program.  Prints a banner and
-   exits 0.  */`) — optional, but useful for anyone opening the
-   file fresh.
-4. Do **not** modify the C source.  The point of A6 is relocation,
-   not code change.  Any bug fix or refactor is a separate commit.
-
-#### Recommended commit sequence
-
-One commit per group of related files.  The safest granularity:
-
-- **Commit A6.1 — the tree and the Makefile.**  Create
-  `userland/musl/{apps,tests}/` and `userland/musl/Makefile`.
-  Add `userland/musl/build/` to `.gitignore`.  No source moved
-  yet; the Makefile builds nothing (or builds from stub files).
-  Commit.
-- **Commit A6.2 — `hello`.**  Move the `hello` heredoc to
-  `userland/musl/apps/hello.c`.  Build via `make -C userland/musl`
-  and verify the produced ELF is functionally identical (run it in
-  the canary).  Commit.
-- **A6.3–A6.7** — same for `echo`, `cat`, `ls`, `memtest`.
-- **A6.8 — `musl_sh`.**  The shell is the largest and most
-  load-bearing source; move it on its own.
-- **A6.9–A6.22** — the ~14 test binaries.  These can be grouped
-  into two or three commits (e.g. "core musl tests" for `musl_min`,
-  `musl_malloc`, `musl_printf`; "process tests" for `musl_fork`,
-  `musl_fork_raw`, `musl_exec`, `musl_wait`; "misc tests" for the
-  rest).  Or one commit per test if you want maximum bisectability.
-- **Commit A6.23 — wire up the image Makefile.**  Change the
-  `mcopy_one` sources from `/tmp/*` to
-  `../userland/musl/build/*.elf`.  Add the `musl-userland`
-  prerequisite.  Update the `clean` target.  Update the top-level
-  `Makefile` if it references `build_musl_tests.sh`.
-- **Commit A6.24 — delete `build_musl_tests.sh`.**  Optional; the
-  script is now redundant.  If you prefer to keep a wrapper for
-  muscle memory, skip this commit.
-- **Commit A6.25 — update `.gitignore`, README, handoff, and any
-  other doc that references `build_musl_tests.sh` or `/tmp/musl_*`.**
-  Small; can be folded into A6.24 if preferred.
-
-That is a **large sequence of commits** — 20+ is not unusual for a
-restructure of this size.  But each is small, mechanical, and
-revertible.  The critical invariant at every step is: **the canary
-stays green.**
-
-#### Test at every step
-
-After each commit in A6, run the full canary:
-
-```
-make clean && ./run
-```
-
-Then in `musl_sh`:
-
-```
-hello
-echo hi
-echo a b c d e
-cat hello-world.txt
-ls
-memtest
-musl_stat
-musl_min
-musl_malloc
-musl_printf
-musl_fork
-musl_exec
-musl_wait
-musl_readdir
-musl_r10probe
-brk_verify
-brkraw
-brkgrow
-```
-
-Every test must remain green at every step, with the same output
-as the current canary table.
-
-**Also verify the FAT has 21 entries at every step.**  If a move
-drops one from the FAT (e.g. the Makefile misses an ELF), the FAT
-would go to 20 and `ls` / `musl_readdir` would show the wrong
-count.  Catch it immediately.
-
-#### Recommended scope for the first A6 session
-
-A6 is a lot of mechanical work.  It is reasonable to split it
-across two or three sessions:
-
-- **Session 1:** A6.1 (tree + Makefile) and the six apps
-  (`hello`, `echo`, `cat`, `ls`, `memtest`, `musl_sh`).
-- **Session 2:** the fourteen test binaries.
-- **Session 3:** wiring the image Makefile, deleting
-  `build_musl_tests.sh`, and updating docs.
-
-Or a single marathon session if you prefer.  The commit sequence
-protects against loss either way.
-
-#### After A6: Phase B
-
-Once A6 is done, Phase B (busybox) has a clean place to live:
-
-- `userland/musl/` is the source tree.
-- Adding busybox means adding a `third_party/busybox/` clone (or a
-  `userland/busybox/` directory with a small wrapper) and copying
-  the built binary into `userland/musl/build/busybox.elf`.
-- The image Makefile's `mcopy_one` line adds `busybox.elf ->
-  BUSYBOX.ELF` like any other app.
-
-**Do not start Phase B before A6** unless you have a specific
-reason.  The heredoc restructure is what makes busybox tractable;
-doing Phase B first means doing busybox as one more heredoc, and
-then having to move it during A6 anyway.
+**Do not push without a plan.**  `dev` currently carries the A6
+work plus the `v0.6.0` tag.  Whether Phase B lands on `dev` only,
+gets merged to `main` at the next milestone, or is pushed
+immediately is a separate decision.  The tagging convention says
+milestone tags only on the published side; the same principle
+applies to Phase B.
 
 ## Open items
 
-- **A6 (musl userland tree):** see "Next step" above for the full
-  plan.  This is the immediate next step.
-- **Phase B (busybox):** after A6.  See Part 1's "Phase B"
-  section.
-- **Open issues to chase, not blocking A6 or Phase B:**
-  - `sys_newfstatat` (262) is unimplemented.  busybox may hit it.
-  - `sys_open` accepts non-directories when called with
-    `O_DIRECTORY`.  Fix in `sys_open`'s fallback path.
-  - `fcntl` (72) is called by musl's `opendir`; unimplemented, so
-    the kernel prints `Unknown syscall: 72`.  A minimal stub would
-    remove the noise.  busybox will almost certainly call `fcntl`
-    for `F_SETFD`/`F_GETFD`/`F_DUPFD`.
-  - `Unknown syscall: N` fires during `musl_readdir` (numbers 6,
-    7, 8, 15, 17, 72).  `72` is traced to `opendir`'s `fcntl`.
-    The others are not on any current hot path.
+- **Phase B (busybox):** the next milestone.  See Part 1's
+  "Phase B" section and the "Next step" above.
+- **Open issues to chase, in priority order, before or during
+  early Phase B:**
+  - `fcntl` (72) is unimplemented; musl's `opendir` calls it.
+    Busybox will call `fcntl` for `F_SETFD`/`F_GETFD`/`F_DUPFD`.
+    A minimal stub removes the noise and unblocks common paths.
+  - `sys_newfstatat` (262) is unimplemented.  Busybox may hit
+    it via `fstatat(fd, path, st, flags)`.
   - `isr14_handler` halts on user-mode faults; should terminate
     the faulting process instead.  This will bite the first time
     busybox segfaults.
+  - `sys_open` accepts non-directories when called with
+    `O_DIRECTORY`.  Fix in `sys_open`'s fallback path.
+  - `Unknown syscall: N` fires during `musl_readdir` (numbers 6,
+    7, 8, 15, 17, 72).  `72` is traced to `opendir`'s `fcntl`.
+    The others are not on any current hot path.
   - `musl_sh` echoes garbage on lines containing backspaces
     (cosmetic).
-- **Deferred cleanups (many of these disappear with A6):**
-  - Audit `puthex`/`put_dec` helpers in `build_musl_tests.sh` for
-    tight margins.  *(Becomes an audit of the same helpers in
-    `userland/musl/tests/` after A6.)*
-  - Duplicate `# Test N:` comments and `musl_min`'s missing
-    `-no-pie` in `build_musl_tests.sh`.  *(Preserve both in A6
-    unless you want to fix them as part of the restructure; the
-    two are separable.)*
+- **Deferred cleanups:**
+  - Audit `puthex`/`put_dec` helpers in `userland/musl/tests/`
+    for tight margins, same as the `musl_r10probe` `puthex64`
+    bug fixed at `20260926D`.  Cosmetic unless a test starts
+    faulting.
   - `PMM_ALLOC_DIAG` in `pmm.c` is inert diagnostic code from the
     `20260924B` `brk` investigation; can be deleted at leisure.
   - Consider writing a small `REBOOT.ELF` musl binary (raw

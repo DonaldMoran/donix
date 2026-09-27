@@ -22,7 +22,7 @@ or removed during the musl migration (A1–A5). See
 
 ## 0. donix — musl migration open items
 
-The A1–A5 migration (see [`ROADMAP.md`](ROADMAP.md) §0 and
+The A1–A6 migration (see [`ROADMAP.md`](ROADMAP.md) §0 and
 [`OSDev_Checklist.md`](OSDev_Checklist.md) §0) fixed the six bugs it
 surfaced (see §7 below for the record). The items in this section are
 the loose ends the migration left behind, or the small syscall gaps
@@ -172,6 +172,40 @@ ever since and never fires.
 
 **Fix:** delete the gated block. If a future `brk` or allocation
 investigation needs it, it is one `git show` away.
+
+### 0.8. `musl_min` was built without `-no-pie` (resolved at A6) ✅
+
+**Status:** ✅ **RESOLVED at A6** (tag `v0.6.0`, session 11).
+
+The old `build_musl_tests.sh` built `musl_min` without the explicit
+`-no-pie` flag while every other binary had it.  `musl_min` worked
+(probably because the musl specs file was adding `-no-pie` implicitly,
+or because the tiny program has no relocations that matter), but the
+inconsistency was real.
+
+The new `userland/musl/Makefile` builds every binary uniformly with
+`-static -no-pie -O2 -mcmodel=large`.  `musl_min` is no longer a
+special case.  Verified by:
+- `readelf -h userland/musl/build/musl_min.elf` → `Type: EXEC`,
+  `Entry point 0x40022b`
+- booting the new `MUSL_MIN.ELF` from the FAT → `MUSL-START`
+
+Kept here for the record.  The "preserve the special case" note in
+the A6 plan is obsolete; the special case is gone.
+
+### 0.9. `build_musl_tests.sh` duplicate comments and `/tmp` staging (resolved at A6) ✅
+
+**Status:** ✅ **RESOLVED at A6** (tag `v0.6.0`, session 11).
+
+`build_musl_tests.sh` had duplicate `# Test 4:` and `# Test 7:`
+comments, and the whole `/tmp` staging model meant that a reboot
+silently lost the musl binaries.  The script is deleted; the
+duplicate comments are gone with it; the `/tmp` staging model is
+gone with it.  `userland/musl/Makefile` is the build recipe and
+`userland/musl/build/` is the output directory.
+
+Kept here for the record.  The "preserve both during A6 unless you
+want to fix them" note in the old cosmetic section is obsolete.
 
 ---
 
@@ -901,8 +935,8 @@ a NULL, then `envp[]`, then a NULL, then strings), and set the initial
 `rsp` to point at `argc` rather than at `user_stack_top`.~~
 
 **What actually happened:** this item was resolved as a side effect of
-the musl migration. Item A6.5 in [`OSDev_Checklist.md`](OSDev_Checklist.md)
-records the `%rdi`/`%rsi` write; item A6.6 records the argv layout
+the musl migration. Item A7.5 in [`OSDev_Checklist.md`](OSDev_Checklist.md)
+records the `%rdi`/`%rsi` write; item A7.6 records the argv layout
 correction. See §0.6 for the follow-up (removing the now-unnecessary
 `%rdi`/`%rsi` writes).
 
@@ -1121,13 +1155,13 @@ that a future reader knows the class of bug is known and that reading
 comments near touched code is part of the review discipline, not an
 afterthought.
 
-**Relevance for donix:** the A1–A5 migration renamed or removed many
+**Relevance for donix:** the A1–A6 migration renamed or removed many
 functions (`sys_spawn`, `sys_sbrk`, `sys_arch_set_fs`,
 `sys_opendir`/`sys_readdir`/`sys_closedir`, `build_user_shell_elf`,
-`user_shell_data.c`). Any comment that still names them as "the thing
-that does X" is now silently wrong. A full-tree grep for the removed
-names is a reasonable cleanup commit at some point; the doc pass
-removed the ones in the docs.
+`user_shell_data.c`, `build_musl_tests.sh`). Any comment that still
+names them as "the thing that does X" is now silently wrong. A
+full-tree grep for the removed names is a reasonable cleanup commit at
+some point; the doc pass at A6.25 removed the ones in the docs.
 
 ### 4i. Kernel log and userland output share the same console and interleave
 
@@ -1438,6 +1472,8 @@ the donix-migration items; sections 3–5 have the historical items.
 | 0.5 | `musl_sh` backspace echo | 15 min | Cosmetic |
 | 0.6 | `sys_execve` `%rdi`/`%rsi` writes | 15 min | Cleanup |
 | 0.7 | `PMM_ALLOC_DIAG` removal | 5 min | Cleanup |
+| 0.8 | `musl_min` `-no-pie` inconsistency | — | ✅ Done (A6, v0.6.0) |
+| 0.9 | `build_musl_tests.sh` cosmetic / `/tmp` staging | — | ✅ Done (A6, v0.6.0) |
 | 1 | Kernel size Option 3 | 30 min | ✅ Done (09a6f79) |
 | 2 | Documentation gaps | 2 hrs | ✅ Done (9b62d46) |
 | 3a | Boot stack off hardcoded address | 1–2 hrs | ✅ Done (e246db6) |
@@ -1484,7 +1520,7 @@ reproducers.
 
 ## 7. Resolved bugs from the migration (for the record)
 
-The A1–A5 migration fixed six bugs that would not have been visible on
+The A1–A6 migration fixed six bugs that would not have been visible on
 the dons-os-only kernel. Each is documented in
 [`handoff.md`](handoff.md) with the exact symptom, root cause, and
 fix. This section is a short index; the handoff is the source of
@@ -1500,7 +1536,7 @@ truth.
 | `execve`'s argv layout zeroed `argv[1]` | `20260926H` | The envp NULL terminator's slot was on top of `argv[0]`'s string. Fixed by putting `strings_start` 8 bytes higher. |
 
 See [`handoff.md`](handoff.md) "Resolved bugs" for the full entries
-and [`OSDev_Checklist.md`](OSDev_Checklist.md) §0.6 for the itemized
+and [`OSDev_Checklist.md`](OSDev_Checklist.md) §0.7 for the itemized
 list.
 
 ---
@@ -1524,4 +1560,5 @@ is to keep the list of "things we know we're wrong about" honest and short.
 Feature work goes in `ROADMAP.md`. Capability tracking goes in
 `OSDev_Checklist.md`. Debt and maintenance go here.
 
-*Last Updated: September 2026 (donix v0.5.5)*
+*Last Updated: September 2026 (donix v0.6.0)*
+
