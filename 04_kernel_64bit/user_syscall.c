@@ -524,7 +524,7 @@ long sys_stat(const char* user_path, void* user_stat) {
  *
  * The pages are tracked in pcb->elf_page_list, populated by
  * elf_add_page_to_pcb from elf_load_into_process, the user-stack
- * allocator, sys_brk/sys_sbrk, and sys_mmap.  Every page in the
+ * allocator, sys_brk, and sys_mmap.  Every page in the
  * list is a user page currently mapped in pcb->cr3.
  *
  * Order matters: unmap before free, so no live PTE points at a
@@ -1333,13 +1333,6 @@ long sys_read(int fd, void* buf, size_t count) {
 /*
  * Linux x86_64 brk(2) — absolute-address ABI.
  *
- * EXPERIMENTAL: this change breaks newlib's `sbrk` in arc2/syscalls.c,
- * which still passes an increment.  That is intentional for this
- * diagnostic run — the goal is to confirm the runaway-`brk` hypothesis
- * for the MUSL_MALLOC.ELF failure.  If confirmed, the real fix is to
- * add a donix-private increment-based syscall for newlib and leave
- * this one Linux-ABI.
- *
  * ABI notes:
  *   - brk(0)            returns the current break, unchanged.
  *   - brk(addr)         sets the break to `addr`.
@@ -1408,54 +1401,6 @@ void* sys_brk(void* addr) {
 
     current->brk_virt = new_brk;
     return (void*)new_brk;
-}
-
-/*
- * donix-private sbrk (505) — increment-based, for newlib.
- *
- * This is the OLD sys_brk semantics, moved to a private syscall
- * number so it no longer conflicts with the Linux brk(2) ABI at
- * number 12.  newlib's arc2/syscalls.c:sbrk calls this.
- *
- * arg0: long inc  (bytes to add to the current break)
- * returns: the OLD break on success, or (void*)-1 on failure.
- *          This is the traditional Unix sbrk() contract, which is
- *          what newlib's sbrk() expects.
- */
-void* sys_sbrk(long inc) {
-    pcb_t* current = process_get_current();
-    if (!current) return (void*)-1;
-
-    static uint64_t heap_base = 0;
-    if (heap_base == 0) heap_base = 0x8000200000ULL;
-
-    uint64_t old_brk = current->brk_virt;
-    if (old_brk == 0) {
-        current->brk_virt = heap_base; old_brk = heap_base;
-    }
-    if (inc == 0) return (void*)old_brk;
-
-    uint64_t new_brk = old_brk + inc;
-    if (inc < 0 && new_brk < heap_base) return (void*)-1;
-
-    uint64_t old_page = (old_brk + 0xFFF) & ~0xFFFULL;
-    uint64_t new_page = (new_brk + 0xFFF) & ~0xFFFULL;
-
-    if (new_page > old_page) {
-        for (uint64_t virt = old_page; virt < new_page; virt += 4096) {
-            uint64_t phys = pmm_alloc_page_for_elf();
-            if (!phys) return (void*)-1;
-
-            void* hhdm = (void*)(HHDM_START + phys);
-            for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
-
-            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
-            vmm_map_page_in_cr3(current->cr3, virt, phys, map_flags);
-            elf_add_page_to_pcb(current, phys);
-        }
-    }
-    current->brk_virt = new_brk;
-    return (void*)old_brk;
 }
 
 long sys_getpid(void) {
@@ -1917,7 +1862,6 @@ uint64_t syscall_dispatch(uint64_t num,
 
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
-        case SYS_DONIX_SBRK:      return (uint64_t)sys_sbrk((long)arg0);
 
         default:
             serial_print("Unknown syscall: ");

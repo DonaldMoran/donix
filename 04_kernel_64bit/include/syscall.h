@@ -11,9 +11,11 @@
  * with a Linux syscall musl uses is at that Linux number.
  *
  * Numbers 500+ are donix-private.  They are for syscalls that
- * exist only in donix and have no Linux equivalent: the reboot
- * hook and the newlib-only arch_set_fs.  musl never calls these;
- * only the newlib userland (arc2/syscalls.c) does.
+ * exist only in donix and have no Linux equivalent.  As of A5
+ * step 5, the only remaining 500+ number is SYS_REBOOT (503).
+ * musl never calls it; it is reached only via the newlib
+ * userland's reboot() wrapper, which is deleted at A5 step 7,
+ * leaving raw syscall 503 as the only way in.
  * ============================================================ */
 
 /* --- Linux x86_64 numbers, implemented --- */
@@ -48,7 +50,6 @@
 
 /* --- donix-private numbers (500+) --- */
 #define SYS_REBOOT      503
-#define SYS_DONIX_SBRK  505
 
 /*
  * SYS_EXECVE (59) — Linux execve.
@@ -81,7 +82,6 @@ void sys_exit(int status);
 long sys_read(int fd, void* buf, size_t count);
 long sys_mprotect(void* addr, size_t len, int prot);
 void* sys_brk(void* addr);
-void* sys_sbrk(long inc);
 
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
