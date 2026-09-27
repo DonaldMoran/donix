@@ -451,6 +451,20 @@ Apply each only when a specific problem requires it.
   is a bug â€” route it through `put_file_slot`.  Any future code that
   aliases a slot must increment the refcount.
 
+- **`busybox sh` (ash) does not apply `musl_sh`'s argv[0] normalization
+  (added 2026-09-27, session 18).**  When you type a bare command like
+  `ls` at the `busybox sh` prompt, `ash` calls `execve("ls", ...)` (or,
+  with its default `PATH`, `execve("/usr/bin/ls", ...)`), not
+  `execve("0:/LS.ELF", ...)`.  `sys_execve` passes that straight to
+  `f_open`, which fails because FatFs rejects the bare name and the
+  leading `/`.  The exec returns -1, and musl reports it as `EPERM`
+  ("Operation not permitted") because donix's `sys_execve` does not set
+  `errno` and musl's wrapper falls back to the initial `errno` value.
+  **Next change:** a kernel-side retry in `sys_execve` — if `f_open`
+  fails and the path is a bare name (no `/`, no `:`), retry with
+  `0:/NAME.ELF` (uppercase).  Same for a leading-`/` path: strip the
+  leading `/`, take the last component, retry `0:/NAME.ELF`.
+
 ### Build system
 
 - **After every patch, verify the edit actually landed in the
@@ -530,9 +544,19 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_getcwd` (79) is not implemented.**  `busybox sh` startup
-  and `busybox pwd` both reach it; the kernel logs
-  `Unknown syscall: 79`.  Easy: return `/`.  **Next change.**
+- **`sys_execve` does not retry bare names (added session 18).**
+  When `ash` calls `execve("ls", ...)` or `execve("/usr/bin/ls", ...)`,
+  `f_open` fails on the FatFs path and the exec returns -1, which musl
+  reports as `sh: ls: Operation not permitted`.  **Next change:** retry
+  with `0:/NAME.ELF` (uppercase) when the path is a bare name or a
+  leading-`/` path whose last component is the name.
+- **`sys_ioctl` returns `-ENOTTY` for every request, including
+  `TCGETS`.**  `ash` uses the failure of `ioctl(0, TCGETS, ...)` to
+  decide stdin is not a tty; as a result it does not echo typed input
+  and does not print a prompt.  Implementing `TCGETS` (with a plausible
+  termios struct — ICANON, ECHO, ISIG, etc.) would make `sh` behave
+  like an interactive shell.  Same for the corresponding `TCSETS`/
+  `TCSETSW`/`TCSETSF`, which can be accepted and ignored.
 - **`sys_newfstatat` (262) is not implemented.**  `sys_fstat` (5)
   and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
   routing" under "Syscall ABI".  Not on any current test's path.
@@ -673,10 +697,10 @@ mapping survives after the tags are gone.  The A6 working tags were
 deleted without being recorded; the session-11 commit table in Part 2
 is the record.  Sessions 13 and 14 used `20260927-01` through
 `20260927-04`; their commit tables in Part 2 are the record.
-Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`;
-their commit tables in Part 2 are the record.  Working tags are
-deleted after their session is consolidated; the SHA in the table
-is what survives.
+Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
+Session 18 used `20260927-08`; its commit table is the record.
+Working tags are deleted after their session is consolidated; the
+SHA in the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, â€¦) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -696,16 +720,18 @@ tags pushed to the remote.  Do not push working tags.
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: busybox runs, its banner prints, and
-`dup2`, `F_DUPFD`, `setsid`, `getppid`, and file_slot_t
-refcounting are green; `getcwd` and then `busybox sh` are next.**
+`dup2`, `F_DUPFD`, `setsid`, `getppid`, `getcwd`, and file_slot_t
+refcounting are green; `busybox sh` runs and its builtins work, but
+it needs an `execve` bare-name retry and `ioctl TCGETS` to be
+fully interactive.**
 
 ---
 
 # Part 2 â€” Session Status
 
-**Last updated:** 2026-09-27 (session 17, setsid + getppid)
-**Current HEAD:** `3a34791` (tag `20260927-07`), on branch `dev`,
-eleven commits ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 18, getcwd; busybox sh reaches command loop)
+**Current HEAD:** `47ca6d9` (tag `20260927-08`), on branch `dev`,
+thirteen commits ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -713,8 +739,8 @@ handling), `20260927-02` (build: busybox integration), `20260927-03`
 (busybox config tracking; deleted, no longer in `git show-ref`),
 `20260927-05` (kernel: dup2 + file_slot_t refcounting; deleted),
 `20260927-06` (kernel: F_DUPFD in fcntl),
-`20260927-07` (kernel: setsid + getppid).  All working tags are
-local-only.
+`20260927-07` (kernel: setsid + getppid),
+`20260927-08` (kernel: getcwd).  All working tags are local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
@@ -722,23 +748,36 @@ local-only.
 
 **Phase B is underway.  busybox runs, the banner prints, and
 `busybox ls` / `cat` / `echo` work.  `dup2`, `F_DUPFD`, `setsid`,
-`getppid`, and file_slot_t refcounting are green.**
+`getppid`, `getcwd`, and file_slot_t refcounting are green.
+`busybox sh` reaches its command loop and executes builtins, but
+external commands fail with "Operation not permitted" and typed
+input is not echoed.**
 
 The kernel speaks enough Linux x86_64 syscalls to run a static
 musl busybox through a directory listing, a single-file `ls`, and
-`cat`/`echo`.  The next functional milestone is `busybox sh`,
-which now starts without `Unknown syscall: 107`/`110` and is
-blocked only on `getcwd` (79).
+`cat`/`echo`, and to run `busybox sh` to a live command loop.  The
+next functional milestone is `busybox sh` being fully interactive:
+external commands working (`execve` retry) and input echoing
+(`ioctl TCGETS`).
 
 **State of the tree:**
 
 - Kernel: Linux x86_64 syscalls plus `SYS_REBOOT` (503).
-- The FAT has **25** entries: the 24 musl builds from A6 plus
+- The FAT has **26** entries: the 25 musl builds from A6 plus
   `BUSYBOX.ELF`.
 - The boot shell is still `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
   busybox is invoked from it, not in place of it.
 - The existing canary (hello, echo, cat, ls, memtest, musl_* tests)
   still passes.
+
+## Session 18 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-08` | `47ca6d9` | kernel: implement getcwd(2) — syscall 79. |
+
+The tag is a working tag (local-only).  The commit message has the
+full narrative.
 
 ## Session 17 commits, in order
 
@@ -815,11 +854,11 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (all green as of `20260927-07`)
+## Canary state (all green as of `20260927-08`)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
-**25** entries.  All binaries are built from `userland/musl/build/`
+**26** entries.  All binaries are built from `userland/musl/build/`
 with nothing in `/tmp`.
 
 The 19 rows below were already green at `v0.6.0` and remain green:
@@ -830,7 +869,7 @@ The 19 rows below were already green at `v0.6.0` and remain green:
 | echo hi | green | `hi` |
 | echo a b c d e | green | `a b c d e` |
 | cat hello-world.txt | green | file contents printed |
-| ls | green | 25 files; sizes match the FAT listing |
+| ls | green | 26 files; sizes match the FAT listing |
 | memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_stat | green | `STAT-OK` and `STAT2-OK` (both `fstat` and `stat`) |
 | musl_min | green | `MUSL-START` |
@@ -839,36 +878,38 @@ The 19 rows below were already green at `v0.6.0` and remain green:
 | musl_fork | green | `A`, `P`, `C` |
 | musl_exec | green | `EXEC-PARENT-START`, `MUSL-START`, `EXEC-PARENT-DONE` |
 | musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK` |
-| musl_readdir | green | 25 entries, `READDIR-DONE count=25` â€” `Unknown syscall: N` interleaved (see open issue) |
+| musl_readdir | green | 26 entries, `READDIR-DONE count=26` â€” `Unknown syscall: N` interleaved (see open issue) |
 | musl_r10probe | green | `R10-AFTER=0xdeadbeefcafebabe` |
 | brk_verify | green | `p=0x8000200000`, `VERIFY-OK` |
 | brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct |
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
 | musl_sh (boot) | green | appears automatically at `donix> ` after `Shell: booting musl_sh from FAT` |
 
-Sessions 13â€“17 additions:
+Sessions 13â€“18 additions:
 
 | Test | State | Notes |
 |------|-------|-------|
 | musl_dup2 | green | `DUP2-OK`.  No heap warnings.  (Before the refcount fix landed in the same commit, this test produced two `HEAP: kfree called on already freed block!` lines at exit â€” the test leaves the aliased fd open, and `close_all_files` double-freed.  That is the bug the refcount fix closed.) |
 | musl_dupfd | green | `DUPFD-OK`.  No heap warnings.  Exercises fcntl(fd, F_DUPFD, min) for min=3 (return >= 3, read works), min=3 again (distinct fd), min=99 (-EINVAL), min=0 (clamped to >= 3). |
 | musl_ids | green | `IDS-OK sid= 3`, `IDS-OK ppid= 2`.  setsid returns the calling pid; getppid returns the parent's pid; setsid is idempotent.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`; noted under Cosmetic.) |
-| busybox ls | green | 25 entries.  No `Unknown syscall`, no fault. |
+| musl_getcwd | green | `GETCWD-OK /`.  Exercises getcwd(buf, 64) (returns buf, writes "/\0"), getcwd(buf, 1) (-ERANGE), getcwd(NULL, 0) (-EINVAL). |
+| busybox ls | green | 26 entries.  No `Unknown syscall`, no fault. |
 | busybox ls 0:/ | green | same output. |
 | busybox ls 0:/HELLO-WORLD.TXT | green | prints `0:/HELLO-WORLD.TXT`. |
 | busybox cat 0:/HELLO-WORLD.TXT | green | file contents. |
 | busybox echo hi | green | `hi`. |
 | busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`).  `CONFIG_BUSYBOX` is now on.  No `Unknown syscall: 33`. |
-| busybox sh (partial) | in progress | Reaches startup and no longer logs `Unknown syscall: 107`/`110`.  Still logs `Unknown syscall: 79` (getcwd) and does not yet print a prompt.  `getcwd` is the next change. |
+| busybox sh (partial) | in progress | Reaches a command loop.  Executes builtins (`exit` returns to `musl_sh`).  External commands fail with `sh: <cmd>: Operation not permitted` — `ash` calls `execve("ls", ...)` or `execve("/usr/bin/ls", ...)` and `sys_execve` cannot resolve the FatFs path.  Typed input is not echoed and no prompt is printed — `ash` uses the failure of `ioctl(0, TCGETS, ...)` to decide stdin is not a tty.  Both fixes are the next two changes. |
 
 The `Unknown syscall: 72` line that used to appear on every `ls` and
 `musl_readdir` is gone â€” `fcntl` is now implemented.  The
 `Unknown syscall: 6` line is gone â€” `sys_lstat` is now implemented.
 The `Unknown syscall: 33` line that used to appear on `busybox`
 (no args) is gone â€” `sys_dup2` is now implemented.  The
-`Unknown syscall: 107` and `Unknown syscall: 110` lines that used
-to appear on `busybox sh` are gone â€” `setsid` and `getppid` are
-now implemented.
+`Unknown syscall: 107`, `Unknown syscall: 110`, and
+`Unknown syscall: 79` lines that used to appear on `busybox sh`
+startup are gone â€” `setsid`, `getppid`, and `getcwd` are now
+implemented.
 
 ## State on disk
 
@@ -877,7 +918,7 @@ now implemented.
   `third_party/busybox/.config` before building.  **Edit only this
   copy.**  The generated file is a build artifact.
 - `userland/musl/` â€” the musl userland source tree (tracked).
-  `Makefile`, `apps/*.c` (6), `tests/*.c` (17).  `build/` is
+  `Makefile`, `apps/*.c` (6), `tests/*.c` (18).  `build/` is
   gitignored.
 - `third_party/busybox/` â€” the busybox source tree and the
   generated `.config`.  Gitignored.  Built from source by
@@ -900,43 +941,50 @@ now implemented.
 
 ## Next step (exactly this, then stop)
 
-**Session 18 continues Phase B.**
+**Session 19 continues Phase B.**
 
 In priority order:
 
-1. **Implement `sys_getcwd` (79).**  `busybox sh` startup reaches
-   it and currently logs `Unknown syscall: 79`; it is the last
-   syscall blocking `sh` from reaching a prompt (as far as we
-   know).  Return `"/"`.  Linux's `getcwd(buf, size)` copies the
-   NUL-terminated string to `buf` and returns `buf`; if the string
-   does not fit, return `-ERANGE`.  This is the next change.
+1. **Kernel-side `execve` bare-name retry.**  When `sys_execve`'s
+   `f_open(path, ...)` fails and `path` has no `:/`, retry with
+   `0:/NAME.ELF` (uppercase, `.ELF` appended).  Same for a path
+   with a leading `/`: strip the leading `/`, take the last
+   component, retry `0:/NAME.ELF`.  This makes `busybox sh`'s
+   external commands (`ls`, `echo`, `cat`) work.  This is the next
+   change.  No new syscall number; `sys_execve` gains a fallback.
 
-2. **Try `busybox sh`.**  The next functional milestone.  It will
-   exercise `fork`, `execve`, `wait4`, pipes, and redirection.  It
-   may hit syscalls beyond `getcwd` â€” whatever it hits next is the
-   following change.
+2. **Implement `ioctl(0, TCGETS, ...)`.**  Return a termios struct
+   with `ICANON | ECHO | ISIG | IEXTEN` (and the usual input/output
+   flags) so `ash` believes stdin is a tty.  Accept and ignore
+   `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes `ash` echo typed input
+   and print a prompt, completing the interactive-shell behavior.
 
-3. **Add more applets** to `configs/busybox.config` once `sh`
-   works.
+3. **Then cut the milestone tag.**  Once (1) and (2) are both green,
+   `busybox sh` is a fully usable interactive shell.  That is the
+   natural point for `v0.6.2` or `v0.7.0`.
+
+4. **Add more applets** to `configs/busybox.config` once `sh`
+   is interactive.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `getcwd` (79) â€” next.
-2. `sys_newfstatat` (262) â€” busybox may route through it once more
+1. `execve` bare-name retry — next.
+2. `ioctl TCGETS` — the other half of interactive `sh`.
+3. `sys_newfstatat` (262) — busybox may route through it once more
    applets are enabled.
-3. `isr14_handler` â€” a user-mode `#PF` currently halts the console;
+4. `isr14_handler` — a user-mode `#PF` currently halts the console;
    busybox's first segfault will end the session instead of
    terminating the process.
-4. `sys_munmap` â€” a stub returning 0; busybox will eventually call
+5. `sys_munmap` — a stub returning 0; busybox will eventually call
    it and expect real unmapping.
-5. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window â€” both
+6. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window — both
    are latent collisions waiting to happen.
-6. `sys_open` accepting `O_DIRECTORY` on non-directories.
-7. The `Unknown syscall: N` cluster in `musl_readdir`.
+7. `sys_open` accepting `O_DIRECTORY` on non-directories.
+8. The `Unknown syscall: N` cluster in `musl_readdir`.
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now eleven commits ahead
+**Do not push without a plan.**  `dev` is now thirteen commits ahead
 of `origin/dev`.  Whether Phase B lands on `dev` only, gets merged
 to `main` at the next milestone, or is pushed immediately is a
 separate decision.  Milestone tags go on the published side; the
@@ -948,11 +996,12 @@ same principle applies to Phase B.
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `getcwd` (79) â€” next.
-  - `sys_newfstatat` (262) â€” three-way delegation.
+  - `execve` bare-name retry — next.
+  - `ioctl TCGETS`.
+  - `sys_newfstatat` (262) — three-way delegation.
   - `isr14_handler` user-mode fault handling.
   - `sys_munmap` real implementation.
-  - `sys_brk` and the mmap window â€” per-process state, not fixed
+  - `sys_brk` and the mmap window — per-process state, not fixed
     bases.
   - `sys_open` `O_DIRECTORY` fix.
   - The `Unknown syscall: N` cluster in `musl_readdir`.
