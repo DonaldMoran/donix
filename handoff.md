@@ -457,10 +457,22 @@ Apply each only when a specific problem requires it.
   `sys_execve` calls it only when the raw `f_open` fails and the path
   contains no `:`.  This is what makes `musl_exec2`'s three test cases
   pass.  It does **not** by itself make `busybox sh`'s external
-  commands work -- see the "busybox sh external commands" open issue
-  below.  Any future caller that hands `sys_execve` a path containing
-  a `:` skips the retry (that is how `musl_sh`'s pre-normalized paths
-  stay on the fast path).
+  commands work, because `ash`'s PATH probe uses `stat`, not
+  `execve` (see below).  Any future caller that hands `sys_execve` a
+  path containing a `:` skips the retry (that is how `musl_sh`'s
+  pre-normalized paths stay on the fast path).
+
+- **Syscalls must return a proper negative errno on failure, not a
+  bare `-1` (added 2026-09-27, session 21).**  musl's
+  `__syscall_ret` converts a return value to `-errno` only when it
+  is in the range `-4095..-1`; a bare `-1` is passed through and the
+  caller's `errno` is left at whatever value it had before, which is
+  almost always stale and misleading.  Every failure path in
+  `user_syscall.c` must return a value like `-ENOENT` or `-EIO`, not
+  `-1`.  The `fatfs_errno()` helper maps a FatFs `FRESULT` to the
+  appropriate negative Linux errno (see the definition in
+  `user_syscall.c`).  This is what made `busybox sh`'s error message
+  change from "Operation not permitted" to "not found".
 
 ### Build system
 
@@ -541,21 +553,17 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_execve`'s bare-name retry is now in place but does not
-  resolve `busybox sh`'s external commands (added session 19).**
-  `musl_exec2` proves the retry fires for `execve("HELLO")`,
-  `execve("/HELLO.ELF")`, and `execve("echo", argv)`.  `busybox sh`
-  still reports `sh: <cmd>: Operation not permitted` when a typed
-  external command is given, and there is no `sys_execve: f_open(...)
-  -> N` diagnostic line in the serial log for that case.  That
-  absence suggests `ash` never reaches `sys_execve` -- it likely
-  fails on an earlier syscall (e.g. `access`, `stat`, or a `PATH`
-  lookup that resolves to something `ash` does not like) and reports
-  `EPERM` from there.  **Next change:** add a per-invocation
-  `serial_print` at the top of `sys_execve` (right after
-  `copy_user_string`) so we can see whether `execve` is entered at
-  all and with what path.  That is a diagnostic, not a fix; the fix
-  depends on what the diagnostic shows.
+- **`sys_stat` does not retry bare names (added session 21).**
+  `busybox sh` calls `stat("/usr/local/sbin/ls")`, or whatever its
+  default PATH entries resolve to, to probe for the command before
+  calling `execve`.  FatFs rejects all of those paths with
+  `FR_INVALID_NAME`, so `sys_stat` returns `-ENOENT` (correctly, now
+  that session 21 fixed the errno mapping), and `ash` reports
+  `sh: ls: not found` and never calls `execve`.  The fix is the same
+  shape as session 19's `execve` retry: if `f_stat(path)` fails with
+  `FR_INVALID_NAME` or `FR_NO_FILE` and the path has no `:`, call
+  `exec_resolve_bare_name(path, resolved, ...)` and retry
+  `f_stat(resolved)`.  **Next change.**
 - **`sys_ioctl` returns `-ENOTTY` for every request, including
   `TCGETS`.**  `ash` uses the failure of `ioctl(0, TCGETS, ...)` to
   decide stdin is not a tty; as a result it does not echo typed input
@@ -704,9 +712,10 @@ deleted without being recorded; the session-11 commit table in Part 2
 is the record.  Sessions 13 and 14 used `20260927-01` through
 `20260927-04`; their commit tables in Part 2 are the record.
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
-Sessions 18 and 19 used `20260927-08` and `-09`; their commit tables
-in Part 2 are the record.  Working tags are deleted after their
-session is consolidated; the SHA in the table is what survives.
+Sessions 18 through 21 used `20260927-08`, `-09`, `-10` and the
+session-21 tag below; their commit tables in Part 2 are the record.
+Working tags are deleted after their session is consolidated; the
+SHA in the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -727,18 +736,18 @@ tags pushed to the remote.  Do not push working tags.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: busybox runs, its banner prints, and
 `dup2`, `F_DUPFD`, `setsid`, `getppid`, `getcwd`, `execve`-retry,
-and file_slot_t refcounting are green; `busybox sh` runs and its
-builtins work, but external commands still fail.  Next: a
-per-invocation `sys_execve` diagnostic to see whether `ash`
-reaches `execve` at all, then `ioctl TCGETS`.**
+errno-mapping, and file_slot_t refcounting are green; `busybox sh`
+runs, its builtins work, and its external-command error messages are
+now accurate ("not found").  Next: the same bare-name retry inside
+`sys_stat`, then `ioctl TCGETS`.**
 
 ---
 
 # Part 2 -- Session Status
 
-**Last updated:** 2026-09-27 (session 19, execve bare-name retry)
-**Current HEAD:** `<new-sha>` (tag `20260927-09`), on branch `dev`,
-fifteen commits ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 21, proper errnos from file syscalls)
+**Current HEAD:** `e8ce6d8` (tag `20260927-10`), on branch `dev`,
+seventeen commits ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -748,8 +757,9 @@ handling), `20260927-02` (build: busybox integration), `20260927-03`
 `20260927-06` (kernel: F_DUPFD in fcntl),
 `20260927-07` (kernel: setsid + getppid),
 `20260927-08` (kernel: getcwd),
-`20260927-09` (kernel: execve bare-name retry).  All working tags
-are local-only.
+`20260927-09` (kernel: execve bare-name retry),
+`20260927-10` (kernel: proper errnos from file syscalls).  All
+working tags are local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
@@ -758,23 +768,22 @@ are local-only.
 **Phase B is underway.  busybox runs, the banner prints, and
 `busybox ls` / `cat` / `echo` work.  `dup2`, `F_DUPFD`, `setsid`,
 `getppid`, `getcwd`, and file_slot_t refcounting are green.
-`sys_execve` now retries bare names, and `musl_exec2` proves the
-retry works.  `busybox sh` still reaches its command loop and
-executes builtins, but typed external commands still fail with
-"Operation not permitted", and typed input is not echoed.**
+`sys_execve` retries bare names, and `musl_exec2` proves it.
+Every file syscall now returns a proper negative errno on failure.
+`busybox sh` runs its command loop, executes builtins, and reports
+accurate error messages ("not found") for external commands.**
 
-The kernel speaks enough Linux x86_64 syscalls to run a static
-musl busybox through a directory listing, a single-file `ls`, and
-`cat`/`echo`, and to run `busybox sh` to a live command loop.  The
-next functional milestone is `busybox sh` being fully interactive.
-Two problems remain, in the order they need solving:
+The next functional milestone is `busybox sh` being fully
+interactive.  Three problems remain, in the order they need
+solving:
 
-1. `ash` does not reach `sys_execve` for typed external commands
-   (evidence: no `sys_execve: f_open(...) -> N` diagnostic line
-   in the serial log even though `ash` reports the failure).  Need
-   a per-invocation `sys_execve` diagnostic to confirm.
+1. `sys_stat` does not retry bare names, so `ash`'s PATH probe
+   fails for every candidate and it never calls `execve`.
 2. `ioctl TCGETS` returning `-ENOTTY` makes `ash` treat stdin as
-   non-interactive.  Fix that and the prompt/echo appear.
+   non-interactive (no prompt, no echo).
+3. Neither of the above has been proven to be the last blocker;
+   once they are fixed, `busybox sh` will either run external
+   commands or expose the next problem.
 
 **State of the tree:**
 
@@ -786,11 +795,20 @@ Two problems remain, in the order they need solving:
 - The existing canary (hello, echo, cat, ls, memtest, musl_* tests)
   still passes.
 
+## Session 21 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-10` | `e8ce6d8` | kernel: return proper errnos from file syscalls. |
+
+The tag is a working tag (local-only).  The commit message has the
+full narrative.
+
 ## Session 19 commits, in order
 
 | Tag | Commit | What |
 |-----|--------|------|
-| `20260927-09` | `<new-sha>` | kernel: sys_execve bare-name retry -- `0:/NAME.ELF`. |
+| `20260927-09` | `f68ab7c` | kernel: sys_execve bare-name retry -- `0:/NAME.ELF`. |
 
 The tag is a working tag (local-only).  The commit message has the
 full narrative.
@@ -879,7 +897,7 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (all green as of `20260927-09`)
+## Canary state (all green as of `20260927-10`)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
@@ -910,13 +928,13 @@ The 19 rows below were already green at `v0.6.0` and remain green:
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
 | musl_sh (boot) | green | appears automatically at `donix> ` after `Shell: booting musl_sh from FAT` |
 
-Sessions 13-19 additions:
+Sessions 13-21 additions:
 
 | Test | State | Notes |
 |------|-------|-------|
 | musl_dup2 | green | `DUP2-OK`.  No heap warnings.  (Before the refcount fix landed in the same commit, this test produced two `HEAP: kfree called on already freed block!` lines at exit -- the test leaves the aliased fd open, and `close_all_files` double-freed.  That is the bug the refcount fix closed.) |
 | musl_dupfd | green | `DUPFD-OK`.  No heap warnings.  Exercises fcntl(fd, F_DUPFD, min) for min=3 (return >= 3, read works), min=3 again (distinct fd), min=99 (-EINVAL), min=0 (clamped to >= 3). |
-| musl_ids | green | `IDS-OK sid= 3`, `IDS-OK ppid= 2`.  setsid returns the calling pid; getppid returns the parent's pid; setsid is idempotent.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`; noted under Cosmetic.) |
+| musl_ids | green | `IDS-OK sid= 22`, `IDS-OK ppid= 2`.  setsid returns the calling pid; getppid returns the parent's pid; setsid is idempotent.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`; noted under Cosmetic.) |
 | musl_getcwd | green | `GETCWD-OK /`.  Exercises getcwd(buf, 64) (returns buf, writes "/\0"), getcwd(buf, 1) (-ERANGE), getcwd(NULL, 0) (-EINVAL). |
 | musl_exec2 | green | `EXEC2-OK`.  Exercises sys_execve's bare-name retry: `execve("HELLO", NULL, NULL)` (bare uppercase, no prefix, no suffix), `execve("/HELLO.ELF", NULL, NULL)` (leading slash, .ELF already present), and `execve("echo", argv, NULL)` (lowercase bare name with argv).  All three fork, resolve to `0:/NAME.ELF`, run the target, and exit 0. |
 | busybox ls | green | 27 entries.  No `Unknown syscall`, no fault. |
@@ -925,7 +943,7 @@ Sessions 13-19 additions:
 | busybox cat 0:/HELLO-WORLD.TXT | green | file contents. |
 | busybox echo hi | green | `hi`. |
 | busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`).  `CONFIG_BUSYBOX` is now on.  No `Unknown syscall: 33`. |
-| busybox sh (partial) | in progress | Reaches a command loop.  Executes builtins (`exit` returns to `musl_sh`).  Typed external commands still fail with `sh: <cmd>: Operation not permitted`.  No `sys_execve: f_open(...) -> N` diagnostic line appears in the serial log for the failure, which suggests `ash` never reaches `sys_execve` for the command -- it likely fails on an earlier syscall (probably `access` or a `PATH` lookup against a fixed default `PATH`).  Typed input is still not echoed and no prompt is printed (ioctl TCGETS, below). |
+| busybox sh (partial) | in progress | Reaches a command loop.  Executes builtins (`exit` returns to `musl_sh`).  Typed external commands now report `sh: <cmd>: not found` (was `Operation not permitted` before session 21 fixed the errno mapping).  The underlying cause is that `sys_stat` does not retry bare names, so `ash`'s PATH probe fails for every candidate and it never calls `execve`.  Typed input is still not echoed and no prompt is printed (ioctl TCGETS, below). |
 
 The `Unknown syscall: 72` line that used to appear on every `ls` and
 `musl_readdir` is gone -- `fcntl` is now implemented.  The
@@ -967,44 +985,37 @@ implemented.
 
 ## Next step (exactly this, then stop)
 
-**Session 20 continues Phase B.**
+**Session 22 continues Phase B.**
 
 In priority order:
 
-1. **Add a per-invocation `sys_execve` diagnostic.**  One
-   `serial_print` at the top of `sys_execve`, right after the
-   `copy_user_string` call for `path`, printing the path string the
-   caller passed.  Rebuild, boot, `busybox sh`, type `ls`.  Two
-   outcomes:
-   - If `sys_execve: path="..."` lines appear, `ash` **is** calling
-     `execve` for the failing command, and we can see exactly what
-     path it passed and whether the retry fires.
-   - If no such lines appear, `ash` is failing before `execve` -- on
-     `access`, `stat`, or something else on the `PATH`-search path --
-     and the fix is not in `sys_execve`.
-   This is a **diagnostic**, not a fix.  Commit only after the
-   diagnostic runs and we know what it shows; the fix depends on
-   the result.  This is the next change.
+1. **Add the bare-name retry to `sys_stat`.**  Mirror the session-19
+   change in `sys_execve`: if `f_stat(path)` fails with
+   `FR_INVALID_NAME` or `FR_NO_FILE` and the path has no `:`, call
+   `exec_resolve_bare_name(path, resolved, ...)` and retry
+   `f_stat(resolved)`.  If that succeeds, fill the `kernel_stat_t`
+   from the resolved entry and return 0.  This is the next change,
+   and it is small -- one function, using the helper that already
+   exists.
 
-2. **Implement `ioctl(0, TCGETS, ...)`.**  Return a termios struct
+2. **Re-test `busybox sh`.**  If the `sys_stat` retry works, `ash`'s
+   PATH probe should succeed and it should call `execve` (whose own
+   retry resolves the path), and `ls` should run.  If it still does
+   not, we take the next diagnostic step.
+
+3. **Implement `ioctl(0, TCGETS, ...)`.**  Return a termios struct
    with `ICANON | ECHO | ISIG | IEXTEN` (and the usual input/output
    flags) so `ash` believes stdin is a tty.  Accept and ignore
    `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes `ash` echo typed input
    and print a prompt.
 
-3. **Revisit `busybox sh` with both in place.**  With `TCGETS`
-   working, `ash` becomes interactive; its command-lookup path may
-   change.  If external commands still fail, the per-invocation
-   diagnostic tells us exactly where.
-
-4. **Then cut the milestone tag.**  Once typed external commands
-   work, `busybox sh` is a fully usable interactive shell.  That is
-   the natural point for `v0.6.2` or `v0.7.0`.
+4. **Then cut the milestone tag.**  Once external commands run and
+   `sh` is interactive, that is the natural point for `v0.6.2` or
+   `v0.7.0`.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `sys_execve` per-invocation diagnostic (next) -- determine whether
-   `ash` reaches `execve`.
+1. `sys_stat` bare-name retry -- next.
 2. `ioctl TCGETS` -- the other half of interactive `sh`.
 3. `sys_newfstatat` (262) -- busybox may route through it once more
    applets are enabled.
@@ -1020,10 +1031,10 @@ In priority order:
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now fifteen commits ahead
-of `origin/dev`.  Whether Phase B lands on `dev` only, gets merged
-to `main` at the next milestone, or is pushed immediately is a
-separate decision.  Milestone tags go on the published side; the
+**Do not push without a plan.**  `dev` is now seventeen commits
+ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
+merged to `main` at the next milestone, or is pushed immediately is
+a separate decision.  Milestone tags go on the published side; the
 same principle applies to Phase B.
 
 ## Open items
@@ -1032,7 +1043,7 @@ same principle applies to Phase B.
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `sys_execve` per-invocation diagnostic -- next.
+  - `sys_stat` bare-name retry -- next.
   - `ioctl TCGETS`.
   - `sys_newfstatat` (262) -- three-way delegation.
   - `isr14_handler` user-mode fault handling.
