@@ -403,15 +403,59 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
 #define F_SETFD  2
 #define F_GETFL  3
 #define F_SETFL  4
+#define F_DUPFD_CLOEXEC 1030
 #define EINVAL_  22
+#define EAGAIN_  11
+#define EBADF_   9
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
-    (void)arg;
-
     file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -(long)9;   /* -EBADF */
+    if (!slot) return -(long)EBADF_;
 
     switch (cmd) {
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC: {
+            /*
+             * Linux fcntl(F_DUPFD, min): return the lowest free fd
+             * >= min, aliased to the same open file description.
+             *
+             * donix reserves fds 0, 1, 2 for stdin/stdout/stderr, and
+             * get_file_slot() refuses them (fd < 3 returns NULL).  So
+             * an F_DUPFD with min = 0, 1, or 2 must still land on an
+             * fd >= 3; otherwise the caller gets a "valid" return
+             * value it cannot subsequently read or write through.
+             * musl's dup(fd) wrapper is fcntl(fd, F_DUPFD, 0), so this
+             * clamp is on the hot path for busybox sh redirection.
+             *
+             * The new fd shares the file_slot_t with `fd` and takes a
+             * reference, exactly like sys_dup2.  The refcount
+             * machinery is what makes the shared slot safe.
+             *
+             * F_DUPFD_CLOEXEC additionally sets FD_CLOEXEC on the new
+             * fd.  donix does not track FD_CLOEXEC (all fds survive
+             * execve), so the flag is silently dropped — the same
+             * behavior as the F_SETFD case below.
+             */
+            int min = (int)arg;
+            if (min < 0 || min >= MAX_PROCESS_FILES) {
+                return -(long)EINVAL_;
+            }
+            pcb_t* self = process_get_current();
+            if (!self) return -(long)EBADF_;
+
+            int start = min;
+            if (start < 3) start = 3;
+
+            int newfd = -1;
+            for (int i = start; i < MAX_PROCESS_FILES; i++) {
+                if (self->file_table[i] == NULL) { newfd = i; break; }
+            }
+            if (newfd == -1) return -(long)EAGAIN_;
+
+            slot->refcount++;
+            self->file_table[newfd] = slot;
+            return (long)newfd;
+        }
         case F_GETFD:  return 0;              /* no FD_CLOEXEC set */
         case F_SETFD:  return 0;              /* ignore the flag   */
         case F_GETFL:  return 0;              /* O_RDONLY          */
