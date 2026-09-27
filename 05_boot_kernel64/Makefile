@@ -1,33 +1,51 @@
 AS := nasm
 
 .PHONY: all clean run run-log run-debug run-verbose run-headless run-kvm run-telnet \
-        run-single run-kvm-single watch-serial clean-logs
+        run-single run-kvm-single watch-serial clean-logs musl-userland
 
 all: boot.bin stage2.bin hdd.img
 
 SINGLE_DRIVE_LBA := 2048
 DISK_SECTORS     := 40960
 
-HELLO_MUSL    := /tmp/hello_musl
-ECHO_MUSL     := /tmp/echo_musl
-CAT_MUSL      := /tmp/cat_musl
-LS_MUSL       := /tmp/ls_musl
-MEMTEST_MUSL  := /tmp/memtest_musl
-MUSL_STAT     := /tmp/musl_stat
-MUSL_MIN      := /tmp/musl_min
-MUSL_PRINTF   := /tmp/musl_printf
-MUSL_MALLOC   := /tmp/musl_malloc
-PRINTNUM      := /tmp/printnum
-BRK_VERIFY    := /tmp/brk_verify
-BRKRAW        := /tmp/brkraw
-BRKGROW       := /tmp/brkgrow
-MUSL_FORK     := /tmp/musl_fork
-MUSL_FORK_RAW := /tmp/musl_fork_raw
-MUSL_EXEC     := /tmp/musl_exec
-MUSL_WAIT     := /tmp/musl_wait
-MUSL_READDIR  := /tmp/musl_readdir
-MUSL_R10PROBE := /tmp/musl_r10probe
-MUSL_SH       := /tmp/musl_sh
+# ------------------------------------------------------------------
+# musl userland.
+#
+# Sources live in ../userland/musl/{apps,tests}/.  Its Makefile
+# builds them into ../userland/musl/build/*.elf.  This Makefile
+# invokes that build before staging the FAT image, and copies the
+# resulting ELFs onto the FAT.
+#
+# Replaces the old /tmp/*_musl staging, which depended on
+# build_musl_tests.sh having been run by hand first.
+# ------------------------------------------------------------------
+USERLAND_DIR := ../userland/musl
+USERLAND_BIN := $(USERLAND_DIR)/build
+
+# Every ELF the musl userland Makefile produces, listed explicitly
+# so the image build has real prerequisites.  If you add a new app
+# or test, add it here and to the FAT-staging list below.
+USERLAND_ELFS := \
+	$(USERLAND_BIN)/hello.elf \
+	$(USERLAND_BIN)/echo.elf \
+	$(USERLAND_BIN)/cat.elf \
+	$(USERLAND_BIN)/ls.elf \
+	$(USERLAND_BIN)/memtest.elf \
+	$(USERLAND_BIN)/musl_sh.elf \
+	$(USERLAND_BIN)/musl_stat.elf \
+	$(USERLAND_BIN)/musl_min.elf \
+	$(USERLAND_BIN)/musl_printf.elf \
+	$(USERLAND_BIN)/musl_malloc.elf \
+	$(USERLAND_BIN)/musl_fork.elf \
+	$(USERLAND_BIN)/musl_fork_raw.elf \
+	$(USERLAND_BIN)/printnum.elf \
+	$(USERLAND_BIN)/brk_verify.elf \
+	$(USERLAND_BIN)/brkraw.elf \
+	$(USERLAND_BIN)/brkgrow.elf \
+	$(USERLAND_BIN)/musl_exec.elf \
+	$(USERLAND_BIN)/musl_wait.elf \
+	$(USERLAND_BIN)/musl_readdir.elf \
+	$(USERLAND_BIN)/musl_r10probe.elf
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -35,14 +53,20 @@ boot.bin: boot.asm
 stage2.bin: stage2.asm
 	$(AS) -f bin stage2.asm -o stage2.bin
 
-hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
+# Build the musl userland.  Phony, so it always runs; the
+# sub-Makefile's own dependency tracking decides what actually
+# needs rebuilding.
+musl-userland:
+	$(MAKE) -C $(USERLAND_DIR)
+
+hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland $(USERLAND_ELFS)
 	rm -f hdd.img
 	qemu-img create -f raw hdd.img 20M
 	dd if=boot.bin of=hdd.img conv=notrunc
 	dd if=stage2.bin of=hdd.img bs=512 seek=1 conv=notrunc
 	dd if=../04_kernel_64bit/kernel.bin of=hdd.img bs=512 seek=128 conv=notrunc
 
-hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
+hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland $(USERLAND_ELFS)
 	rm -f hdd-single.img
 	qemu-img create -f raw hdd-single.img 20M
 	dd if=boot.bin of=hdd-single.img conv=notrunc
@@ -62,29 +86,30 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
 	        echo "mcopy $$src -> ::/$$dst"; \
 	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) "$$src" "::/$$dst" ; \
 	    else \
-	        echo "WARN: $$src not found; $$dst will be missing from the image"; \
+	        echo "ERROR: $$src missing — did the musl userland build fail?"; \
+	        exit 1; \
 	    fi \
 	}; \
-	mcopy_one "$(HELLO_MUSL)"    HELLO.ELF ; \
-	mcopy_one "$(ECHO_MUSL)"     ECHO.ELF ; \
-	mcopy_one "$(CAT_MUSL)"      CAT.ELF ; \
-	mcopy_one "$(LS_MUSL)"       LS.ELF ; \
-	mcopy_one "$(MEMTEST_MUSL)"  MEMTEST.ELF ; \
-	mcopy_one "$(MUSL_STAT)"     MUSL_STAT.ELF ; \
-	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
-	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
-	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF ; \
-	mcopy_one "$(MUSL_FORK)"       MUSL_FORK.ELF ; \
-	mcopy_one "$(MUSL_FORK_RAW)"   MUSL_FORK_RAW.ELF ; \
-	mcopy_one "$(PRINTNUM)"      PRINTNUM.ELF ; \
-	mcopy_one "$(BRK_VERIFY)"    BRK_VERIFY.ELF ; \
-	mcopy_one "$(BRKRAW)"        BRKRAW.ELF ; \
-	mcopy_one "$(BRKGROW)"       BRKGROW.ELF ; \
-	mcopy_one "$(MUSL_EXEC)"     MUSL_EXEC.ELF ; \
-	mcopy_one "$(MUSL_WAIT)"     MUSL_WAIT.ELF ; \
-	mcopy_one "$(MUSL_READDIR)"  MUSL_READDIR.ELF ; \
-	mcopy_one "$(MUSL_R10PROBE)" MUSL_R10PROBE.ELF ; \
-	mcopy_one "$(MUSL_SH)"       MUSL_SH.ELF
+	mcopy_one "$(USERLAND_BIN)/hello.elf"          HELLO.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/echo.elf"           ECHO.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/cat.elf"            CAT.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/ls.elf"             LS.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/memtest.elf"        MEMTEST.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_stat.elf"      MUSL_STAT.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_min.elf"       MUSL_MIN.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_printf.elf"    MUSL_PRINTF.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_malloc.elf"    MUSL_MALLOC.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork.elf"      MUSL_FORK.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork_raw.elf"  MUSL_FORK_RAW.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/printnum.elf"       PRINTNUM.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/brk_verify.elf"     BRK_VERIFY.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
 
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
@@ -148,3 +173,4 @@ clean-logs:
 
 clean: clean-logs
 	rm -f boot.bin stage2.bin hdd.img hdd-single.img
+	$(MAKE) -C $(USERLAND_DIR) clean
