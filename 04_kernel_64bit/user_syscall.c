@@ -394,9 +394,8 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
  * requests musl actually issues, so opendir succeeds.  Everything
  * else returns -EINVAL.
  *
- * F_DUPFD is not implemented.  If a later busybox applet needs it
- * (shell redirection, pipes), implement it as a real dup of the
- * file_slot_t here.
+ * F_DUPFD is implemented; F_DUPFD_CLOEXEC aliases it, with the
+ * close-on-exec bit silently dropped (donix does not track it).
  */
 #define F_DUPFD  0
 #define F_GETFD  1
@@ -1687,6 +1686,41 @@ long sys_getpid(void) {
 }
 
 /*
+ * Linux x86_64 getppid(2) — syscall 110.
+ *
+ * Returns the calling process's parent pid.  pid 0 in pcb_t means
+ * "no parent" (idle, kernel shell, user shell); Linux returns 1
+ * for the ultimate ancestor, so map 0 to 1 here.  busybox ash
+ * calls this to populate $PPID; the exact value does not matter
+ * for correctness, but it must be a plausible pid.
+ */
+long sys_getppid(void) {
+    pcb_t* current = process_get_current();
+    if (!current) return 1;
+    if (current->parent_pid == 0) return 1;
+    return (long)current->parent_pid;
+}
+
+/*
+ * Linux x86_64 setsid(2) — syscall 107.
+ *
+ * Creates a new session.  donix has no notion of sessions or
+ * process groups; the pragmatic implementation is a no-op that
+ * returns the calling process's pid (the new session id in
+ * Linux's model).  busybox ash calls this at startup to detach
+ * from the controlling terminal and does not depend on any
+ * session semantics beyond a successful return.
+ *
+ * Linux would return -EPERM if the caller is already a process
+ * group leader; that case does not arise here.
+ */
+long sys_setsid(void) {
+    pcb_t* current = process_get_current();
+    if (!current) return -(long)1;
+    return (long)current->pid;
+}
+
+/*
  * Linux x86_64 set_tid_address(2).
  *
  * musl's __libc_start_main calls this during init and uses the
@@ -2152,6 +2186,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
+        case SYS_GETPPID:         return (uint64_t)sys_getppid();
+        case SYS_SETSID:          return (uint64_t)sys_setsid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;

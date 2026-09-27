@@ -42,6 +42,8 @@
 #define SYS_WAIT4           61
 #define SYS_FCNTL           72
 #define SYS_UNLINK          87
+#define SYS_SETSID          107
+#define SYS_GETPPID         110
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
@@ -93,5 +95,7 @@ long sys_unlink(const char* path);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
+long sys_setsid(void);
+long sys_getppid(void);
 
 #endif
