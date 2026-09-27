@@ -34,6 +34,7 @@
 #define SYS_RT_SIGPROCMASK  14
 #define SYS_IOCTL           16
 #define SYS_WRITEV          20
+#define SYS_ACCESS     21
 #define SYS_DUP2            33
 #define SYS_GETPID          39
 #define SYS_FORK            57
@@ -50,6 +51,7 @@
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_EXIT_GROUP      231
 #define SYS_NEWFSTATAT      262
+#define SYS_FACCESSAT       269
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GETRANDOM       318
 #define SYS_RSEQ            334

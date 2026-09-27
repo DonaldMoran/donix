@@ -14,6 +14,9 @@
 #include "include/user_space.h"
 #include "ff.h"
 
+/* Defined below, in the execve helpers section. */
+static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
+
 /* Defined in kmain.c — reboots the machine via keyboard controller + ACPI reset port. */
 extern void handle_reboot_sequence(void);
 
@@ -56,6 +59,11 @@ static char g_write_bounce[WRITE_CHUNK];
  * open/write/close/read.  Set to 0 for production.
  * ============================================================ */
 #define DEBUG_FIL 0
+
+/* Set DEBUG_STAT_TRACE to 1 to log every sys_stat call.  Used to
+ * find out exactly which paths busybox ash's PATH probe stats.
+ * Set to 0 for production. */
+#define DEBUG_STAT_TRACE 0
 
 // ============================================================
 // FILE TABLE SLOT HEADER
@@ -812,6 +820,51 @@ long sys_fstat(int fd, void* user_stat) {
 }
 
 /*
+ * Shared f_stat-with-bare-name-retry helper.
+ *
+ * Both sys_stat and sys_access need the same thing: stat the path
+ * as given; if that fails with FR_INVALID_NAME / FR_NO_FILE and
+ * the path has no ':' (i.e. is not already in FatFs drive form),
+ * resolve the base name to "0:/NAME.ELF" and retry.
+ *
+ * On success, *out_fno holds the FILINFO and the function returns
+ * FR_OK.  On failure, returns the last FRESULT.
+ */
+static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
+    FRESULT r = f_stat(path, out_fno);
+
+    if (r == FR_INVALID_NAME || r == FR_NO_FILE || r == FR_NO_PATH) {
+        int has_drive = 0;
+        for (const char* p = path; *p; p++) {
+            if (*p == ':') { has_drive = 1; break; }
+        }
+
+        char resolved[USER_PATH_MAX];
+        if (!has_drive &&
+            exec_resolve_bare_name(path, resolved, sizeof(resolved)) == 0) {
+#if DEBUG_STAT_TRACE
+            serial_print("f_stat retry: '");
+            serial_print(path);
+            serial_print("' -> '");
+            serial_print(resolved);
+            serial_print("' = ");
+            serial_print_dec((uint64_t)r);
+#endif
+            FRESULT r2 = f_stat(resolved, out_fno);
+#if DEBUG_STAT_TRACE
+            serial_print("/");
+            serial_print_dec((uint64_t)r2);
+            serial_print("\n");
+#endif
+            if (r2 == FR_OK) {
+                r = FR_OK;
+            }
+        }
+    }
+    return r;
+}
+
+/*
  * Linux x86_64 stat(2) — syscall 4.
  *
  * Path-based sibling of sys_fstat.  musl's stat(path, st) routes
@@ -837,6 +890,12 @@ long sys_stat(const char* user_path, void* user_stat) {
     }
     strip_dot_prefix(path);
 
+#if DEBUG_STAT_TRACE
+    serial_print("sys_stat: '");
+    serial_print(path);
+    serial_print("'\n");
+#endif
+
     /* ".", "/", "0:", "0:/" — synthesize a root-directory stat.
      * f_stat would return FR_INVALID_NAME for all of them. */
     if (path_is_root(path)) {
@@ -849,7 +908,7 @@ long sys_stat(const char* user_path, void* user_stat) {
     }
 
     FILINFO fno;
-    FRESULT r = f_stat(path, &fno);
+    FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
         return fatfs_errno(r);
     }
@@ -874,6 +933,73 @@ long sys_stat(const char* user_path, void* user_stat) {
  */
 long sys_lstat(const char* user_path, void* user_stat) {
     return sys_stat(user_path, user_stat);
+}
+
+/*
+ * Linux x86_64 access(2) — syscall 21.
+ *
+ * Returns 0 if the path exists and the requested permission bits
+ * are satisfiable, -errno otherwise.  donix does not track UNIX
+ * permissions (FAT has none), so we only check existence: F_OK
+ * (0), R_OK (4), W_OK (2), X_OK (1) all reduce to "does this
+ * path resolve to something on the FAT".
+ *
+ * The path is checked with the same f_stat-with-retry used by
+ * sys_stat, so "ls", "echo", and "/usr/local/sbin/ls" all resolve
+ * the same way they do for stat.
+ *
+ * Why this exists: busybox's find_execable() (libbb/find_execable.c)
+ * calls access(path, X_OK) for each PATH candidate before deciding
+ * whether to execve it.  On donix there is no sys_access, so the
+ * probe hit "Unknown syscall: 21", returned -ENOSYS, and ash
+ * concluded the command did not exist — before ever reaching
+ * sys_stat or sys_execve.  That is why `sh: ls: not found`
+ * appeared even though stat("ls") would now succeed.
+ */
+long sys_access(const char* user_path, int mode) {
+    (void)mode;   /* permissions are not tracked; existence is all */
+
+    if (!user_path) return -(long)EFAULT_;
+
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(path);
+
+#if DEBUG_STAT_TRACE
+    serial_print("sys_access: '");
+    serial_print(path);
+    serial_print("'\n");
+#endif
+
+    /* Root always "exists" as a directory. */
+    if (path_is_root(path)) {
+        return 0;
+    }
+
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 faccessat(2) — syscall 269.
+ *
+ * musl's faccessat() on x86_64 with AT_EACCESS unset does NOT go
+ * straight to syscall 269; it calls access() (21).  But busybox
+ * and glibc-built code may call faccessat directly, and glibc's
+ * faccessat wrapper is __NR_faccessat (269).  Implement it as a
+ * direct alias of sys_access; the dirfd / flags arguments are
+ * ignored, which is correct for the only case we can support
+ * (AT_FDCWD, no flags).
+ */
+long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
+    (void)dirfd; (void)flags;
+    return sys_access(user_path, mode);
 }
 
 // ============================================================
@@ -2374,6 +2500,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
+        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
+        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
