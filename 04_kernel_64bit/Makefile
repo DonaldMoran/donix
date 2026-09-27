@@ -200,9 +200,6 @@ fatfs/ffunicode.o: fatfs/ffunicode.c
 vga.o: vga.c
 	$(CC) $(CFLAGS) -I. -c vga.c -o vga.o
 
-syscall.o: syscall.c
-	$(CC) $(CFLAGS) -I. -c syscall.c -o syscall.o
-
 elf.o: elf.c
 	$(CC) $(CFLAGS) -I. -c elf.c -o elf.o
 

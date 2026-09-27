@@ -36,10 +36,6 @@ static char g_write_bounce[WRITE_CHUNK];
  * ============================================================ */
 #define DEBUG_FIL 0
 
-/* Set DEBUG_WRITE_BOUNCE to 1 to detect reentrant console writes
- * through the shared g_write_bounce buffer.  Diagnostic only. */
-#define DEBUG_WRITE_BOUNCE 0
-
 // ============================================================
 // FILE TABLE SLOT HEADER
 // ============================================================
@@ -1141,26 +1137,11 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (!self) return -1;
 
     if (fd == 1 || fd == 2) {
-#if DEBUG_WRITE_BOUNCE
-        static volatile int in_bounce = 0;
-        if (__sync_lock_test_and_set(&in_bounce, 1)) {
-            serial_print("[write] BOUNCE REENTRY pid=");
-            serial_print_dec((uint64_t)self->pid);
-            serial_print(" fd=");
-            serial_print_dec((uint64_t)fd);
-            serial_print(" count=");
-            serial_print_dec((uint64_t)count);
-            serial_print("\n");
-        }
-#endif
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
             size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
             if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
-#if DEBUG_WRITE_BOUNCE
-                __sync_lock_release(&in_bounce);
-#endif
                 return -1;
             }
             for (size_t i = 0; i < chunk; i++) {
@@ -1169,9 +1150,6 @@ long sys_write(int fd, const void* buf, size_t count) {
             }
             user_ptr += chunk; remaining -= chunk;
         }
-#if DEBUG_WRITE_BOUNCE
-        __sync_lock_release(&in_bounce);
-#endif
         return (long)count;
     }
 

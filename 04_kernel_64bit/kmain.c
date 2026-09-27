@@ -1002,10 +1002,7 @@ static void handle_command(const char *cmd) {
         if (test_program_len == 0) { vga_print("Binary missing.\n> "); return; }
         pcb_t* proc = process_create("elf_prog", 0x8000000000ULL, 0);
         if (proc) {
-            uint64_t old_cr3; __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
-            __asm__ volatile("mov %0, %%cr3" : : "r"(proc->cr3));
             uint64_t entry = load_elf_into_user_process(proc, test_program);
-            __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3));
             if (entry != 0) {
                 keyboard_buffer_flush();
                 scheduler_ready_queue_add(proc);
