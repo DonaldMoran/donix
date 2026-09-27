@@ -1089,15 +1089,27 @@ Newlib is gone.  Phase B is busybox.**
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-26 (session 9, A5 complete)
-**Current HEAD:** `28b0d60` (LLD_BUG_REPORT update; doc pass — no code change)
-**Last known-good code tag:** `20260926-08` (A5 step 8)
-**Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
+**Last updated:** 2026-09-26 (session 10, doc pass and initial publish)
+**Current HEAD:** `2980852` (tag `v0.5.5`); published to
+https://github.com/DonaldMoran/donix
+**Last known-good code tag:** `20260926-08` (A5 step 8) — the
+`20260926-NN` and `20260926A`–`Z` working tags were deleted locally
+after the doc pass; their commit mapping is preserved in
+`migration-tags.txt`.
+**Disaster preserved at:** branch `disaster-20260923A`
+(commit `47262a9`, local only)
 
 ## Current milestone
 
-**A5 complete at `20260926-08`.**  The newlib userland, build rules,
-and libraries are gone.  The kernel is musl-only:
+**Session 10 complete: doc pass, version bump, initial publish.**
+
+The `v0.5.5` release tag marks the end of the musl migration and the
+start of the published donix project.  The repository is at
+https://github.com/DonaldMoran/donix.
+
+The kernel and userland state is unchanged from `20260926-08` (A5
+step 8):
+
 - Only Linux x86_64 syscalls plus `SYS_REBOOT` (503) in
   `syscall_dispatch`.
 - The FAT has 21 entries; every one is a musl build.
@@ -1107,12 +1119,33 @@ and libraries are gone.  The kernel is musl-only:
 - `kernel.bin` shrank by ~88 KB from removing the embedded newlib
   shell blob.
 
+The three version banners in `kmain.c` now read `donix v0.5.5`
+(previously `DonsDOS v0.5.5`).
+
 **Next milestone: Phase B — busybox / coreutils against musl.**
 See Part 1's "Phase B" section.  The first target is a static
 busybox binary; it exercises a much larger syscall surface than the
 tiny musl tests and will surface the next batch of ABI gaps.
 
-## Session 9 commits, in order
+## Session 10 commits, in order
+
+| Commit | What |
+|--------|------|
+| `ed9b024` | Remove `SYS_EXEC_PLAN.md` (design plan preserved in git history at `ecc8ade`). |
+| `63f11f7` | `migration-tags.txt` — preserve the A1–A5 working tag map (56 tags). |
+| `5fe61c6` | `README.md` — rewrite for donix (musl, Linux syscall ABI). |
+| `8c161cd` | `ROADMAP.md` — promote v0.5.5 to its own milestone section. |
+| `402d296` | `OSDev_Checklist.md` — add donix migration section, Linux ABI, musl. |
+| `bfc8222` | `MAINTENANCE.md` — add donix migration items, close resolved, mark dons-os era. |
+| `28b0d60` | `LLD_BUG_REPORT.md` — update for donix; drop stale local-path section. |
+| `b08061c` | `handoff.md` — update Current HEAD to the doc-pass tip. |
+| `2980852` | `kmain` — rename `DonsDOS` to `donix` in the three version banners.  Tagged `v0.5.5`. |
+
+Publishing: `git push -u origin main` (1795 objects, 5.19 MiB) and
+`git push origin --tags` (35 tags) to
+`git@github.com:DonaldMoran/donix.git`.
+
+## Session 9 commits (A5 — retained for history)
 
 | Tag | Commit | What |
 |-----|--------|------|
@@ -1125,7 +1158,7 @@ tiny musl tests and will surface the next batch of ABI gaps.
 | `20260926-07` | `A5 step 7: delete the newlib userland tree` | Removed `userland/newlib/` whole, the `userland` phony target, `USERLAND_DIR`, `USER_CFLAGS`, and the `all: userland kernel.bin` prerequisite. |
 | `20260926-08` | `A5 step 8: remove dead code` | Deleted `syscall.c`, `DEBUG_WRITE_BOUNCE`, the dead CR3 switch in `kmain.c`'s `elfload`, and the unused `vmm_clone_kernel_half` / `vmm_free_user_page_tables`. |
 
-## Canary state (all green as of `20260926-08`)
+## Canary state (all green as of `20260926-08`; unchanged by the doc pass)
 
 Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
@@ -1221,9 +1254,18 @@ Plan Phase B as a sequence of small commits:
 
 Each is its own commit with the existing canary re-run.
 
+**Consider A6 first.**  The handoff proposes a `userland/musl/` tree
+(mirroring the deleted `userland/newlib/`) so that busybox and any
+future userland program live in a proper source tree instead of a
+growing `build_musl_tests.sh` heredoc.  This is a couple of hours of
+mechanical work and makes Phase B much cleaner.  It is not required,
+but it is recommended.
+
 ## Open items
 
 - **Phase B (busybox):** see "Next step" above.
+- **A6 (musl userland tree):** optional restructure, recommended
+  before Phase B.
 - **Open issues to chase, not blocking Phase B:**
   - `sys_newfstatat` (262) is unimplemented.  busybox may hit it.
   - `sys_open` accepts non-directories when called with
