@@ -1,0 +1,85 @@
+# migration-tags.txt — A1–A5 working tag map (dons-os → donix)
+#
+# The 56 local-only working tags created during the newlib-to-musl
+# migration.  They may be deleted before the public push; this file
+# preserves the name-to-commit mapping so tag names referenced in
+# handoff.md and ROADMAP.md stay resolvable.
+#
+# Format: tag  commit-SHA  commit subject
+#
+# The SHA is the commit the tag points at, not the tag object's own
+# SHA.  Some tags are annotated (git cat-file -t <tag> reports
+# "tag"); for those, the annotated tag object has its own SHA which
+# is not listed here.  Resolve a tag to its commit with either:
+#     git rev-list -n1 <tag>
+#     git log -1 <commit-SHA>
+#
+# Two naming schemes appear:
+#   YYYYMMDDA..Z    pre-A5, one letter per commit per day
+#   YYYYMMDD-NN     A5, two-digit sequence per day
+# The numeric scheme was introduced at 20260926Z because the letter
+# scheme was exhausted (Z is the last letter).
+#
+# These are NOT the release tags.  The dons-os version tags
+# (v0.0.1 through v0.5.4) and the donix migration-completion tag
+# (v0.5.5) remain as real git tags.
+#
+# Reconstruct the file after tag deletion:
+#     git log --format='%h %s' <commit-SHA>
+
+20260922A 690d328 A1: conservative syscall renumbering to Linux x86_64 numbers ...
+20260922B f40ae5e A2 item 1: add arch_prctl(ARCH_SET_FS) as syscall 158
+20260922C 06b2da1 stage2: move 32-to-64-bit handoff stack out of staging A
+20260922D 44212aa vmm: split 2 MB huge pages when mapping a 4 KB page inside them
+20260922E 0e38186 A2 item 2: add set_tid_address (218)
+20260922F 9b2164b sys_waitpid: re-scan for a zombie after setting BLOCKED
+20260922G e9dafd3 A2 item 20: add writev(20); move getpid to 39
+20260922H a465b4e A1 completion: finish syscall renumbering to Linux x86_64
+20260923A 47262a9 A2.7: implement mmap(9), munmap(11), mprotect(10); fix brk(12) ABI
+20260924A f1790a3 build: fix newlib userland Makefile; stage test binaries; ignore handoff.md
+20260924B 5a8b5c3 PMM: add temporary per-call allocation diagnostic
+20260924C 0627215 writev: read iov via safe_copy_from_user; drop diagnostics
+20260924D bdd940b fork: A2 item 11 working; canary green
+20260924E 22e8aa5 fork: preserve rdi/rsi/rdx across syscall; musl_fork works
+20260924F e1ae38c process_exit: switch to idle instead of halting when ready queue is empty
+20260924G e99bddc remove dead-keyboard diagnostics
+20260924H 6ea6bec syscall.h: document 59 as reserved for real execve
+20260924I 10b880d A2.12 step 2: in-place Linux execve(59)
+20260924J 64cf2e7 A2.13: encode wait4 status as Linux wait-status word
+20260924K f5b8fbb A2.14: getdents64(217), open-on-directory, musl_readdir test
+20260924L eec5ac4 Fix syscall return path: preserve user %r10, do not clobber %rax
+20260926-01 e7b2dc3 A5 step 1: remove newlib *-elf targets and user-elfs aggregate
+20260926-02 de1a40f A5 step 2: remove SYS_DONIX_SPAWN (507) and sys_spawn
+20260926-03 e725bf8 A5 step 3: remove SYS_OPENDIR/SYS_READDIR/SYS_CLOSEDIR (500-502)
+20260926-04 171473d A5 step 4: remove SYS_ARCH_SET_FS (504)
+20260926-05 a6f34c0 A5 step 5: remove SYS_DONIX_SBRK (505)
+20260926-06 10264c1 A5 step 6: remove embedded newlib shell and its fallback
+20260926-07 f043fa2 A5 step 7: delete the newlib userland tree
+20260926-08 cf2c6f2 A5 step 8: remove dead code (syscall.c, DEBUG_WRITE_BOUNCE, dead CR3 switch, unused vmm helpers)
+20260926-09 64ec5f5 handoff: A5 complete; Phase B is next
+20260926A 6e4932e sys_read: fd 0 returns on first byte, not on count (POSIX short read)
+20260926B e023b47 A3: add minimal musl shell, wired into image build
+20260926C 6170393 A3: musl_sh reads a line byte-at-a-time, echoes as typed
+20260926D 43db361 musl_r10probe: fix stack buffer overflow in puthex64 (b[24] -> b[32])
+20260926E 43d5202 Save/restore MSR_FS_BASE per process across context switches
+20260926F fc4795b A3: musl_sh tokenizes its command line into argv
+20260926G d056c72 execve: pass argc/argv in %rdi/%rsi for newlib crt0.S
+20260926H a77b3a7 execve: envp NULL terminator needs its own slot (fix argv[1] clobber)
+20260926I 692b9d9 A3: musl_sh normalizes argv[0] to 0:/NAME.ELF
+20260926J 42e6a5c boot: load MUSL_SH.ELF from FAT as default shell, embedded newlib as fallback
+20260926K 2c28e64 handoff: A3 complete; newlib line-editor/FatFs issue diagnosed
+20260926L 0faacdb A4: add musl hello as HELLO_MUSL.ELF (parallel, not replacing newlib HELLO.ELF)
+20260926M 10957ee A4: add musl echo as ECHO_MUSL.ELF (parallel, not replacing newlib ECHO.ELF)
+20260926N 6a39633 A4: add musl cat as CAT_MUSL.ELF (parallel, not replacing newlib CAT.ELF)
+20260926O 033b655 handoff: A4 hello/echo/cat done; ls blocked on kernel stat
+20260926P cbeb83b build: use project-local musl 1.2.5 from source (toolchain/musl-gcc.sh)
+20260926Q c9296ea handoff: A4 progress; musl is project-local; stat is next
+20260926R 9b912b8 sys_fstat: implement Linux fstat(2) for A4 ls
+20260926S d20218d handoff: sys_fstat green; sys_stat and fstatat routing recorded
+20260926T 07cab97 sys_stat: implement Linux stat(2) for A4 ls
+20260926U 6678ed3 handoff: sys_stat green; ls_musl is next
+20260926V 639055b A4: add musl ls as LS_MUSL.ELF (parallel, not replacing newlib LS.ELF)
+20260926W f60039d A4: add musl memtest as MEMTEST_MUSL.ELF (parallel, not replacing newlib MEMTEST.ELF)
+20260926X 7b9e479 handoff: A4 complete; cut-over is next
+20260926Y c9f479c A4 cut-over: HELLO/ECHO/CAT/LS/MEMTEST.ELF are now the musl builds
+20260926Z a0a3abc handoff: add YYYYMMDD-NN tagging convention (letter scheme exhausted at Z)
