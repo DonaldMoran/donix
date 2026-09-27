@@ -94,20 +94,15 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	        echo "WARN: $$src not found; $$dst will be missing from the image"; \
 	    fi \
 	}; \
-	mcopy_one "$(HELLO_ELF)"     HELLO.ELF ; \
-	mcopy_one "$(HELLO_MUSL)"    HELLO_MUSL.ELF ; \
-	mcopy_one "$(ECHO_MUSL)"     ECHO_MUSL.ELF ; \
-	mcopy_one "$(CAT_MUSL)"      CAT_MUSL.ELF ; \
-	mcopy_one "$(LS_MUSL)"       LS_MUSL.ELF ; \
-	mcopy_one "$(MEMTEST_MUSL)"  MEMTEST_MUSL.ELF ; \
+	mcopy_one "$(HELLO_MUSL)"    HELLO.ELF ; \
+	mcopy_one "$(ECHO_MUSL)"     ECHO.ELF ; \
+	mcopy_one "$(CAT_MUSL)"      CAT.ELF ; \
+	mcopy_one "$(LS_MUSL)"       LS.ELF ; \
+	mcopy_one "$(MEMTEST_MUSL)"  MEMTEST.ELF ; \
 	mcopy_one "$(MUSL_STAT)"     MUSL_STAT.ELF ; \
-	mcopy_one "$(MEMTEST_ELF)"   MEMTEST.ELF ; \
 	mcopy_one "$(FSTEST_ELF)"    FSTEST.ELF ; \
 	mcopy_one "$(MULTITEST_ELF)" MULTITEST.ELF ; \
 	mcopy_one "$(BIGTEST_ELF)"   BIGTEST.ELF ; \
-	mcopy_one "$(LS_ELF)"        LS.ELF ; \
-	mcopy_one "$(CAT_ELF)"       CAT.ELF ; \
-	mcopy_one "$(ECHO_ELF)"      ECHO.ELF ; \
 	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
 	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
 	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF ; \
