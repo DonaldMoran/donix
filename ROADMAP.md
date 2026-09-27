@@ -1,10 +1,9 @@
-# ROADMAP
 ### donix (x86_64) — Project Roadmap
 
 This roadmap outlines the evolution of **donix**, from its origin as
 **dons-os** through the musl migration to the current state and beyond.
 
-Section **0** describes the **donix milestone** (`v0.5.5`) — the
+Section **0** describes the **donix milestone** (`v0.5.5`, extended by `v0.6.0`) — the
 newlib-to-musl migration that produced this project. Sections 1–4 and
 the per-version milestone entries through `v0.5.4` describe **dons-os
 history**: the kernel that donix inherited. They are preserved here
@@ -24,15 +23,15 @@ see [`MAINTENANCE.md`](MAINTENANCE.md).
 
 ---
 
-## 0. donix — the musl migration — v0.5.5 (completed)
+## 0. donix — the musl migration — v0.5.5 / v0.6.0 (completed)
 
 donix was forked from dons-os at its `v0.5.4` tag. The goal was to
 re-target the OS to **static musl-linked binaries** and speak the
 **Linux x86_64 syscall ABI natively**, without disturbing the kernel
 infrastructure that dons-os had built.
 
-This is the work that produced donix, and it is captured by the
-completion tag **`v0.5.5`**. It was done in five phases, all complete.
+This is the work that produced donix, and it is captured by the completion tag **`v0.5.5`** (the musl migration) and **`v0.6.0`**
+(the musl userland source tree, phase A6). It was done in six phases, all complete.
 
 ### A1 — pure syscall renumbering
 
@@ -92,6 +91,24 @@ steps, each its own commit and canary run:
 
 Complete at `20260926-08`.
 
+### A6 — musl userland source tree
+
+The musl userland was moved out of the heredoc-based
+`build_musl_tests.sh` and into a tracked source tree at
+`userland/musl/`. The C sources do not change; only where they live
+and how they are built. Complete at `20260927-03`, tagged `v0.6.0`
+after the doc pass.
+
+- `userland/musl/{apps,tests}/` hold the sources; `Makefile` builds
+  each `.c` into `build/*.elf`.
+- `05_boot_kernel64/Makefile` invokes `make -C ../userland/musl` and
+  stages the resulting ELFs onto the FAT.
+- `build_musl_tests.sh` deleted.
+- `musl_min` now built with `-no-pie` like every other binary.
+- Residual newlib artifacts under `04_kernel_64bit/`
+  (`user_newlib_linker.ld`, `user_shell_data.c`, and the empty
+  `userland/newlib/` directory) removed in a separate cleanup commit.
+
 ### What `v0.5.5` means
 
 At `v0.5.5`, the kernel speaks Linux x86_64 syscalls, the shell is
@@ -112,7 +129,7 @@ The 56 working tags used during the migration (`20260922A` through
 `20260926-09`) are recorded in
 [`migration-tags.txt`](migration-tags.txt) with their commit SHAs. The
 release tags inherited from dons-os (`v0.0.1` through `v0.5.4`) remain
-as real git tags; `v0.5.5` is the donix completion tag.
+as real git tags; `v0.5.5` and `v0.6.0` are the donix completion tags.
 
 ### Bugs found and fixed during the migration
 
@@ -1780,19 +1797,19 @@ passed through verbatim).
 ### ✔ musl Toolchain (added in donix)
 - `toolchain/install_musl.sh` — clone and build musl 1.2.5 from source
 - `toolchain/musl-gcc.sh` — wrapper around the project-local specs file
-- `build_musl_tests.sh` — build every musl ELF the FAT image carries
+- `userland/musl/Makefile` — build every musl ELF the FAT image carries
 
 ---
 
 ## Status Summary
 
-The **donix v0.5.5** block lists the migration work that produced this
+The **donix v0.5.5 / v0.6.0** block lists the migration work that produced this
 project. The rows below it describe dons-os capabilities that carried
 forward; the **Syscall ABI** row reflects donix's current state.
 
 | Stage | Status |
 |-------|--------|
-| **donix v0.5.5 — musl migration** | ✔ **Complete** |
+| **donix v0.5.5 / v0.6.0 — musl migration + userland tree** | ✅ **Complete** |
 | A1 — syscall renumbering | ✔ Complete |
 | A2 — musl syscalls added (`arch_prctl`, `set_tid_address`, `fork`, `execve`, `wait4`, `getdents64`, `stat`, `fstat`, ...) | ✔ Complete |
 | A3 — `musl_sh` boot shell | ✔ Complete |
@@ -1893,8 +1910,11 @@ musl 1.2.5.
    ```
    The result is `_install/bin/busybox`, a static musl-linked ELF.
 
-2. Copy it to the FAT as `BUSYBOX.ELF` via `build_musl_tests.sh` or
-   the image Makefile.
+2. Copy it to the FAT as `BUSYBOX.ELF`: add the built binary to
+   `userland/musl/build/busybox.elf` (or stage it under
+   `third_party/busybox/` and add an `mcopy_one` line), add the ELF
+   path to `USERLAND_ELFS` in `05_boot_kernel64/Makefile`, and add a
+   matching `mcopy_one` line.
 
 3. From `musl_sh`: `busybox.elf echo hello` (or the correct argv
    layout — busybox expects `argv[0]` to be the applet name).

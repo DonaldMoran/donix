@@ -18,6 +18,9 @@ What changed since dons-os:
   `0:/MUSL_SH.ELF`. There is no embedded shell and no fallback.
 - The newlib userland — the shell, the C library, the syscall shims,
   and the `arc2/` runtime — has been fully retired.
+- The musl userland lives in a tracked **`userland/musl/`** tree
+  (apps + tests + a Makefile), built directly by the image Makefile.
+  There is no heredoc build script and no `/tmp` staging step any more.
 
 Related documents:
 
@@ -57,29 +60,36 @@ state; its `v0.5.4` tag is the last version before donix began.
 
 ### Userland
 
-The musl userland is built from source against the project-local musl
-tree. It lives in two places:
+The musl userland lives in a tracked source tree at the repository root:
 
-- **`build_musl_tests.sh`** — a tracked build script that compiles every
-  musl-linked ELF the FAT image carries. Each program's source is a
-  heredoc inside the script; the resulting binaries land in `/tmp/`,
-  from which the image build copies them to the FAT partition.
+- **`userland/musl/Makefile`** — builds every `.c` under `apps/` and
+  `tests/` into `build/*.elf` using the project-local musl toolchain.
+- **`userland/musl/apps/`** — the six real userland programs:
+  `hello`, `echo`, `cat`, `ls`, `memtest`, `musl_sh`.
+- **`userland/musl/tests/`** — the fourteen diagnostic binaries:
+  `musl_min`, `musl_malloc`, `musl_printf`, `musl_fork`,
+  `musl_fork_raw`, `musl_exec`, `musl_wait`, `musl_readdir`,
+  `musl_r10probe`, `musl_stat`, `printnum`, `brk_verify`, `brkraw`,
+  `brkgrow`.
+- **`userland/musl/build/`** — gitignored output directory; the image
+  Makefile copies every ELF from here onto the FAT partition.
+
+The image build (`05_boot_kernel64/Makefile`) invokes
+`make -C ../userland/musl` before staging the FAT, so the ELFs are
+always built from source. No `/tmp` staging and no separate build
+script are involved.
+
 - **`toolchain/`** — the tracked scripts that build and use musl:
   - `install_musl.sh` — clones upstream musl at v1.2.5 and installs it
     into `third_party/musl-install/` (gitignored).
   - `musl-gcc.sh` — a two-line wrapper that invokes `gcc -specs
     <repo>/third_party/musl-install/lib/musl-gcc.specs`.
 
-There is **no `userland/` tree** in the donix tree today. The dons-os
-newlib userland (`userland/newlib/`) was deleted at A5 step 7 as part
-of retiring newlib. A proper `userland/musl/` tree is planned; the
-project's current state and near-term plan are described in
-[`handoff.md`](handoff.md).
-
 ### Other
 
 - **05_boot_kernel64** — Full boot chain: stage2 loads the kernel via
   multi-pass segment incrementing, enters long mode, jumps to `_start`.
+  Its Makefile also builds and stages the musl userland.
 - **test-files** — Files copied into the single-drive FAT partition at
   image-build time.
 - **`run`** — One-line-per-option QEMU launch script; uncomment the
@@ -105,14 +115,15 @@ The top-level Makefile builds and runs all components.
 
 ```
 ./toolchain/install_musl.sh       # clone and build musl 1.2.5
-./build_musl_tests.sh             # build all musl userland binaries
 ```
 
-Both are idempotent. `install_musl.sh` bails if `third_party/musl-src/`
-is not exactly at `v1.2.5`; delete that directory and re-run if you want
-to force a rebuild. `build_musl_tests.sh` writes its outputs to
-`/tmp/`, which Fedora does **not** persist across reboots — re-run it
-after any reboot before booting the OS if the musl binaries are missing.
+This is idempotent. `install_musl.sh` bails if
+`third_party/musl-src/` is not exactly at `v1.2.5`; delete that
+directory and re-run if you want to force a rebuild.
+
+The musl userland does not need a separate bootstrap step: it is built
+on demand by `make` from `userland/musl/`, with output in
+`userland/musl/build/`.
 
 ### Build and run
 
@@ -323,8 +334,9 @@ library rather than a hand-rolled mini-libc. `printf`, `malloc`/`free`,
   script header for the flags and the reason they are all required.
 - **`toolchain/musl-gcc.sh`** — a two-line wrapper around the specs
   file. Every musl binary is built with this wrapper.
-- **`build_musl_tests.sh`** — the build recipe for every musl ELF in
-  the tree. Sources are heredocs; outputs go to `/tmp/`.
+- **`userland/musl/Makefile`** — the build recipe for every musl ELF
+  in the tree. Sources are ordinary `.c` files under `apps/` and
+  `tests/`; outputs go to `userland/musl/build/`.
 
 ### What works end-to-end
 
@@ -343,18 +355,20 @@ library rather than a hand-rolled mini-libc. `printf`, `malloc`/`free`,
 
 ### How to build a user program
 
-There is no separate userland tree today. To add a program:
+The tree is at `userland/musl/`. To add a program:
 
-1. Add a heredoc to `build_musl_tests.sh` alongside the existing tests
-   and apps.
+1. Create `userland/musl/apps/yourprogram.c` (or
+   `userland/musl/tests/yourprogram.c` for a diagnostic test).
 2. Add an `mcopy_one` line to `05_boot_kernel64/Makefile` naming the
-   binary's FAT destination.
-3. Run `./build_musl_tests.sh` and then `./run`.
+   binary's FAT destination, and add the same path to the
+   `USERLAND_ELFS` list in that Makefile so `make` knows to build it.
+3. `./run` (or `make -C userland/musl` followed by `make -C
+   05_boot_kernel64 hdd-single.img`).
 
 Any program that reads a filename argument should take a **bare
 filename** on `argv[1]` (e.g. `hello-world.txt`) and prepend `0:/`
-itself, because `musl_sh` only normalizes `argv[0]`. See `cat_musl` in
-`build_musl_tests.sh` for the pattern.
+itself, because `musl_sh` only normalizes `argv[0]`. See
+`userland/musl/apps/cat.c` for the pattern.
 
 ### What's not there (yet)
 
@@ -448,7 +462,8 @@ load failure is a hard serial PANIC.
 ## User shell (`musl_sh`)
 
 Launched by the boot-time default (no `k` key). It is a musl-linked
-static ELF loaded from `0:/MUSL_SH.ELF`.
+static ELF loaded from `0:/MUSL_SH.ELF`. Its source is
+`userland/musl/apps/musl_sh.c`.
 
 `musl_sh` is a simple REPL:
 
@@ -458,7 +473,7 @@ static ELF loaded from `0:/MUSL_SH.ELF`.
   contains `:/`, then `execve`s it.
 - Passes the remaining tokens as `argv[1..n]` verbatim. It does **not**
   normalize file arguments — a program that takes a filename must
-  prepend `0:/` itself. See `cat_musl` in `build_musl_tests.sh`.
+  prepend `0:/` itself. See `userland/musl/apps/cat.c`.
 - Blocks in `wait4` after the `execve`, so parent and child output are
   serialized.
 
@@ -640,12 +655,17 @@ boot chain, the interrupt-driven kernel, PMM, VMM, heap, userland,
 ELF loader, newlib, storage, and the REPL shell as they existed before
 donix forked.
 
-The **donix** completion tag is:
+The **donix** completion tags are:
 
 - `v0.5.5` — musl migration complete. The kernel now speaks Linux
   x86_64 syscalls, the shell is `musl_sh`, the userland C library is
   musl 1.2.5, and the newlib userland has been fully retired. See the
   tag message for the full changelog.
+- `v0.6.0` — **musl userland source tree (A6).** The userland now
+  lives in a tracked `userland/musl/` tree with a Makefile, built
+  directly by the image Makefile. `build_musl_tests.sh` is gone; the
+  `/tmp` staging step is gone. Behavior of the FAT image and the
+  canary is unchanged.
 
 The 56 working tags created during the A1–A5 migration
 (`20260922A`–`20260926Z` and `20260926-01`–`20260926-09`) are recorded
@@ -662,7 +682,9 @@ For the session-by-session story of the migration, see
 
 donix currently runs a musl-linked userland against a Linux-x86_64-ABI
 kernel, with a working `fork`/`execve`/`wait4` shell, a FAT filesystem,
-and a functioning storage layer.
+and a functioning storage layer. The userland is a tracked source
+tree at `userland/musl/`; the kernel is still the same higher-half
+kernel it has been since v0.5.5.
 
 A detailed capability checklist is maintained in
 [`OSDev_Checklist.md`](OSDev_Checklist.md), and the plan for what comes
@@ -685,7 +707,7 @@ unimplemented syscalls.
   visible as `Unknown syscall: 72` noise on serial, not a functional
   problem today.
 - **`sys_open` accepts non-directories when called with
-  `O_DIRECTORY`.** `ls_musl 0:/hello-world.txt` prints an empty
+  `O_DIRECTORY`.** `ls 0:/hello-world.txt` prints an empty
   listing and exits 0 instead of failing. Fix deferred; see
   `handoff.md`.
 - **`isr14_handler` halts on user-mode faults.** The `#PF` handler
@@ -723,3 +745,4 @@ against musl**. The plan and the ordering of work are in
 
 This project is licensed under the **MIT License**.
 Use freely, modify freely, credit appreciated.
+
