@@ -28,6 +28,27 @@ static char g_write_bounce[WRITE_CHUNK];
 /* Maximum number of program headers we accept in an ELF. */
 #define EXEC_MAX_PHDRS 16
 
+/* Common Linux x86_64 errno values used by the file syscalls.
+ *
+ * musl's __syscall_ret converts any return value in the range
+ * -4095..-1 to -errno; anything outside that range, including a
+ * plain -1, is passed through unchanged and then the caller's
+ * errno stays whatever it was, which is a stale value that
+ * produces misleading error messages.  So a syscall that means
+ * to report "file not found" MUST return -ENOENT, not -1.
+ */
+#define EPERM_   1
+#define ENOENT_  2
+#define EIO_     5
+#define EBADF_   9
+#define EAGAIN_  11
+#define ENOMEM_  12
+#define EFAULT_  14
+#define ENOEXEC  8
+#define ECHILD   10
+#define EINVAL_  22
+#define ERANGE_  34
+
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -198,6 +219,48 @@ static void strip_dot_prefix(char* p) {
     char* dst = p;
     while (*src) *dst++ = *src++;
     *dst = '\0';
+}
+
+/*
+ * Map a FatFs FRESULT to a Linux -errno suitable for return
+ * from a syscall.
+ *
+ * Called only on failure (r != FR_OK).  The mapping is
+ * approximate: FatFs does not distinguish as finely as POSIX,
+ * but the two that matter here are FR_NO_FILE / FR_NO_PATH
+ * (-> ENOENT) and FR_INVALID_NAME (also a "does not exist in
+ * this form" signal for our purposes, but arguably EINVAL).
+ *
+ * FR_INVALID_NAME is mapped to ENOENT because busybox ash probes
+ * PATH candidates like "/usr/local/sbin/ls" with stat() and
+ * expects a "not found" answer (ENOENT) for anything it will
+ * not be able to exec.  Reporting EINVAL there makes ash print
+ * "Invalid argument" instead of "not found", which is just as
+ * misleading as the old "Operation not permitted".
+ */
+static long fatfs_errno(FRESULT r) {
+    switch (r) {
+        case FR_OK:            return 0;
+        case FR_NO_FILE:       return -(long)ENOENT_;
+        case FR_NO_PATH:       return -(long)ENOENT_;
+        case FR_INVALID_NAME:  return -(long)ENOENT_;
+        case FR_DENIED:        return -(long)EPERM_;
+        case FR_EXIST:         return -(long)EPERM_;
+        case FR_INVALID_OBJECT:return -(long)EBADF_;
+        case FR_WRITE_PROTECTED:return -(long)EPERM_;
+        case FR_INVALID_DRIVE: return -(long)ENOENT_;
+        case FR_NOT_READY:     return -(long)EIO_;
+        case FR_DISK_ERR:      return -(long)EIO_;
+        case FR_INT_ERR:       return -(long)EIO_;
+        case FR_NOT_ENABLED:   return -(long)EIO_;
+        case FR_NO_FILESYSTEM: return -(long)EIO_;
+        case FR_TIMEOUT:       return -(long)EIO_;
+        case FR_LOCKED:        return -(long)EIO_;
+        case FR_NOT_ENOUGH_CORE:return -(long)EIO_;
+        case FR_TOO_MANY_OPEN_FILES:return -(long)EIO_;
+        case FR_MKFS_ABORTED:  return -(long)EIO_;
+        default:               return -(long)EIO_;
+    }
 }
 
 /* Fill a kernel_stat_t describing the FAT root as a directory. */
@@ -403,9 +466,6 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
 #define F_GETFL  3
 #define F_SETFL  4
 #define F_DUPFD_CLOEXEC 1030
-#define EINVAL_  22
-#define EAGAIN_  11
-#define EBADF_   9
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
     file_slot_t* slot = get_file_slot(fd, 0);
@@ -468,22 +528,25 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
 // ============================================================
 long sys_open(const char* path, int flags) {
     pcb_t* self = process_get_current();
-    if (!self || !path) return -1;
+    if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
     strip_dot_prefix(local_path);
 
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
-    if (fd == -1) return -1;
+    if (fd == -1) return -(long)EIO_;
 
     BYTE mode = 0;
     switch (flags & 0x3) {
         case 0:  mode |= FA_READ;             break;
         case 1:  mode |= FA_WRITE;            break;
         case 2:  mode |= FA_READ | FA_WRITE;  break;
-        default: kfree(slot); self->file_table[fd] = NULL; return -1;
+        default: kfree(slot); self->file_table[fd] = NULL;
+                 return -(long)EINVAL_;
     }
 
     if (flags & 0x0400) {
@@ -532,7 +595,7 @@ long sys_open(const char* path, int flags) {
         if (!dir_obj) {
             kfree(slot);
             self->file_table[fd] = NULL;
-            return -1;
+            return -(long)EIO_;
         }
         const char* dir_path = is_root ? "0:/" : local_path;
         FRESULT dr = f_opendir(dir_obj, dir_path);
@@ -549,14 +612,14 @@ long sys_open(const char* path, int flags) {
         serial_print("\n");
         kfree(slot);
         self->file_table[fd] = NULL;
-        return -1;
+        return fatfs_errno(dr);
     }
 
     FIL* file_obj = (FIL*)kmalloc(sizeof(FIL));
     if (!file_obj) {
         kfree(slot);
         self->file_table[fd] = NULL;
-        return -1;
+        return -(long)EIO_;
     }
 
     FRESULT r = f_open(file_obj, local_path, mode);
@@ -596,12 +659,12 @@ long sys_open(const char* path, int flags) {
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
-    return -1;
+    return fatfs_errno(r);
 }
 
 long sys_close(int fd) {
     file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -1;
+    if (!slot) return -(long)EBADF_;
 
     pcb_t* self = process_get_current();
     self->file_table[fd] = NULL;
@@ -629,13 +692,13 @@ long sys_close(int fd) {
  */
 long sys_dup2(int oldfd, int newfd) {
     pcb_t* self = process_get_current();
-    if (!self) return -(long)9;   /* -EBADF */
+    if (!self) return -(long)EBADF_;
 
-    if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)9;
-    if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)9;
+    if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
+    if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
 
     file_slot_t* old_slot = get_file_slot(oldfd, 0);
-    if (!old_slot) return -(long)9;   /* -EBADF */
+    if (!old_slot) return -(long)EBADF_;
 
     /* dup2(fd, fd) is a no-op returning fd, not an error. */
     if (oldfd == newfd) return (long)newfd;
@@ -659,10 +722,12 @@ long sys_dup2(int oldfd, int newfd) {
 
 long sys_unlink(const char* path) {
     pcb_t* self = process_get_current();
-    if (!self || !path) return -1;
+    if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
     strip_dot_prefix(local_path);
 
     FRESULT r = f_unlink(local_path);
@@ -671,7 +736,7 @@ long sys_unlink(const char* path) {
         serial_print(local_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
-        return -1;
+        return fatfs_errno(r);
     }
     return 0;
 }
@@ -711,10 +776,10 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
 }
 
 long sys_fstat(int fd, void* user_stat) {
-    if (!user_stat) return -1;
+    if (!user_stat) return -(long)EFAULT_;
 
     file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -1;
+    if (!slot) return -(long)EBADF_;
 
     kernel_stat_t st;
     FILINFO fno;
@@ -735,13 +800,13 @@ long sys_fstat(int fd, void* user_stat) {
         fno.fattrib = AM_DIR;
         fno.fsize   = 0;
     } else {
-        return -1;
+        return -(long)EBADF_;
     }
 
     fill_kstat_from_filinfo(&st, &fno);
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -1;
+        return -(long)EFAULT_;
     }
     return 0;
 }
@@ -758,15 +823,17 @@ long sys_fstat(int fd, void* user_stat) {
  * has removed any leading "./" that musl's lstat()/stat() would
  * otherwise hand us.
  *
- * Returns 0 on success, -1 on failure.  Like sys_fstat, proper
- * negative errno is deferred until a caller actually inspects it.
+ * Failure return is a proper negative errno (via fatfs_errno) so
+ * that callers like busybox ash's PATH search get a sensible
+ * message ("No such file or directory") instead of the default
+ * "Operation not permitted" that musl assigns to a bare -1.
  */
 long sys_stat(const char* user_path, void* user_stat) {
-    if (!user_path || !user_stat) return -1;
+    if (!user_path || !user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
-        return -1;
+        return -(long)EFAULT_;
     }
     strip_dot_prefix(path);
 
@@ -776,7 +843,7 @@ long sys_stat(const char* user_path, void* user_stat) {
         kernel_stat_t st;
         fill_kstat_as_root(&st);
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-            return -1;
+            return -(long)EFAULT_;
         }
         return 0;
     }
@@ -784,14 +851,14 @@ long sys_stat(const char* user_path, void* user_stat) {
     FILINFO fno;
     FRESULT r = f_stat(path, &fno);
     if (r != FR_OK) {
-        return -1;
+        return fatfs_errno(r);
     }
 
     kernel_stat_t st;
     fill_kstat_from_filinfo(&st, &fno);
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -1;
+        return -(long)EFAULT_;
     }
     return 0;
 }
@@ -1036,7 +1103,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EFAULT_;
     }
 
     /* ---- 1. Copy the path string. ---- */
@@ -1044,7 +1111,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         serial_print("sys_execve: bad path pointer\n");
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EFAULT_;
     }
 
     /* ---- 2. Open and read the whole ELF file. ----
@@ -1088,7 +1155,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print_dec(fr);
         serial_print("\n");
         __asm__ volatile("sti");
-        return -1;
+        return fatfs_errno(fr);
     }
 
     Elf64_Ehdr ehdr;
@@ -1098,7 +1165,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: short read of ELF header\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
 
     if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
@@ -1106,18 +1173,18 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: not an ELF file\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOEXEC;
     }
-    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n");     f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n");  f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n");        f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n");         f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n");     f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n");  f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n");        f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n");         f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
         ehdr.e_phnum == 0 || ehdr.e_phnum > EXEC_MAX_PHDRS) {
         serial_print("sys_execve: bad program header table\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOEXEC;
     }
 
     FSIZE_t file_size = f_size(&file);
@@ -1125,7 +1192,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: file size out of range\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
     uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
     if (!elf_buf) {
@@ -1134,14 +1201,14 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print(" bytes\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOMEM_;
     }
     fr = f_lseek(&file, 0);
     if (fr != FR_OK) {
         serial_print("sys_execve: rewind failed\n");
         kfree(elf_buf); f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
     UINT total = 0;
     while (total < file_size) {
@@ -1155,7 +1222,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             serial_print("\n");
             kfree(elf_buf); f_close(&file);
             __asm__ volatile("sti");
-            return -1;
+            return -(long)EIO_;
         }
         if (br == 0) break;
         total += br;
@@ -1165,7 +1232,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: short read of file body\n");
         kfree(elf_buf);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
 
     /* ---- 3. Snapshot argv from the OLD address space. ---- */
@@ -1183,7 +1250,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("] pointer\n");
                 kfree(elf_buf);
                 __asm__ volatile("sti");
-                return -1;
+                return -(long)EFAULT_;
             }
             if (user_str_va == 0) break;
 
@@ -1194,7 +1261,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("] string\n");
                 kfree(elf_buf);
                 __asm__ volatile("sti");
-                return -1;
+                return -(long)EFAULT_;
             }
         }
     }
@@ -1446,7 +1513,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 // ============================================================
 long sys_wait4(long pid, int* user_status, int options) {
     pcb_t* self = process_get_current();
-    if (!self) return -1;
+    if (!self) return -(long)ECHILD;
 
     uint64_t target = (pid <= 0) ? (uint64_t)-1 : (uint64_t)pid;
 
@@ -1475,14 +1542,14 @@ long sys_wait4(long pid, int* user_status, int options) {
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
-                    return -1;
+                    return -(long)EFAULT_;
                 }
             }
             return reaped;
         }
 
         if (!live) {
-            return -1;
+            return -(long)ECHILD;
         }
 
         if (options & WNOHANG) {
@@ -1532,7 +1599,7 @@ long sys_wait4(long pid, int* user_status, int options) {
 long sys_write(int fd, const void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
-    if (!self) return -1;
+    if (!self) return -(long)EBADF_;
 
     if (fd == 1 || fd == 2) {
         size_t remaining = count;
@@ -1540,7 +1607,7 @@ long sys_write(int fd, const void* buf, size_t count) {
         while (remaining > 0) {
             size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
             if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
-                return -1;
+                return -(long)EFAULT_;
             }
             for (size_t i = 0; i < chunk; i++) {
                 char c = g_write_bounce[i];
@@ -1555,19 +1622,19 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (slot) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
-        if (!bounce) return -1;
+        if (!bounce) return -(long)ENOMEM_;
 
         size_t total_written = 0;
         while (total_written < count) {
             size_t chunk = (count - total_written) > 512 ? 512 : (count - total_written);
             if (safe_copy_from_user(bounce, (const uint8_t*)buf + total_written, chunk) != 0) {
                 kfree(bounce);
-                return (total_written > 0) ? (long)total_written : -1;
+                return (total_written > 0) ? (long)total_written : -(long)EFAULT_;
             }
             UINT written;
             if (f_write(file_obj, bounce, chunk, &written) != FR_OK) {
                 kfree(bounce);
-                return (total_written > 0) ? (long)total_written : -1;
+                return (total_written > 0) ? (long)total_written : -(long)EIO_;
             }
             total_written += written;
             if (written < chunk) break;
@@ -1576,7 +1643,7 @@ long sys_write(int fd, const void* buf, size_t count) {
         return (long)total_written;
     }
 
-    return -1;
+    return -(long)EBADF_;
 }
 
 struct iovec {
@@ -1606,13 +1673,13 @@ struct iovec {
 #define DEBUG_WRITEV 0
 
 long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
-    if (!user_iov || iovcnt <= 0) return 0;
-    if (iovcnt > WRITEV_MAX_IOVS) return -22;  /* -EINVAL */
+    if (!user_iov || iovcnt <= 0) return -(long)EINVAL_;
+    if (iovcnt > WRITEV_MAX_IOVS) return -(long)EINVAL_;
 
     struct iovec local[WRITEV_MAX_IOVS];
     size_t bytes = (size_t)iovcnt * sizeof(struct iovec);
     if (safe_copy_from_user(local, user_iov, bytes) != 0) {
-        return -14;  /* -EFAULT */
+        return -(long)EFAULT_;
     }
 
 #if DEBUG_WRITEV
@@ -1645,7 +1712,7 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
-    if (!self) return 0;
+    if (!self) return -(long)EBADF_;
 
     if (fd == 0) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
@@ -1654,7 +1721,7 @@ long sys_read(int fd, void* buf, size_t count) {
             if (kbd_buffer_get(&c)) {
                 __asm__ volatile("sti");
                 if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
-                else return -1;
+                else return -(long)EFAULT_;
                 /*
                  * Return as soon as at least one byte has been copied.
                  *
@@ -1683,18 +1750,18 @@ long sys_read(int fd, void* buf, size_t count) {
     if (slot) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
-        if (!bounce) return -1;
+        if (!bounce) return -(long)ENOMEM_;
 
         size_t total_read = 0;
         while (total_read < count) {
             size_t chunk = (count - total_read) > 512 ? 512 : (count - total_read);
             UINT read_bytes;
             if (f_read(file_obj, bounce, chunk, &read_bytes) != FR_OK) {
-                kfree(bounce); return -1;
+                kfree(bounce); return -(long)EIO_;
             }
             if (read_bytes == 0) break;
             if (safe_copy_to_user((uint8_t*)buf + total_read, bounce, read_bytes) != 0) {
-                kfree(bounce); return -1;
+                kfree(bounce); return -(long)EFAULT_;
             }
             total_read += read_bytes;
             if (read_bytes < chunk) break;
@@ -1703,7 +1770,7 @@ long sys_read(int fd, void* buf, size_t count) {
         return (long)total_read;
     }
 
-    return 0;
+    return -(long)EBADF_;
 }
 
 /*
@@ -1816,7 +1883,7 @@ long sys_getppid(void) {
  */
 long sys_setsid(void) {
     pcb_t* current = process_get_current();
-    if (!current) return -(long)1;
+    if (!current) return -(long)EPERM_;
     return (long)current->pid;
 }
 
@@ -1841,12 +1908,12 @@ long sys_setsid(void) {
  * 34 is ERANGE on Linux x86_64.  22 is EINVAL.
  */
 long sys_getcwd(char* buf, unsigned long size) {
-    if (!buf) return -(long)22;         /* -EINVAL */
-    if (size < 2) return -(long)34;     /* -ERANGE: need "/" + NUL */
+    if (!buf) return -(long)EINVAL_;
+    if (size < 2) return -(long)ERANGE_;
 
     const char path[] = "/";
     if (safe_copy_to_user(buf, path, sizeof(path)) != 0) {
-        return -(long)14;               /* -EFAULT */
+        return -(long)EFAULT_;
     }
     return (long)(uint64_t)buf;
 }
@@ -1940,14 +2007,14 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
     (void)prot;
     (void)offset;
 
-    if (length == 0) return -(long)22;  /* -EINVAL */
+    if (length == 0) return -(long)EINVAL_;
 
     if ((flags & MAP_ANONYMOUS) == 0 || fd != -1) {
-        return -(long)ENOMEM;
+        return -(long)ENOMEM_;
     }
 
     pcb_t* self = process_get_current();
-    if (!self) return -(long)ENOMEM;
+    if (!self) return -(long)ENOMEM_;
 
     uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
 
@@ -1956,13 +2023,13 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         base = (uint64_t)addr & ~0xFFFULL;
     } else {
         base = mmap_find_free_slot(self, rounded);
-        if (base == 0) return -(long)ENOMEM;
+        if (base == 0) return -(long)ENOMEM_;
     }
 
     for (uint64_t v = base; v < base + rounded; v += 0x1000) {
         uint64_t phys = pmm_alloc_page_for_elf();
         if (!phys) {
-            return -(long)ENOMEM;
+            return -(long)ENOMEM_;
         }
 
         void* hhdm = (void*)(HHDM_START + phys);
@@ -2040,15 +2107,15 @@ long sys_set_robust_list(void* head, size_t len) {
  * needs real randomness later, implement getrandom against the PIT
  * or RDRAND.
  */
-#define ENOSYS 38
+#define ENOSYS_ 38
 long sys_getrandom(void* buf, size_t buflen, unsigned int flags) {
     (void)buf; (void)buflen; (void)flags;
-    return -(long)ENOSYS;
+    return -(long)ENOSYS_;
 }
 
 long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
     (void)rseq; (void)rseq_len; (void)flags; (void)sig;
-    return -(long)ENOSYS;
+    return -(long)ENOSYS_;
 }
 
 /*
@@ -2088,15 +2155,15 @@ long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
 #define GETDENTS64_MAXREC (GETDENTS64_HDR + 256)
 
 long sys_getdents64(int fd, void* dirp, size_t count) {
-    if (!dirp) return -(long)14;      /* -EFAULT */
-    if (count == 0) return -(long)22; /* -EINVAL */
+    if (!dirp) return -(long)EFAULT_;
+    if (count == 0) return -(long)EINVAL_;
 
     file_slot_t* slot = get_file_slot(fd, FILE_KIND_DIR);
-    if (!slot) return -(long)9;       /* -EBADF */
+    if (!slot) return -(long)EBADF_;
 
     FILINFO fno;
     FRESULT r = f_readdir((DIR*)slot->obj, &fno);
-    if (r != FR_OK) return -(long)5;    /* -EIO */
+    if (r != FR_OK) return -(long)EIO_;
     if (fno.fname[0] == '\0') return 0; /* end of directory */
 
     size_t nlen = 0;
@@ -2111,7 +2178,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
          * musl always passes a buffer large enough, so this is
          * unreachable in practice.
          */
-        return -(long)22; /* -EINVAL */
+        return -(long)EINVAL_;
     }
 
     uint8_t entbuf[GETDENTS64_MAXREC];
@@ -2125,7 +2192,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
     for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
 
     if (safe_copy_to_user(dirp, entbuf, reclen) != 0) {
-        return -(long)14;  /* -EFAULT */
+        return -(long)EFAULT_;
     }
     return (long)reclen;
 }
@@ -2167,7 +2234,7 @@ long sys_fork(void) {
     pcb_t* parent = process_get_current();
     if (!parent) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EAGAIN_;
     }
 
     /*
@@ -2179,7 +2246,7 @@ long sys_fork(void) {
     pcb_t* child = process_create(parent->name, parent->entry_point, 0);
     if (!child) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EAGAIN_;
     }
     scheduler_ready_queue_remove(child);
 
@@ -2204,7 +2271,7 @@ long sys_fork(void) {
                 serial_print("sys_fork: out of memory for stack page\n");
                 process_destroy(child);
                 __asm__ volatile("sti");
-                return -1;
+                return -(long)ENOMEM_;
             }
 
             const uint8_t* src = (const uint8_t*)(HHDM_START + parent_phys);
@@ -2281,7 +2348,7 @@ long sys_arch_prctl(int code, void* addr) {
         if (self) self->fs_base = (uint64_t)addr;
         return 0;
     }
-    return -1;
+    return -(long)EINVAL_;
 }
 
 
@@ -2339,6 +2406,6 @@ uint64_t syscall_dispatch(uint64_t num,
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");
-            return -1;
+            return -(long)ENOSYS_;
     }
 }
