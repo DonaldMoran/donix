@@ -1,5 +1,5 @@
 # MAINTENANCE
-### dons-os (x86_64) — Known Debt, Latent Bugs, and Maintenance Work
+### donix (x86_64) — Known Debt, Latent Bugs, and Maintenance Work
 
 This document lists everything that is *known to be unfinished, fragile,
 or debt-laden* in the current codebase, but which is not a feature. It is
@@ -12,6 +12,166 @@ rough estimate, not a commitment.
 
 Completed items are struck through (~~like this~~) and marked with ✅.
 They are kept in place for history; do not delete them.
+
+Items marked **🔵 dons-os era** were filed before the fork. They are
+kept for history; the referenced code may have been renamed, renumbered,
+or removed during the musl migration (A1–A5). See
+[`handoff.md`](handoff.md) and [`ROADMAP.md`](ROADMAP.md) §0.
+
+---
+
+## 0. donix — musl migration open items
+
+The A1–A5 migration (see [`ROADMAP.md`](ROADMAP.md) §0 and
+[`OSDev_Checklist.md`](OSDev_Checklist.md) §0) fixed the six bugs it
+surfaced (see §7 below for the record). The items in this section are
+the loose ends the migration left behind, or the small syscall gaps
+that the next milestone (busybox, Phase B) will hit.
+
+Ordered by priority — do the ones at the top first.
+
+### 0.1. `fcntl` (Linux 72) is unimplemented
+
+**Status:** noisy; unblocks a common path when stubbed
+**Effort:** 30 minutes
+
+musl's `opendir()` calls `fcntl(fd, F_SETFD, FD_CLOEXEC)` after the
+`open(O_DIRECTORY)`. `sys_fcntl` is not implemented, so the kernel
+prints `Unknown syscall: 72` on serial and returns `-1`. musl ignores
+the failure, so it does not break `opendir` today.
+
+Busybox and most real Unix programs call `fcntl` for
+`F_SETFD`/`F_GETFD`/`F_DUPFD`/`F_GETFL`/`F_SETFL`. The last two are
+the ones that matter for stdio buffering and non-blocking I/O.
+
+**Fix:** add a minimal `sys_fcntl(fd, cmd, arg)` that:
+- returns 0 for `F_SETFD` and `F_GETFD` (with `F_GETFD` returning 0,
+  i.e. no close-on-exec flag is tracked),
+- returns `fd` for `F_DUPFD` (dup not implemented; the fd is returned
+  unchanged, which is correct for programs that only use `fcntl` to
+  set flags),
+- returns 0 for `F_SETFL`, `F_GETFL` (with `F_GETFL` returning
+  `O_RDWR`),
+- returns `-EINVAL` for anything else.
+
+Deferred until busybox needs it, but it should be a small, low-risk
+commit.
+
+### 0.2. `sys_newfstatat` (Linux 262) is unimplemented
+
+**Status:** unreachable from the current canary; busybox will hit it
+**Effort:** 45 minutes (mostly mirroring the existing `sys_stat`/`sys_fstat`)
+
+`sys_stat` (4) and `sys_fstat` (5) are done. `fstatat(fd, path, st,
+flags)` with a non-`AT_FDCWD` fd and a relative path routes to
+`__syscall(SYS_newfstatat, ...)` = 262. Nothing in the current musl
+canary reaches it (`ls` uses absolute `0:/` paths).
+
+**Fix:** implement `sys_newfstatat(int dirfd, const char *path, void
+*statbuf, int flags)`:
+- if `dirfd == AT_FDCWD` or the path is absolute, delegate to
+  `sys_stat`.
+- otherwise, return `-ENOSYS` for now (there is no per-process cwd
+  yet, and no directory fd to resolve relative paths against). This
+  is enough to make busybox's `stat` calls succeed when they use
+  absolute paths.
+- the `AT_EMPTY_PATH` case (an empty path with `fstat`-like
+  semantics) should delegate to `sys_fstat`.
+
+The three-way delegation matches the existing `fstatat_kstat` routing
+described in [`handoff.md`](handoff.md) under "musl `fstatat`
+routing."
+
+### 0.3. `sys_open` accepts non-directories when called with `O_DIRECTORY`
+
+**Status:** cosmetic; only triggers on user error
+**Effort:** 15 minutes
+
+`ls 0:/hello-world.txt` prints `0 file(s), 0 directory(ies)` and
+exits 0, instead of failing with "not a directory." FatFs's
+`f_opendir` accepts a file path and yields a `DIR` whose `f_readdir`
+immediately returns "no entries"; `sys_open`'s `f_opendir` fallback
+path does not verify that the target is actually a directory.
+
+**Fix:** after `f_opendir` succeeds, check the entry's
+`fattrib & AM_DIR`; if not set, close and return `-ENOTDIR` (20).
+One call to `f_stat` in the fallback path.
+
+### 0.4. `isr14_handler` halts on user-mode faults
+
+**Status:** latent; will bite the first time busybox segfaults
+**Effort:** 30 minutes
+
+The `#PF` handler checks only `g_expect_fault`; it does not look at
+`error_code & 4` to distinguish a user-mode fault from a kernel-mode
+one. Any unexpected user-mode fault kills the console instead of
+terminating the faulting process.
+
+**Fix:** in `isr14_handler`, if `(error_code & 4)` (user-mode) and
+`g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
+process instead of halting. `sys_exit` on a user-mode process halts
+the CPU (there is no user shell to return to), so the practical
+difference is: the offending user process dies *cleanly* and prints a
+diagnostic, rather than taking the kernel down with a low-level
+`#PF` dump. Whether the console recovers depends on whether the
+faulting process was the shell — a future commit could restart the
+shell or drop back to the kernel shell.
+
+**Related:** item 3f (self-test fault triggers must be kernel-mode)
+is the same coupling in a different guise. Fixing 0.4 does not fix
+3f; both remain open.
+
+### 0.5. `musl_sh` echoes garbage on lines containing backspaces
+
+**Status:** cosmetic
+**Effort:** 15 minutes
+
+The kernel trace shows the argv that actually reaches `sys_execve` is
+correct — `argc` matches the number of tokens typed, and the program
+output is right — but the echoed input line is scrambled when the
+typed line contains backspaces. `musl_sh`'s read loop handles `\b` /
+`0x7f` by emitting `"\b \b"` (three bytes) and decrementing the
+buffer index, so the *stored* line is correct. The garble is in the
+display.
+
+**Fix, if wanted:** emit `"\b \b"` only when stdout is a real tty,
+or drop the erase-on-backspace entirely and just decrement `n`. The
+second is simpler and matches the current architecture (no tty
+concept); the echo simply stops pretending to erase.
+
+### 0.6. `sys_execve` writes `%rdi`/`%rsi` unnecessarily
+
+**Status:** code cleanliness; no behavioral effect
+**Effort:** 15 minutes
+
+`sys_execve` writes `argc` to the resume-frame slot that ends up in
+`%rdi` (`ktop[-12]`) and the argv array base to the slot for `%rsi`
+(`ktop[-13]`). This was done because donix's newlib-era
+`arc2/crt0.S` read `argc`/`argv` from registers instead of the SysV
+stack layout. musl's `_start` reads the SysV stack layout and ignores
+`%rdi`/`%rsi`, so these two writes are now no-ops.
+
+**Fix:** delete the two lines. Harmless to leave in place, but the
+comment block above them is a long explanation of a bygone
+compatibility requirement. Removing both keeps the reader from
+wondering whether they are load-bearing.
+
+**Related:** this is what §3m used to describe (as a *correctness*
+problem under newlib). With musl, the SysV layout is what matters and
+it is already written. See §3m for the historical entry.
+
+### 0.7. `PMM_ALLOC_DIAG` is inert diagnostic code
+
+**Status:** cosmetic
+**Effort:** 5 minutes
+
+`pmm.c` still has the `PMM_ALLOC_DIAG`-gated per-call allocation
+counter that was added during the `20260924B` `brk` investigation
+(see §3d and the handoff's "Resolved bugs"). It has been set to 0
+ever since and never fires.
+
+**Fix:** delete the gated block. If a future `brk` or allocation
+investigation needs it, it is one `git show` away.
 
 ---
 
@@ -199,7 +359,7 @@ of the exception tests.
 Defer this until you have multiple user processes. It's not a problem
 with one.
 
-### 3d. `sys_brk`'s `heap_base` is a single constant
+### 3d. `brk`'s `heap_base` is a single constant
 
 **Status:** code cleanliness, not functional
 **Effort:** 15 minutes
@@ -207,7 +367,8 @@ with one.
 Every process's heap starts at the same virtual address
 (`0x8000200000`) and grows in its own address space (different `cr3`),
 so there's no address conflict. But the shared constant is ugly. A
-future refactor would move it into the PCB.
+future refactor would move it into the PCB. **dons-os-era:** the
+syscall is now Linux `brk` = 12 with the absolute-address ABI.
 
 ### 3e. `vmm_map_page_in_cr3` does not flush the TLB
 
@@ -249,6 +410,9 @@ policy. That decouples "the process terminated by design" from "the
 process terminated because it was a kernel diagnostic," which are
 different concepts that the current code conflates. Not urgent — no
 user-mode fault test exists or is planned.
+
+**Related:** item 0.4 (isr14_handler halts on user-mode faults) is the
+same coupling from a different direction.
 
 ### 3g. ~~`EFER.NXE` is not enabled~~ ✅
 
@@ -394,12 +558,13 @@ requires `base >= 0xFFFFFFFF80000000ULL`.  Before the fix it was
 relaxed to "base must be non-zero" so the self-test could pass while
 the GDT lived in low memory.~~
 
-### 3i. Clang 22.1.8 miscompiles FatFs (`ff.c`) at every optimization level
+### 3i. Clang 22.1.8 miscompiles FatFs (`ff.c`) at every optimization level 🔵 dons-os era
 
 **Status:** ✅ **WORKED AROUND (v0.5.2).** `fatfs/ff.o` and
 `fatfs/ffunicode.o` are compiled with `/opt/cross/bin/x86_64-elf-gcc`
 at `-O2` instead of Clang. GCC produces correct code and links cleanly
-with the Clang-built kernel objects.
+with the Clang-built kernel objects. **The workaround carried forward
+into donix unchanged.**
 
 **Effort:** none until both Clang and LLD handle `ff.c` correctly
 
@@ -425,7 +590,7 @@ Only the first 3 bytes are present. Runtime effect: `#UD` at the
 truncated instruction.
 
 **Bug 2 — Clang 22.1.8 hangs `f_unlink` at `-O1`.**
-At `-O1`, `SYS_UNLINK` hangs. The CPU enters `f_unlink` or
+At `-O1`, `unlink` hangs. The CPU enters `f_unlink` or
 `remove_chain` and never returns. Adding `serial_print` calls to
 `f_unlink` and `remove_chain` makes the hang go away, which is
 characteristic of a register-allocation-dependent codegen bug.
@@ -460,7 +625,7 @@ exhibit any of the bugs above.
 
 **Verified.** With GCC-compiled `ff.o` and `ffunicode.o`:
 - `fatmount` and `fatls` show `HELLO-WORLD.TXT` (long name).
-- `SYS_UNLINK` completes and does not hang.
+- `unlink` completes and does not hang.
 - The multi-file test in the user shell creates, verifies, deletes,
   and confirms deletion of three files.
 - `selftest` passes 17/17.
@@ -479,7 +644,7 @@ filed; no reduced test case).
 compiling `ff.c` with Clang. If all three bugs are gone, remove the
 GCC override. Until then, `FATFS_CC` stays.
 
-### 3j. ~~`SYS_EXEC` bring-up surfaced three latent memory-safety bugs~~ ✅
+### 3j. ~~`SYS_EXEC` bring-up surfaced three latent memory-safety bugs~~ ✅ 🔵 dons-os era
 
 **Status:** ✅ **DONE (v0.5.3).** All three are fixed. This entry is
 kept for history and to document the *specific symptom* each bug
@@ -558,13 +723,13 @@ slightly larger than it was before v0.5.3 — still bounded by the
 
 #### Bug C — `context_switch` resumed processes by `entry_point`
 
-**Symptom:** after `waitpid` returned, the user shell *restarted from
+**Symptom:** after `wait4` returned, the user shell *restarted from
 its entry point* instead of resuming where it had blocked. The restart
-cleared `.bss`, reinitialized newlib, and re-entered `main`. Newlib's
-global state was not designed to survive a second initialization, so
-`printf` misbehaved for some format strings — the shell accepted `A`
-and `9` (which use the syscall path directly) but ignored `1` (which
-goes through newlib's `printf`).
+cleared `.bss`, reinitialized the C library, and re-entered `main`.
+Global state was not designed to survive a second initialization, so
+`printf` misbehaved for some format strings — the shell accepted some
+keystrokes (the ones that use the syscall path directly) but ignored
+others (the ones that go through `printf`).
 
 **Root cause:** the resume side of `context_switch` chose between the
 user and kernel resume paths by comparing `next->entry_point` against
@@ -581,8 +746,8 @@ user and kernel resume paths by comparing `next->entry_point` against
 This is correct for the *first* dispatch of a fresh process, because
 `process_create` builds the frame with `entry_point` in the RIP slot.
 But it is wrong for resuming a process that was preempted or blocked
-in kernel mode: such a process has `entry_point = 0x8000000000` (a
-user address) but its saved frame has `CS = 0x18` and a kernel RIP.
+in kernel mode: such a process has `entry_point = 0x400000` (a user
+address) but its saved frame has `CS = 0x18` and a kernel RIP.
 The old code took the user branch and *rebuilt* the frame from
 `entry_point` and `user_stack_top`, silently restarting the process
 at `_start`.
@@ -619,7 +784,7 @@ destroyed the PCB pointer before the two `push [r12 + offset]` reads
 that followed. Fixed by reordering the loads so `r12` is clobbered
 only after the frame is complete.
 
-### 3k. `sys_exec` cannot write to another process's address space via the standard helpers
+### 3k. `sys_execve` cannot write to another process's address space via the standard helpers
 
 **Status:** fixed in v0.5.4 (`safe_copy_to_user_cr3`). Kept for history.
 **Effort:** 45 minutes to diagnose, 20 minutes to fix.
@@ -632,12 +797,12 @@ garbage byte.
 **Root cause:** `safe_copy_to_user` and `safe_copy_from_user` resolve
 their user address against `process_get_current()->cr3`. That is
 correct for a normal syscall, where the caller and the target are the
-same process. `sys_exec` is unusual: it writes into a *child* process
-whose `cr3` is different from the caller's. My first attempt switched
-`cr3` to the child's around the write, but `safe_copy_to_user` still
-read `current->cr3` (the caller's) and therefore resolved the child's
-virtual addresses against the caller's page tables. Because both
-processes use the same user-stack virtual addresses
+same process. `sys_execve` is unusual: it writes into a *child*
+process whose `cr3` is different from the caller's. The first attempt
+switched `cr3` to the child's around the write, but `safe_copy_to_user`
+still read `current->cr3` (the caller's) and therefore resolved the
+child's virtual addresses against the caller's page tables. Because
+both processes use the same user-stack virtual addresses
 (`0x80000F0000..0x8000100000`), the write succeeded — into the
 *caller's* stack, not the child's. The child then read its own
 (freshly zeroed) stack page and found the argv array full of zeros.
@@ -658,8 +823,8 @@ process is the target."
 **Effort:** 30 minutes if it ever bites; ~2 hours to do properly
 **Introduced by:** v0.5.4 Stage 4
 
-`sys_exec` reserves 4 KB at the top of the child's user stack for the
-argv region. Strings are placed at the **bottom** of that region
+`sys_execve` reserves 4 KB at the top of the child's user stack for
+the argv region. Strings are placed at the **bottom** of that region
 (growing up), the pointer array sits just below the strings, and the
 top of the region is left free as a gap between argv and the child's
 own downward-growing stack frames.
@@ -685,50 +850,61 @@ plus the 136-byte array, plus any slack the caller passes).
    the stack (e.g. `0x8000100000`) with `PT_USER | PT_WRITE`, put
    argv there, and set `rdi`/`rsi` accordingly. The stack has no
    interaction with argv at all. More invasive but the cleanest.
-3. **Copy argv into the child's BSS.** Requires cooperation from
-   `crt0.S` and a linker section; ugly.
+3. **Copy argv into the child's BSS.** Requires cooperation from the
+   libc's `_start` and a linker section; ugly.
 
 **Why it is fine for now:** every userland program in the tree today
 uses a shallower stack than the gap. The bug is real but cannot be
 triggered by anything currently on the FAT image.
 
-**Related:** the same 4 KB region is also where a *future* `sys_exec`
-caller might want to place `envp`. If `envp` is added before this
-item is fixed, the gap shrinks further. Fix this before adding
-`envp`.
+**Related:** the same 4 KB region is also where a *future*
+`sys_execve` caller might want to place `envp`. If `envp` is added
+before this item is fixed, the gap shrinks further. Fix this before
+adding `envp`.
 
-### 3m. The initial child `rsp` is not SysV-compliant
+### 3m. ~~The initial child `rsp` is not SysV-compliant~~ ✅ — *for musl*
 
-**Status:** documented design choice; divergence from the ABI
-**Effort:** n/a now; significant if a prebuilt binary is ever linked
-**Introduced by:** v0.5.4 Stage 4
+**Status:** ✅ **RESOLVED for musl.** The original complaint was about
+the newlib-era `arc2/crt0.S`, which read `argc`/`argv` from `%rdi`/
+`%rsi` instead of the SysV stack layout. With newlib retired (A5 step
+7), all userland programs use musl's `_start`, which reads the SysV
+stack layout. `sys_execve` writes that layout correctly.
 
-In standard SysV, `_start` reads `argc`, `argv`, and `envp` off the
-initial stack. Our `crt0.S` reads them from `rdi` and `rsi` instead:
+Text below kept for history: it describes the state before the
+migration and the concern that motivated the SysV layout work.
 
-- `sys_exec` writes `argc` to resume-frame slot 9 (rdi) and the
-  `argv` array pointer to slot 10 (rsi).
-- `crt0.S` stashes `rdi` and `rsi` in a `.data` slot at the very top
+~~**Effort:** n/a now; significant if a prebuilt binary is ever linked~~
+~~**Introduced by:** v0.5.4 Stage 4~~
+
+~~In standard SysV, `_start` reads `argc`, `argv`, and `envp` off the
+initial stack. Our `crt0.S` reads them from `rdi` and `rsi` instead:~~
+
+~~- `sys_exec` writes `argc` to resume-frame slot 9 (rdi) and the
+  `argv` array pointer to slot 10 (rsi).~~
+~~- `crt0.S` stashes `rdi` and `rsi` in a `.data` slot at the very top
   of `_start` — *before* the BSS-clear loop, which clobbers `rdi`
   and `rsi` via `rep stosb` — and reads them back just before
-  `call main`.
+  `call main`.~~
 
-**Why this is fine:** every userland program in the tree links our
-own `crt0.S`. The convention is internal to dons-os.
+~~**Why this was fine:** every userland program in the tree linked our
+own `crt0.S`. The convention was internal to dons-os.~~
 
-**When it will break:** the day someone tries to link a prebuilt
-static binary (a compiler's `crt1.o`, a precompiled test suite, a
-third-party program) that expects the stack-based convention. That
-program's `_start` will read garbage for `argc`/`argv` and will
-almost certainly crash or behave nonsensically.
+~~**When it would have broken:** the day someone tried to link a
+prebuilt static binary (a compiler's `crt1.o`, a precompiled test
+suite, a third-party program) that expects the stack-based convention.
+That program's `_start` would read garbage for `argc`/`argv` and would
+almost certainly crash or behave nonsensically.~~
 
-**If SysV compliance is ever needed:** write the argv array and
-strings onto the stack in the SysV layout (argc at `rsp`, then
-`argv[]`, then a NULL, then `envp[]`, then a NULL, then strings), and
-set the initial `rsp` to point at `argc` rather than at
-`user_stack_top`. That is a substantial change to `sys_exec` and a
-small change to `crt0.S`. Not planned; recorded here so the choice
-is deliberate.
+~~**If SysV compliance were needed:** write the argv array and strings
+onto the stack in the SysV layout (argc at `rsp`, then `argv[]`, then
+a NULL, then `envp[]`, then a NULL, then strings), and set the initial
+`rsp` to point at `argc` rather than at `user_stack_top`.~~
+
+**What actually happened:** this item was resolved as a side effect of
+the musl migration. Item A6.5 in [`OSDev_Checklist.md`](OSDev_Checklist.md)
+records the `%rdi`/`%rsi` write; item A6.6 records the argv layout
+correction. See §0.6 for the follow-up (removing the now-unnecessary
+`%rdi`/`%rsi` writes).
 
 ---
 
@@ -736,7 +912,7 @@ is deliberate.
 
 **Status:** ✅ **DONE for 4a–4d.** Items 4e, 4f, 4g, 4h are architectural,
 documentation-only, or code-review discipline and deferred. Item 4i is
-new (v0.5.4) and open.
+open. Item 4j is new.
 
 ### 4a. ~~Dead declarations~~ ✅
 
@@ -781,6 +957,9 @@ into one readable block, removed the mid-thought narrative about
 - `stage2.asm`'s comments about "was 64 sectors" are accurate but
   accumulate cruft every time the layout changes. Consider a single
   "history" section rather than inline archaeology.~~
+
+**Note for donix:** the `arc2/` tree and `user_shell.c` were removed
+at A5 step 7; this item is closed by deletion.
 
 ### 4d. ~~Serial output is not atomic~~ ✅
 
@@ -855,15 +1034,17 @@ gated off. But it is the design the console subsystem should be
 built on, and it should be in place before per-user tty support is
 added.
 
-**Observed symptom, pre-fix, that this design addresses:** in the
-`20260919N` capture, the user shell's banner appears twice, with the
-second copy truncated mid-word (`ib 4.x User Shell==`).  The kernel's
-`PRINT_BOTH` output and the user shell's `printf` (via `sys_write`)
-are both writing to the same console, and the kernel's prompt logic
-races with the user shell's banner.  The print lock covers kernel-side
-prints; it does not cover user-mode `sys_write` output.  This is the
-class of interleaving the ring buffer design fixes once a tty layer
-exists.  Not urgent.
+**Observed symptom, pre-fix, that this design addresses:** in an
+early capture, the user shell's banner appeared twice, with the
+second copy truncated mid-word. The kernel's `PRINT_BOTH` output and
+the user shell's `printf` (via `sys_write`) were both writing to the
+same console, and the kernel's prompt logic raced with the user
+shell's banner. The print lock covers kernel-side prints; it does not
+cover user-mode `sys_write` output. This is the class of interleaving
+the ring buffer design fixes once a tty layer exists. Not urgent.
+
+**Related:** item 4i is the specific, ongoing symptom. This item is
+the architectural fix.
 
 ### 4f. Print functions must remain leaf functions
 
@@ -912,7 +1093,7 @@ you ever wonder "is printing slow?"
 
 When a function changes role — `gdt_fix_user_segments` going from
 load-bearing to a no-op, `gdt_init` going from a no-op to load-bearing,
-`test_program.asm`'s tail comment describing an exit path that was
+a test program's tail comment describing an exit path that was
 never taken — comments elsewhere that *name* those functions as "the
 thing that does X" become silently wrong.  There is no mechanical way
 to catch this: the compiler cannot see it, the linker cannot see it,
@@ -925,11 +1106,10 @@ Two instances surfaced in an earlier session:
    descriptors.  After 3h, `gdt_init` is the authoritative builder;
    `gdt_fix_user_segments` is a no-op.  Caught during code review of
    the 3h patch.
-2. **`test_program.asm`'s header comment** (during the 5a-iii
-   discussion) described a "must terminate via `SYS_EXIT`" contract
-   that was never true for a user-mode process in this kernel —
-   user processes halt on exit by design.  The comment was removed
-   rather than corrected.
+2. **A test program's header comment** described a "must terminate
+   via `SYS_EXIT`" contract that was never true for a user-mode
+   process in this kernel — user processes halt on exit by design.
+   The comment was removed rather than corrected.
 
 **Discipline:** before committing a change that alters a function's
 role, `grep` the tree for the function name and update every comment
@@ -941,33 +1121,41 @@ that a future reader knows the class of bug is known and that reading
 comments near touched code is part of the review discipline, not an
 afterthought.
 
+**Relevance for donix:** the A1–A5 migration renamed or removed many
+functions (`sys_spawn`, `sys_sbrk`, `sys_arch_set_fs`,
+`sys_opendir`/`sys_readdir`/`sys_closedir`, `build_user_shell_elf`,
+`user_shell_data.c`). Any comment that still names them as "the thing
+that does X" is now silently wrong. A full-tree grep for the removed
+names is a reasonable cleanup commit at some point; the doc pass
+removed the ones in the docs.
+
 ### 4i. Kernel log and userland output share the same console and interleave
 
-**Status:** cosmetic; visible in every REPL session since v0.6.0
+**Status:** cosmetic; visible in every `musl_sh` session
 **Effort:** ~1 hour (route kernel logs to serial only, or add a
 `klog_enable` syscall)
-**Introduced by:** v0.6.0 (the REPL began spawning many short-lived
-processes, each producing a kernel log line on `sys_exec`)
+**Introduced by:** the REPL shell that started spawning many
+short-lived processes, each producing a kernel log line on `execve`
 
-Every `SYS_EXEC` call prints `sys_exec: spawned pid=N entry=0x... (NAME)`
-to the console via `serial_print`. `sys_open` prints a line for every
-`f_open` failure. Since v0.6.0, these kernel lines interleave with
+Every `execve` prints `sys_execve: pid=N entry=0x... argc=N rsp=0x...
+(NAME)` to the console via `serial_print`. `sys_open` prints a line
+for every `f_open` failure. These kernel lines interleave with
 userland output:
 
 ```
-] bigtest
-sys_exec: spawned pid=6 entry=0x0000008000000000 ([bigtest] 4096-byte round-trip through FatFs
-bigtest.ELF)
-  wrote 4096 / 4096 bytes
+donix> musl_sh
+sys_execve: pid=3 entry=0x400221 argc=1 rsp=0x80000FEFD8 (hello.ELF)
+hello from donix (musl)
 ```
 
-The kernel's `... (bigtest.ELF)\n` was emitted mid-line with the child's
-own `printf` output spliced in. Cosmetic only — nothing is corrupted,
-the program runs correctly — but it makes the shell output hard to
-read, and it will get worse as more processes run.
+The kernel's `sys_execve: ...` line was emitted mid-line with the
+child's own `printf` output spliced in. Cosmetic only — nothing is
+corrupted, the program runs correctly — but it makes the shell output
+hard to read, and it will get worse as more processes run.
 
-`multitest` produces three `sys_open: f_open FAIL` lines for its own
-*expected* failures (the post-delete existence check). Those lines are
+`musl_readdir` produces `Unknown syscall: N` lines for several
+unimplemented syscalls (see item 0.1 for `fcntl`; the others are
+`lstat`, `mkdir`, `creat`, `rt_sigreturn`, `pread64`). Those lines are
 correct in content but noise on the console.
 
 **Options, in order of preference:**
@@ -976,8 +1164,8 @@ correct in content but noise on the console.
    COM1; `vga_putc` writes to the console userland also uses. Today
    both `serial_print` and `vga_putc` write to the console (the
    Makefile wires `-serial stdio`, and the shell reads/writes
-   fd 0/1 which the kernel routes to both). If `sys_exec`'s log and
-   `sys_open`'s failure log go to `serial_print` only (which under
+   fd 0/1 which the kernel routes to both). If `execve`'s log and
+   `open`'s failure log go to `serial_print` only (which under
    `-serial stdio` is the same terminal as the console, but
    *asynchronously* on the host's terminal side), the interleaving
    may or may not persist depending on how QEMU multiplexes.
@@ -995,6 +1183,10 @@ during development.
 
 **Related:** item 4e is the underlying architectural fix; this entry
 is the specific symptom that made it visible.
+
+### 4j. `sys_execve` writes `%rdi`/`%rsi` unnecessarily
+
+Duplicated from §0.6 for the hygiene-tracking view. See §0.6.
 
 ---
 
@@ -1032,8 +1224,8 @@ coverage does not
 
   **What is not covered by 5a-i:** the handlers' *diagnostic* path
   (`g_expect_fault == -1`) is untested — that's the path the `test`
-  command takes.  User-mode faults are untested; see item 3f for the
-  coupling that makes this non-trivial.
+  command takes.  User-mode faults are untested; see items 3f and
+  0.4 for the coupling that makes this non-trivial.
 
 - **5a-ii ✅ DONE (commit `182c1ef`).**  Every non-fault test that
   had an inline body in `handle_command` was refactored into a
@@ -1076,7 +1268,7 @@ coverage does not
   decision, not a bug.
 
   `elfload` launches a *user-mode* process.  When a user process
-  exits — by `SYS_EXIT` or by fault — `process_exit` halts the CPU.
+  exits — by `exit` or by fault — `process_exit` halts the CPU.
   That is the intended behavior: the user shell is the terminal
   interactive console, and there is nothing behind it to return to.
   The kernel shell is a boot-time choice, not a persistent fallback.
@@ -1087,11 +1279,10 @@ coverage does not
   loader is broken, but because "launch a user process" and "return to
   the caller" are mutually exclusive in this kernel.
 
-  `elfload` is already exercised indirectly: `usershell` uses the same
+  `elfload` is already exercised indirectly: `musl_sh` uses the same
   `process_create` + `elf_load_into_process` + `scheduler_switch_to`
-  path on every boot that drops into the user shell.  If the loader
-  regressed, the user shell would fail to start — a much louder signal
-  than a self-test line.
+  path on every boot.  If the loader regressed, the shell would fail
+  to start — a much louder signal than a self-test line.
 
   The expected-fault tests in 5a-i work because their children are
   *kernel-mode* processes (`entry_point >= KERNEL_BASE`), which
@@ -1100,17 +1291,16 @@ coverage does not
 
   Nothing here needs fixing.  If direct loader coverage is ever
   wanted, the route is a kernel-mode ELF whose entry point is in
-  kernel text — which tests a different scenario than `usershell`
+  kernel text — which tests a different scenario than `musl_sh`
   exercises, and is not worth building just for `selftest`.
 
-- **5a-iv ✅ DONE (v0.5.2).** Multi-file delete test (user shell
-  option 6). The user shell's multi-file test now exercises the full
-  file lifecycle: create 3 files, write to each, close, reopen, read
-  back, close, `unlink`, then confirm each file is gone by attempting
-  to reopen it. Option 6 passes end to end.
+- **5a-iv ✅ DONE (v0.5.2).** Multi-file delete test. The multi-file
+  test now exercises the full file lifecycle: create 3 files, write
+  to each, close, reopen, read back, close, `unlink`, then confirm
+  each file is gone by attempting to reopen it. Passes end to end.
 
-  This requires `SYS_UNLINK` (syscall #7) and the userland `unlink()`
-  shim. Both were added in v0.5.2.
+  This requires `unlink` (Linux 87) and the musl wrapper's use of it.
+  Both were present by v0.5.2.
 
   **Interaction with 3i.** This test surfaced the Clang 22.1.8
   miscompile at `-O1`. With `ff.c` at `-O1`, the delete phase hangs;
@@ -1122,7 +1312,7 @@ A build flag (`-DSELFTEST`) that makes the kernel run a fixed test
 sequence at boot and print results to serial, then halt. Useful for
 regression checks after a change.  Unlike the interactive `selftest`
 command, 5b's whole purpose is "run and stop," so it *can* include a
-final user-mode step (launch `usershell`, let it run, halt) — that is
+final user-mode step (launch `musl_sh`, let it run, halt) — that is
 a design question for 5b, not part of the interactive command.
 
 ### 5c. `make test` target
@@ -1132,35 +1322,35 @@ the serial output, and reports pass/fail based on the output. Automatable
 with a serial-to-file and a grep. Would let you catch regressions without
 watching the boot.
 
-### 5d. Spawn regression test (new, from v0.5.3)
+### 5d. Spawn regression test
 
 **Status:** not yet built
 **Effort:** ~1 hour, once 5a-i's infrastructure is understood
 **Priority:** after 5b and 5c, but before the next feature
 
-`SYS_EXEC` and `SYS_WAITPID` are now the newest and most complex
-features in the tree. They exercise three separate subsystems
-(`pmm_alloc_page`, `vmm_clone_page_table`, `context_switch`) that all
-had memory-safety bugs during bring-up, and the bugs were subtle
-enough that they manifested only under specific timing. A future
-regression in any of the three would be caught by the shell option A
+`execve` and `wait4` are the most complex features in the tree. They
+exercise three separate subsystems (`pmm_alloc_page`,
+`vmm_clone_page_table`, `context_switch`) that all had memory-safety
+bugs during bring-up (see §3j), and the bugs were subtle enough that
+they manifested only under specific timing. A future regression in any
+of the three would be caught by running a command in `musl_sh`
 promptly, but only if someone runs it.
 
 A test that runs the same path from the self-test would give a
 deterministic signal. The shape:
 
-- A kernel-mode child process whose entry point calls `sys_exec` on
+- A kernel-mode child process whose entry point calls `sys_execve` on
   a known ELF (`0:/HELLO.ELF`), reads the returned pid, and then
-  blocks in `sys_waitpid` on that pid.
+  blocks in `sys_wait4` on that pid.
 - The child's exit status is 0 if the spawn+wait sequence completes
   and the reaped pid matches, non-zero otherwise.
 - The kernel shell's `selftest` command runs the child, waits for it
   to exit, and reads back the status.
 
-**The complication:** `sys_exec` spawns a *user-mode* process, and
+**The complication:** `sys_execve` spawns a *user-mode* process, and
 user-mode processes halt the CPU when they exit (see 5a-iii). So the
 inner spawned child cannot be the one whose exit status the test
-reads. The outer child (the one that called `sys_exec`) must be
+reads. The outer child (the one that called `sys_execve`) must be
 kernel-mode, so its exit resumes the kernel shell. This is the same
 "expected-fault triggers must be kernel-mode" constraint as item 3f,
 in a different guise.
@@ -1172,7 +1362,7 @@ Concretely, the test would need:
 2. A way to communicate "this child is a self-test, don't halt on
    its inner user-mode child's exit." The mechanism for the inner
    child's exit is the standard parent-wake path: `process_exit`
-   wakes the parent and the parent's `sys_waitpid` returns. Only the
+   wakes the parent and the parent's `sys_wait4` returns. Only the
    *outer* child's exit is special.
 3. `HELLO.ELF` present on the mounted FAT volume. This is guaranteed
    in the single-drive build (the Makefile `mcopy`s it in), but not
@@ -1184,41 +1374,39 @@ This is worth building. It closes the loop on the three fixes in §3j
 by making them regression-detectable. It is not blocking any feature
 work, but it should be done before the next feature lands.
 
-### 5e. argv / REPL regression tests (new, from v0.5.4)
+### 5e. argv / REPL regression tests
 
 **Status:** not yet built
 **Effort:** ~1 hour
 **Priority:** alongside 5d
 
-`v0.5.4` added argv passing, the `echo` and `cat` programs, the
-`ls` directory-listing program, and the directory syscalls
-(`SYS_OPENDIR`/`SYS_READDIR`/`SYS_CLOSEDIR`). The four bugs found
-during that work (three in the earlier stages, one in argv) were all
-caught by manual inspection of a serial capture, not by an automated
-test.
+The musl era added argv passing, the `echo` and `cat` programs, the
+`ls` directory-listing program, and the Linux directory syscalls
+(`open(O_DIRECTORY)` + `getdents64`). Several bugs found during that
+work were caught by manual inspection of a serial capture, not by an
+automated test.
 
 Natural regression checks, in order of value:
 
 1. **`fstest --verify` cross-boot persistence.** Run `fstest`,
    reboot, then run `fstest --verify`. It should print `[fstest] PASS
    (file survived reboot, byte-exact)`. This works today because
-   argv is now passed; before v0.5.4 the `--verify` argument could
+   argv is passed; before argv existed, the `--verify` argument could
    not reach the child. There is no automated way to test the cross-
    boot path — it needs two boots — but a scripted QEMU run in 5c
    could do it.
 2. **argv round-trip.** `echo hello world` should print `hello world`;
    `echo one two three` should print `one two three`; `cat
    HELLO-WORLD.TXT` should print the file contents. These are the
-   tests that caught the argv-layout bug (§3l). A `make test` target
-   (5c) could spawn these from a scripted session and grep the
-   output.
+   tests that caught the argv-layout bug. A `make test` target (5c)
+   could spawn these from a scripted session and grep the output.
 3. **`ls` output stability.** After a fresh boot, `ls` should list
    exactly the files on the FAT image, with correct sizes. An
    automated comparison against the `mdir` output from image-build
    time is possible but fiddly.
 4. **Empty-argv path.** `echo` with no arguments should print a blank
    line; `cat` with no arguments should print `usage: cat FILE`. These
-   exercise the `argc == 0` and `argc == 1` paths in `sys_exec`.
+   exercise the `argc == 0` and `argc == 1` paths in `sys_execve`.
 
 None of these are hard, but they need a test harness that can feed
 input to a running QEMU and read its output. That is 5c.
@@ -1238,8 +1426,18 @@ the newest and least-exercised code paths in the tree.
 
 ## 6. Priorities, one more time
 
+The list below is the "do these, in this order" view.  Section 0 has
+the donix-migration items; sections 3–5 have the historical items.
+
 | # | Item | Effort | Status |
 |---|------|--------|--------|
+| 0.1 | `fcntl` (Linux 72) stub | 30 min | Next (busybox needs it) |
+| 0.2 | `sys_newfstatat` (Linux 262) | 45 min | Next (busybox needs it) |
+| 0.3 | `sys_open` `O_DIRECTORY` fix | 15 min | Whenever |
+| 0.4 | `isr14_handler` user-mode fault handling | 30 min | Before busybox |
+| 0.5 | `musl_sh` backspace echo | 15 min | Cosmetic |
+| 0.6 | `sys_execve` `%rdi`/`%rsi` writes | 15 min | Cleanup |
+| 0.7 | `PMM_ALLOC_DIAG` removal | 5 min | Cleanup |
 | 1 | Kernel size Option 3 | 30 min | ✅ Done (09a6f79) |
 | 2 | Documentation gaps | 2 hrs | ✅ Done (9b62d46) |
 | 3a | Boot stack off hardcoded address | 1–2 hrs | ✅ Done (e246db6) |
@@ -1256,21 +1454,22 @@ the newest and least-exercised code paths in the tree.
 | 3j-c | `context_switch` resume-by-entry-point | 1 hr | ✅ Done (v0.5.3) |
 | 3k | `safe_copy_to_user_cr3` for cross-process writes | 20 min | ✅ Done (v0.5.4) |
 | 3l | argv region shares user stack top | 2 hrs if needed | Open; safe today |
-| 3m | initial child rsp not SysV-compliant | — | Documented design choice |
+| 3m | initial child rsp not SysV-compliant | — | ✅ Resolved for musl |
 | 4a | Dead declarations | 15 min | ✅ Done (20260919F) |
 | 4b | Double-build in `run` | 15 min | ✅ Done (20260919F) |
-| 4c | Stale comments | 30 min | ✅ Done (20260919F) |
+| 4c | Stale comments | 30 min | ✅ Done (20260919F); closed by A5 step 7 |
 | 4d | Serial/VGA output atomicity | 1 hr | ✅ Done (20260919G, 20260919H) |
 | 4e | Print lock → ring buffer | 1–2 hrs | Before tty/per-user console |
 | 4f | Print functions as leaf functions | — | Documented invariant |
 | 4g | Print-lock hold diagnostic | 30 min | Build when needed |
 | 4h | Comments that name functions by role | — | Ongoing discipline |
 | 4i | Kernel log and userland output interleave | 1 hr | Cosmetic; fix with tty |
+| 4j | `sys_execve` `%rdi`/`%rsi` writes | 15 min | Same as 0.6 |
 | 5a-i | Self-test: exception path | 2 hrs | ✅ Done (f132903) |
 | 5a-ii | Self-test: non-fault tests | 1.5 hrs | ✅ Done (182c1ef) |
 | 5a-iii | `elfload` in selftest | — | Declined (see §5a) |
-| 5a-iv | Multi-file delete test (option 6) | — | ✅ Done (v0.5.2) |
-| 5b | Boot-time self-test mode | 1 hr | Next |
+| 5a-iv | Multi-file delete test | — | ✅ Done (v0.5.2) |
+| 5b | Boot-time self-test mode | 1 hr | After busybox |
 | 5c | `make test` target | 1 hr | After 5b |
 | 5d | Spawn regression test | 1 hr | Before next feature |
 | 5e | argv/REPL regression tests | 1 hr | After 5c |
@@ -1281,35 +1480,28 @@ it should be revisited whenever the toolchain is updated. If a future
 Clang or LLD version still miscompiles `ff.c`, the report has the
 reproducers.
 
-Everything on this list is either done, deferred, declined, or
-architectural.  The natural next steps, in order of value:
+---
 
-1. **Testing infrastructure (5b, 5c)** — the last two pieces of the
-   self-test work.  5b runs the same 17 tests at boot and halts; 5c
-   wraps 5b in a headless QEMU invocation and greps the serial log
-   for the summary line.  Do these before starting new features.
-2. **A spawn regression test (5d) and argv tests (5e)** — `SYS_EXEC`,
-   `SYS_WAITPID`, and the argv-passing machinery are now the newest
-   and most complex features in the tree. They exercise three
-   subsystems (`pmm_alloc_page`, `vmm_clone_page_table`,
-   `context_switch`) that all had memory-safety bugs during bring-up.
-   A kernel-mode self-test child that opens `0:/HELLO.ELF`, spawns it,
-   waits for it, and asserts exit status 0 would catch future
-   regressions before they reach the user shell. The argv tests (5e)
-   would catch layout regressions like §3l.
-3. **The ring buffer (4e)** — the correct long-term design for the
-   print path.  Do this before the tty subsystem lands. Item 4i is
-   the specific cosmetic symptom that will keep being visible until
-   then.
-4. **The ELF-loader `PT_NX` follow-up (§3g)** — mark non-executable
-   segments (data, BSS, user stack) as `PT_NX`.  With `EFER.NXE` on
-   since v0.5.1 and the deep `vmm_clone_page_table` in place since
-   v0.5.3, this is now a small, safe change.
-5. **Fixing the argv region landmine (§3l)** — only if a recursive
-   user program is added. Not urgent, but the first such program
-   will silently corrupt its own argv, which is a confusing failure.
-   Doing the fix before adding that program is cheaper than doing it
-   after.
+## 7. Resolved bugs from the migration (for the record)
+
+The A1–A5 migration fixed six bugs that would not have been visible on
+the dons-os-only kernel. Each is documented in
+[`handoff.md`](handoff.md) with the exact symptom, root cause, and
+fix. This section is a short index; the handoff is the source of
+truth.
+
+| Bug | Fixed at | Summary |
+|-----|----------|---------|
+| `%r10` clobbered by syscall return path | `20260924L` | Linux ABI clobbers only `%rax`, `%rcx`, `%r11`. musl's stdio keeps a live pointer in `%r10` across `writev`. |
+| `sys_read` on fd 0 blocked until `count` | `20260926A` | POSIX terminal semantics: return on the first available byte. |
+| `brk` increment ABI vs Linux absolute-address ABI | `20260924B` | musl's `brk(0x26c41000)` was interpreted as "add", causing an unbounded page-mapping loop. |
+| `MSR_FS_BASE` not saved/restored/inherited per process | `20260926E` | musl reads `%fs:0` on the child's first instruction after `fork`; the MSR was effectively per-CPU. |
+| `execve` did not pass `argc`/`argv` in `%rdi`/`%rsi` | `20260926G` | newlib's `crt0.S` read them from registers; musl reads the SysV stack layout. Both were satisfied during the transition. |
+| `execve`'s argv layout zeroed `argv[1]` | `20260926H` | The envp NULL terminator's slot was on top of `argv[0]`'s string. Fixed by putting `strings_start` 8 bytes higher. |
+
+See [`handoff.md`](handoff.md) "Resolved bugs" for the full entries
+and [`OSDev_Checklist.md`](OSDev_Checklist.md) §0.6 for the itemized
+list.
 
 ---
 
@@ -1332,4 +1524,4 @@ is to keep the list of "things we know we're wrong about" honest and short.
 Feature work goes in `ROADMAP.md`. Capability tracking goes in
 `OSDev_Checklist.md`. Debt and maintenance go here.
 
-*Last Updated: September 2026 (v0.5.4)*
+*Last Updated: September 2026 (donix v0.5.5)*
