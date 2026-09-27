@@ -1,3 +1,8 @@
+> **Referenced by the README's "What you need" section.** This report
+> documents the Clang/LLD bugs that require the cross-GCC workaround
+> for FatFs. The bugs are still present in Clang 22.1.8 / LLD 22.1.8;
+> the report is live, not frozen.
+
 # Toolchain bug reports — tracking note
 
 Three separate compiler/linker bugs in Fedora's Clang/LLD 22.1.8
