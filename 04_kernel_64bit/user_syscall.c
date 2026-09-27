@@ -41,14 +41,16 @@ static char g_write_bounce[WRITE_CHUNK];
 // ============================================================
 //
 // The per-process file_table[] holds file_slot_t*, not raw FIL*.
-// Each slot says whether its obj is a FIL or a DIR.
+// Each slot says whether its obj is a FIL or a DIR, and carries a
+// refcount so that sys_dup2 can share a slot between two fds
+// without either close freeing the other's memory.
 
 #define FILE_KIND_FILE 1
 #define FILE_KIND_DIR  2
 
 typedef struct file_slot_s {
     uint32_t kind;
-    uint32_t _pad;
+    uint32_t refcount;
     void    *obj;
 } file_slot_t;
 
@@ -310,18 +312,40 @@ static int copy_user_string(char* dst, size_t dst_cap, const char* user_src) {
 // ============================================================
 // FILE TABLE HELPERS
 // ============================================================
+
+/*
+ * Release one reference to a file_slot_t.
+ *
+ * Decrements the refcount; frees the slot's obj and the slot itself
+ * only when the count reaches zero.  This is what makes sys_dup2's
+ * aliasing safe: after dup2, two fds share one slot, and closing
+ * either fd must not free memory the other fd still points at.
+ *
+ * Callers that just want to detach an fd without freeing the slot
+ * (e.g. sys_close, which sets file_table[fd] = NULL separately)
+ * use this and then clear their own table entry.
+ */
+static void put_file_slot(file_slot_t* slot) {
+    if (!slot) return;
+    if (slot->refcount > 1) {
+        slot->refcount--;
+        return;
+    }
+    if (slot->kind == FILE_KIND_FILE) {
+        f_close((FIL*)slot->obj);
+    } else if (slot->kind == FILE_KIND_DIR) {
+        f_closedir((DIR*)slot->obj);
+    }
+    kfree(slot->obj);
+    kfree(slot);
+}
+
 static void close_all_files(pcb_t* proc) {
     if (!proc) return;
     for (int i = 3; i < MAX_PROCESS_FILES; i++) {
         file_slot_t* slot = (file_slot_t*)proc->file_table[i];
         if (!slot) continue;
-        if (slot->kind == FILE_KIND_FILE) {
-            f_close((FIL*)slot->obj);
-        } else if (slot->kind == FILE_KIND_DIR) {
-            f_closedir((DIR*)slot->obj);
-        }
-        kfree(slot->obj);
-        kfree(slot);
+        put_file_slot(slot);
         proc->file_table[i] = NULL;
     }
 }
@@ -338,9 +362,9 @@ static int alloc_file_slot(file_slot_t** out_slot) {
 
     file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
     if (!slot) return -1;
-    slot->kind = 0;
-    slot->_pad = 0;
-    slot->obj  = NULL;
+    slot->kind     = 0;
+    slot->refcount = 1;
+    slot->obj      = NULL;
     self->file_table[fd] = slot;
     *out_slot = slot;
     return fd;
@@ -536,19 +560,58 @@ long sys_close(int fd) {
     file_slot_t* slot = get_file_slot(fd, 0);
     if (!slot) return -1;
 
-    if (slot->kind == FILE_KIND_FILE) {
-        f_close((FIL*)slot->obj);
-    } else if (slot->kind == FILE_KIND_DIR) {
-        f_closedir((DIR*)slot->obj);
-    } else {
-        return -1;
-    }
-    kfree(slot->obj);
-
     pcb_t* self = process_get_current();
     self->file_table[fd] = NULL;
-    kfree(slot);
+    put_file_slot(slot);
     return 0;
+}
+
+/*
+ * Linux x86_64 dup2(2) — syscall 33.
+ *
+ * Duplicate oldfd onto newfd.  If newfd is already open it is
+ * closed first; if oldfd == newfd the call is a no-op that returns
+ * newfd.  Returns newfd on success, -EBADF if oldfd is not open.
+ *
+ * The file_slot_t is SHARED, not copied: after dup2, both fds
+ * point at the same slot, and the slot's refcount is incremented.
+ * Closing either fd drops one reference; the slot's obj and the
+ * slot itself are freed only when the count reaches zero.  This
+ * is what put_file_slot does, and it is what makes
+ *
+ *     open(); dup2(fd, 7); exit();
+ *
+ * safe: exit() closes both fds, the first close drops refcount to
+ * 1, the second frees the slot once.
+ */
+long sys_dup2(int oldfd, int newfd) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)9;   /* -EBADF */
+
+    if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)9;
+    if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)9;
+
+    file_slot_t* old_slot = get_file_slot(oldfd, 0);
+    if (!old_slot) return -(long)9;   /* -EBADF */
+
+    /* dup2(fd, fd) is a no-op returning fd, not an error. */
+    if (oldfd == newfd) return (long)newfd;
+
+    /*
+     * If newfd was already open, detach it and drop its reference.
+     * put_file_slot frees only when the refcount reaches zero, so
+     * if newfd was aliased to another live fd, the slot survives.
+     */
+    file_slot_t* new_slot = (file_slot_t*)self->file_table[newfd];
+    if (new_slot) {
+        self->file_table[newfd] = NULL;
+        put_file_slot(new_slot);
+    }
+
+    /* Share the slot and take a new reference. */
+    old_slot->refcount++;
+    self->file_table[newfd] = old_slot;
+    return (long)newfd;
 }
 
 long sys_unlink(const char* path) {
@@ -2043,6 +2106,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);

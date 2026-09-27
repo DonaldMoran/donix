@@ -44,6 +44,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/brkgrow.elf \
 	$(USERLAND_BIN)/musl_exec.elf \
 	$(USERLAND_BIN)/musl_wait.elf \
+	$(USERLAND_BIN)/musl_dup2.elf \
 	$(USERLAND_BIN)/musl_readdir.elf \
 	$(USERLAND_BIN)/musl_r10probe.elf \
 	$(USERLAND_BIN)/busybox.elf
@@ -108,6 +109,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF ; \

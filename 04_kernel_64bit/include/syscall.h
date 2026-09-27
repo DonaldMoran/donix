@@ -34,6 +34,7 @@
 #define SYS_RT_SIGPROCMASK  14
 #define SYS_IOCTL           16
 #define SYS_WRITEV          20
+#define SYS_DUP2            33
 #define SYS_GETPID          39
 #define SYS_FORK            57
 #define SYS_EXECVE          59
@@ -87,6 +88,7 @@ void* sys_brk(void* addr);
 
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
+long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
