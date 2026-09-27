@@ -1,23 +1,13 @@
 AS := nasm
 
 .PHONY: all clean run run-log run-debug run-verbose run-headless run-kvm run-telnet \
-        run-single run-kvm-single watch-serial clean-logs \
-        hello-elf memtest-elf fstest-elf multitest-elf bigtest-elf ls-elf cat-elf echo-elf user-elfs
+        run-single run-kvm-single watch-serial clean-logs
 
 all: boot.bin stage2.bin hdd.img
 
 SINGLE_DRIVE_LBA := 2048
 DISK_SECTORS     := 40960
 
-USERLAND_DIR := ../04_kernel_64bit/userland/newlib
-HELLO_ELF     := $(USERLAND_DIR)/apps/hello.elf
-MEMTEST_ELF   := $(USERLAND_DIR)/apps/memtest.elf
-FSTEST_ELF    := $(USERLAND_DIR)/apps/fstest.elf
-MULTITEST_ELF := $(USERLAND_DIR)/apps/multitest.elf
-BIGTEST_ELF   := $(USERLAND_DIR)/apps/bigtest.elf
-LS_ELF        := $(USERLAND_DIR)/apps/ls.elf
-CAT_ELF       := $(USERLAND_DIR)/apps/cat.elf
-ECHO_ELF      := $(USERLAND_DIR)/apps/echo.elf
 HELLO_MUSL    := /tmp/hello_musl
 ECHO_MUSL     := /tmp/echo_musl
 CAT_MUSL      := /tmp/cat_musl
@@ -45,25 +35,6 @@ boot.bin: boot.asm
 stage2.bin: stage2.asm
 	$(AS) -f bin stage2.asm -o stage2.bin
 
-hello-elf:
-	$(MAKE) -C $(USERLAND_DIR) hello
-memtest-elf:
-	$(MAKE) -C $(USERLAND_DIR) memtest
-fstest-elf:
-	$(MAKE) -C $(USERLAND_DIR) fstest
-multitest-elf:
-	$(MAKE) -C $(USERLAND_DIR) multitest
-bigtest-elf:
-	$(MAKE) -C $(USERLAND_DIR) bigtest
-ls-elf:
-	$(MAKE) -C $(USERLAND_DIR) ls
-cat-elf:
-	$(MAKE) -C $(USERLAND_DIR) cat
-echo-elf:
-	$(MAKE) -C $(USERLAND_DIR) echo
-
-user-elfs: hello-elf memtest-elf fstest-elf multitest-elf bigtest-elf ls-elf cat-elf echo-elf
-
 hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
 	rm -f hdd.img
 	qemu-img create -f raw hdd.img 20M
@@ -71,7 +42,7 @@ hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
 	dd if=stage2.bin of=hdd.img bs=512 seek=1 conv=notrunc
 	dd if=../04_kernel_64bit/kernel.bin of=hdd.img bs=512 seek=128 conv=notrunc
 
-hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
+hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin
 	rm -f hdd-single.img
 	qemu-img create -f raw hdd-single.img 20M
 	dd if=boot.bin of=hdd-single.img conv=notrunc
@@ -100,9 +71,6 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin user-elfs
 	mcopy_one "$(LS_MUSL)"       LS.ELF ; \
 	mcopy_one "$(MEMTEST_MUSL)"  MEMTEST.ELF ; \
 	mcopy_one "$(MUSL_STAT)"     MUSL_STAT.ELF ; \
-	mcopy_one "$(FSTEST_ELF)"    FSTEST.ELF ; \
-	mcopy_one "$(MULTITEST_ELF)" MULTITEST.ELF ; \
-	mcopy_one "$(BIGTEST_ELF)"   BIGTEST.ELF ; \
 	mcopy_one "$(MUSL_MIN)"      MUSL_MIN.ELF ; \
 	mcopy_one "$(MUSL_PRINTF)"   MUSL_PRINTF.ELF ; \
 	mcopy_one "$(MUSL_MALLOC)"   MUSL_MALLOC.ELF ; \
