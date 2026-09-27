@@ -1266,6 +1266,40 @@ dons-os `dev` is the recovery point. donix is a clone; if it goes bad,
 `git restore .` or re-clone from dons-os. Commit after every successful
 milestone. One change at a time so `git restore .` always works.
 
+### Tagging convention
+
+Tags through `20260926Z` use a single-letter suffix
+(`20260922A`–`20260926Z`), incrementing through the alphabet within a
+calendar day.  That scheme is now exhausted: `Z` is the last letter,
+and it is used by the commit that introduces this note (the one you
+are reading the tag of).  Do not extend it.
+
+From the next commit onward, use:
+
+    YYYYMMDD-NN
+
+where `NN` is a two-digit sequence starting at `01` and incrementing
+per commit within that day.  A new day restarts at `01` under its
+own date.  Examples:
+
+    20260926-01
+    20260926-02
+    ...
+    20260927-01
+
+The two-digit zero-padding is required so lexical sort order matches
+chronological order.  If a single day ever exceeds 99 commits
+(unlikely), use three digits for that day and accept that it sorts
+after the two-digit tags.
+
+Do not renumber or retag existing tags.  The single-letter history
+stays as it is; the new scheme applies only to new tags.
+
+The A5 plan in Part 2 has eight numbered steps.  Each step is its own
+commit; under the new scheme those would be tagged `20260926-01`
+through `20260926-08` if all done on 2026-09-26, or spread across
+multiple dates if the work spans days.
+
 ## Summary for any session
 
 1. Confirm donix baseline works: boot, `hello`, `memtest`, `ls`, `cat`,
