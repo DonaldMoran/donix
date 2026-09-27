@@ -42,6 +42,10 @@ musl arrives.
 
 Static-link busybox against musl and try running it.
 
+**Phase A is complete as of `20260926-08`.**  The kernel speaks Linux
+x86_64 syscalls, the shell is musl, the userland apps are musl, and
+newlib has been fully retired from the tree.  Phase B is next.
+
 ## The one critical rule
 
 **One change at a time. Test. Commit. Revert on failure.**
@@ -59,13 +63,13 @@ Unless a specific tested problem requires it:
 - `context_switch.asm`
 - `interrupts.c`
 - `kmain.c`
-- the prebuilt newlib `.a` files
-- `arc2/crt0.S`
-- `arc2/reent.c`
-- `user_newlib_linker.ld`
+- the prebuilt newlib `.a` files *(now removed — A5 step 7)*
+- `arc2/crt0.S` *(now removed — A5 step 7)*
+- `arc2/reent.c` *(now removed — A5 step 7)*
+- `user_newlib_linker.ld` *(now removed — A5 step 7)*
 
-All of these work in the baseline. The last three are the ones the
-previous session damaged.
+All of these work in the baseline. The last four no longer exist;
+they were removed with the newlib tree at A5 step 7.
 
 ## Phase A milestones
 
@@ -177,8 +181,8 @@ a fresh boot.
 - Path normalization (`0:/` + `.ELF` for bare names) — `20260926I`.
 - `musl_sh` is the default boot shell, loaded from
   `0:/MUSL_SH.ELF` from the FAT.  The embedded newlib shell
-  (`build_user_shell_elf`) remains as a fallback if the FAT read
-  fails or the file is missing — `20260926J`.
+  (`build_user_shell_elf`) remained as a fallback at `20260926J`;
+  it was removed at A5 step 6.
 
 Two kernel fixes were required along the way:
 - `sys_execve` must pass `argc`/`argv` in `%rdi`/`%rsi` so that
@@ -205,79 +209,85 @@ Target list and current status:
 
 **A4 complete at `20260926W`.**  All five apps have parallel musl
 builds on the FAT, tested individually, with the newlib originals
-intact and the full canary green.  The next milestone is the
-**cut-over** (below), then **A5** (retire newlib).
+intact and the full canary green.  The next milestone was the
+**cut-over**, then **A5** (retire newlib).
 
 **Parallel-then-cut-over pattern.**  Each app is first built as a
 parallel `*_MUSL.ELF` alongside the newlib binary, tested in
 isolation, committed.  Only then does a separate commit replace the
 FAT name (`HELLO.ELF` → musl build) and retire the newlib binary.
 The parallel commit and the cut-over commit are always two distinct
-changes.  The parallel phase is finished; the cut-over phase is next.
+changes.  Both phases are complete.
 
 ### A4 cut-over (complete at `20260926Y`)
 
-Each `*_MUSL.ELF` currently exists *alongside* the corresponding
-newlib `*.ELF`.  The cut-over replaces the FAT name with the musl
-build and retires the newlib binary.  **One app per commit**, in
-this order of risk (lowest first): `echo`, `hello`, `cat`, `ls`,
-`memtest`.
-
-Each cut-over commit:
-
-1. Changes `05_boot_kernel64/Makefile`: the `mcopy_one` line for
-   `NAME.ELF` now copies `$(NAME_MUSL)` instead of `$(NAME_ELF)`.
-   The `*_MUSL.ELF` `mcopy_one` line is removed — the musl binary
-   is now the one named `NAME.ELF` on the FAT.
-2. Removes `NAME_MUSL :=` from the variables block if it is no
-   longer referenced.
-3. Runs the canary with the new FAT layout.  `musl_sh`'s argv[0]
-   normalization already builds `0:/NAME.ELF`, so no shell change
-   is needed — the command name the user types is unchanged.
-4. Commits with a message like
-   `A4 cut-over: NAME.ELF is now the musl build`.  Tag.
-
-Do **not** cut over two apps in the same commit.  A single cut-over
-at a time, tested, committed, tagged.  If a cut-over breaks the
-canary, `git restore .` and diagnose before continuing.
-
-After all five are cut over, the newlib userland is still *built*
-by `04_kernel_64bit/userland/newlib/Makefile`, just not copied to
-the FAT.  Retiring the newlib build tree (Makefile, `.a` files,
-`arc2/`, `apps/`, the whole
-`04_kernel_64bit/userland/newlib/` directory) is **A5**.
+Each `*_MUSL.ELF` existed *alongside* the corresponding newlib
+`*.ELF`.  The cut-over replaced the FAT name with the musl build and
+retired the newlib binary.
 
 **Complete at `20260926Y`.**  All five apps cut over in a single
-commit (see Part 2's "Cut-over details" and "Note on session 8's
-commit policy" for why one commit rather than five).  The newlib
-`.elf` files are still built but no longer copied to the FAT.
+commit (see Part 2's cut-over notes for why one commit rather than
+five).  At that tag the newlib `.elf` files were still built but no
+longer copied to the FAT.  They are now fully removed — A5 step 7.
 
-### A5 — retire newlib
+### A5 — retire newlib (complete at `20260926-08`)
 
-Remove the newlib userland, build rules, and libraries. Safe because
-nothing uses them.  This is *after* the cut-over, not before: the
-cut-over needs the newlib binaries present on the FAT for a
-side-by-side comparison during the canary re-run.
+Remove the newlib userland, build rules, and libraries.  Done as
+eight commits, each tested against the full canary before the next.
 
-Concretely, A5 removes:
+**A5 removes, by step:**
 
-- The `04_kernel_64bit/userland/newlib/` tree (Makefile, `.a` files,
-  `arc2/`, `apps/`, `include/`).
-- The `hello-elf` / `memtest-elf` / `fstest-elf` / etc. rules in
-  `05_boot_kernel64/Makefile` that call into that tree.
-- Any `mcopy_one` lines that reference `$(HELLO_ELF)` and friends.
-- The `SYS_DONIX_SPAWN` (507) case in `syscall_dispatch` and
-  `sys_spawn` itself — nothing will call it after newlib is gone.
-- The `SYS_OPENDIR` / `SYS_READDIR` / `SYS_CLOSEDIR` (500–502)
-  cases — those are newlib-only conveniences.  *Unless* the musl
-  binaries need them for some path; verify before removing.
-- The `SYS_ARCH_SET_FS` (504) case — newlib-only.
-- `SYS_DONIX_SBRK` (505) — newlib-only.
-- The embedded newlib shell (`build_user_shell_elf`) and its
-  fallback path in `kmain.c`.
+1. **Newlib `*-elf` phony targets and `user-elfs` aggregate**
+   (`05_boot_kernel64/Makefile`).  Also removed `FSTEST`,
+   `MULTITEST`, `BIGTEST` from the FAT: those were the only
+   `mcopy_one` lines sourcing `$(USERLAND_DIR)` and have no musl
+   port.  FAT went 24 → 21 entries.  Tag `20260926-01`.
+2. **`SYS_DONIX_SPAWN` (507) and `sys_spawn`.**  Nothing in the
+   musl path called 507; newlib's `arc2/syscalls.c:spawn` was the
+   only caller.  Removed the `#define` and forward declaration too.
+   Tag `20260926-02`.
+3. **`SYS_OPENDIR` / `SYS_READDIR` / `SYS_CLOSEDIR` (500–502).**
+   Newlib-only conveniences; musl's `opendir` goes through Linux
+   `open(O_DIRECTORY)` + `getdents64`, which is a separate
+   implementation (`sys_getdents64`) and stays.  Also removed the
+   now-dead kernel-side `dons_dirent_t` typedef.  Tag `20260926-03`.
+4. **`SYS_ARCH_SET_FS` (504).**  Newlib-only; musl uses
+   `arch_prctl(ARCH_SET_FS)` = 158, a separate case that stays.
+   Tag `20260926-04`.
+5. **`SYS_DONIX_SBRK` (505).**  Newlib-only increment-based sbrk.
+   musl uses `brk(12)` with the Linux absolute-address ABI, which
+   is a separate function and stays.  Tag `20260926-05`.
+6. **The embedded newlib shell and its fallback.**  Deleted the
+   xxd-generated blob (`user_shell_data.c`, ~89 KB), its Makefile
+   rule and object entry, and every reference in `kmain.c`.  The
+   boot path now reads `0:/MUSL_SH.ELF` from the FAT as the only
+   shell source; a failure to read or load it is a serial PANIC
+   rather than a silent fallback.  Removed the `usershell` command
+   from the debug kernel shell.  Kernel shrank by ~88 KB.  Tag
+   `20260926-06`.
+7. **`04_kernel_64bit/userland/newlib/`.**  The whole tree: the
+   newlib Makefile, built `.a` files, `arc2/`, `apps/`, `include/`.
+   Removed the `userland` phony target, the `all: userland
+   kernel.bin` prerequisite, the `$(MAKE) -C $(USERLAND_DIR) clean`
+   line, the `USERLAND_DIR` variable, and the now-unused
+   `USER_CFLAGS`.  Tag `20260926-07`.
+8. **Dead-code cleanup.**  Deleted `syscall.c` (unlinked stubs);
+   removed `DEBUG_WRITE_BOUNCE` from `user_syscall.c`; removed the
+   dead CR3 switch in `kmain.c`'s `elfload` case; deleted the
+   unused `vmm_clone_kernel_half` / `vmm_free_user_page_tables`
+   from `vmm.c` / `vmm.h`.  Tag `20260926-08`.
 
-A5 is its own commit or sequence of commits, done carefully and
-tested between each.  Not started yet.
+Each step has its own commit and canary run.  The full canary was
+green after every step.
+
+**What remains in the tree after A5:**
+- `SYS_REBOOT` (503) is the only 500+ syscall number left in
+  `syscall_dispatch`.
+- The only userland is musl.  The FAT has `HELLO.ELF`, `ECHO.ELF`,
+  `CAT.ELF`, `LS.ELF`, `MEMTEST.ELF`, `MUSL_SH.ELF`, and the musl
+  test binaries, all built against the project-local musl 1.2.5.
+- The only boot shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
+- `make` produces `kernel.bin` only.  No recursive userland build.
 
 ## musl build
 
@@ -422,8 +432,8 @@ Apply each only when a specific problem requires it.
   `process_create` will resume at the wrong RIP.  The helper
   `load_elf_into_user_process` in `kmain.c` (added at `20260926J`)
   rewrites the frame's RIP slot at `[pcb->rsp + 0x78]` after a
-  successful load.  All three ELF-to-user-process call sites
-  (`kmain`'s boot path, `usershell`, `elfload`) go through it.
+  successful load.  All ELF-to-user-process call sites (`kmain`'s
+  boot path and the debug-shell `elfload` command) go through it.
   The latent bug was invisible while the only such binary was the
   embedded newlib shell, which is linked at exactly
   `0x8000000000` — the same value `kmain` passed as `entry_point`,
@@ -562,19 +572,11 @@ Apply each only when a specific problem requires it.
   `%rsi` on entry.  donix's newlib `crt0.S` (`arc2/crt0.S`) does the
   opposite: its first two instructions are
   `mov [rip + argc_saved], rdi` and `mov [rip + argv_saved], rsi`,
-  and it never reads the SysV layout.  Both conventions must be
-  satisfied for `sys_execve` to work with either kind of binary.  The
-  frame slots are `-96` (`%rdi`) and `-104` (`%rsi`) from
-  `kernel_stack_top`, i.e. `ktop[-12]` and `ktop[-13]` in C.  Fixed
-  at `20260926G`; `sys_spawn` already did this via `frame[9]`/
-  `frame[10]` of the child's initial resume frame.
-
-- **`SYS_DONIX_SPAWN` (507) is the newlib spawn number.**  The newlib
-  userland calls 507 for spawn semantics (`arc2/syscalls.c:spawn`).
-  Number 59 is the real Linux `execve`, implemented at `20260924I`.
-  `sys_spawn` (507) still creates a new process; `sys_execve` (59)
-  replaces the caller's address space in place.  Do not point newlib
-  at 59.  This case will be deleted in A5 after newlib is gone.
+  and it never reads the SysV layout.  Both conventions had to be
+  satisfied while both kinds of binary existed.  With newlib gone
+  (A5 step 7), the `%rdi`/`%rsi` writes in `sys_execve`
+  (`ktop[-12]`, `ktop[-13]`) are harmless but no longer necessary;
+  they are kept for now.  Fixed at `20260926G`.
 
 - **A raw-syscall test that reads a kernel-written buffer must declare
   the buffer as an asm memory output — `"+m"(*ptr)`, not just
@@ -607,12 +609,12 @@ Apply each only when a specific problem requires it.
 - **musl's POSIX wrappers do not always go through your donix-private
   syscalls.**  musl's `opendir()` is `open(path, O_RDONLY|O_DIRECTORY)`
   followed by `readdir()` which uses `getdents64(2)`.  It never calls
-  the donix-private `SYS_OPENDIR` (500) — that is a newlib-only
-  convenience.  `sys_open` had to grow a directory fallback (at
-  `20260924K`) because otherwise musl's `opendir` failed with
-  `FR_INVALID_NAME`.  When you add a syscall that has a donix-private
-  equivalent, check which one musl actually uses before assuming they
-  map 1:1.
+  the donix-private `SYS_OPENDIR` (500) — that was a newlib-only
+  convenience, removed at A5 step 3.  `sys_open` grew a directory
+  fallback (at `20260924K`) because otherwise musl's `opendir` failed
+  with `FR_INVALID_NAME`; that fallback stays.  When you add a
+  syscall that has a donix-private equivalent, check which one musl
+  actually uses before assuming they map 1:1.
 
 - **musl `fstatat` routing — what `fstat`, `stat`, and `lstat`
   actually call.**  Read from the project-local musl source at
@@ -648,20 +650,17 @@ Apply each only when a specific problem requires it.
   - `sys_stat` (4) is what `stat` calls when the path is absolute
     or `AT_FDCWD` is the fd.  **Implemented at `20260926T`.**
     Tested by `musl_stat`'s second half (`stat("0:/HELLO-WORLD.TXT",
-    &st)`) — green.  This was the last kernel blocker for `ls_musl`,
-    which builds `0:/NAME` paths and calls `stat()` on them.
+    &st)`) — green.
   - `sys_newfstatat` (262) is what `fstatat(fd, path, st, flags)`
     calls when the fd is not `AT_FDCWD` and the path is not
-    absolute.  **Not yet implemented.**  Not needed by `ls_musl`
-    (which uses absolute `0:/` paths) or by `memtest_musl`.
-    Deferred commit; nothing in A4 depends on it.
+    absolute.  **Not yet implemented.**  Not on any current test's
+    path.
   - `sys_statx` (332) is not reached on x86_64 because the
     `sizeof(st_atime_sec) < sizeof(time_t)` guard is false.  No
     implementation needed.
   - `SYS_lstat` (6) is only reached via `lstat()` with
-    `AT_SYMLINK_NOFOLLOW`.  Nothing in A4 needs it.  Not
-    implemented; if something calls it, it will print
-    `Unknown syscall: 6`.
+    `AT_SYMLINK_NOFOLLOW`.  Not implemented; if something calls it,
+    it will print `Unknown syscall: 6`.
 
 - **`sys_stat` and `sys_fstat` share `fill_kstat_from_filinfo`.**
   Both construct a FatFs `FILINFO` (from an open `FIL` for `fstat`,
@@ -679,54 +678,29 @@ Apply each only when a specific problem requires it.
   `readdir` passes a buffer big enough for one `linux_dirent64`, so
   the fit check never fails in practice.
 
-- **`musl_sh`'s argv[0] normalization matches the newlib shell's
+- **`musl_sh`'s argv[0] normalization matches the old newlib shell's
   convention.**  `musl_sh` normalizes `argv[0]` to `0:/NAME.ELF` if
   the token has no `:/`, and passes `argv[1..n]` through verbatim.
-  That mirrors `user_shell.c:run_external`'s
-  `snprintf(path, sizeof(path), "0:/%s.ELF", argv[0])`, and it is
-  what the newlib `cat`/`echo` expect (bare filenames; they prepend
-  `0:/` themselves).  Added at `20260926I`.  This convention also
-  shapes the A4 ports: a musl `cat`/`echo` built for A4 must take a
-  bare filename on `argv[1]` and prepend `0:/` itself, exactly as
-  the newlib versions do, or the `musl_sh`-to-binary interface
-  breaks.  `cat_musl` (`20260926N`) does this.  Any future A4 port
-  that reads a file argument must do the same.
+  Added at `20260926I`.  This convention shapes the A4 ports: a musl
+  `cat`/`echo`/`ls` port must take a bare filename on `argv[1]` and
+  prepend `0:/` itself, or the `musl_sh`-to-binary interface breaks.
+  `cat_musl` (`20260926N`), `echo_musl` (`20260926M`), and `ls_musl`
+  (`20260926V`) all do this.  Any future port that reads a filename
+  argument must do the same.
 
-- **A4 ports of newlib apps must take a bare filename on `argv[1]`
-  and prepend `0:/` themselves.**  See the `musl_sh` convention
-  entry above.  The newlib `cat.c` does
-  `snprintf(path, sizeof(path), "0:/%s", argv[1])`; the musl port
-  does the equivalent with a manual copy loop.  Do **not** expect
-  the shell to pass a full path for a file argument — `musl_sh`
-  normalizes only `argv[0]`.  This is the single most likely source
-  of silent failure in an A4 port that takes a filename.
+- **A4 ports that enumerate a directory take a bare directory name
+  on `argv[1]` and prepend `0:/`.**  The `ls_musl` port
+  (`20260926V`) does this.  The musl port accepts an optional
+  `argv[1]`, normalizes it to `0:/NAME` if it has no `:/`, and passes
+  it to `opendir`.
 
-- **A4 ports that enumerate a directory should take a bare directory
-  name on `argv[1]` and prepend `0:/`, same as `cat`/`echo`.**  The
-  `ls_musl` port (`20260926V`) does this and works.  The newlib `ls`
-  hardcodes `opendir("0:/")` and takes no argument; the musl port
-  accepts an optional `argv[1]`, normalizes it to `0:/NAME` if it has
-  no `:/`, and passes it to `opendir`.
+### Build system
 
-### stdio / newlib
-
-- **If newlib `printf` breaks after a change, suspect the change, not
-  newlib.** In baseline it works. Check the four A1 files against the
-  table; check that no case label or handler body changed; if `crt0.S`
-  or the linker script were modified, revert them.
-
-### Build system (fixed 2026-09-24, tag `20260924A`)
-
-- **The newlib userland Makefile needs `mkdir -p` for build dirs and
-  `lib/libc.a` as a prerequisite.** `make <app>` from a clean tree
-  failed with "can't create build/apps/memtest.o: No such file or
-  directory" because `prep` only ran via `all`. Worse, `.o` rebuilds
-  did not force `.elf` relinks, so a stale `sbrk` was being linked and
-  masking new code. Fixed with `| dirs` order-only prerequisites and
-  `lib/libc.a` added to each `.elf` target.
 - **Always confirm the .elf is relinked** after touching a source:
-  `ls -l apps/NAME.elf` should be newer than the `.o` files. A stale
-  link can hide a real fix for an entire session.
+  `ls -l apps/NAME.elf` should be newer than the `.o` files.  A stale
+  link can hide a real fix for an entire session.  *(Applies to any
+  future build with `.o` files that need relink; the newlib userland
+  Makefile this referred to is gone.)*
 - **After every patch, verify the edit actually landed in the
   tree you are building.**  A session was lost to editing the wrong
   project directory: the kernel was built from a stale file, and
@@ -744,7 +718,7 @@ Apply each only when a specific problem requires it.
 
 ### Musl build specifics (added 2026-09-26, tag `20260926P`)
 
-- **`*_MUSL.ELF` binaries got dramatically smaller** when the switch
+- **Musl binaries got dramatically smaller** when the switch
   from Fedora's musl to the project-local musl happened at
   `20260926P`.  `HELLO_MUSL.ELF` went 79 KB → 18 KB;
   `MUSL_SH.ELF` went 94 KB → 20 KB; `MUSL_READDIR.ELF` 117 KB →
@@ -803,23 +777,11 @@ Apply each only when a specific problem requires it.
   bug was nondeterministic because it depended on the interleaving of
   the shell's block and the child's exit.
 
-  Diagnosis: two diagnostic prints (`EXIT:` at the top of
-  `process_exit`, `WAKE:`/`IRQ1-pre`/`IRQ1-post` around
-  `process_wake_all_blocked`) captured a run where the child exited
-  with `qhead=(empty)` and took the halt.  The same sequence on other
-  runs showed a non-empty queue, confirming the race.
-
   Fix: in `process_exit`'s fallback path, if `idle` is a valid PCB
   (pid 1 exists), switch to it via `context_switch(exiting, idle)`
   instead of halting.  Idle `hlt`s until the next timer tick; the
   next keyboard IRQ wakes the shell via `process_wake_all_blocked`,
   and `timer_preempt_handler` picks it up on the following tick.
-
-  A secondary symptom — "shell prompt returns but keyboard goes
-  dead" — was reported but never reproduced.  It may be the same
-  race with a different interleaving.  If it reappears, reopen.
-  (See also the `20260926` entry below, which turned out *not* to be
-  this.)
 
 - **Linux `brk` ABI vs. increment `sbrk`** (resolved 2026-09-24, tag
   `20260924B`).  The original symptom was misdiagnosed as a PMM
@@ -836,20 +798,15 @@ Apply each only when a specific problem requires it.
 
   Fix: `sys_brk` (12) now uses the Linux absolute-address ABI, and
   newlib's increment-based `sbrk` moved to a donix-private syscall 505
-  (`SYS_DONIX_SBRK`).  The kernel's `sys_sbrk(505)` implements the old
-  semantics; `arc2/syscalls.c:sbrk` was updated to call it.
-
-  The PMM was never broken.  The "anomaly" was a correct counter
-  reflecting a runaway caller.
+  (`SYS_DONIX_SBRK`).  That private syscall was deleted at A5 step 5
+  with the newlib tree.
 
 - **`mprotect` missing** (resolved 2026-09-24, tag `20260924B`).
   musl calls `mprotect` right after `mmap` to set permissions on the
   new region.  The kernel had no case for it, so the dispatcher
   returned `-1` and musl faulted.  Added as a stub returning 0; real
   permission changes (guarding the `PROT_NONE` pages musl requests
-  with `MAP_FIXED`) are not implemented.  If a later test needs real
-  protection, add the page-table walk in `sys_mprotect` and update
-  the PTE bits.
+  with `MAP_FIXED`) are not implemented.
 
 - **Copy-then-swap `execve` (abandoned)** (investigated 2026-09-24,
   tag `20260924I`).  The first design for in-place `execve` built the
@@ -860,23 +817,20 @@ Apply each only when a specific problem requires it.
   It failed.  The scratch CR3 had to share high-half page tables
   with the caller's CR3; `vmm_free_user_page_tables(old_cr3)` then
   freed page-table pages that the new CR3 still referenced, causing
-  8 double-frees and a page-fault cascade (recursive #PF, RSP
-  marching down by the handler frame size).  Two separate attempts
-  at narrowing the shared state both failed.
+  8 double-frees and a page-fault cascade.
 
   Fix: **abandoned copy-then-swap.**  The shipped `execve` does
   teardown-then-load directly in `self->cr3`: no scratch, no swap,
   no shared page tables.  Failure after teardown calls
   `sys_exit(-1)` instead of returning `-errno`; the Linux contract
   is not fully honored on those paths, but the paths are unreachable
-  for a validated in-memory ELF.  If a caller-recoverable failure
-  is ever needed, revisit copy-then-swap with proper page-table
-  ownership.
+  for a validated in-memory ELF.
 
   The two helper functions written for the abandoned design
   (`vmm_clone_kernel_half`, `vmm_free_user_page_tables` in `vmm.c`)
-  are currently unused but kept in the tree; they may be useful when
-  `fork` needs real copy-on-write.
+  were unused after `execve` shipped and were deleted at A5 step 8.
+  Their source remains in git history if a future COW implementation
+  wants to reference them.
 
 - **`musl_printf` / `printnum` dump garbage — kernel bug, fixed at
   `20260924L`.**  This was previously misdiagnosed as a musl-internal
@@ -888,19 +842,6 @@ Apply each only when a specific problem requires it.
   binary's own `.rodata` / `.eh_frame`.  The newline from
   `printf("MUSL-PRINTF\n")` was silently dropped.  `ls` looped
   forever printing `FILE     (0 bytes)`.
-
-  Raw-byte dump of the user's iov array in `sys_writev`:
-
-      [writev raw] 28 42 40 00 00 00 00 00   iov[0].base = 0x404228
-                   0b 00 00 00 00 00 00 00   iov[0].len  = 11
-                   57 ff 0f 00 80 00 00 00   iov[1].base = 0x80000FFF57
-                   20 ff 0f 00 80 00 00 00   iov[1].len  = 0x80000FFF20
-
-  `iov[0]` is correct (`base = "MUSL-PRINTF\n"` in `.rodata`,
-  `len = 11`).  `iov[1]` contains two user-stack addresses where a
-  musl-internal buffer pointer and its length should be.  The kernel
-  faithfully copied what musl wrote; musl wrote garbage because the
-  kernel had corrupted a register musl was relying on.
 
   Root cause: the syscall return path in `user_syscall_entry.asm`
   discarded the saved `%r10` and reused `%r10` as a scratch for the
@@ -916,18 +857,10 @@ Apply each only when a specific problem requires it.
   fix: `R10-AFTER=0x00000080000fff60` (a user RSP).  After the fix:
   `R10-AFTER=0xdeadbeefcafebabe`.
 
-  First attempt at the fix (wrong): used `pop rax` to stash the user
-  RSP.  That destroyed `%rax`, the syscall return value.  `ls`
-  looped forever on a positive-but-meaningless `readdir` return;
-  `printnum` printed `x=42` then NUL bytes.
-
   Corrected fix: restore `%r10` with `pop r10`, do not touch `%rax`
   on the return path, and load the user RSP from the kernel stack
   frame last via `mov rsp, [rsp - 72]`, using no GPR.  Frame layout
   and `process_fork_copy_frame` offsets unchanged.
-
-  New test: `musl_r10probe` (`build_musl_tests.sh`, image Makefile).
-  `musl_printf`, `printnum`, and `ls` are all green after the fix.
 
 - **`musl_wait` read a stale status on the first `wait4(-1)`**
   (resolved 2026-09-24, tag `20260924J`).  The test printed
@@ -944,148 +877,63 @@ Apply each only when a specific problem requires it.
   (resolved 2026-09-26, tag `20260926A`).  POSIX `read(2)` on a
   terminal returns on the first available byte; donix's `sys_read`
   looped until `bytes_read == count`.  Invisible under the newlib
-  shell (which reads 1 byte at a time, so `count == 1` and the loop
-  exited on the first byte anyway), but a musl program doing
+  shell (which reads 1 byte at a time), but a musl program doing
   `read(0, buf, 255)` would block until 255 keystrokes had been
-  entered.  Discovered when `musl_sh`'s prompt appeared and then
-  ignored all input: the shell's `read(0, line, 255)` was consuming
-  each keystroke into its buffer but never returning to `main`.
-  Confirmed by typing 256 characters into the frozen shell and
-  finally seeing `EXEC-FAILED`.
+  entered.
 
   Fix: in `sys_read`'s fd-0 branch, the `continue` after a successful
   `safe_copy_to_user` becomes `break`.  One token changed.  This is
-  the same class of bug as the `%r10` clobber: kernel ABI did not
-  match Linux's, and newlib's usage never exercised the difference.
+  the same class of bug as the `%r10` clobber.
 
 - **`musl_r10probe` `puthex64` stack buffer overflow** (resolved
   2026-09-26, tag `20260926D`).  `char b[24]` filled with a 29-byte
-  string (`"R10-AFTER=0x"` prefix + 16 hex digits + newline).  Latent
-  since `20260924L`; the compiler warned about it at build time but
-  the test passed anyway because the overflow landed in unused stack
-  space under the newlib-spawn path.
-
-  Exposed when the test was first run under `musl_sh` via `execve`:
-  different stack layout, and the overflow clobbered a live pointer.
-  Symptom was a fatal `#PF` at `CR2=0x28`, `RIP=0x40097B`, with
-  `PTE PRESENT, phys 0x28`.
-
-  Fix: `char b[24]` → `char b[32]` at the `musl_r10probe` `puthex64`
-  in `build_musl_tests.sh`.  One line.
-
-  **NOTE: this fix did not, on its own, make the test reliable.**
-  The page fault that first exposed this overflow turned out to be
-  a *separate* kernel bug — the `MSR_FS_BASE` issue fixed at
-  `20260926E`.  The `b[32]` fix only removed one of the ways the
-  symptom could manifest.
+  string.  Fix: `char b[24]` → `char b[32]`.  One line.
 
 - **Second `execve` from the same `musl_sh` faulted fatally**
-  (resolved 2026-09-26, tag `20260926E`).  The previous session's
-  diagnosis — page-table corruption in `vmm_clone_page_table` or
-  in `sys_execve`'s teardown — was **wrong**.  Reading
-  `vmm_clone_page_table`, `vmm_free_user_page_tables`, and
-  `sys_execve`'s `exec_free_and_unmap_user_pages` side by side
-  showed that the teardown frees only data pages listed in
-  `pcb->elf_page_list`, never page-table structures, and the child's
-  `elf_page_list` is populated only with its own fresh stack pages
-  by `process_create`.  No shared page-table page is freed.  The
-  "freed page-table page" reading of `PTE = 0x3` was also wrong:
-  `0x3` is the identity-map PTE for the low 2 MB, present but
-  supervisor-only, and `CR2 = 0x34` is a near-null user dereference.
-
-  The actual bug: `MSR_FS_BASE` (0xC0000100) is set once by
-  `arch_prctl(ARCH_SET_FS)` and was never saved or restored across
-  context switches, making it effectively per-CPU instead of
-  per-process.  After the first child ran `arch_prctl` with its own
-  TLS base, the parent `musl_sh`'s TLS base was clobbered.  On the
-  parent's next `fork`, musl's `fork` wrapper loaded `errno`
-  through `%fs`, got a null/stale pointer, and faulted at
-  `CR2 = 0x34`, `RIP = 0x4009BD` (the `mov (%rax), %eax` after
-  `__errno_location`; disassembly confirmed `0x4009BD` is that
-  exact instruction).
+  (resolved 2026-09-26, tag `20260926E`).  The actual bug:
+  `MSR_FS_BASE` (0xC0000100) is set once by `arch_prctl(ARCH_SET_FS)`
+  and was never saved or restored across context switches, making it
+  effectively per-CPU instead of per-process.  After the first child
+  ran `arch_prctl` with its own TLS base, the parent `musl_sh`'s TLS
+  base was clobbered.  On the parent's next `fork`, musl's `fork`
+  wrapper loaded `errno` through `%fs`, got a null/stale pointer, and
+  faulted.
 
   Fix, part 1: add `uint64_t fs_base;` to `pcb_t` (appended after
   `file_table`, past `block_kind = 0x158`, so `context_switch.asm`'s
   hardcoded offsets are unchanged), record it in `sys_arch_set_fs`
   and `sys_arch_prctl(ARCH_SET_FS)`, and save/restore around every
-  context switch: the preemptive CR3 switch in
-  `timer_preempt_handler` (which does not go through
-  `context_switch`) and all three `context_switch` call sites in
-  `scheduler.c`.
+  context switch.
 
-  Fix, part 2: the first fix unmasked a second bug.  `sys_fork` did
-  not inherit the parent's `fs_base`, so the child ran with
-  `MSR_FS_BASE = 0`.  musl's `__post_Fork` reads `%fs:0x0` on the
-  child's first instruction after `_Fork` returns — before any
-  syscall — and faulted at `CR2 = 0`, `RIP = 0x4014D5`.  Disassembly
-  confirmed `0x4014D5` is `mov %fs:0x0, %rdx` inside `__get_tp`,
-  called from `__post_Fork`.  Adding
+  Fix, part 2: `sys_fork` did not inherit the parent's `fs_base`, so
+  the child ran with `MSR_FS_BASE = 0`.  Adding
   `child->fs_base = parent->fs_base;` in `sys_fork` closed it.
 
-  Both parts landed in the same commit because they were discovered
-  together: part 1 is not correct on its own (it introduces a new
-  failure mode on the child's first instruction), and part 2 is only
-  meaningful once `fs_base` exists.
-
-  Files changed: `04_kernel_64bit/include/process.h` (new field),
-  `user_syscall.c` (record at `arch_prctl`, inherit in `sys_fork`),
-  `interrupts.c` (save/restore in `timer_preempt_handler`),
-  `scheduler.c` (save/restore at the three `context_switch` call
-  sites).  `context_switch.asm` was not touched.  The newlib canary
-  never calls `arch_prctl`, so its `fs_base` stays 0 and every
-  `wrmsr(0xC0000100, 0)` on switch is a harmless no-op.
+  Both parts landed in the same commit.
 
 - **`sys_execve` clobbered `argv[1]` for short `argv[0]` values**
-  (resolved 2026-09-26, tag `20260926H`).  Symptom: newlib
-  `cat hello-world.txt` under `musl_sh` printed nothing and exited
-  cleanly; the kernel trace showed `argc=2` reaching `sys_execve`,
-  so the argument array was delivered, but the child saw an empty
-  `argv[1]`.
-
-  Root cause: `sys_execve`'s argv layout wrote the `envp` NULL
-  terminator at `argv_region_bottom + array_bytes`, the same
-  address as `strings_start`.  For `argv[0] = "cat"` (4 bytes), the
-  `argv[1]` string began inside the 8-byte zeroing window and was
-  clobbered.  For `argv[0] = "0:/cat.elf"` (11 bytes), the
-  collateral damage stopped before `argv[1]`, so the bug was
-  invisible until `musl_sh`'s normalization started passing short
-  bare names.
-
+  (resolved 2026-09-26, tag `20260926H`).  Root cause: `sys_execve`'s
+  argv layout wrote the `envp` NULL terminator at
+  `argv_region_bottom + array_bytes`, the same address as
+  `strings_start`.  For `argv[0] = "cat"` (4 bytes), the `argv[1]`
+  string began inside the 8-byte zeroing window and was clobbered.
   Fix: `strings_start = argv_region_bottom + array_bytes + 8`.
-  The `envp` NULL write address is unchanged.  `sys_spawn` already
-  had this fix from an earlier session.
 
 - **`sys_execve` did not pass `argc`/`argv` in `%rdi`/`%rsi`**
-  (resolved 2026-09-26, tag `20260926G`).  Symptom: newlib `cat`
-  under `musl_sh` reached `main` but printed `(null)` for `argv[1]`.
-  Root cause: `crt0.S` reads `argc`/`argv` from `%rdi`/`%rsi` on
-  entry; `sys_execve` set the SysV stack layout but not those
-  registers, so `crt0.S` stashed the execve call's own arguments —
-  pointers into the old, torn-down address space — into
-  `argc_saved`/`argv_saved`.  Fix: write `ktop[-12] = argc` and
-  `ktop[-13] = array_base`.  `sys_spawn` already did the
-  equivalent via `frame[9]`/`frame[10]`.
+  (resolved 2026-09-26, tag `20260926G`).  Fix: write
+  `ktop[-12] = argc` and `ktop[-13] = array_base`.
 
 - **`musl_sh`'s `argv[0]` was not normalized** (resolved
-  2026-09-26, tag `20260926I`).  Symptom: `cat hello-world.txt`
-  under `musl_sh` called `f_open("cat")` and failed.  Root cause:
-  `musl_sh` passed the raw typed token as the path; the newlib
-  shell's convention is to prepend `0:/` and append `.ELF`.  Fix:
-  `musl_sh` now builds `path = "0:/" + argv[0] + ".ELF"` unless
-  `argv[0]` already contains `:/`, matching
-  `user_shell.c:run_external`.
+  2026-09-26, tag `20260926I`).  Fix: `musl_sh` now builds
+  `path = "0:/" + argv[0] + ".ELF"` unless `argv[0]` already
+  contains `:/`.
 
 ### Open issues
 
-- **A4 cut-over is complete at `20260926Y`.**  See "A4 cut-over
-  (complete at `20260926Y`)" above.  Nothing outstanding; the
-  section is kept only for the record of how the cut-over was done.
 - **`sys_newfstatat` (262) is not implemented.**  `sys_fstat` (5)
   and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
-  routing" under "Syscall ABI".  `sys_newfstatat` is not on any
-  current A4 test's path; it is a "for general correctness" commit
-  that can wait until either a test exercises it or the A4 backlog
-  is being cleared.
+  routing" under "Syscall ABI".  Not on any current test's path.
+  Phase B (busybox) may exercise it.
 - **`sys_open` accepts non-directories when called with
   `O_DIRECTORY`.**  Observed at `20260926V`: `ls_musl
   0:/hello-world.txt` prints `0 file(s), 0 directory(ies)` and
@@ -1095,135 +943,66 @@ Apply each only when a specific problem requires it.
   `f_opendir` fallback path does not verify that the target is
   actually a directory.  Fix (deferred): after `f_opendir`
   succeeds, check the entry's `fattrib & AM_DIR`; if not set,
-  close and return `-ENOTDIR`.  Not blocking anything; A4's
-  `ls_musl` uses `0:/` (a directory) and works correctly.
+  close and return `-ENOTDIR`.
 - **`fcntl` (72) is called by musl's `opendir`.**  Confirmed at
   `20260926V`: musl's `opendir` does
   `open(path, O_RDONLY|O_DIRECTORY)` then
   `fcntl(fd, F_SETFD, FD_CLOEXEC)`.  `sys_fcntl` is unimplemented,
   so the kernel prints `Unknown syscall: 72` and returns `-1`;
-  musl ignores the failure.  This is the same number in the
-  `musl_readdir` open issue below and is now traced to its caller.
-  Implementing `fcntl` as a minimal stub (return 0 for
-  `F_SETFD`/`F_GETFD`, `-1` for others) would remove the noise and
-  is a small, low-risk commit.  Deferred.
-- **Newlib shell's line editor mishandles backspaces; a malformed
-  line can leave FatFs in a bad state.**  Reproduced at
-  `20260926J`.  The clean sequence works:
-
-      ] cat hello-world.txt   → prints the file (pid=4)
-      ] ls                    → prints 23 entries (pid=5)
-
-  The failing sequence inserts a line with backspaces between them:
-
-      ] cat     ls            → the `ls` output shows a garbage
-                                entry "FILE   ls-diale.ct=  (0 bytes)"
-      ] ls                    → f_open(0:/ls.ELF) -> 4 (FR_NO_FILE)
-      ] ls                    → f_open(0:/ls.ELF) -> 4
-
-  The newlib shell's line editor has a known backspace echo bug
-  (see "Cosmetic / housekeeping" in Part 1).  A line containing
-  backspaces can produce a command line whose stored buffer differs
-  from what was echoed, and the resulting malformed command appears
-  to corrupt the shared FatFs volume state or the kernel-side file
-  table, so the *next* command cannot find its ELF.  The clean
-  sequence in the *same* capture as the failure (a fresh boot,
-  `] cat` then `] ls` with no backspaces in between) works, which
-  rules out "any `cat` poisons the volume".
-
-  Not reachable from `musl_sh`, which has no line editor and reads
-  input byte-at-a-time.  Will be deleted with the newlib shell at
-  A5.
-
-- **`musl_sh` echoes garbage when the typed line contains
-  backspaces.**  Observed at `20260926M`, `20260926N`, `20260926P`,
-  and again at `20260926W` (`memtest_musl`).  The kernel trace
-  shows the argv that actually reached `sys_execve` is correct —
-  `argc` matches the number of tokens typed, and the program output
-  is right — but the echoed input line is scrambled.  `musl_sh`'s
-  read loop handles `\b`/`0x7f` by emitting `"\b \b"` (three bytes)
-  and decrementing the buffer index, so the *stored* line is
-  correct; the garble is in what the terminal displays.  Cosmetic.
-  Fix, if wanted: emit `"\b \b"` only when stdout is a real tty,
-  or drop the erase-on-backspace entirely and just decrement `n`.
-
-- **`musl_readdir` under `musl_sh` prints `Unknown syscall: N`
-  between entries.**  Numbers seen at `20260926J` and unchanged
-  since: 6, 7, 8, 15, 17, 72.  `72` is now traced to musl's
-  `opendir` calling `fcntl` (see above).  The others (`6` lstat,
-  `7` mkdir, `8` creat, `15` rt_sigreturn, `17` pread64) have not
-  been traced to a caller yet.  The `readdir` loop still returns
-  the correct count (29), so the test is green, but the noise is
-  real.  Next step if investigated: add a one-line serial print in
-  `syscall_dispatch`'s `default:` case that includes the caller's
-  PID and the saved user RIP
-  (`*(uint64_t*)(self->kernel_stack_top - 56)`), to see which
-  process and which user instruction is calling the unimplemented
-  number.
-
+  musl ignores the failure.  Implementing `fcntl` as a minimal
+  stub (return 0 for `F_SETFD`/`F_GETFD`, `-1` for others) would
+  remove the noise.  Deferred.
+- **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
+  seen: 6, 7, 8, 15, 17, 72.  `72` is traced to musl's `opendir`
+  calling `fcntl`.  The others (`6` lstat, `7` mkdir, `8` creat,
+  `15` rt_sigreturn, `17` pread64) have not been traced to a
+  caller yet.  The `readdir` loop still returns the correct count,
+  so the test is green, but the noise is real.
 - **`isr14_handler` halts on user-mode faults.**  The `#PF` handler
   checks only `g_expect_fault`; it does not look at `error_code & 4`
   to distinguish a user-mode fault from a kernel-mode one.  Any
   unexpected user-mode fault kills the console instead of
-  terminating the faulting process.  Not blocking A4, but it will
-  bite the next time a user program faults unexpectedly.  Fix: in
-  `isr14_handler`, if `(error_code & 4)` and
-  `g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
-  process instead of halting.
-
-- If the "prompt returns, keyboard dead" symptom reappears, check
-  whether the cause is the `20260924F` idle-fallback race.  The
-  second-`execve` bug that previously shared this symptom space is
-  now resolved (see `20260926E` above).
+  terminating the faulting process.  Fix: in `isr14_handler`, if
+  `(error_code & 4)` and `g_expect_fault != 0x0E`, call
+  `sys_exit(-1)` for the faulting process instead of halting.
+- **`musl_sh` echoes garbage when the typed line contains
+  backspaces.**  The kernel trace shows the argv that actually
+  reached `sys_execve` is correct, but the echoed input line is
+  scrambled.  Cosmetic.  Fix, if wanted: emit `"\b \b"` only when
+  stdout is a real tty, or drop the erase-on-backspace entirely
+  and just decrement `n`.
 
 ### Cosmetic / housekeeping
 
-- `syscall.c:29` has an old stub `sys_brk` that shadows the real one in
-  `user_syscall.c`. `syscall.o` is **not** in `OBJS` in the kernel
-  Makefile, so `syscall.c` is not linked at all. Not fatal, but
-  confusing. Clean up later (delete the file in its own commit).
 - `build_musl_tests.sh` has duplicate `# Test 4:` and `# Test 7:`
   comments (copy-paste artifacts from `musl_twommap` and the
   `brkraw`/`brkgrow` tests).  Cosmetic.
 - `musl_min` is built without `-no-pie` while every other musl test
   uses it.  `musl_min` works, but for consistency at some point it
   should match.  Cosmetic.
-- Shell line-editing has a backspace echo bug. Not on critical path.
-  (This is the root cause of the FatFs corruption open issue
-  above, but the fix is A5's problem, not a standalone cleanup.)
-- `sys_spawn` still prints its serial trace with the prefix
-  `sys_execve:` (a string literal, not a symbol).  Cosmetic; rename
-  the literal to `sys_spawn:` at the next convenient edit.  Will be
-  deleted along with `sys_spawn` in A5 anyway.
-- `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in `vmm.c`
-  / `vmm.h` are unused (written for the abandoned copy-then-swap
-  `execve`).  Kept for future copy-on-write work.  If still unused
-  after A5, delete in a cleanup commit.
-- `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is currently `0` (gated,
-  inert).  It was added at `20260924L` to test a shared-bounce-buffer
-  theory for the `printnum` NUL bytes; the theory was wrong, the flag
-  never fired.  Keep it gated for now as a diagnostic in case the
-  symptom reappears; delete in a cleanup commit if still unused.
-- `kmain.c`'s `handle_command` `elfload` case still does a manual
-  `mov %cr3, %proc->cr3` around `load_elf_into_user_process`.  That
-  switch is a leftover from an older `elf_load_into_process` that
-  resolved PTEs against the active CR3; the current one takes the
-  target CR3 as a parameter, so the switch is dead code.  Keeping
-  it as-is for now; delete in a cleanup commit.
-- The `syscall.h` header's `SYS_EXECVE` doc comment still says
-  "NOT YET IMPLEMENTED" and describes the dispatcher routing 59 to
-  `sys_spawn` as a placeholder.  That was replaced at `20260924I`.
-  Doc-only, stale; fix in a cleanup commit.
+- Audit the other `puthex`/`put_dec` helpers in
+  `build_musl_tests.sh` for tight margins, same as the
+  `musl_r10probe` `puthex64` bug fixed at `20260926D`.  Cosmetic
+  unless a test starts faulting.
+- `SYS_REBOOT` (503) is the only 500+ syscall in
+  `syscall_dispatch`.  It is reachable only via raw `syscall(503)`
+  from a musl program; there is no musl-side wrapper.  If a user
+  program needs to reboot the machine, write a tiny `REBOOT.ELF`
+  that issues the raw syscall, or implement Linux `reboot(2)`
+  (syscall 169).  Not blocking anything.
+- `PMM_ALLOC_DIAG` in `pmm.c` is gated diagnostic code from the
+  `20260924B` `brk` investigation; harmless, can be deleted at
+  leisure.
 
 ## Testing harness
 
 - **Kernel shell:** `k` at boot prompt
   (`proclist`, `schstat`, `heapstat`, `selftest`, `fatls`,
-  `usershell`, `elfload`).
+  `elfload`).  (`usershell` was removed at A5 step 6.)
 - **User shell:** `musl_sh`, launched automatically from the FAT
-  as `0:/MUSL_SH.ELF` at boot (since `20260926J`).  Do not press
-  `k` to get it.  Falls back to the embedded newlib shell if
-  `MUSL_SH.ELF` cannot be read from the FAT.
+  as `0:/MUSL_SH.ELF` at boot.  Do not press `k` to get it.  There
+  is no newlib fallback any more; a FAT read failure is a serial
+  PANIC.
 - **QEMU:** `make runkernel64-kvm-single` (fast),
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
   The normal `./run` script uses
@@ -1234,8 +1013,8 @@ Apply each only when a specific problem requires it.
   set the `-d in_asm,cpu` flag; that only appears in the
   `run-debug-log` target.
 - **Serial:** `-serial stdio` for kernel log. VGA to the QEMU window.
-- **musl test binaries** are built by `build_musl_tests.sh` (tracked,
-  committed at `57a3f9e`, extended through `20260926W` with
+- **musl test binaries** are built by `build_musl_tests.sh`
+  (tracked, committed at `57a3f9e`, extended through A5 with
   `musl_exec`, `musl_wait`, `musl_readdir`, `musl_r10probe`,
   `musl_sh`, `hello_musl`, `echo_musl`, `cat_musl`, `ls_musl`,
   `memtest_musl`, and `musl_stat`).
@@ -1250,15 +1029,14 @@ Apply each only when a specific problem requires it.
   a `WARN: ... not found` line during `hdd-single.img` build but
   does **not** fail the build — the image is silently missing those
   ELFs.
-- **Canary run pattern.**  Every A4 port follows the same manual
-  test: boot, run the new `*_MUSL.ELF` from `musl_sh`, run the
-  corresponding newlib binary from `musl_sh` in the same boot, run
-  a few error cases, then run the full canary suite.  This is
-  tedious but is what "one change at a time" costs.  Automating it
-  (a `musl_sh` script-mode that reads commands from a file, plus a
-  QEMU wrapper that boots and greps `capture.txt`) was considered
-  at `20260926N` and deferred.  Revisit when the manual cost grows
-  past the patch cost.
+- **Canary run pattern.**  Boot `musl_sh`, run each test in the
+  Part 2 canary table in order, compare against the expected
+  output.  Tedious but is what "one change at a time" costs.
+  Automating it (a `musl_sh` script-mode that reads commands from
+  a file, plus a QEMU wrapper that boots and greps `capture.txt`)
+  was considered at `20260926N` and deferred.  Revisit when the
+  manual cost grows past the patch cost; A5 was done manually and
+  stayed manageable.
 
 ## Recovery
 
@@ -1270,11 +1048,10 @@ milestone. One change at a time so `git restore .` always works.
 
 Tags through `20260926Z` use a single-letter suffix
 (`20260922A`–`20260926Z`), incrementing through the alphabet within a
-calendar day.  That scheme is now exhausted: `Z` is the last letter,
-and it is used by the commit that introduces this note (the one you
-are reading the tag of).  Do not extend it.
+calendar day.  That scheme is exhausted; `Z` is the last letter and
+was used by the commit that introduced the new scheme.
 
-From the next commit onward, use:
+From the commit after that one onward, use:
 
     YYYYMMDD-NN
 
@@ -1288,241 +1065,110 @@ own date.  Examples:
     20260927-01
 
 The two-digit zero-padding is required so lexical sort order matches
-chronological order.  If a single day ever exceeds 99 commits
-(unlikely), use three digits for that day and accept that it sorts
-after the two-digit tags.
+chronological order.
 
 Do not renumber or retag existing tags.  The single-letter history
 stays as it is; the new scheme applies only to new tags.
 
-The A5 plan in Part 2 has eight numbered steps.  Each step is its own
-commit; under the new scheme those would be tagged `20260926-01`
-through `20260926-08` if all done on 2026-09-26, or spread across
-multiple dates if the work spans days.
-
 ## Summary for any session
 
-1. Confirm donix baseline works: boot, `hello`, `memtest`, `ls`, `cat`,
-   `echo`, `printf`, `malloc`.
-2. Apply A1 only: four files, numbers only. No `crt0.S`, no linker
-   script, no semantics, no new syscalls.
-3. Test. Commit if it works. Revert and diagnose if it doesn't.
-4. Then A2 items 1–14, one at a time, each tested with a tiny musl
-   program. Newlib's existing userland is the regression canary after
-   each.
-5. Do not add `fork`/`execve`/`getdents64` wrappers to the newlib
-   userland. That work will be discarded when musl arrives.
-6. Produce **small targeted patches, not full files.** Ask to see
-   current file content before patching. Ask for test results before
-   the next patch.
-7. If the assistant suggests changes to `crt0.S`,
-   `user_newlib_linker.ld`, or `reent.c` during A1, push back: out of
-   scope.
-8. If a test fails, `git restore .` and diagnose. **Do not proceed
-   with a broken milestone.**
-9. Commit with explicit `git add <file>...`, not `git add -A`.  Verify
-   `git diff --cached --stat` before committing.
+1. Confirm donix baseline works: boot to `musl_sh`, run the canary
+   (`hello`, `echo`, `cat`, `ls`, `memtest`, `musl_*` tests).
+2. Apply one logical change at a time.  Test.  Commit.  Tag.
+3. Revert with `git restore .` on any failure and diagnose before
+   proceeding.
+4. Commit with explicit `git add <file>...`, not `git add -A`.
+   Verify `git diff --cached --stat` before committing.
 
 ## The one-line summary
 
-**Use newlib only as a regression canary for existing userland binaries.
-Add new syscalls to the kernel and test them with musl from the start.
-Never write new libc wrappers in newlib that you'll throw away when
-musl lands.**
+**donix runs static musl-linked binaries on Linux x86_64 syscalls.
+Newlib is gone.  Phase B is busybox.**
 
 ---
 
 # Part 2 — Session Status
 
-**Last updated:** 2026-09-26 (session 8, A4 cut-over complete)
-**Current HEAD:** `20260926X` (commit `7b9e479`); this handoff
-commit will be `20260926Y`
-**Last known-good tag:** `20260926X` (the cut-over commit `20260926Y`
-will become known-good once committed and tested)
+**Last updated:** 2026-09-26 (session 9, A5 complete)
+**Current HEAD:** `20260926-09` (this handoff)
+**Last known-good code tag:** `20260926-08` (A5 step 8)
 **Disaster preserved at:** branch `disaster-20260923A` (commit `47262a9`)
 
 ## Current milestone
 
-**A4 cut-over complete at `20260926Y`.**  All five userland apps
-(`hello`, `echo`, `cat`, `ls`, `memtest`) on the FAT are now the musl
-builds.  The newlib `.elf` files are still built by the newlib
-userland Makefile (via the `user-elfs` target in
-`05_boot_kernel64/Makefile`) but are no longer copied to the FAT.
-The full canary is green.  The FAT contains **24** entries, down
-from 29 before the cut-over.
+**A5 complete at `20260926-08`.**  The newlib userland, build rules,
+and libraries are gone.  The kernel is musl-only:
+- Only Linux x86_64 syscalls plus `SYS_REBOOT` (503) in
+  `syscall_dispatch`.
+- The FAT has 21 entries; every one is a musl build.
+- The boot shell is `musl_sh`, loaded from `0:/MUSL_SH.ELF`.  No
+  newlib fallback.
+- `make` produces `kernel.bin` only.  No recursive userland build.
+- `kernel.bin` shrank by ~88 KB from removing the embedded newlib
+  shell blob.
 
-**Next milestone: A5 (retire newlib).**  See "A5" under Part 1 for
-the concrete list of files, Makefile rules, and syscall cases to
-remove.  Do not attempt in the same session as the cut-over.
+**Next milestone: Phase B — busybox / coreutils against musl.**
+See Part 1's "Phase B" section.  The first target is a static
+busybox binary; it exercises a much larger syscall surface than the
+tiny musl tests and will surface the next batch of ABI gaps.
 
-## Session 8 commits, in order
+## Session 9 commits, in order
 
 | Tag | Commit | What |
 |-----|--------|------|
-| `20260926Y` | `A4 cut-over: HELLO/ECHO/CAT/LS/MEMTEST.ELF are now the musl builds` | One Makefile change.  See "Cut-over details" below. |
+| `20260926-01` | `A5 step 1: remove newlib *-elf targets and user-elfs aggregate` | Also dropped `FSTEST`/`MULTITEST`/`BIGTEST.ELF` from the FAT (no musl port).  FAT 24 → 21 entries. |
+| `20260926-02` | `A5 step 2: remove SYS_DONIX_SPAWN (507) and sys_spawn` | Nothing in the musl canary called 507. |
+| `20260926-03` | `A5 step 3: remove SYS_OPENDIR/SYS_READDIR/SYS_CLOSEDIR (500-502)` | Also removed the dead kernel-side `dons_dirent_t` typedef. |
+| `20260926-04` | `A5 step 4: remove SYS_ARCH_SET_FS (504)` | Newlib-only; musl uses `arch_prctl` = 158. |
+| `20260926-05` | `A5 step 5: remove SYS_DONIX_SBRK (505)` | Newlib-only; musl uses `brk` = 12. |
+| `20260926-06` | `A5 step 6: remove embedded newlib shell and its fallback` | Deleted `user_shell_data.c` (~89 KB), its Makefile rule, and all references in `kmain.c`.  Boot path now panics on FAT read failure.  Kernel shrank by ~88 KB. |
+| `20260926-07` | `A5 step 7: delete the newlib userland tree` | Removed `userland/newlib/` whole, the `userland` phony target, `USERLAND_DIR`, `USER_CFLAGS`, and the `all: userland kernel.bin` prerequisite. |
+| `20260926-08` | `A5 step 8: remove dead code` | Deleted `syscall.c`, `DEBUG_WRITE_BOUNCE`, the dead CR3 switch in `kmain.c`'s `elfload`, and the unused `vmm_clone_kernel_half` / `vmm_free_user_page_tables`. |
 
-**Note on session 8's commit policy.**  Unlike the earlier A4 ports,
-the cut-over was done as a **single commit** covering all five apps,
-rather than one commit per app.  The cut-over is a mechanical
-Makefile-only change with no kernel code and no new binaries; each
-app's parallel musl build was already validated at `20260926L`/
-`20260926M`/`20260926N`/`20260926V`/`20260926W`, and all five were
-cut over in one working session with the canary run once at the end.
-This deviates from the "one app per commit" guidance in Part 1's
-"A4 cut-over" section, deliberately, because:
-  - no kernel or library code changed,
-  - the parallel builds were already individually validated,
-  - the FAT-layout change is uniform across all five apps,
-  - the single canary run at the end exercises every app anyway.
+## Canary state (all green as of `20260926-08`)
 
-If a future regression is traced to the cut-over, `git restore .`
-or `git checkout 20260926X -- 05_boot_kernel64/Makefile` reverts all
-five at once.  Part 1's guidance stands for any *future* cut-over-
-style change where a per-app commit would isolate a real risk.
-
-## Cut-over details (`20260926Y`)
-
-Single edit to `05_boot_kernel64/Makefile`:
-
-- The five `mcopy_one "$(NAME_ELF)" NAME.ELF` lines became
-  `mcopy_one "$(NAME_MUSL)" NAME.ELF` for `HELLO`/`ECHO`/`CAT`/
-  `LS`/`MEMTEST`.
-- The five `mcopy_one "$(NAME_MUSL)" NAME_MUSL.ELF` lines were
-  removed.
-- The five `NAME_MUSL :=` variables in the variables block are
-  **kept** (they are now what the `NAME.ELF` mcopy lines reference).
-- The `*-elf` phony targets, the `user-elfs` aggregate target, and
-  the newlib `USERLAND_DIR`/`NAME_ELF` variables are **unchanged**.
-  The newlib `.elf` files are still built on every image build;
-  they are just not copied to the FAT.
-
-Nothing in the kernel changed.  Nothing in `musl_sh` changed (its
-argv[0] normalization already builds `0:/NAME.ELF`, so the command
-names the user types are unchanged).
-
-## Canary state (all green as of `20260926Y`)
-
-Boot-time shell is `musl_sh`; the canaries below were run from its
+Boot-time shell is `musl_sh`.  The canaries below were run from its
 `donix> ` prompt in a single boot, in this order.  The FAT contains
-**24** entries.
+**21** entries.
 
 | Test | State | Notes |
 |------|-------|-------|
-| hello | green | `hello from donix (musl)` — this is now the musl binary |
+| hello | green | `hello from donix (musl)` |
 | echo hi | green | `hi` |
 | echo a b c d e | green | `a b c d e` |
 | cat hello-world.txt | green | file contents printed |
-| ls | green | 24 files; sizes match the FAT listing |
-| memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) — this is now the musl binary |
+| ls | green | 21 files; sizes match the FAT listing; `Unknown syscall: 72` once |
+| memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_stat | green | `STAT-OK` and `STAT2-OK` (both `fstat` and `stat`) |
-| printnum | green | `x=42` |
-| musl_min | green | `MUSL-START` (run twice) |
+| musl_min | green | `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK`, `SMALL-OK` |
 | musl_printf | green | `MUSL-PRINTF` |
-| musl_fork | green | `A`, `P`, then child `C` |
-| musl_fork_raw | green | `A`, `P`, `C` |
+| musl_fork | green | `A`, `P`, `C` |
 | musl_exec | green | `EXEC-PARENT-START`, `MUSL-START`, `EXEC-PARENT-DONE` |
-| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 got=24 s=11`, `WAIT-ANY-2 got=25 s=22`, `WAIT-ALL-OK` |
-| musl_readdir | green | 24 entries, `READDIR-DONE count=24` — `Unknown syscall: N` interleaved (see open issue) |
+| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK` |
+| musl_readdir | green | 21 entries, `READDIR-DONE count=21` — `Unknown syscall: N` interleaved (see open issue) |
 | musl_r10probe | green | `R10-AFTER=0xdeadbeefcafebabe` |
 | brk_verify | green | `p=0x8000200000`, `VERIFY-OK` |
 | brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct |
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
 | musl_sh (boot) | green | appears automatically at `donix> ` after `Shell: booting musl_sh from FAT` |
 
-The newlib originals are no longer on the FAT and are not exercised
-as runtime binaries any more.  Their source and the `.elf` files are
-still built (see "Cut-over details") and remain available as a
-compile-time reference until A5 removes them.
-
-## Next step (exactly this, then stop)
-
-**A5 is next and is substantial.  Do not start it in this session.**
-
-When a new session begins, the first thing to do is a quick
-sanity re-check that `20260926Y` still builds and boots cleanly (the
-`./run` script does a clean rebuild), then plan A5 as its own
-sequence.
-
-**A5 plan, in the order it should be done (each is its own commit,
-tested between):**
-
-1. **Remove the newlib `*-elf` phony targets and `user-elfs`
-   aggregate.**  In `05_boot_kernel64/Makefile`, delete the
-   `hello-elf` / `memtest-elf` / `fstest-elf` / `multitest-elf` /
-   `bigtest-elf` / `ls-elf` / `cat-elf` / `echo-elf` rules, remove
-   `user-elfs` from `.PHONY` and delete its rule, and drop
-   `user-elfs` from the `hdd-single.img` prerequisites.  Remove
-   the `USERLAND_DIR`/`NAME_ELF` variable block.  The kernel
-   doesn't use these; the FAT already points at `/tmp/*_musl`.
-   **Test:** `make clean && ./run` — should build and boot
-   identically to `20260926Y`.
-
-2. **Remove the `SYS_DONIX_SPAWN` (507) case from
-   `syscall_dispatch` and delete `sys_spawn`.**  Nothing calls it
-   after step 1; newlib's `arc2/syscalls.c:spawn` was its only
-   caller, and that path is now unreachable.  **Test:** full
-   canary — `musl_fork`, `musl_fork_raw`, `musl_exec`, `musl_wait`
-   must all still be green.
-
-3. **Remove the newlib-only `SYS_OPENDIR` / `SYS_READDIR` /
-   `SYS_CLOSEDIR` (500–502) cases.**  Verify nothing in the
-   musl path uses them first (`grep -rn 'SYS_OPENDIR\|SYS_READDIR\|
-   SYS_CLOSEDIR' 04_kernel_64bit/` should show only the
-   dispatcher and possibly the newlib userland).  **Test:** full
-   canary — `ls`, `musl_readdir` must still be green.
-
-4. **Remove the `SYS_ARCH_SET_FS` (504) case.**  Newlib-only;
-   musl uses 158 (`arch_prctl`) which is a different case.
-   **Test:** full canary — `musl_fork`, `musl_fork_raw` must
-   still be green.
-
-5. **Remove `SYS_DONIX_SBRK` (505).**  Newlib-only.  **Test:**
-   full canary — `memtest`, `musl_malloc` must still be green.
-
-6. **Remove the embedded newlib shell and its fallback path.**
-   `build_user_shell_elf` in the kernel Makefile, and the
-   fallback branch in `kmain.c` that calls it.  The FAT read of
-   `0:/MUSL_SH.ELF` becomes the only path.  **Test:** boot —
-   `musl_sh` must still appear automatically.  If the FAT read
-   fails, there must now be a clear error, not a silent fallback.
-
-7. **Delete `04_kernel_64bit/userland/newlib/`.**  The whole
-   tree: Makefile, `.a` files, `arc2/`, `apps/`, `include/`.
-   **Test:** `git clean -fdx 04_kernel_64bit/userland/` then
-   `./run` — clean build from scratch, full canary green.
-
-8. **Cleanup commit(s).**  All the deferred cosmetic items from
-   Part 1's "Cosmetic / housekeeping": delete `syscall.c` (dead),
-   delete `DEBUG_WRITE_BOUNCE`, remove the dead CR3 switch in
-   `kmain.c`'s `elfload` case, fix the stale `SYS_EXECVE` doc
-   comment in `syscall.h`, audit the `puthex`/`put_dec` helpers in
-   `build_musl_tests.sh`, fix the duplicate `# Test N:` comments
-   and `musl_min`'s missing `-no-pie`.  Also delete the unused
-   `vmm_clone_kernel_half` / `vmm_free_user_page_tables` if
-   nothing has started using them for COW.
-
-Steps 1–7 are the A5 core.  Step 8 is cleanup that can be
-interspersed or done last.  Steps 1–7 should not be combined in a
-single commit — each removes a distinct subsystem and each needs
-its own canary run.
+The pids assigned during the canary depend on the exact sequence of
+commands, since each `sys_execve` in `musl_sh`'s `fork`ed child
+consumes a pid.  The test logic is pid-independent; only the
+`s=`/`r=` values in `musl_wait` are load-bearing, and they match.
 
 ## State on disk
 
 - `/tmp/musl_*` and `/tmp/*_musl` — musl test binaries, rebuilt by
   `build_musl_tests.sh`.  **`/tmp` is not persistent across reboots
   on Fedora.**  If the `MUSL_*.ELF` files are missing from a boot,
-  run `./build_musl_tests.sh` first.  This is unchanged from
-  `20260926W`; the cut-over only changed which `/tmp/*` path maps
-  to which `::/*.ELF` name.
+  run `./build_musl_tests.sh` first.
 - `third_party/musl-src/` and `third_party/musl-install/` — the
   musl source and install trees.  **Gitignored.**  Rebuild with
   `./toolchain/install_musl.sh`.  Requires network access for the
   initial clone.
 - `toolchain/install_musl.sh` and `toolchain/musl-gcc.sh` — tracked.
-- `04_kernel_64bit/userland/newlib/apps/*.elf` — still built on
-  every image build (the phony targets are unchanged), but no
-  longer copied to the FAT.  Will be deleted at A5 step 7.
 - `/tmp/20260923A-working-tree.patch` (614 lines) — plain-text backup
   of abandoned work from the disaster commit.  Can be deleted.
 - `/tmp/memtest2.c.bak` (524 bytes) — backup of an untracked test.
@@ -1530,51 +1176,80 @@ its own canary run.
   Can be deleted.
 - `notes_musl.txt` was moved out of the tree at `20260926P` (now at
   `/tmp/notes_musl.txt`).
-- `vmm_clone_kernel_half` and `vmm_free_user_page_tables` in
-  `vmm.c` / `vmm.h` are currently unused.  Kept for future
-  copy-on-write work.
-- `DEBUG_WRITE_BOUNCE` in `user_syscall.c` is `0` (gated, inert).
 - `04_kernel_64bit/kmain.c` has the two helpers,
   `load_file_to_buffer` and `load_elf_into_user_process`.
 
+## Next step (exactly this, then stop)
+
+**Phase B is next.  It is substantial; plan a full session.**
+
+The first target is a static busybox binary.  Approach:
+
+1. Build busybox against the project-local musl:
+   ```
+   cd third_party
+   git clone https://git.busybox.net/busybox
+   cd busybox
+   git checkout 1_36_stable   # or whatever the current stable is
+   make defconfig
+   # Set CONFIG_STATIC=y, CONFIG_PREFIX=/tmp/busybox-install
+   # Set CROSS_COMPILE= (use toolchain/musl-gcc.sh directly)
+   make -j$(nproc)
+   make install
+   ```
+   The result is `_install/bin/busybox`, a static musl-linked ELF.
+2. Copy it to the FAT as `BUSYBOX.ELF` via `build_musl_tests.sh` or
+   the image Makefile.
+3. From `musl_sh`: `busybox.elf echo hello` (or the correct argv
+   layout — busybox expects `argv[0]` to be the applet name).
+4. Watch the `Unknown syscall: N` output.  Every unimplemented
+   syscall busybox hits is a candidate for the next kernel commit.
+
+**Do not expect it to work on the first try.**  Busybox at startup
+does much more than the current canary tests: it installs signal
+handlers, reads `/proc` or sysfs, checks terminal settings, and
+uses `fcntl`, `getuid`, `getgid`, `geteuid`, `getegid`, `umask`,
+`rt_sigreturn`, `prctl`, `setrlimit`/`getrlimit`, `uname`, and
+possibly `access`/`faccessat`.  Each of those is a small
+implementation.
+
+Plan Phase B as a sequence of small commits:
+1. Get busybox to link (probably a build-script change only).
+2. Get it to reach `main` (may need new syscalls).
+3. Get one applet (`echo` is easiest) to work.
+4. Get a real applet (`ls`, `cat`) working.
+
+Each is its own commit with the existing canary re-run.
+
 ## Open items
 
-- **A5 (retire newlib):** see "Next step" above for the eight
-  commits.  Do not attempt in the same session as the cut-over
-  (which this session is).  Substantial — plan a full session.
-- **Open issues to chase, not blocking A5:**
+- **Phase B (busybox):** see "Next step" above.
+- **Open issues to chase, not blocking Phase B:**
+  - `sys_newfstatat` (262) is unimplemented.  busybox may hit it.
   - `sys_open` accepts non-directories when called with
-    `O_DIRECTORY` (observed via `ls_musl 0:/hello-world.txt`).
-    Deferred fix in `sys_open`'s fallback path.
+    `O_DIRECTORY`.  Fix in `sys_open`'s fallback path.
   - `fcntl` (72) is called by musl's `opendir`; unimplemented, so
-    the kernel prints `Unknown syscall: 72` and returns `-1`; musl
-    ignores it.  A minimal stub would remove the noise.  Deferred.
-    **This is still visible in the `20260926Y` canary** (`ls`
-    prints one `Unknown syscall: 72`, `musl_readdir` prints one
-    `Unknown syscall: 72`).
-  - `sys_newfstatat` (262) is unimplemented.  Not on any current
-    path.  Deferred.
+    the kernel prints `Unknown syscall: 72`.  A minimal stub would
+    remove the noise.  busybox will almost certainly call `fcntl`
+    for `F_SETFD`/`F_GETFD`/`F_DUPFD`.
   - `Unknown syscall: N` fires during `musl_readdir` (numbers 6,
     7, 8, 15, 17, 72).  `72` is traced to `opendir`'s `fcntl`.
-    The others are not on any current hot path.  **Still visible
-    at `20260926Y`.**
-  - `isr14_handler` still halts on user-mode faults; should
-    terminate the faulting process instead.
+    The others are not on any current hot path.
+  - `isr14_handler` halts on user-mode faults; should terminate
+    the faulting process instead.  This will bite the first time
+    busybox segfaults.
   - `musl_sh` echoes garbage on lines containing backspaces
-    (cosmetic; visible in the `20260926Y` capture as the
-    `u musl_rqo 0probe 10probe` line).
-- **Deferred cleanups** (now folded into A5 step 8 above):
-  - Delete `syscall.c` (dead — `syscall.o` is not in `OBJS`).
-  - Delete `DEBUG_WRITE_BOUNCE` from `user_syscall.c`.
-  - Remove the dead CR3 switch in `kmain.c`'s `elfload` case.
-  - Fix the stale `SYS_EXECVE` doc comment in `syscall.h`.
-  - Audit the other `puthex`/`put_dec` helpers in
-    `build_musl_tests.sh` for tight margins.
+    (cosmetic).
+- **Deferred cleanups:**
+  - Audit `puthex`/`put_dec` helpers in `build_musl_tests.sh` for
+    tight margins.
   - Duplicate `# Test N:` comments and `musl_min`'s missing
     `-no-pie` in `build_musl_tests.sh`.
-- The newlib shell's backspace/FatFs-corruption open issue from
-  `20260926J` is now moot (nothing runs the newlib shell any more)
-  and will be closed by A5 step 6.
+  - `PMM_ALLOC_DIAG` in `pmm.c` is inert diagnostic code from the
+    `20260924B` `brk` investigation; can be deleted at leisure.
+  - Consider writing a small `REBOOT.ELF` musl binary (raw
+    `syscall(503)`) so userland can reboot the machine, since the
+    newlib shell's `reboot` command is gone with A5 step 6.
 
 ## How to use this file
 
