@@ -7,18 +7,20 @@
 # Toolchain: ../toolchain/musl-gcc.sh (project-local musl 1.2.5).
 #
 # Phase B: busybox is built from ../../third_party/busybox/ (gitignored,
-# configured with CONFIG_STATIC=y and a minimal applet set) and copied
-# into build/ so the image Makefile can treat it like any other ELF.
-# The stamp file makes the busybox build run once per clean build,
-# and again if third_party/busybox/.config changes.
+# configured via ../../configs/busybox.config, installed into the
+# source tree before building) and copied into build/ so the image
+# Makefile can treat it like any other ELF.  The stamp file makes the
+# busybox build run once per clean build, and again if
+# configs/busybox.config changes.
 
 MUSL_GCC := ../../toolchain/musl-gcc.sh
 CFLAGS   := -static -no-pie -O2 -mcmodel=large
 
-BUSYBOX_DIR   := ../../third_party/busybox
-BUSYBOX_BIN   := $(BUSYBOX_DIR)/busybox
-BUSYBOX_STAMP := build/.busybox.stamp
-BUSYBOX_ELF   := build/busybox.elf
+BUSYBOX_DIR    := ../../third_party/busybox
+BUSYBOX_BIN    := $(BUSYBOX_DIR)/busybox
+BUSYBOX_STAMP  := build/.busybox.stamp
+BUSYBOX_ELF    := build/busybox.elf
+BUSYBOX_CONFIG := ../../configs/busybox.config
 
 APP_SRCS  := $(wildcard apps/*.c)
 TEST_SRCS := $(wildcard tests/*.c)
@@ -38,12 +40,17 @@ build/%.elf: apps/%.c | build
 build/%.elf: tests/%.c | build
 	$(MUSL_GCC) $(CFLAGS) -o $@ $<
 
+# Install the tracked config into the (ignored) busybox source tree.
+# configs/busybox.config is the canonical copy; third_party/busybox/.config
+# is generated from it.  A fresh clone has no .config, so this rule
+# fires and creates it before the busybox build runs.
+$(BUSYBOX_DIR)/.config: $(BUSYBOX_CONFIG)
+	cp $< $@
+
 # Busybox: run its own make once, drop a stamp, then copy the
-# resulting binary into build/.  The stamp has no file prerequisite
-# (only the order-only `build`), so make only rebuilds when the
-# stamp itself is gone — i.e. after `make clean`.  Adding
-# third_party/busybox/.config as a prerequisite forces a rebuild
-# whenever the config changes; that's what we want during Phase B.
+# resulting binary into build/.  The stamp depends on the generated
+# .config, which in turn depends on the tracked config, so an edit
+# to configs/busybox.config forces a rebuild.
 $(BUSYBOX_STAMP): $(BUSYBOX_DIR)/.config | build
 	$(MAKE) -C $(BUSYBOX_DIR) CC=$(abspath $(MUSL_GCC))
 	touch $@
