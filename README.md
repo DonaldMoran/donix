@@ -1,19 +1,19 @@
 ### donix is not Linux.
 
-It runs Linux binaries. It speaks the Linux syscall ABI. It runs
-**busybox** — the shell, the line editor, the applets, the whole
-thing — on top of a from-scratch x86_64 kernel. No kernel source from
-Linus, no glibc, no distro. It is a small operating system that talks
-to real, statically linked musl binaries as if they were natively
-compiled for it.
+It runs Linux binaries. It speaks the Linux syscall ABI. It boots
+straight into **busybox `ash`** — the shell, the line editor, the
+applets, the whole thing — on top of a from-scratch x86_64 kernel. No
+kernel source from Linus, no glibc, no distro. It is a small operating
+system that talks to real, statically linked musl binaries as if they
+were natively compiled for it.
 
 It boots on bare metal through 16-bit real mode, 32-bit protected mode,
 and into 64-bit long mode; starts a higher-half C kernel; brings up
 paging, the heap, a preemptive scheduler, an ELF loader, an ATA driver,
-and a FAT16 filesystem; and drops you at a prompt where you can run
-user programs loaded off disk. Nothing is emulated, nothing is stubbed
-out at the syscall layer that matters, and nothing is a subset of a
-larger system.
+and a FAT16 filesystem; and drops you at a working Unix shell with a
+real per-process working directory. Nothing is emulated, nothing is
+stubbed out at the syscall layer that matters, and nothing is a subset
+of a larger system.
 
 It is a kernel. It is not Linux.
 
@@ -37,8 +37,9 @@ few thousand lines. There is no hidden kernel, no borrowed scheduler,
 no "and then a miracle happens." You can read the whole thing in a
 weekend and understand every line.
 
-It is also a working system, not a toy. It runs a shell. It forks,
-execs, and waits. It reads directories and stats files. It allocates
+It is also a working system, not a toy. It boots you into a real shell.
+It forks, execs, and waits. It changes directories and resolves
+relative paths. It reads directories and stats files. It allocates
 memory with `malloc` and frees it. It does all of that through the same
 syscall interface Linux does, using the same ABI, so that real,
 unmodified musl binaries can run on a kernel that shares no code with
@@ -50,29 +51,38 @@ That's the point. That's the whole point.
 
 ## What it does
 
-- **Boots from BIOS to a 64-bit shell** with no dependency on a
+- **Boots from BIOS to a busybox shell** with no dependency on a
   bootloader like GRUB or Limine. Every stage — the boot sector, the
   long-mode entry, the kernel loading, the transition to ring 3 — is
-  hand-written.
+  hand-written. On boot you land in `ash`, the busybox shell, at a `$`
+  prompt.
 - **Runs static musl binaries** compiled against musl 1.2.5, built from
   source into the project. Programs are ordinary C, linked the way any
   Unix program is linked; they just happen to run on a kernel that
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
-  `fstat` — the numbers and semantics match Linux x86_64. musl's
-  `printf`, `malloc`, and `opendir` work unmodified.
-- **Has a working shell.** `musl_sh` forks, execs, waits, and drops you
-  at a `donix> ` prompt. `cat hello-world.txt` prints the file.
-  `echo hi` prints `hi`. `ls` lists the FAT volume. Real programs, real
-  syscalls, real output.
-- **Runs busybox.** A static musl-linked busybox 1.36.1 executes on
-  donix: its `ash` shell is interactive (prompt, echo, backspace,
-  line editing), it forks and execs external binaries via `PATH`,
-  and its own applets (`busybox ls`, `busybox echo`) run in-process.
+  `fstat`, `chdir`, `getcwd` — the numbers and semantics match Linux
+  x86_64. musl's `printf`, `malloc`, and `opendir` work unmodified.
+- **Has a working per-process working directory.** `chdir` and `getcwd`
+  are real; `cd /bin; ls` lists `/bin`; the change survives `fork` and
+  `execve`. Relative paths (`.`, `..`, `./x`, plain names) resolve
+  against the cwd in `sys_open`, `sys_stat`, and `sys_access`.
+- **Runs busybox as the primary shell.** A static musl-linked busybox
+  1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
+  backspace, line editing, history), its applets (`ls`, `cat`, `echo`,
+  `pwd`, `wc`) run in-process via standalone mode, and `/bin/busybox`
+  is a real path on the image. It forks and execs external binaries,
+  and it shares the working directory with the rest of the system.
   This is the strongest evidence that the syscall ABI is right —
-  busybox is a real, widely-deployed program that expects a real
-  Unix kernel underneath it.
+  busybox expects a real Unix kernel underneath it, and on donix it
+  gets one.
+- **Has a second, minimal shell.** Typing `exit` at the busybox `$`
+  prompt returns you to `musl_sh`, the project's own shell, with its
+  own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
+  forks, execs, and waits like the busybox shell does. `cat
+  hello-world.txt` prints the file; `echo hi` prints `hi`; `ls` lists
+  the FAT volume.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is 20 short C files. There is no build system you can't read in
@@ -121,7 +131,8 @@ project builds busybox from source the first time you build a disk
 image, driven by `configs/busybox.config`. The source is cloned into
 `third_party/busybox/` (gitignored). **Network access is required on
 first run** — it clones from `https://git.busybox.net/busybox`. The
-tracked config sets `CONFIG_STATIC=y` and `CONFIG_FEATURE_EDITING=y`.
+tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`, and
+`CONFIG_FEATURE_SH_STANDALONE=y` (so applets run in-process).
 
 ---
 
@@ -183,8 +194,10 @@ line inside the `menu()` function, and execute the script. It will:
 The default uncommented line is the single-drive TCG configuration.
 
 **Interact with the OS in the QEMU window**, not the terminal. The
-terminal shows the kernel's serial log; the shell prompt (`donix> `) is
-on the emulated VGA console.
+terminal shows the kernel's serial log; the shell is on the emulated
+VGA console. On boot you land in busybox `ash` (a `$` prompt). Type
+`exit` to return to donix's own shell (a `donix> ` prompt); type
+`busybox sh` or `/bin/busybox sh` to get back into `ash`.
 
 To stop QEMU, close the window or press `Ctrl-C` in the terminal.
 
@@ -223,7 +236,7 @@ top-level `Makefile` for other modes.
   include/              kernel headers
 05_boot_kernel64/       boot chain assembly, image builder
 userland/musl/          musl userland source tree
-  apps/                 real userland programs (hello, echo, cat, ls,
+  apps/                 userland programs (hello, echo, cat, ls,
                         memtest, musl_sh)
   tests/                diagnostic binaries (musl_min, musl_fork, etc.)
   Makefile              builds every .c into build/*.elf; also builds
@@ -234,7 +247,7 @@ third_party/            source trees and build prefixes (gitignored):
 toolchain/              musl build and wrapper scripts
 test-files/             files copied into the FAT image
 run                     QEMU launch menu
-docs/                   historical record (see below)
+docs/                   reference material (see below)
 ```
 
 The kernel and the userland are separate layers. The kernel build does
@@ -251,7 +264,12 @@ not reach into `userland/musl/`; the image Makefile invokes
   is true right now.
 - [`ROADMAP.md`](ROADMAP.md) — what's next. Future work only;
   completed milestones are in the handoff's session history.
-- [`docs/`](docs/) — historical record:
+- [`docs/`](docs/) — reference material:
+  - `docs/strategy.md` — Phase A/B plan, rules, tagging convention,
+    git hygiene.
+  - `docs/gotchas.md` — every bug writeup, by subsystem.
+  - `docs/open-issues.md` — the full deferred-work list.
+  - `docs/session-log.md` — commit tables and per-test canary notes.
   - `docs/migration-history.md` — the A1–A6 migration from dons-os
     (newlib) to musl, step by step.
   - `docs/dons-os-history.md` — the pre-fork dons-os version-by-version
