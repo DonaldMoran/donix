@@ -755,7 +755,7 @@ long sys_unlink(const char* path) {
 }
 
 /*
- * Linux x86_64 mkdir(2) — syscall 7.
+ * Linux x86_64 mkdir(2) — syscall 83.
  *
  * FatFs has no notion of UNIX permissions, so the mode argument is
  * ignored.  Path normalization is identical to sys_unlink's:
@@ -765,14 +765,23 @@ long sys_unlink(const char* path) {
  *
  * An empty path returns -ENOENT before reaching FatFs.  Linux
  * returns -ENOENT from mkdir("") too, so this matches the Linux
- * ABI.  busybox ash's line editor probes mkdir("") once per
- * keystroke through the normal syscall path (confirmed by tracing
- * the return address to user_syscall_entry) and ignores the
- * result; the early return keeps that probe out of the FatFs
- * path and avoids a per-keystroke diagnostic print.  The probe
- * was what surfaced the missing syscall -- without mkdir(2), every
- * interactive busybox sh session printed "Unknown syscall: 7"
- * between characters.
+ * ABI.  The early return is defensive: it keeps an empty-path
+ * call out of the FatFs diagnostic path rather than letting
+ * f_mkdir("") produce a confusing error.
+ *
+ * HISTORY: this function was originally registered at syscall 7
+ * (tag 20260927-18), on the theory that the per-keystroke
+ * "Unknown syscall: 7" noise from busybox ash's line editor was
+ * an mkdir("") probe.  That was a misidentification.  On Linux
+ * x86_64, 7 is poll(2) and mkdir is 83; ash's line editor was
+ * polling stdin for readability once per keystroke, not calling
+ * mkdir.  Implementing mkdir at 7 silenced the noise, and because
+ * the old number was never reached by any correct caller, the
+ * handler was effectively dead code that shadowed poll.  The
+ * number is now 83, matching the Linux ABI, so stock binaries
+ * (busybox) reach it.  The missing poll(2) is tracked in
+ * docs/open-issues.md and is the reason the keystroke noise
+ * returns until poll is implemented.
  *
  * FatFs returns FR_EXIST when a directory or file of the same name
  * already exists; fatfs_errno maps that to -EPERM.  Linux would
@@ -795,10 +804,9 @@ long sys_mkdir(const char* path, int mode) {
 
     if (local_path[0] == '\0') {
         /* An empty path is not a valid path on any Unix.  Linux
-         * returns -ENOENT from mkdir("").  busybox ash's line
-         * editor probes with mkdir("") once per keystroke and
-         * ignores the result; the explicit early return keeps
-         * that probe out of the FatFs diagnostic path. */
+         * returns -ENOENT from mkdir("") too.  The early return
+         * keeps an empty-path call out of the FatFs diagnostic
+         * path. */
         return -(long)ENOENT_;
     }
 
@@ -2068,7 +2076,7 @@ long sys_getppid(void) {
 }
 
 /*
- * Linux x86_64 setsid(2) — syscall 107.
+ * Linux x86_64 setsid(2) — syscall 112.
  *
  * Creates a new session.  donix has no notion of sessions or
  * process groups; the pragmatic implementation is a no-op that
@@ -2079,6 +2087,16 @@ long sys_getppid(void) {
  *
  * Linux would return -EPERM if the caller is already a process
  * group leader; that case does not arise here.
+ *
+ * HISTORY: this function was originally registered at syscall 107
+ * (tag 20260927-07), because busybox ash's startup logged
+ * "Unknown syscall: 107" and 107 was assumed to be setsid.  It is
+ * not: on Linux x86_64, 107 is geteuid(2) and setsid is 112.  The
+ * handler at 107 was therefore reached by ash's geteuid() call,
+ * which received the caller's pid where it expected a uid.  The
+ * real setsid(2) call from musl (112) went unhandled.  The number
+ * is now 112, matching the Linux ABI.  geteuid(2) at 107 is now
+ * an unhandled gap, tracked in docs/open-issues.md.
  */
 long sys_setsid(void) {
     pcb_t* current = process_get_current();

@@ -10,6 +10,16 @@
  * table.  Every case in syscall_dispatch that shares a number
  * with a Linux syscall musl uses is at that Linux number.
  *
+ * This file is the source of truth for the kernel's syscall
+ * numbering.  When adding or changing an entry, verify the
+ * number against the canonical Linux x86_64 table,
+ * arch/x86/entry/syscalls/syscall_64.tbl.  Do NOT guess a
+ * number from the name of the syscall that appears to be
+ * missing: the "Unknown syscall: N" diagnostic names the
+ * number the caller used, which may be a different syscall
+ * entirely.  (See docs/gotchas.md: mkdir was at 7, which is
+ * poll; setsid was at 107, which is geteuid.)
+ *
  * Numbers 500+ are donix-private.  They are for syscalls that
  * exist only in donix and have no Linux equivalent.  As of A5
  * step 5, the only remaining 500+ number is SYS_REBOOT (503).
@@ -26,7 +36,6 @@
 #define SYS_STAT            4
 #define SYS_FSTAT           5
 #define SYS_LSTAT           6
-#define SYS_MKDIR           7
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -44,9 +53,10 @@
 #define SYS_WAIT4           61
 #define SYS_FCNTL           72
 #define SYS_GETCWD          79
+#define SYS_MKDIR           83
 #define SYS_UNLINK          87
-#define SYS_SETSID          107
 #define SYS_GETPPID         110
+#define SYS_SETSID          112
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
