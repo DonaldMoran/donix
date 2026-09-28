@@ -3,118 +3,15 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-28 (session 29)
-**Current HEAD:** tag `20260928-17-shell-autolaunch`, branch `dev`
-**Last milestone:** `v0.6.2` (published)
-**Next milestone:** `v0.6.3` — "the shell is fully usable":
-`geteuid(2)` (107) and `chdir(2)` (80) are the last two gaps.
-The exploring-copy port is complete.
+**Last updated:** 2026-09-28 (session 30)
+**Current HEAD:** tag `v0.6.3`, branch `dev`
+**Last milestone:** `v0.6.3` (published) — the shell is fully usable
+**Next milestone:** undecided; candidates below.
 
 Commits are named by tag only, never by SHA.  Working tags are
 local and permanent -- `git show <tag>` always resolves.  The
 commit record is `docs/session-log.md`; the commit message carries
 the narrative.
-
----
-
-## Session 30 (new, do this first)
-
-**Goal: close `v0.6.3` — make the shell fully usable.**  The
-session-29 port is done and verified.  Two syscall gaps remain,
-and each is one commit.
-
-**Nothing else in this handoff comes before this section.**
-
-### Item 1 — `geteuid(2)`, syscall 107
-
-Return a fixed uid.  1000 is fine; nothing on donix checks it.
-This stops the one-time `Unknown syscall: 107` that prints at
-every ash startup.
-
-Three edits:
-
-1. `include/syscall.h`: add `#define SYS_GETEUID 107`.
-2. `04_kernel_64bit/user_syscall.c`: add, next to `sys_setsid`:
-
-   ```c
-   /*
-    * Linux x86_64 geteuid(2) — syscall 107.
-    *
-    * donix has no users; return a fixed uid.  1000 matches the
-    * typical Fedora user and is what musl/busybox expect to see
-    * as a plausible non-root uid.  Nothing on donix checks the
-    * value.
-    *
-    * HISTORY: session 24 mistakenly implemented setsid at 107,
-    * which meant ash's geteuid() call received the caller's pid
-    * where it expected a uid.  Session 27 (tag 20260928-05)
-    * moved setsid to 112 and exposed the real 107 gap.  This is
-    * the closure of that gap.
-    */
-   long sys_geteuid(void) {
-       return 1000;
-   }
-   ```
-
-3. `syscall_dispatch`: add `case SYS_GETEUID: return (uint64_t)sys_geteuid();`
-
-**Test:** boot, and confirm the serial log shows **no**
-`Unknown syscall: 107` at ash startup.  `Unknown syscall: 157`
-(`prctl`) will still appear once per busybox invocation — that
-one is separately tracked and not in scope.
-
-**Tag:** `20260928-18-geteuid`.
-
----
-
-### Item 2 — `chdir(2)`, syscall 80
-
-Busybox `ash`'s `cd` calls it and currently gets `ENOSYS`.
-Minimal first cut, per the session-29 plan:
-
-- Add a `cwd` field to `pcb_t` (`char cwd[USER_PATH_MAX]` or a
-  fixed size; default `"/"`).
-- Implement `sys_chdir`: copy the path, resolve it with
-  `f_stat_with_retry`, check the result is a directory
-  (`AM_DIR`), and store the path in `self->cwd`.  Return 0 or
-  `-errno`.
-- Make `sys_getcwd` return `self->cwd` instead of the hardcoded
-  `"/"`.
-
-**Full relative-path threading** (making `sys_open`, `sys_stat`,
-`sys_access`, `sys_execve` resolve relative paths against
-`self->cwd`) is a **follow-up**, not part of this first cut.  If
-a test needs it, do it as its own commit.  For now, `cd` succeeds
-and `pwd` returns the stored path, which is enough to stop the
-error and let the shell be considered usable.
-
-**Test:** boot → ash → `cd /bin` → `pwd` shows `/bin`, no error.
-Then `cd /` → `pwd` shows `/`.  Then `ls` still works (from ash,
-`ls` is an applet; the kernel isn't consulted).
-
-**Note:** `cd` is a busybox *builtin*, so this only exercises
-`sys_chdir` from inside ash.  `busybox cd` from `donix>` will
-still fail with `applet not found` — expected, `cd` is not an
-applet.
-
-**Tag:** `20260928-19-chdir`.
-
----
-
-### Item 3 — cut `v0.6.3`, then stop
-
-Once both items are in and the focused canary is green, tag
-`v0.6.3`.  Update this file's "Last milestone" line and rewrite
-the "Next milestone" line.
-
-Then stop.  Next-next, in rough priority order:
-
-- The user-mode `#PF` test binary (open-issues item 4).
-- Busybox applet symlinks on the FAT volume (open-issues item 5).
-- `FEATURE_TAB_COMPLETION`.
-- The **VFS layer** — see `docs/open-issues.md`.  The
-  `sys_execve` path resolution is a shim; the VFS is the real
-  fix, and it should not be preceded by a fourth hardcoded path.
 
 ---
 
@@ -130,131 +27,167 @@ Full strategy, rules, and the one-change-at-a-time discipline:
 
 ---
 
-## Where we are
+## Where we are — v0.6.3
 
-Session 29 completed the exploring-copy port.  Six commits:
+**The shell is fully usable.**  Boot drops into busybox ash; `exit`
+returns to the donix shell; both shells have `cd`, `pwd`, `ls`,
+`cat`, and they all respect the working directory.
+
+The cwd story, end to end:
+
+- `chdir(2)` (80) stores an absolute path in `pcb->cwd`.
+- `getcwd(2)` (79) returns it; musl's `getcwd()` wrapper accepts it.
+- `sys_open`, `sys_stat`, `sys_access` resolve relative paths (`.`,
+  `..`, `./x`, `../x`, plain names) against `pcb->cwd` via
+  `resolve_against_cwd`.
+- `sys_fork` copies `cwd` to the child; `sys_execve` preserves it.
+- `ls` and `cat` (donix-native) pass paths through unchanged; the
+  kernel resolves them.  (They used to prepend `0:/`.)
+- `musl_sh` has `cd`, `pwd`, `exit` builtins, run in the parent.
+
+Also closed this session: `geteuid(2)` (107) and `prctl(2)` (157,
+`PR_SET_NAME` accepted and dropped).  **The serial log is free of
+`Unknown syscall:` lines.**
+
+Session 30 tags (all on 2026-09-28):
 
 | Tag | What |
 |---|---|
-| `20260928-12-kernel-abs-path` | abs-path attempt (b) in sys_execve |
-| `20260928-13-musl_sh-passthrough` | shell stops rewriting argv[0] |
-| `20260928-14-kernel-bin-fallback` | `/bin` fallback + VFS SHIM note |
-| `20260928-15-busybox-standalone` | config: in-process applets |
-| `20260928-16-image-bin-busybox` | image: `/bin/busybox` layout |
-| `20260928-17-shell-autolaunch` | boot drops into ash |
+| `20260928-20-geteuid` | kernel: geteuid(2) -- syscall 107 |
+| `20260928-21-prctl` | kernel: prctl(2) PR_SET_NAME -- syscall 157 |
+| `20260928-22-chdir` | kernel: chdir(2) -- syscall 80 |
+| `20260928-23-cwd-resolution` | kernel: resolve relative paths against cwd |
+| `20260928-24-userland-cwd` | userland: ls/cat pass paths through |
+| `20260928-25-musl_sh-builtins` | musl_sh: cd/pwd/exit builtins |
 
-All six verified end-to-end in QEMU.  What the shell can now do:
+### Known limitation
 
-- Boot → busybox ash directly (no `donix>` first).
-- `exit` at ash → `donix>` prompt.
-- `busybox sh` (or `/bin/busybox sh`) at `donix>` → back into ash.
-- Inside ash, `ls`, `cat`, `echo`, `ls /bin`, `ls /` run
-  **in-process**, no fork (standalone mode).
-- Path forms that resolve: bare name (`ls`, `hello`), leading
-  slash (`/ls`, `/bin/busybox`), full FatFs (`0:/LS.ELF`).
-- Root shadows `/bin`: `ls` at `donix>` is the donix-native
-  `LS.ELF`, not a busybox applet.
-
-The two known gaps, both to be closed for `v0.6.3`:
-
-- **`geteuid(2)` (107) not implemented.**  Prints `Unknown
-  syscall: 107` once at every ash startup.
-- **`chdir(2)` (80) not implemented.**  `cd` in ash fails with
-  `Function not implemented`.
+`cd ..` at `donix>` fails (`cd: cannot cd to ..`).  The `musl_sh`
+`cd` builtin passes the raw `..` to `chdir`, and FatFs has no `..`
+entry.  **`cd ..` inside ash works** (ash resolves `..` against its
+own `$PWD` first).  See `docs/open-issues.md`.
 
 ---
 
-## Canary state (focused canary green as of `20260928-17`)
+## Next step (do this first)
 
-**The focused canary changed in session 29** because the shell
-auto-launches now: on boot you land at the ash `$` prompt, not at
-`donix>`.
+**Session 31.  Pick a direction, then one change at a time.**
+
+Candidates, roughly in order of value:
+
+1. **The user-mode `#PF` test binary.**  `fault_kill_current(0x0E)`
+   in `isr14_handler` (tag `20260928-04`) is in but unverified
+   end-to-end.  Needs a test binary that dereferences a bad pointer
+   without setting `g_expect_fault`.  Small, closes a real gap.
+
+2. **`cd ..` at `donix>`.**  Make `builtin_cd` resolve `.`/`..`
+   against `getcwd()` before calling `chdir`, or make `sys_chdir`
+   resolve through `resolve_against_cwd` the way the path syscalls
+   do.  Small.
+
+3. **`newfstatat` (262).**  Number reserved, no dispatch case.
+   musl routes `fstatat` through `stat`/`lstat` on x86_64 for the
+   common case, so it is not hit yet, but a caller passing
+   `AT_FDCWD` plus flags would reach it.
+
+4. **The VFS layer (larger).**  `sys_execve`'s three-attempt path
+   resolution is a shim.  When a VFS lands, delete it.  Do not add
+   a fourth attempt; build the VFS.  See `docs/open-issues.md`.
+
+5. **Busybox applet symlinks** on the FAT volume, for `/bin/NAME`
+   as a real file.  Standalone mode side-steps this for applets.
+
+Pick one, do it, test it, tag it.  Do not bundle.
+
+---
+
+## Canary state (focused canary green as of `20260928-25`)
+
+**Boot drops into ash.**  The focused canary reflects that:
 
     # on boot, ash is already running
-    ls                          # standalone applet, in-process
-    echo hi                     # standalone applet
+    pwd                         # /
+    cd /bin
+    pwd                         # /bin
+    ls                          # busybox
+    cd ..
+    pwd                         # /
+    ls                          # full root listing
     exit                        # back to donix>
-    ls                          # donix-native LS.ELF
+    pwd                         # /
+    cd /bin
+    pwd                         # /bin
+    ls                          # busybox (donix-native ls)
+    cat busybox                 # reads /bin/busybox
+    cd /
+    pwd                         # /
     ls hello-world.txt
     memtest
     musl_fork
     musl_exec2
     musl_wait
-    busybox ls                  # /bin fallback (c2)
-    busybox ash                 # re-enter ash
-    # at the ash prompt: ls, echo hi, exit
+    busybox ls
+    busybox pwd                 # /bin (after cd /bin)
+    busybox ash
+    # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
 
-**Do NOT add a bare `sh` row.**  There is no `/bin/sh`; `sh` at
-`donix>` resolves to `0:/SH.ELF` (missing) then `0:/BIN/SH`
-(missing).  Use `busybox sh` or `/bin/busybox sh`.  This is
-expected until applet symlinks are installed.
+**Do NOT add `cd ..` at `donix>` as a canary row** -- it fails (see
+Known limitation).  `cd ..` inside ash is fine.
 
-**Note:** inside ash, `cat hello-world` (no extension) fails with
-`No such file or directory`.  That is busybox's own `cat` doing
-relative-path resolution against `/`, where the file is
-`HELLO-WORLD.TXT`.  Not a bug.  Use `cat hello-world.txt`.
+**Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
+`busybox sh` or `/bin/busybox sh`.
 
 The **full canary** (milestone-only) adds: `echo`, `cat`,
 `musl_stat`, `musl_min`, `musl_malloc`, `musl_printf`,
 `musl_exec`, `musl_readdir`, `musl_r10probe`, `brk_verify`,
 `brkraw`, `brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`,
-`musl_getcwd`, `busybox echo`, `busybox pwd`,
-`busybox wc hello-world.txt`.
+`musl_getcwd`, `busybox echo`, `busybox wc hello-world.txt`.
 
 **Canary rows must not mutate the disk.**  No standing `mkdir`
-row; `rmdir`/`unlink` don't exist yet to clean up.  Test `mkdir`
-manually once, then rebuild the image.
+row; `rmdir`/`unlink` do not exist yet to clean up.
 
-**Known expected noise (not canary failures):** running ash
-prints `Unknown syscall: 157` once per invocation
-(`prctl(PR_SET_NAME, ...)`) — harmless, tracked.  `Unknown
-syscall: 107` is being closed in session 30.  `Unknown syscall:
-7` no longer appears (poll is implemented).
+**Expected noise:** none.  The serial log has no `Unknown syscall:`
+lines as of this milestone.  The `sys_execve: pid=... (name)`
+trace lines are informational, not errors.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. `geteuid(2)` (107) not implemented — session 30 item 1.
-2. `chdir(2)` (80) not implemented — `cd` in ash fails.
-   Session 30 item 2.
-3. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution is a stand-in for a virtual filesystem.  When a VFS
-   lands, delete the block; do not add a fourth attempt.  See
-   `docs/open-issues.md`.
-4. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
+1. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
    `isr14_handler`, tag `20260928-04`) is in but unverified
-   end-to-end — needs a test binary that dereferences a bad
-   pointer without setting `g_expect_fault`.
-5. Busybox applet symlinks not installed on the FAT volume.
-   Standalone mode side-steps this for applets; symlinks are
-   still relevant for `/bin/NAME` as a real file.
+   end-to-end.
+2. `cd ..` at `donix>` fails (the `musl_sh` builtin passes raw
+   `..` to FatFs).  ash is unaffected.
+3. **VFS layer (eventual).**  `sys_execve`'s path resolution is a
+   shim for a filesystem layer donix does not have.  When it
+   lands, delete the shim; do not extend it.
+4. `newfstatat` (262) has a reserved number but no dispatch case.
+5. Busybox applet symlinks not installed; standalone mode
+   side-steps this for applets.
 
-Also open: syscall-table audit script; fork is O(~6 MB) per call;
-`sys_newfstatat` (262) not implemented; `sys_munmap` is a stub;
+Also open: syscall-table audit script (the table itself was
+audited in session 30 and is correct; the script would keep it
+correct); fork is O(~6 MB) per call; `sys_munmap` is a stub;
 `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are latent
-collisions; `musl_wait` emits hundreds of progress dots before
-its children exit.
+collisions; `musl_wait` emits hundreds of progress dots.
 
 ---
 
 ## State on disk
 
 - `configs/busybox.config` — tracked canonical busybox config.
-  Edit only this copy; `userland/musl/Makefile` installs it to
-  `third_party/busybox/.config`.  Now has
-  `FEATURE_PREFER_APPLETS=y`, `FEATURE_SH_STANDALONE=y`,
+  Has `FEATURE_PREFER_APPLETS=y`, `FEATURE_SH_STANDALONE=y`,
   `BUSYBOX_EXEC_PATH="/bin/busybox"`.
-- `userland/musl/` — tracked musl userland (`apps/` 6, `tests/`
-  19).  `build/` gitignored.
+- `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
+  `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   — gitignored; rebuild with `./toolchain/install_musl.sh`.
 - `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
-- `~/code/x/` — the exploring copy.  **Fully ported as of
-  session 29**; the four changes it held are now in the real
-  tree.  Safe to delete whenever; kept for now as a reference.
-  Do not edit it; do not pull from it.
+- `~/code/x/` — the exploring copy.  Fully ported; safe to delete
+  whenever.  `~/code/y/` — a second copy used for a bisection
+  experiment this session; also safe to delete.
 - `docs/` — reference material, see below.
 
 ---
@@ -266,14 +199,13 @@ needs it.
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  Lookup
-  material; grep when you hit a specific problem.  **Session 29
-  added: "Bare-name resolution has two layers, and the shell is
-  the wrong place for it."**
+- `docs/gotchas.md` — every bug writeup, by subsystem.  Session 30
+  candidates to add: the `sys_getcwd` absolute-cwd requirement
+  (musl rejects a non-absolute cwd), and the `puts_raw`-vs-`printf`
+  newline quirk.
 - `docs/session-log.md` — commit tables (tag-only) and per-test
-  canary notes.  Append a row per commit.
-- `docs/open-issues.md` — full open-issues list and deferred
-  cleanups.  **Session 29 added the VFS-layer item.**
+  canary notes.
+- `docs/open-issues.md` — full open-issues list.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — frozen at
@@ -285,12 +217,11 @@ needs it.
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Phase B: busybox ash is interactive, runs
-applets in-process, and is the boot shell; `exit` returns to the
-donix prompt.  Session 29 completed the exploring-copy port and
-added a `/bin` fallback so bare `busybox` resolves.  Session 30
-implements `geteuid(2)` (107) and `chdir(2)` (80), the last two
-gaps, and cuts `v0.6.3`.**
+`userland/musl/`.  `v0.6.3`: the shell is fully usable -- boot into
+busybox ash, `exit` to the donix shell, and `cd`/`pwd`/`ls`/`cat`
+respect the working directory in both shells, across fork and exec.
+The serial log is free of `Unknown syscall:` lines.  Session 31:
+pick one item from Next step and do it.**
 
 ---
 

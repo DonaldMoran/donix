@@ -2,6 +2,29 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 30 (2026-09-28)
+| Tag | What |
+|-----|------|
+| `20260928-20-geteuid` | kernel: implement geteuid(2) -- syscall 107 |
+| `20260928-21-prctl` | kernel: implement prctl(2) PR_SET_NAME -- syscall 157 |
+| `20260928-22-chdir` | kernel: implement chdir(2) -- syscall 80 |
+| `20260928-23-cwd-resolution` | kernel: resolve relative paths against cwd, end to end |
+| `20260928-24-userland-cwd` | userland: ls/cat pass paths through; kernel resolves cwd |
+| `20260928-25-musl_sh-builtins` | musl_sh: cd, pwd, exit builtins; printf for pwd newline |
+| `v0.6.3` | milestone: the shell is fully usable |
+
+**Milestone `v0.6.3`** — `cd`, `pwd`, `ls`, `cat` respect the
+working directory in both shells (`musl_sh` and busybox ash),
+across `fork` and `execve`.  The serial log is free of
+`Unknown syscall:` lines.  Three fixes made cwd work end to end:
+`resolve_against_cwd` in `sys_open`/`sys_stat`/`sys_access`,
+`sys_fork` copying `cwd`, and `sys_chdir` storing an absolute
+path.  `ls.c`/`cat.c` stopped prepending `0:/`.  `musl_sh` gained
+`cd`/`pwd`/`exit` builtins.
+
+**Known limitation at this milestone:** `cd ..` at `donix>` fails
+(the builtin passes raw `..` to FatFs); `cd ..` inside ash works.
+
 ## Session 29 (2026-09-28)
 | Tag | What |
 |-----|------|
@@ -117,31 +140,29 @@ messages carry the narrative)
 session 11's tags were deleted before the reuse, so the session-11
 tags no longer resolve -- the commit messages are the record)
 
-## Per-test canary notes (session 29)
+## Per-test canary notes (session 30, v0.6.3)
 
-Focused canary, boot-into-ash variant (green as of `20260928-17`):
+Focused canary, boot-into-ash, cwd-aware (green as of
+`20260928-25`):
 
 | Row | Result |
 |-----|--------|
-| (boot lands in ash) | ash prompt appears; no `donix>` first |
-| `ls` (in ash) | in-process, no `sys_execve` line |
-| `echo hi` (in ash) | in-process |
-| `exit` (at ash) | returns to `donix>` |
-| `ls` (at donix>) | donix-native `LS.ELF` output |
-| `ls hello-world.txt` | works |
-| `memtest` | works |
-| `musl_fork` | works |
-| `musl_exec2` | works |
-| `musl_wait` | works |
-| `busybox ls` (at donix>) | resolves via /bin fallback (c2) |
-| `busybox ash` (at donix>) | re-enters ash |
-| `hello` (at donix>, after exit) | works |
+| (boot lands in ash) | ash prompt; no `donix>` first |
+| `pwd` (ash) | `/` |
+| `cd /bin` (ash) | no error |
+| `pwd` (ash) | `/bin` |
+| `ls` (ash) | `busybox` |
+| `cd ..` (ash) | no error |
+| `pwd` (ash) | `/` |
+| `exit` | returns to `donix>` |
+| `pwd` (donix>) | `/` |
+| `cd /bin` (donix>) | no error |
+| `pwd` (donix>) | `/bin` |
+| `ls` (donix>) | `busybox` (donix-native ls) |
+| `cat busybox` (donix>) | reads /bin/busybox |
+| `cd /` (donix>) | no error |
+| `pwd` (donix>) | `/` |
+| `busybox pwd` (donix>) | `/bin` after `cd /bin` |
 
-Known noise, not failures: `Unknown syscall: 157` once per
-busybox invocation (`prctl(PR_SET_NAME)`).  `Unknown syscall:
-107` once at ash startup (`geteuid`) — being closed in session
-30.
-
-Not-a-canary note: `cat hello-world` inside ash fails with
-`No such file or directory`.  busybox `cat` resolves relative to
-`/`, where the file is `HELLO-WORLD.TXT`.  Use the extension.
+No `Unknown syscall:` lines anywhere.  `cd ..` at `donix>` is a
+known failure and is NOT a canary row.
