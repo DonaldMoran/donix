@@ -1315,15 +1315,23 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 2. Open and read the whole ELF file. ----
      *
-     * First try the path exactly as the caller supplied it.  If
-     * f_open fails, and the path is a bare name or a leading-/
-     * path (i.e. has no ':' anywhere), try the resolved form
-     * "0:/NAME.ELF" with NAME uppercased to match the FAT layout.
+     * Three attempts, in order:
      *
-     * This is the retry that makes busybox ash's execve("ls",...)
-     * work: musl_sh already normalizes before calling execve, but
-     * ash does not, and there is no PATH and no shell rc file that
-     * could do it for us.
+     *   (a) the path exactly as the caller supplied it;
+     *   (b) if the path starts with '/', "0:" + path, preserving
+     *       case and suffix -- the Unix-style absolute path form;
+     *   (c) if the path has no ':' at all, the bare-name form
+     *       "0:/NAME.ELF" with NAME uppercased and ".ELF" appended
+     *       -- the form ash uses when it calls execve("ls", ...).
+     *
+     * (b) is what makes `/bin/busybox sh` work from the custom
+     * musl shell: the kernel was previously handing "/bin/busybox"
+     * straight to FatFs, which rejects any path with a leading
+     * slash.  The kernel is the layer that should translate a
+     * Unix-style path to the FatFs form, not the caller.
+     *
+     * (c) is unchanged from before and is what makes ash's bare
+     * names resolve.
      */
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
@@ -1333,16 +1341,50 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (*p == ':') { has_drive = 1; break; }
         }
 
-        char resolved[USER_PATH_MAX];
-        int can_retry = !has_drive &&
-                        exec_resolve_bare_name(path, resolved,
-                                               sizeof(resolved)) == 0;
+        /*
+         * Attempt (b): Unix-style absolute path -> "0:" + path.
+         *
+         * Preserves case and any suffix: the caller named an
+         * exact path, so we honor it as written and only add the
+         * drive prefix FatFs requires.  No uppercasing, no
+         * ".ELF" appended.
+         */
+        if (!has_drive && path[0] == '/') {
+            char resolved[USER_PATH_MAX];
+            size_t plen = 0;
+            while (path[plen]) plen++;
+            if (plen + 3 <= sizeof(resolved)) {   /* "0:" + path + NUL */
+                resolved[0] = '0';
+                resolved[1] = ':';
+                for (size_t i = 0; i <= plen; i++) {
+                    resolved[2 + i] = path[i];
+                }
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+            /* if too long, skip (b) and fall through to (c) */
+        }
 
-        if (can_retry) {
-            FRESULT fr2 = f_open(&file, resolved, FA_READ | FA_OPEN_EXISTING);
-            if (fr2 == FR_OK) {
-                /* Retry succeeded.  Fall through with `file` open. */
-                fr = FR_OK;
+        /*
+         * Attempt (c): bare name -> "0:/NAME.ELF".
+         *
+         * This is the retry that makes busybox ash's
+         * execve("ls", ...) work: musl_sh already normalizes
+         * before calling execve, but ash does not, and there is
+         * no PATH and no shell rc file that could do it for us.
+         */
+        if (fr != FR_OK && !has_drive) {
+            char resolved[USER_PATH_MAX];
+            if (exec_resolve_bare_name(path, resolved,
+                                       sizeof(resolved)) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
             }
         }
     }
