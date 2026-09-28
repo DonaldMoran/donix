@@ -1872,6 +1872,14 @@ long sys_read(int fd, void* buf, size_t count) {
                  * shell never noticed because it reads 1 byte at a
                  * time (count == 1), so the loop exited on the
                  * first byte anyway.
+                 *
+                 * The byte is NOT echoed here.  Users of this path
+                 * that want their input echoed (musl_sh, the kernel
+                 * shell) do the echoing themselves.  busybox ash
+                 * with FEATURE_EDITING=y also echoes itself via
+                 * lineedit.c.  Echoing here as well would
+                 * double-echo every keystroke for whichever of
+                 * those programs was currently reading.
                  */
                 break;
             }
@@ -2078,24 +2086,204 @@ long sys_set_tid_address(int* tidptr) {
 }
 
 /*
- * Linux x86_64 ioctl(2) — minimal stub.
+ * Linux x86_64 ioctl(2) — syscall 16.
  *
- * musl's __stdout_write calls ioctl(1, TCGETS, &tio) to decide
- * whether stdout is a terminal.  If the ioctl fails, musl treats
- * stdout as a regular file and uses fully-buffered stdio, flushing
- * on exit.  That is exactly the behavior we want for donix's serial
- * console, which is not a POSIX tty.
+ * Previously returned -ENOTTY for every request.  That is fine for
+ * musl's __stdout_write probe (stdout is not a tty; buffered stdio
+ * is what donix wants), but it is fatal for busybox ash: ash treats
+ * a failing ioctl(0, TCGETS, ...) as "stdin is not a tty" and, in
+ * that mode, neither prints a prompt nor echoes typed input.  The
+ * shell still runs commands — it is usable blind — but it is not
+ * interactive.
  *
- * Return -ENOTTY (errno 25) for all requests.  The Linux syscall ABI
- * expects negative errno in the return register.
+ * This implementation returns a plausible struct termios for
+ * TCGETS on fd 0 (stdin), 1 (stdout), and 2 (stderr), and accepts
+ * TCSETS / TCSETSW / TCSETSF as no-ops.  It also answers
+ * TIOCGWINSZ with a 24x80 window, because busybox ash probes the
+ * window size -- not TCGETS -- to decide whether stdin is an
+ * interactive terminal.  Everything else still returns -ENOTTY.
  *
- * If a later test genuinely needs a working TCGETS (e.g. busybox's
- * `tput` or `stty`), implement a proper termios response then.
+ * Echo of typed input is NOT done by the kernel.  busybox ash,
+ * built with FEATURE_EDITING=y, does its own echo and line
+ * editing via lineedit.c; musl_sh and the kernel shell echo typed
+ * input themselves.  The kernel hands the raw bytes to the reader
+ * and lets the reader decide what to display.
+ *
+ * The struct termios layout is musl's, from bits/termios.h on
+ * x86_64.  49 bytes, no trailing padding:
+ *
+ *     offset  size  field
+ *       0      4    c_iflag   (tcflag_t = unsigned int)
+ *       4      4    c_oflag
+ *       8      4    c_cflag
+ *      12      4    c_lflag
+ *      16      1    c_line
+ *      17     32    c_cc[32]
+ *      49          total
+ *
+ * The flags we report (ICANON | ECHO | ISIG | IEXTEN, etc.) are
+ * the standard cooked-mode set; ash only reads the flags, not the
+ * control characters, but c_cc[VEOF]/[VERASE]/[VINTR] are filled
+ * in anyway so a future caller that does read them gets sane
+ * values.
+ *
+ * Linux x86_64 ioctl request codes:
+ *     TCGETS     = 0x5401
+ *     TCSETS     = 0x5402
+ *     TCSETSW    = 0x5403
+ *     TCSETSF    = 0x5404
+ *     TIOCGWINSZ = 0x5413
+ *     TIOCSWINSZ = 0x5414
  */
+
 #define ENOTTY 25
+
+/* ioctl request codes (Linux x86_64). */
+#define TCGETS_  0x5401
+#define TCSETS_  0x5402
+#define TCSETSW_ 0x5403
+#define TCSETSF_ 0x5404
+#define TIOCGWINSZ_ 0x5413
+#define TIOCSWINSZ_ 0x5414
+
+/* termios flag bits (musl bits/termios.h, x86_64). */
+#define T_ICRNL  0x0100   /* c_iflag: map CR to NL on input       */
+#define T_OPOST  0x0001   /* c_oflag: enable output processing    */
+#define T_ONLCR  0x0004   /* c_oflag: map NL to CR-NL on output   */
+#define T_CS8    0x0030   /* c_cflag: 8 bits per byte             */
+#define T_CREAD  0x0080   /* c_cflag: enable receiver             */
+#define T_CLOCAL 0x0800   /* c_cflag: ignore modem control lines  */
+#define T_B38400 0x000F   /* c_cflag: baud rate B38400            */
+#define T_ISIG   0x0001   /* c_lflag: enable signals (INTR, etc.) */
+#define T_ICANON 0x0002   /* c_lflag: canonical (line) mode       */
+#define T_ECHO   0x0008   /* c_lflag: echo input characters       */
+#define T_ECHOE  0x0010   /* c_lflag: echo erase as BS-SP-BS      */
+#define T_ECHOK  0x0020   /* c_lflag: echo NL after kill char     */
+#define T_IEXTEN 0x8000   /* c_lflag: enable implementation-defined input */
+
+/* Control-character indices (musl bits/termios.h). */
+#define T_VEOF   0
+#define T_VINTR  3
+#define T_VERASE 0x7F
+
+/*
+ * A plausible cooked-mode termios.  Field-by-field initialization is
+ * used instead of a struct literal so the layout is explicit at the
+ * point of definition; the wire format is what matters, not the C
+ * type, since we memcpy the bytes into user space.
+ *
+ * Total size is 49 bytes (4+4+4+4+1+32), matching musl's struct on
+ * x86_64.  No compiler padding is inserted because every field
+ * except c_line and c_cc is naturally aligned, and c_cc is a byte
+ * array.
+ */
+typedef struct {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+} kernel_termios_t;
+
+static void fill_kernel_termios(kernel_termios_t* tio) {
+    for (size_t i = 0; i < sizeof(*tio); i++) ((uint8_t*)tio)[i] = 0;
+
+    tio->c_iflag = T_ICRNL;
+    tio->c_oflag = T_OPOST | T_ONLCR;
+    tio->c_cflag = T_B38400 | T_CS8 | T_CREAD | T_CLOCAL;
+    tio->c_lflag = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN;
+    tio->c_line  = 0;
+
+    tio->c_cc[T_VEOF]   = 0x04;   /* ^D */
+    tio->c_cc[T_VINTR]  = 0x03;   /* ^C */
+    tio->c_cc[T_VERASE] = 0x7F;   /* DEL */
+}
+
+/*
+ * A plausible window size.  busybox ash probes this (not TCGETS)
+ * to decide whether stdin is an interactive terminal: it calls
+ * ioctl(0, TIOCGWINSZ, &ws) and, if that succeeds with non-zero
+ * rows and columns, prints a prompt and echoes typed input.  If
+ * it fails, ash runs in non-interactive mode -- it still reads
+ * and executes commands, but silently, with no prompt and no
+ * echo.
+ *
+ * The struct is Linux x86_64 struct winsize: four unsigned
+ * shorts, 8 bytes total, no padding.  24x80 is the classic
+ * VT100 default; the pixel fields are zero, which is what Linux
+ * returns for a text console and what ash expects.
+ */
+typedef struct {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+} kernel_winsize_t;
+
+static void fill_kernel_winsize(kernel_winsize_t* ws) {
+    ws->ws_row    = 24;
+    ws->ws_col    = 80;
+    ws->ws_xpixel = 0;
+    ws->ws_ypixel = 0;
+}
+
 long sys_ioctl(int fd, unsigned long request, void* argp) {
-    (void)fd; (void)request; (void)argp;
-    return -(long)ENOTTY;
+    switch (request) {
+        case TCGETS_: {
+            /*
+             * Only fds 0/1/2 are terminals; anything else is a file
+             * or directory and gets -ENOTTY, which is the truth.
+             * argp must be a valid user pointer of at least
+             * sizeof(kernel_termios_t) bytes.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            kernel_termios_t tio;
+            fill_kernel_termios(&tio);
+            if (safe_copy_to_user(argp, &tio, sizeof(tio)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TIOCGWINSZ_: {
+            /*
+             * fd 0 is what ash probes, but answering on 0/1/2 is
+             * harmless and matches the TCGETS handling above.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            kernel_winsize_t ws;
+            fill_kernel_winsize(&ws);
+            if (safe_copy_to_user(argp, &ws, sizeof(ws)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TCSETS_:
+        case TCSETSW_:
+        case TCSETSF_:
+        case TIOCSWINSZ_:
+            /*
+             * Accept and ignore.  donix's console has no settable
+             * line discipline or window size; pretending the write
+             * succeeded is what ash expects and costs nothing.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            return 0;
+        default:
+            return -(long)ENOTTY;
+    }
 }
 
 #define MMAP_BASE 0x8010000000ULL
