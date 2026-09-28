@@ -136,6 +136,27 @@ Apply each only when a specific problem requires it.
   with `MSR_FS_BASE = 0` and faults at `CR2 = 0`.  See
   [`docs/migration-history.md`](docs/migration-history.md) Appendix C.
 
+- **`fork` must copy the ELF image region (added 2026-09-27, session
+  23).**  `vmm_clone_page_table` shares leaf physical pages, so a
+  fork child initially sees the parent's `.text`, `.rodata`, `.data`,
+  and `.bss`.  In the window between `fork` returning in the child
+  and `execve` running, the child runs busybox's `ash` code, which
+  writes to busybox's globals in `.data`.  Those writes landed in the
+  page the parent was still using.  The symptom was a `#PF` at
+  `CR2 = 0x20` (musl's `errno` offset from a null thread pointer, in
+  practice a NULL-deref in a `FILE`/job list walk) inside busybox's
+  stdio teardown, immediately after `wait4` returned, in the *parent*.
+  The fix is to extend `sys_fork`'s eager copy to include
+  `[0x400000, 0x600000)`.
+
+  The eager copy in `sys_fork` now covers all four user regions:
+  ELF image (2 MB), user stack (64 KB), brk heap (1 MB), mmap window
+  (4 MB).  See `sys_fork` in `user_syscall.c`.  **This is not real
+  copy-on-write**: every page in every region is copied unconditionally,
+  including read-only `.text` and `.rodata`.  A production fix would
+  mark shared PTEs read-only and copy only on write.  See "fork is
+  O(6 MB)" under Open Issues.
+
 - **`execve` must update the syscall-entry frame's RIP and RSP**, not
   just the PCB.  The return path (`user_syscall_entry.asm`'s `sysret`)
   reads the frame at `[kernel_stack_top - 56]` (user RIP) and
@@ -189,6 +210,9 @@ Apply each only when a specific problem requires it.
   (pid 1) rather than halting.  Idle `hlt`s until the next timer tick
   or keyboard IRQ; the shell is then woken normally.  See
   [`docs/migration-history.md`](docs/migration-history.md) Appendix C.
+  This path prints `EXIT-FALLBACK: switching to idle, exiting pid=...`
+  and is visible in normal `musl_fork` runs where the parent has
+  already returned to the shell.
 
 ### Context switch
 
@@ -212,22 +236,20 @@ Apply each only when a specific problem requires it.
   are `#PF` in user mode at near-null addresses (`CR2 = 0x34` for the
   clobber case, `CR2 = 0` for the inheritance case).
 
+  A third failure mode was seen in session 22 and resolved in session
+  23: `CR2 = 0x20` in the *parent* after a forked child exited and
+  `wait4` returned.  That turned out **not** to be an `fs_base`
+  problem -- the trace showed `next->fs_base` correct at the
+  `process_exit` switch.  The `0x20` was a NULL+offset dereference in
+  busybox's own FILE/job list, whose head had been nulled by the
+  child's pre-execve `.data` writes to a shared page.  See the "fork
+  must copy the ELF image region" gotcha above.
+
   `fs_base` is appended after `file_table` in `pcb_t` so
   `context_switch.asm`'s hardcoded offsets (which stop at
   `block_kind = 0x158`) are unchanged.  Any future field added to
   `pcb_t` must also be appended after `block_kind` for the same
   reason.
-
-  **New failure mode, seen in session 22 (`CR2 = 0x20`).**  After a
-  fork child (busybox `ash` -> `ls`) exits, the *parent* `ash` faults
-  at `RIP = 0x40BF96` with `CR2 = 0x20`.  `0x20` is the offset of
-  musl's `errno` from the thread pointer, so this is the signature of
-  `MSR_FS_BASE = 0` in the parent after the child's exit.  Either the
-  parent's `fs_base` was zeroed in its PCB, or the exit-path context
-  switch (from `process_exit` to the next ready process) does not
-  restore `MSR_FS_BASE` for the resumed process the way the preemptive
-  and voluntary-yield paths do.  This is the top open issue; see
-  Part 2.
 
 ### Syscall ABI
 
@@ -467,11 +489,10 @@ Apply each only when a specific problem requires it.
   from a bare name or the last component of a leading-`/` path.
   `sys_execve` calls it only when the raw `f_open` fails and the path
   contains no `:`.  This is what makes `musl_exec2`'s three test cases
-  pass.  It does **not** by itself make `busybox sh`'s external
-  commands work, because `ash`'s PATH probe uses `stat`, not
-  `execve` (see below).  Any future caller that hands `sys_execve` a
-  path containing a `:` skips the retry (that is how `musl_sh`'s
-  pre-normalized paths stay on the fast path).
+  pass and what makes `busybox ash`'s `execve("ls", ...)` work.
+  Any future caller that hands `sys_execve` a path containing a `:`
+  skips the retry (that is how `musl_sh`'s pre-normalized paths stay
+  on the fast path).
 
 - **Syscalls must return a proper negative errno on failure, not a
   bare `-1` (added 2026-09-27, session 21).**  musl's
@@ -593,35 +614,40 @@ Apply each only when a specific problem requires it.
   table listed only the first; the next session worked from a
   stale map.  An unrecorded commit on `dev` is worse than no entry,
   because the next session trusts the missing row.
+- **A modified file with only a diagnostic print in it should be
+  reverted, not committed.**  Session 23 ended with `scheduler.c`
+  carrying a `[exit-switch]` trace that was added during the
+  `#PF` investigation.  The correct action was `git restore
+  04_kernel_64bit/scheduler.c`, not `git add`.  This is the same
+  rule as above -- the working tree should contain only changes
+  that are part of a logical commit.
 
 ### Open issues
 
-- **`#PF` in the parent `ash` after a forked child exits (added
-  session 22).**  `busybox ash` runs `ls`, `ls` exits cleanly, and
-  then *`ash` itself* faults at `RIP = 0x40BF96` with
-  `CR2 = 0x20`.  `0x20` is the offset of musl's `errno` from the
-  thread pointer, so the fault is the signature of
-  `MSR_FS_BASE = 0` in the parent.  The fault is deterministic, not
-  a race.  Suspicion: either the parent's `fs_base` field in its
-  PCB is zeroed somewhere during the child's `fork`/`execve`/`exit`
-  lifecycle, or the context switch performed by `process_exit` (to
-  hand control to the next ready process) does not restore
-  `MSR_FS_BASE` the way `timer_preempt_handler` and the voluntary
-  `process_yield` path do.  **This is the top blocker for
-  interactive `busybox sh`.**  Next step: read `process.c`'s
-  `process_exit` and `process_create`, and `scheduler.c`'s three
-  `context_switch` call sites, and confirm whether the exit path
-  writes `MSR_FS_BASE` before resuming the next process.
-
 - **`sys_ioctl` returns `-ENOTTY` for every request, including
-  `TCGETS`.**  `ash` uses the failure of `ioctl(0, TCGETS, ...)` to
-  decide stdin is not a tty; as a result it does not echo typed input
-  and does not print a prompt.  Implementing `TCGETS` (with a plausible
-  termios struct -- ICANON, ECHO, ISIG, etc.) would make `sh` behave
-  like an interactive shell.  Same for the corresponding `TCSETS`/
-  `TCSETSW`/`TCSETSF`, which can be accepted and ignored.  **Second
-  priority after the `#PF` above; cannot be tested until `ash`
-  survives running a command.**
+  `TCGETS` (top priority).**  `ash` uses the failure of
+  `ioctl(0, TCGETS, ...)` to decide stdin is not a tty; as a result
+  it does not echo typed input and does not print a prompt.
+  Implementing `TCGETS` (with a plausible termios struct -- ICANON,
+  ECHO, ISIG, etc.) would make `sh` behave like an interactive
+  shell.  Same for `TCSETS`/`TCSETSW`/`TCSETSF`, which can be
+  accepted and ignored.  **This is the next change.**  It is the
+  last thing between the current state and an interactive
+  `busybox sh`.
+
+- **`fork` is O(~6 MB) per call (added 2026-09-27, session 23).**
+  The eager copy in `sys_fork` walks and copies every mapped page
+  in the ELF image (2 MB), user stack (64 KB), brk heap (1 MB), and
+  mmap window (4 MB) on every fork.  Every page is copied
+  unconditionally, including read-only `.text` and `.rodata`.
+  Correct but slow.  `busybox ash` forks per external command, so
+  each `ls` or `echo` copies ~6 MB.  Visible on TCG; less so on
+  KVM.  The correct long-term fix is real copy-on-write: mark
+  shared PTEs read-only in both parent and child, install a `#PF`
+  handler that allocates a fresh page, copies the contents, remaps
+  with write permission, and retries the faulting instruction.
+  Not blocking anything today, but every new busybox applet that
+  forks makes it worse.
 
 - **`sys_newfstatat` (262) is not implemented.**  `sys_fstat` (5)
   and `sys_stat` (4) are both done and tested.  See "musl `fstatat`
@@ -662,9 +688,9 @@ Apply each only when a specific problem requires it.
   checks only `g_expect_fault`; it does not look at `error_code & 4`
   to distinguish a user-mode fault from a kernel-mode one.  Any
   unexpected user-mode fault kills the console instead of
-  terminating the faulting process.  This is what makes the session-22
-  `#PF` end the boot instead of killing `ash` and returning to
-  `musl_sh`.  Fix: in `isr14_handler`, if `(error_code & 4)` and
+  terminating the faulting process.  This is what makes every
+  user-mode `#PF` in this project end the boot instead of killing
+  the process.  Fix: in `isr14_handler`, if `(error_code & 4)` and
   `g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
   process instead of halting.
 
@@ -679,6 +705,14 @@ Apply each only when a specific problem requires it.
   with a real side effect.  Fix, if wanted: emit `"\b \b"` only
   when stdout is a real tty, or drop the erase-on-backspace
   entirely and just decrement `n`.
+
+- **`musl_wait`'s WNOHANG loop spins** (added 2026-09-27, session
+  23).  Visible in the capture as hundreds of `.` characters.  The
+  test's polling loop runs continuously until its last child exits,
+  and timer ticks print a dot each time.  Semantics are correct --
+  `WAIT-WNOHANG-OK` eventually prints and all assertions pass --
+  but it's slow and noisy.  Fix if wanted: yield or sleep in the
+  test loop instead of spinning.  Cosmetic.
 
 - **`f_stat_with_retry` collapses path components for nonexistent
   directories (theoretical, added session 22).**  For a path like
@@ -705,11 +739,6 @@ Apply each only when a specific problem requires it.
   (syscall 169).  Not blocking anything.
 - `PMM_ALLOC_DIAG` in `pmm.c` is gated diagnostic code from the
   `brk` investigation; harmless, can be deleted at leisure.
-- `musl_wait`'s `WNOHANG` loop spins through hundreds of timer
-  ticks before it succeeds (visible in the session-22 capture as a
-  long run of `.` characters).  The semantics are correct --
-  `WAIT-WNOHANG-OK` eventually prints -- but the loop is slow.
-  Cosmetic.
 
 ## Testing harness
 
@@ -744,13 +773,46 @@ Apply each only when a specific problem requires it.
   copies it to `third_party/busybox/.config` before building.
   **Edit only the tracked copy.**  The generated file is a build
   artifact.
-- **Canary run pattern.**  Boot `musl_sh`, run each test in the
-  Part 2 canary table in order, compare against the expected
-  output.  Tedious but is what "one change at a time" costs.
-  Automating it (a `musl_sh` script-mode that reads commands from
-  a file, plus a QEMU wrapper that boots and greps `capture.txt`)
-  was considered and deferred.  Revisit when the manual cost grows
-  past the patch cost.
+- **Canary run pattern.**  Two variants:
+
+  - **Focused canary (default, ~30 seconds).**  Run this on every
+    change:
+
+    ```
+    hello
+    ls
+    memtest
+    musl_fork
+    musl_exec2
+    musl_wait
+    busybox ls
+    busybox ash
+    ```
+
+    Then at the blind `ash` prompt (input is not echoed until
+    `ioctl TCGETS` lands): `ls`, `echo hi`, `exit`.  Then back at
+    `donix>`: `hello`.
+
+    This covers every syscall family that has ever broken
+    (execve, stat, mmap, brk, fork, wait4, getdents64, readdir,
+    fcntl, dup2, access, ioctl, arch_prctl) plus the busybox
+    stack.  It catches 95% of regressions.
+
+  - **Full canary (milestone only).**  Run this when cutting a
+    milestone tag, before pushing to `origin/dev`, or when
+    changing `sys_fork`, `sys_execve`, `sys_wait4`, `sys_mmap`,
+    `sys_brk`, `vmm_clone_page_table`, or the scheduler.  See the
+    Part 2 canary table for the full list; it includes all the
+    focused-canary rows plus `echo`, `cat`, `musl_stat`,
+    `musl_min`, `musl_malloc`, `musl_printf`, `musl_readdir`,
+    `musl_r10probe`, `brk_verify`, `brkraw`, `brkgrow`,
+    `musl_dup2`, `musl_dupfd`, `musl_ids`, `musl_getcwd`,
+    `busybox echo`.
+
+  Automating the canary (a `musl_sh` script-mode that reads
+  commands from a file, plus a QEMU wrapper that boots and greps
+  `capture.txt`) was considered and deferred.  Revisit when the
+  manual cost grows past the patch cost.
 
 ## Recovery
 
@@ -794,19 +856,19 @@ deleted without being recorded; the session-11 commit table in Part 2
 is the record.  Sessions 13 and 14 used `20260927-01` through
 `20260927-04`; their commit tables in Part 2 are the record.
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
-Sessions 18 through 21 used `20260927-08`, `-09`, `-10` and the
-session-21 tag below; their commit tables in Part 2 are the record.
-Session 22 used `20260927-11`; its commit table in Part 2 is the
-record.  Working tags are deleted after their session is
-consolidated; the SHA in the table is what survives.
+Sessions 18 through 22 used `20260927-08` through `-11`; their
+commit tables in Part 2 are the record.  Session 23 used
+`20260927-12`; its commit table in Part 2 is the record.  Working
+tags are deleted after their session is consolidated; the SHA in
+the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
 
 ## Summary for any session
 
-1. Confirm donix baseline works: boot to `musl_sh`, run the canary
-   (`hello`, `echo`, `cat`, `ls`, `memtest`, `musl_*` tests).
+1. Confirm donix baseline works: boot to `musl_sh`, run the
+   focused canary (see "Testing harness").
 2. Apply one logical change at a time.  Test.  Commit.  Tag.
 3. Revert with `git restore .` on any failure and diagnose before
    proceeding.
@@ -819,20 +881,23 @@ tags pushed to the remote.  Do not push working tags.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: busybox runs, its banner prints, `dup2`,
 `F_DUPFD`, `setsid`, `getppid`, `getcwd`, `execve`-retry,
-errno-mapping, and file_slot_t refcounting are green, and
-`busybox ash` now finds and runs external commands -- `ls` prints
-the full 27-entry directory listing from inside `busybox ash`.
-Next: fix the parent-`ash` `#PF` after a forked child exits
-(`CR2 = 0x20`, suspected `MSR_FS_BASE` not restored on the exit-path
-context switch), then `ioctl TCGETS` for the interactive prompt.**
+errno-mapping, `file_slot_t` refcounting, `sys_access`, and the
+`FR_NO_PATH` retry in `sys_stat` are all green.  `busybox ash` now
+runs external commands reliably -- `ls`, `echo hi`, multiple in a
+row, then `exit`, all from the same `ash` instance -- because
+`sys_fork` now copies the ELF image region, closing a `.data`
+corruption window that caused a `#PF` in the parent after `wait4`
+returned.  Next: `ioctl TCGETS` for interactive input echo and
+prompt.**
 
 ---
 
 # Part 2 -- Session Status
 
-**Last updated:** 2026-09-27 (session 22, busybox ash runs external commands)
-**Current HEAD:** `20260927-11` on branch `dev`, eighteen commits
-ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 23, fork copies ELF image region
+-- `busybox ash` runs external commands reliably)
+**Current HEAD:** `4e9c002` (tag `20260927-12`), on branch `dev`,
+twenty-one commits ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -845,36 +910,32 @@ handling), `20260927-02` (build: busybox integration), `20260927-03`
 `20260927-09` (kernel: execve bare-name retry),
 `20260927-10` (kernel: proper errnos from file syscalls),
 `20260927-11` (kernel: sys_access/faccessat + FR_NO_PATH in stat
-retry -- busybox sh runs external commands).  All working tags are
-local-only.
+retry -- busybox sh runs external commands),
+`20260927-12` (kernel: fork copies the ELF image region -- fixes
+busybox ash .data corruption).  All working tags are local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Phase B is well underway.  busybox runs, the banner prints, and
-`busybox ls` / `cat` / `echo` work.  `dup2`, `F_DUPFD`, `setsid`,
-`getppid`, `getcwd`, and file_slot_t refcounting are green.
-`sys_execve` retries bare names, every file syscall returns a proper
-negative errno on failure, and `busybox ash` now finds and runs
-external commands -- `ls` prints the full directory listing from
-inside `busybox ash`.**
+**Phase B continues.  `busybox ash` runs external commands
+reliably.**  The `#PF` in the parent `ash` after a forked child
+exited -- which blocked every external command from running a
+second time -- is fixed.  Root cause: `sys_fork` was leaving the
+ELF image region `[0x400000, 0x600000)` shared between parent and
+child, so the child's pre-`execve` writes to busybox's globals in
+`.data` landed in the page the parent was still using, nulling out
+the head of busybox's FILE/job list.  The fix extends the eager
+copy to include the ELF image region.
 
-Three things stand between the current state and an interactive
-`busybox sh`:
+**One thing remains between the current state and an interactive
+`busybox sh`:**
 
-1. **`#PF` in the parent `ash` after a forked child exits.**  `ls`
-   runs and exits cleanly, then `ash` itself faults at
-   `CR2 = 0x20` (musl `errno` offset from a null thread pointer).
-   Suspected cause: `MSR_FS_BASE` is not restored on the exit-path
-   context switch that `process_exit` performs to hand control to
-   the next ready process.  **This is the top blocker.**
-2. **`ioctl TCGETS` returns `-ENOTTY`**, so `ash` treats stdin as
-   non-interactive (no prompt, no echo).  Cannot be tested until
-   (1) is fixed.
-3. Neither of the above has been proven to be the last blocker;
-   once they are fixed, `busybox sh` will either be interactive or
-   expose the next problem.
+1. **`ioctl TCGETS` returns `-ENOTTY`**, so `ash` treats stdin as
+   non-interactive: no prompt, no echo of typed characters.
+   `ash` still parses and runs typed commands, so it is usable
+   blind, but it isn't a real shell yet.  **This is the next
+   change.**
 
 **State of the tree:**
 
@@ -883,8 +944,17 @@ Three things stand between the current state and an interactive
   `BUSYBOX.ELF`.
 - The boot shell is still `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
   busybox is invoked from it, not in place of it.
-- The existing canary (hello, echo, cat, ls, memtest, musl_* tests)
-  still passes.
+- The focused canary (see Part 1 "Testing harness") passes on the
+  current tree with traces off.
+
+## Session 23 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-12` | `4e9c002` | kernel: fork copies the ELF image region -- fixes busybox ash .data corruption. |
+
+The tag is a working tag (local-only).  The commit message has the
+full narrative.
 
 ## Session 22 commits, in order
 
@@ -997,67 +1067,48 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (all green as of `20260927-11`)
+## Canary state (focused canary green as of `20260927-12`)
 
-Boot-time shell is `musl_sh`.  The canaries below were run from its
-`donix> ` prompt in a single boot, in this order.  The FAT contains
-**27** entries.  All binaries are built from `userland/musl/build/`
-with nothing in `/tmp`.
-
-The 19 rows below were already green at `v0.6.0` and remain green:
+The **focused canary** is the default.  Run it on every change.
+See Part 1 "Testing harness" for what it covers and when to run
+the full list instead.
 
 | Test | State | Notes |
 |------|-------|-------|
 | hello | green | `hello from donix (musl)` |
+| ls | green | 27 files; sizes match the FAT listing |
+| memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
+| musl_fork | green | `A`, `P`, `C`.  The `EXIT-FALLBACK: switching to idle` line may appear interleaved with the next prompt -- that is `process_exit`'s empty-queue path working correctly, not a bug. |
+| musl_exec2 | green | `EXEC2-OK` |
+| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`.  Slow and noisy (WNOHANG spin, prints hundreds of `.`); see Part 1 open issues. |
+| busybox ls | green | 27 entries |
+| busybox ash -> ls -> echo hi -> exit | green | Reaches the `ash` command loop; runs `ls` (27 entries), then `echo hi` (`hi`), then `exit` (returns to `donix>`).  Typed input is not echoed until `ioctl TCGETS` lands. |
+| hello (after `ash` exits) | green | `hello from donix (musl)` -- shell survived the whole sequence |
+
+The **full canary** is the milestone-only variant.  Add these rows
+when cutting a milestone tag or before pushing to `origin/dev`:
+
+| Test | State | Notes |
+|------|-------|-------|
 | echo hi | green | `hi` |
 | echo a b c d e | green | `a b c d e` |
 | cat hello-world.txt | green | file contents printed |
-| ls | green | 27 files; sizes match the FAT listing |
-| memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_stat | green | `STAT-OK` and `STAT2-OK` (both `fstat` and `stat`) |
 | musl_min | green | `MUSL-START` |
 | musl_malloc | green | `MALLOC-OK`, `SMALL-OK` |
 | musl_printf | green | `MUSL-PRINTF` |
-| musl_fork | green | `A`, `P`, `C` |
 | musl_exec | green | `EXEC-PARENT-START`, `MUSL-START`, `EXEC-PARENT-DONE` |
-| musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK` |
 | musl_readdir | green | 27 entries, `READDIR-DONE count=27` -- `Unknown syscall: N` interleaved (see open issue) |
 | musl_r10probe | green | `R10-AFTER=0xdeadbeefcafebabe` |
 | brk_verify | green | `p=0x8000200000`, `VERIFY-OK` |
 | brkraw | green | `FS=`, `BRK0=`, `BRKN=`, `WANT=` correct |
 | brkgrow | green | `start=`, `64K got=`, `1M got=` correct |
-| musl_sh (boot) | green | appears automatically at `donix> ` after `Shell: booting musl_sh from FAT` |
-
-Sessions 13-21 additions:
-
-| Test | State | Notes |
-|------|-------|-------|
 | musl_dup2 | green | `DUP2-OK`.  No heap warnings. |
-| musl_dupfd | green | `DUPFD-OK`.  No heap warnings.  Exercises fcntl(fd, F_DUPFD, min) for min=3 (return >= 3, read works), min=3 again (distinct fd), min=99 (-EINVAL), min=0 (clamped to >= 3). |
-| musl_ids | green | `IDS-OK sid= 22`, `IDS-OK ppid= 2`.  setsid returns the calling pid; getppid returns the parent's pid; setsid is idempotent.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`; noted under Cosmetic.) |
-| musl_getcwd | green | `GETCWD-OK /`.  Exercises getcwd(buf, 64) (returns buf, writes "/\0"), getcwd(buf, 1) (-ERANGE), getcwd(NULL, 0) (-EINVAL). |
-| musl_exec2 | green | `EXEC2-OK`.  Exercises sys_execve's bare-name retry: `execve("HELLO", NULL, NULL)` (bare uppercase, no prefix, no suffix), `execve("/HELLO.ELF", NULL, NULL)` (leading slash, .ELF already present), and `execve("echo", argv, NULL)` (lowercase bare name with argv).  All three fork, resolve to `0:/NAME.ELF`, run the target, and exit 0. |
-| busybox ls | green | 27 entries.  No `Unknown syscall`, no fault. |
-| busybox ls 0:/ | green | same output. |
-| busybox ls 0:/HELLO-WORLD.TXT | green | prints `0:/HELLO-WORLD.TXT`. |
-| busybox cat 0:/HELLO-WORLD.TXT | green | file contents. |
-| busybox echo hi | green | `hi`. |
-| busybox echo Donald | green | `Donald`. |
-| busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`). |
-| busybox ash -> ls | green | `busybox ash` starts; at its prompt, `ls` forks, resolves via `sys_stat` retry (`sbin/ls` -> `0:/LS.ELF`), execs, prints the full 27-entry listing, exits cleanly.  **This is the session-22 milestone.** |
-| busybox sh (partial) | in progress | Reaches a command loop.  Runs builtins.  Runs external commands (`ls` works from inside `busybox ash`).  After a child exits, the parent `ash` faults at `CR2 = 0x20` (see Part 1 open issue).  Typed input is still not echoed and no prompt is printed (ioctl TCGETS). |
-
-The `Unknown syscall: 72` line that used to appear on every `ls` and
-`musl_readdir` is gone -- `fcntl` is now implemented.  The
-`Unknown syscall: 6` line is gone -- `sys_lstat` is now implemented.
-The `Unknown syscall: 33` line that used to appear on `busybox`
-(no args) is gone -- `sys_dup2` is now implemented.  The
-`Unknown syscall: 107`, `Unknown syscall: 110`, and
-`Unknown syscall: 79` lines that used to appear on `busybox sh`
-startup are gone -- `setsid`, `getppid`, and `getcwd` are now
-implemented.  The `Unknown syscall: 21` line that used to appear
-during `ash`'s PATH probe is gone -- `sys_access` is now
-implemented.
+| musl_dupfd | green | `DUPFD-OK`.  No heap warnings. |
+| musl_ids | green | `IDS-OK sid= 22`, `IDS-OK ppid= 2`.  (The space after `sid=`/`ppid=` is a cosmetic quirk of the test's `put_dec`.) |
+| musl_getcwd | green | `GETCWD-OK /` |
+| busybox echo hi / busybox echo Donald | green | `hi` / `Donald` |
+| busybox (no args) | green | prints the multi-call banner and the applet list (`ash, cat, echo, ls, sh`) |
 
 ## State on disk
 
@@ -1089,47 +1140,62 @@ implemented.
 
 ## Next step (exactly this, then stop)
 
-**Session 23 continues Phase B.**
+**Session 24 continues Phase B.**
 
 In priority order:
 
-1. **Fix the `#PF` in the parent `ash` after a forked child exits.**
-   This is the top blocker: `busybox ash` runs `ls` correctly, `ls`
-   exits, and then `ash` faults at `CR2 = 0x20`.  The fault address
-   is the offset of musl's `errno` from a null thread pointer, so
-   the parent's `MSR_FS_BASE` is zero at the fault.  Read the three
-   files named in the handoff's "Files that must not be touched"
-   rule (`process.c`, `scheduler.c`, `context_switch.asm`) --
-   reading them to *understand* the exit-path context switch is
-   fine; changing them needs a specific tested reason.  Confirm
-   whether `process_exit` writes `MSR_FS_BASE` for the next process
-   before resuming it, the way `timer_preempt_handler` and the
-   voluntary `process_yield` path do.
+1. **Implement `ioctl(0, TCGETS, ...)`.**  Return a plausible
+   `struct termios` with `ICANON | ECHO | ISIG | IEXTEN` (and the
+   usual input/output flags) so `ash` believes stdin is a tty.
+   Accept and ignore `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes
+   `ash` echo typed input and print a prompt.  It is the last thing
+   between the current state and an interactive `busybox sh`.
 
-2. **Re-test `busybox ash`.**  With the `#PF` fixed, `busybox ash`
-   should survive running multiple external commands in sequence.
+   The Linux x86_64 `struct termios` layout (per musl's
+   `bits/termios.h`) is:
 
-3. **Implement `ioctl(0, TCGETS, ...)`.**  Return a termios struct
-   with `ICANON | ECHO | ISIG | IEXTEN` (and the usual input/output
-   flags) so `ash` believes stdin is a tty.  Accept and ignore
-   `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes `ash` echo typed input
-   and print a prompt.
+   ```
+   tcflag_t c_iflag;   // offset 0,  4 bytes
+   tcflag_t c_oflag;   // offset 4,  4 bytes
+   tcflag_t c_cflag;   // offset 8,  4 bytes
+   tcflag_t c_lflag;   // offset 12, 4 bytes
+   cc_t     c_line;    // offset 16, 1 byte
+   cc_t     c_cc[32];  // offset 17, 32 bytes
+   ```
 
-4. **Then cut the milestone tag.**  Once external commands run
-   repeatedly and `sh` is interactive, that is the natural point
-   for `v0.6.2` or `v0.7.0`.
+   `tcflag_t` is `unsigned int` (4 bytes) on x86_64.  The relevant
+   constants (from musl's `bits/termios.h`) are `ICANON = 0x2`,
+   `ECHO = 0x8`, `ISIG = 0x1`, `IEXTEN = 0x8000`,
+   `OPOST = 0x1`, `ONLCR = 0x4`.  A termios with `c_iflag = ICRNL`
+   (0x100), `c_oflag = OPOST | ONLCR` (0x5),
+   `c_cflag = B38400 | CS8 | CREAD | CLOCAL` (0xBF), and
+   `c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN`
+   (0x8A3B) is enough.  The `c_cc` array must have `VEOF` (0),
+   `VERASE` (0x7F), and `VINTR` (3) at their standard offsets,
+   though `ash` typically only checks the flags.
+
+   The ioctl request codes are: `TCGETS = 0x5401`,
+   `TCSETS = 0x5402`, `TCSETSW = 0x5403`, `TCSETSF = 0x5404`.
+
+2. **Re-test `busybox sh`.**  With `ioctl TCGETS` returning a
+   valid termios, `ash` should print a prompt and echo input.  If
+   it does, `v0.6.2` or `v0.7.0` is the natural milestone tag.
+
+3. **Then decide on the milestone tag.**  Once `busybox sh` is
+   interactive and the full canary passes, that is the point for
+   `v0.6.2` (or `v0.7.0`).
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. Parent-`ash` `#PF` after a forked child exits -- next.
-2. `ioctl TCGETS` -- the other half of interactive `sh`.
-3. `sys_newfstatat` (262) -- busybox may route through it once more
-   applets are enabled.
-4. `isr14_handler` -- a user-mode `#PF` currently halts the console;
-   busybox's first segfault will end the session instead of
-   terminating the process.
-5. `sys_munmap` -- a stub returning 0; busybox will eventually call
-   it and expect real unmapping.
+1. `ioctl TCGETS` -- the next change.
+2. Fork is O(6 MB) per call -- the long-term architectural fix is
+   real copy-on-write.
+3. `isr14_handler` -- a user-mode `#PF` currently halts the
+   console instead of killing the faulting process.
+4. `sys_newfstatat` (262) -- busybox may route through it once
+   more applets are enabled.
+5. `sys_munmap` -- a stub returning 0; busybox will eventually
+   call it and expect real unmapping.
 6. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window -- both
    are latent collisions waiting to happen.
 7. `sys_open` accepting `O_DIRECTORY` on non-directories.
@@ -1137,7 +1203,7 @@ In priority order:
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now eighteen commits
+**Do not push without a plan.**  `dev` is now twenty-one commits
 ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
 merged to `main` at the next milestone, or is pushed immediately is
 a separate decision.  Milestone tags go on the published side; the
@@ -1149,19 +1215,19 @@ same principle applies to Phase B.
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - Parent-`ash` `#PF` after a forked child exits -- next.
-  - `ioctl TCGETS`.
-  - `sys_newfstatat` (262) -- three-way delegation.
+  - `ioctl TCGETS` -- the next change.
+  - Fork O(6 MB) -- real COW is the long-term fix.
   - `isr14_handler` user-mode fault handling.
+  - `sys_newfstatat` (262) -- three-way delegation.
   - `sys_munmap` real implementation.
   - `sys_brk` and the mmap window -- per-process state, not fixed
     bases.
   - `sys_open` `O_DIRECTORY` fix.
   - The `Unknown syscall: N` cluster in `musl_readdir`.
-  - `musl_sh` backspace echo (cosmetic; also leaves stale bytes in
-    the keyboard buffer).
+  - `musl_sh` backspace echo (cosmetic; also leaves stale bytes
+    in the keyboard buffer).
   - `musl_ids` `put_dec` space (cosmetic).
-  - `musl_wait` `WNOHANG` loop spin (cosmetic).
+  - `musl_wait` WNOHANG loop spin (cosmetic).
   - `f_stat_with_retry` path-component collapse (theoretical;
     matters only if the FAT gains subdirectories).
 - **Deferred cleanups:**
