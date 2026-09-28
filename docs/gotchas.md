@@ -28,6 +28,56 @@ fresh and which are long-settled.
   bare forms.  Parser lives in `vga_putc_unlocked`.  (Added
   2026-09-28, session 26.)
 
+### Syscall ABI
+
+- **Syscall numbers must match the Linux x86_64 ABI; never guess from
+  the diagnostic.**  donix's syscall table is supposed to use the
+  real Linux x86_64 numbers.  When an entry diverges, the failure is
+  invisible to any test built against donix's own expectations, and
+  the `Unknown syscall: N` diagnostic names the *number the caller
+  used* -- which may be a completely different syscall from the one
+  you think is missing.
+
+  Found in session 27, two instances of the same mistake:
+
+    - `mkdir` was at 7.  Linux has `poll` at 7 and `mkdir` at 83.
+    - `setsid` was at 107.  Linux has `geteuid` at 107 and `setsid`
+      at 112.
+
+  In both cases the handler was written because a caller logged
+  `Unknown syscall: 7` / `Unknown syscall: 107`, and the number was
+  assumed to name the missing call.  It did not: 7 was `poll`, 107
+  was `geteuid`.  The handlers sat at numbers no correct caller
+  uses, so they were dead code -- and they shadowed the real
+  syscalls at those numbers (a caller doing `poll(fds,1,timeout)`
+  got `sys_mkdir`'s return values; a caller doing `geteuid()` got
+  `sys_setsid`'s pid).
+
+  Symptom that exposed it: `busybox mkdir` printed `Function not
+  implemented` while `Unknown syscall: 83` appeared in the serial
+  log.  busybox calls the real Linux number 83; the kernel's handler
+  was at 7.
+
+  Corrected in tag `20260928-05` (mkdir 83, setsid 112).  The
+  previously masked gaps -- `poll(2)` at 7 and `geteuid(2)` at 107 --
+  are now visible and tracked in `docs/open-issues.md`.
+
+  Lesson: any new syscall entry must be checked against the
+  canonical Linux x86_64 table,
+  `arch/x86/entry/syscalls/syscall_64.tbl`.  Do NOT infer the number
+  from what appears to be missing.  The diagnostic names the
+  caller's number, which is authoritative; use it.  (Learned
+  2026-09-28, session 27.)
+
+- **musl is unmodified upstream; it uses the real Linux numbers.**
+  `third_party/musl-install/include/bits/syscall.h` has
+  `__NR_mkdir 83`, `__NR_setsid 112`, `__NR_poll 7`.  So a
+  musl-built binary calls the real numbers, and a kernel handler at
+  any other number is simply never reached from musl.  This is what
+  made the divergences above invisible to the musl tests: nothing
+  musl calls ever went to 7 or 107 expecting mkdir/setsid.  (Learned
+  2026-09-28, session 27.)
+
 ## Process / scheduler
 (existing entries: fork_copy_frame preserves %r8/%r9; fork eager
 stack copy; fork inherits fs_base; fork copies ELF image region;
@@ -42,7 +92,7 @@ yield removes BLOCKED; exit empty-queue fallback)
 (existing entries: MSR_FS_BASE save/restore/inherit; pcb_t field
 ordering after block_kind)
 
-## Syscall ABI
+## Syscall ABI (continued)
 (existing entries: return path preserves all but rax/rcx/r11;
 sys_read returns first byte; SYS_EXIT=60; -mcmodel=large note;
 16-slot frame layout; epilogue loads user RSP last; execve argv

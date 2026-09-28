@@ -4,6 +4,15 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 27 (2026-09-28)
+| Tag | What |
+|-----|------|
+| `20260928-04` | kernel: isr14_handler kills faulting process on user-mode #PF |
+| (untagged) | handoff: session 27 mid-session checkpoint |
+| `20260928-05` | kernel: align mkdir (83) and setsid (112) with the Linux ABI |
+| `20260928-06` | busybox: enable pwd, wc, mkdir applets |
+| `20260928-07` | handoff: session 27 -- syscall ABI audit, poll/geteuid next |
+
 ## Session 26 (2026-09-28)
 | Tag | What |
 |-----|------|
