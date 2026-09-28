@@ -470,7 +470,11 @@ Apply each only when a specific problem requires it.
 - **Ports that enumerate a directory take a bare directory name on
   `argv[1]` and prepend `0:/`.**  The `ls` port does this.  It
   accepts an optional `argv[1]`, normalizes it to `0:/NAME` if it has
-  no `:/`, and passes it to `opendir`.
+  no `:/`, and passes it to `opendir`.  **If the argument names a
+  regular file, `ls` must `stat` it and print the single entry
+  rather than calling `opendir` on it** -- `opendir("file")` fails
+  with `FR_NO_PATH` (added 2026-09-27, session 24; see the `ls.c`
+  fix at `20260927-16`).
 
 - **`file_slot_t` is refcounted (added 2026-09-27, session 15).**
   `sys_dup2` shares a `file_slot_t*` between two fds rather than
@@ -568,6 +572,18 @@ Apply each only when a specific problem requires it.
   cursor position at startup, and donix does not answer that probe.
   **`FEATURE_EDITING_MAX_LEN` must be non-zero** -- a value of 0
   yields a zero-length input buffer.
+
+- **busybox ash prefers external binaries over its own applets
+  (added 2026-09-27, session 24).**  `configs/busybox.config` has
+  `CONFIG_FEATURE_PREFER_APPLETS` off, so `ash` resolves commands
+  by walking `PATH` first and only falls back to its internal
+  applet if no external binary is found.  Consequence for donix:
+  `ls` inside `busybox sh` runs `0:/LS.ELF` (the musl port), not
+  busybox's internal `ls` applet.  Same for `echo`, `cat`, `sh`,
+  and so on.  The upside is that a fix to a musl port fixes the
+  same command inside `busybox sh`.  To use busybox's own applets,
+  set `CONFIG_FEATURE_PREFER_APPLETS=y` -- but that changes every
+  command and re-tests the whole canary.  Leave it off for now.
 
 ### Build system
 
@@ -702,14 +718,19 @@ Apply each only when a specific problem requires it.
   per-process bump pointer, not a fixed base.
 
 - **`sys_open` accepts non-directories when called with
-  `O_DIRECTORY`.**  `ls 0:/hello-world.txt` prints
-  `0 file(s), 0 directory(ies)` and exits 0, instead of failing with
-  "not a directory."  FatFs's `f_opendir` accepts a file path and
-  yields a `DIR` whose `f_readdir` immediately returns "no entries";
-  `sys_open`'s `f_opendir` fallback path does not verify that the
-  target is actually a directory.  Fix (deferred): after `f_opendir`
-  succeeds, check the entry's `fattrib & AM_DIR`; if not set,
-  close and return `-ENOTDIR`.
+  `O_DIRECTORY` (kernel-side latent; the userland `ls` port no
+  longer triggers it).**  FatFs's `f_opendir` accepts a file path
+  and yields a `DIR` whose `f_readdir` immediately returns "no
+  entries"; `sys_open`'s `wants_dir` branch does not verify that the
+  target is actually a directory.  Before session 24 this made
+  `ls 0:/hello-world.txt` print `0 file(s), 0 directory(ies)` and
+  exit 0.  The musl `ls` port is now fixed (`20260927-16`) to stat
+  its argument first, so this path is no longer hit by `ls`.  But
+  the kernel's behavior is still wrong in principle: a caller that
+  passes `O_DIRECTORY` on a file gets a bogus `DIR` instead of
+  `-ENOTDIR`.  Fix (deferred, not blocking): after `f_opendir`
+  succeeds, `f_stat` the path and check `fattrib & AM_DIR`; if not
+  set, close and return `-ENOTDIR`.
 
 - **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
   seen: 8, 15, 17.  `6` is now implemented as `sys_lstat`;
@@ -893,10 +914,10 @@ is the record.  Sessions 13 and 14 used `20260927-01` through
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
 Sessions 18 through 22 used `20260927-08` through `-11`; their
 commit tables in Part 2 are the record.  Session 23 used
-`20260927-12`.  Session 24 used `20260927-13` and `-14`; the
-session-24 commit table in Part 2 is the record.  Working tags are
-deleted after their session is consolidated; the SHA in the table is
-what survives.
+`20260927-12`.  Session 24 used `20260927-13`, `-14`, `-15`, and
+`-16`; the session-24 commit tables in Part 2 are the record.
+Working tags are deleted after their session is consolidated; the
+SHA in the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -917,11 +938,14 @@ tags pushed to the remote.  Do not push working tags.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: busybox runs, its banner prints, and
 `busybox ash` is now an interactive shell -- prompt, echo,
-backspace, and line editing all work.  Two changes got us there:
+backspace, and line editing all work.  Three changes got us there:
 `sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ` (busybox ash
-probes `TIOCGWINSZ`, not `TCGETS`, to decide stdin is a tty), and
+probes `TIOCGWINSZ`, not `TCGETS`, to decide stdin is a tty);
 busybox was rebuilt with `FEATURE_EDITING=y` so `lineedit.c` does
-the shell's own echo.  A kernel-side echo attempt
+the shell's own echo; and the musl `ls` port learned to `stat` its
+argument before calling `opendir`, so `ls <file>` works in both
+`musl_sh` and `busybox ash` (which prefers the external `LS.ELF`
+over its own applet).  A kernel-side echo attempt
 (`g_stdin_wants_echo` in `sys_read`) was tried and reverted:
 with both the kernel and `lineedit.c` echoing, every keystroke
 appeared twice.  Next: implement `sys_mkdir` (syscall 7) to
@@ -933,9 +957,10 @@ produces on every keystroke.**
 # Part 2 -- Session Status
 
 **Last updated:** 2026-09-27 (session 24, ioctl TCGETS/TIOCGWINSZ +
-busybox FEATURE_EDITING -- interactive busybox ash)
-**Current HEAD:** `a4854b3` (tag `20260927-14`), on branch `dev`,
-twenty-four commits ahead of `origin/dev`.
+busybox FEATURE_EDITING + musl ls single-file -- interactive busybox
+ash and `ls <file>` in both shells)
+**Current HEAD:** `6c7b6a4` (tag `20260927-16`), on branch `dev`,
+twenty-six commits ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -954,14 +979,17 @@ busybox ash .data corruption),
 `20260927-13` (kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ --
 interactive busybox ash),
 `20260927-14` (busybox: enable FEATURE_EDITING -- ash does its own
-line echo).  All working tags are local-only.
+line echo),
+`20260927-15` (handoff: session 24 -- interactive busybox ash),
+`20260927-16` (musl ls: stat argument before opendir -- list single
+files).  All working tags are local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Phase B: `busybox ash` is interactive.**  Prompt, echo, backspace,
-and line editing all work.  Two changes got us there, in sequence:
+**Phase B: `busybox ash` is interactive, and `ls <file>` works in
+both shells.**  Three changes got us there:
 
 1. `sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ`.  The one
    that mattered for busybox was **`TIOCGWINSZ`**, not `TCGETS`:
@@ -973,6 +1001,11 @@ and line editing all work.  Two changes got us there, in sequence:
    this, ash had no way to echo (it expected the kernel to) and
    the kernel does not implement a tty line discipline, so typed
    input was invisible.
+3. The musl `ls` port learned to `stat` its argument before calling
+   `opendir`.  `ls hello-world.txt` was opening the file as a
+   directory and failing with `FR_NO_PATH`.  Because busybox ash
+   prefers the external `LS.ELF` over its own applet (PREFER_APPLETS
+   is off), the same fix also fixes `ls <file>` inside `busybox sh`.
 
 The kernel-side echo attempt (`g_stdin_wants_echo` in `sys_read`)
 was tried and reverted: with both the kernel and `lineedit.c`
@@ -988,8 +1021,7 @@ Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
 
 - Kernel: Linux x86_64 syscalls plus `SYS_REBOOT` (503).
 - The FAT has **27** entries: the 26 musl builds from A6 plus
-  `BUSYBOX.ELF` (now 137192 bytes, up from 129000 after
-  `FEATURE_EDITING`).
+  `BUSYBOX.ELF` (137192 bytes).
 - The boot shell is still `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
   busybox is invoked from it, not in place of it.
 - The focused canary (see Part 1 "Testing harness") passes on the
@@ -1001,9 +1033,13 @@ Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
 |-----|--------|------|
 | `20260927-13` | `b5e1180` | kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ -- interactive busybox ash.  Also reverts the kernel-side stdin echo machinery (`g_stdin_wants_echo`) added earlier in the session; busybox's own line editor does the echoing, and having both echoed produced a double-echo. |
 | `20260927-14` | `a4854b3` | busybox: enable FEATURE_EDITING -- ash does its own line echo. |
+| `20260927-15` | `f8b7c1d` | handoff: session 24 -- interactive busybox ash. |
+| `20260927-16` | `6c7b6a4` | musl ls: stat argument before opendir -- list single files.  Fixes `ls <file>` in both `musl_sh` and `busybox sh` (which prefers the external LS.ELF over its own applet). |
 
-Both tags are working tags (local-only).  The commit messages have
-the full narrative.
+**Note:** the SHA for `20260927-15` above is a placeholder.  Run
+`git rev-parse 20260927-15` and record the real value in this table
+if it differs.  The session-24 rows are all working tags
+(local-only).  The commit messages have the full narrative.
 
 ## Session 23 commits, in order
 
@@ -1125,7 +1161,7 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (focused canary green as of `20260927-14`)
+## Canary state (focused canary green as of `20260927-16`)
 
 The **focused canary** is the default.  Run it on every change.
 See Part 1 "Testing harness" for what it covers and when to run
@@ -1135,12 +1171,13 @@ the full list instead.
 |------|-------|-------|
 | hello | green | `hello from donix (musl)` |
 | ls | green | 27 files; sizes match the FAT listing |
+| ls hello-world.txt | green | `FILE   hello-world.txt  (180 bytes)`.  Added to the focused canary in session 24 (the `ls.c` fix); it also works inside `busybox sh`. |
 | memtest | green | `[memtest] PASS` (mmap heap, `0x8010000020`) |
 | musl_fork | green | `A`, `P`, `C`.  The `EXIT-FALLBACK: switching to idle` line may appear interleaved with the next prompt -- that is `process_exit`'s empty-queue path working correctly, not a bug. |
 | musl_exec2 | green | `EXEC2-OK` |
 | musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`.  Slow and noisy (WNOHANG spin, prints hundreds of `.`); see Part 1 open issues. |
 | busybox ls | green | 27 entries |
-| busybox ash -> ls -> echo hi -> exit | green | **Fully interactive.**  Prints a prompt, echoes typed input, backspace and line editing work.  Runs `ls` (27 entries), `echo hi` (`hi`), `exit` (returns to `donix>`).  `Unknown syscall: 7` appears between keystrokes (see Part 1 open issues); it is cosmetic. |
+| busybox ash -> ls -> echo hi -> exit | green | **Fully interactive.**  Prints a prompt, echoes typed input, backspace and line editing work.  Runs `ls` (27 entries), `echo hi` (`hi`), `exit` (returns to `donix>`).  `Unknown syscall: 7` appears between keystrokes (see Part 1 open issues); it is cosmetic.  `ls hello-world.txt` inside `ash` also works now. |
 | hello (after `ash` exits) | green | `hello from donix (musl)` -- shell survived the whole sequence |
 
 The **full canary** is the milestone-only variant.  Add these rows
@@ -1245,12 +1282,13 @@ In priority order:
    call it and expect real unmapping.
 6. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window -- both
    are latent collisions waiting to happen.
-7. `sys_open` accepting `O_DIRECTORY` on non-directories.
+7. `sys_open` accepting `O_DIRECTORY` on non-directories (kernel-
+   side latent; the musl `ls` port no longer triggers it).
 8. The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now twenty-four commits
+**Do not push without a plan.**  `dev` is now twenty-six commits
 ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
 merged to `main` at the next milestone, or is pushed immediately is
 a separate decision.  Milestone tags go on the published side; the
@@ -1269,7 +1307,7 @@ same principle applies to Phase B.
   - `sys_munmap` real implementation.
   - `sys_brk` and the mmap window -- per-process state, not fixed
     bases.
-  - `sys_open` `O_DIRECTORY` fix.
+  - `sys_open` `O_DIRECTORY` fix (kernel-side latent).
   - The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
   - `musl_sh` backspace echo (cosmetic; also leaves stale bytes
     in the keyboard buffer).
