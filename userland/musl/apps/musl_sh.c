@@ -87,53 +87,20 @@ int main(void) {
             if (argc == 0) _exit(0);   /* should not happen: n>0 checked above */
 
             /*
-             * Resolve argv[0] to a full path, matching the newlib
-             * shell's convention (user_shell.c:run_external):
+             * Pass argv[0] through unchanged.  The kernel's
+             * sys_execve now handles both forms the user might
+             * type:
              *
-             *     snprintf(path, sizeof(path), "0:/%s.ELF", argv[0]);
+             *   - a bare name like "ls"  -> "0:/LS.ELF" (attempt c)
+             *   - an absolute path like "/LS.ELF"
+             *                            -> "0:/LS.ELF" (attempt b)
              *
-             * The user types a bare command name (`cat`, `hello`);
-             * the shell turns it into `0:/NAME.ELF`.  If the token
-             * already contains `:/` (the user typed a full path
-             * like `0:/musl_r10probe.elf`), leave it alone.
-             *
-             * argv[1..n] are passed verbatim, exactly as the newlib
-             * shell does.  The newlib cat/echo expect bare
-             * filenames and prepend `0:/` themselves.
+             * The old rewriting here turned "/LS.ELF" into
+             * "0://LS.ELF.ELF" (double slash, doubled suffix),
+             * which FatFs rejected before the kernel's retry could
+             * see it.  Doing nothing is now correct.
              */
-            char path[128];
-            {
-                const char* tok = argv[0];
-                int has_prefix = 0;
-                for (const char* q = tok; *q; q++) {
-                    if (q[0] == ':' && q[1] == '/') { has_prefix = 1; break; }
-                }
-                if (has_prefix) {
-                    int i = 0;
-                    while (tok[i] && i < (int)sizeof(path) - 1) {
-                        path[i] = tok[i];
-                        i++;
-                    }
-                    path[i] = 0;
-                } else {
-                    int i = 0;
-                    path[i++] = '0';
-                    path[i++] = ':';
-                    path[i++] = '/';
-                    for (const char* q = tok; *q && i < (int)sizeof(path) - 1; q++) {
-                        path[i++] = *q;
-                    }
-                    if (i < (int)sizeof(path) - 5) {
-                        path[i++] = '.';
-                        path[i++] = 'E';
-                        path[i++] = 'L';
-                        path[i++] = 'F';
-                    }
-                    path[i] = 0;
-                }
-            }
-
-            execve(path, argv, (char**)0);
+            execve(argv[0], argv, (char**)0);
             puts_raw("EXEC-FAILED\n", 12);
             _exit(127);
         }
