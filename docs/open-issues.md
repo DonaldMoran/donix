@@ -2,9 +2,9 @@ Full list.  `handoff.md` carries the top 5.  Priority order,
 highest first.
 
 1. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
-   `isr14_handler`, tag `20260928-04`) is in but unverified
-   end-to-end -- needs a test binary that dereferences a bad
-   pointer without setting `g_expect_fault`.
+   `isr14_handler`) is in but unverified end-to-end -- needs a test
+   binary that dereferences a bad pointer without setting
+   `g_expect_fault`.
 2. `cd ..` at `donix>` fails.  The `musl_sh` `cd` builtin passes
    the raw `..` to `chdir`, and FatFs has no `..` directory entry,
    so `sys_chdir`'s `f_stat_with_retry("..")` returns ENOENT.
@@ -14,7 +14,7 @@ highest first.
    (b) `sys_chdir` resolves through `resolve_against_cwd` the way
    `sys_open`/`sys_stat`/`sys_access` now do.  (b) is more
    Unix-shaped -- chdir should accept relative paths like every
-   other path syscall.  Session 30 (tag `20260928-23`).
+   other path syscall.  Session 30.
 3. **VFS layer (eventual).**  `sys_execve` resolves paths through
    a three-attempt block in the kernel (attempt b: leading `/` ->
    `0:` + path; attempt c: `0:/NAME.ELF`, `0:/BIN/NAME`,
@@ -51,7 +51,7 @@ highest first.
     directories (theoretical).
 16. `prctl(2)` (157) is minimal: `PR_SET_NAME` accepted and
     dropped.  A Unix-shaped implementation would add a per-process
-    `comm` field.  Session 30 (tag `20260928-21`).
+    `comm` field.  Session 30.
 
 ## Deferred cleanups
 
@@ -59,3 +59,6 @@ highest first.
 - Remove `PMM_ALLOC_DIAG` from `pmm.c`.
 - Small `REBOOT.ELF` (raw `syscall(503)`).
 - Delete `~/code/x` and `~/code/y` (both fully ported).
+- Add session-30 gotchas to `docs/gotchas.md`: the `sys_getcwd`
+  absolute-cwd requirement, and the `puts_raw`-vs-`printf` newline
+  quirk.
