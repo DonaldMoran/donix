@@ -1,0 +1,89 @@
+# donix session log
+
+Append-only.  One row per commit, named by tag only -- never by
+SHA.  Git resolves tags; the handoff never duplicates what git
+already records.  Working tags are local and permanent.
+
+## Session 25 (2026-09-27)
+| Tag | What |
+|-----|------|
+| `20260927-18` | kernel: implement mkdir(2) -- syscall 7 |
+| `20260927-19` | busybox: enable FEATURE_EDITING_HISTORY=256 |
+| `20260927-20` | handoff: session 25 |
+
+## Session 24 (2026-09-27)
+| Tag | What |
+|-----|------|
+| `20260927-13` | kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ -- interactive busybox ash |
+| `20260927-14` | busybox: enable FEATURE_EDITING |
+| `20260927-15` | handoff: session 24 |
+| `20260927-16` | musl ls: stat argument before opendir |
+| `20260927-17` | handoff: session 24 final |
+
+(tags `20260927-13` through `-17` were deleted before the `v0.6.2`
+push; from session 25 onward they are kept, so this is the last
+session where the tags themselves no longer resolve -- the commit
+messages carry the narrative)
+
+## Session 23 (2026-09-27)
+| Tag | What |
+|-----|------|
+| `20260927-12` | kernel: fork copies the ELF image region |
+
+## Session 22 (2026-09-27)
+| Tag | What |
+|-----|------|
+| `20260927-11` | kernel: sys_access/faccessat + FR_NO_PATH in stat retry |
+
+## Session 21
+| `20260927-10` | kernel: return proper errnos from file syscalls |
+
+## Session 19
+| `20260927-09` | kernel: sys_execve bare-name retry |
+
+## Session 18
+| `20260927-08` | kernel: implement getcwd(2) |
+
+## Session 17
+| `20260927-07` | kernel: implement setsid(2) and getppid(2) |
+
+## Session 16
+| `20260927-06` | kernel: implement F_DUPFD in fcntl(2) |
+
+## Session 15
+| `20260927-05` | kernel: implement dup2(2), file_slot_t refcounting |
+
+## Session 14
+| Tag | What |
+|-----|------|
+| `20260927-04` | busybox: track config under `configs/` |
+| (untagged) | handoff: session 14 |
+| (untagged) | kmain: bump donix banner to 0.6.1 |
+
+## Session 13
+| Tag | What |
+|-----|------|
+| `20260927-01` | kernel: fcntl(2), distinct anonymous mmap VAs, root/`./` path handling |
+| `20260927-02` | build: busybox integrated into the userland build |
+| `20260927-03` | handoff: session 13 -- published as `v0.6.1` |
+
+## Session 12
+| (untagged) | Docs restructure |
+
+## Session 11
+| Tag | What |
+|-----|------|
+| `20260927-00` | cleanup: remove residual newlib artifacts from `04_kernel_64bit` |
+| `20260927-01` | A6.1: `userland/musl` tree, Makefile, and all sources |
+| `20260927-02` | A6.23: build and stage musl userland from `userland/musl` |
+| `20260927-03` | A6.24: delete `build_musl_tests.sh` |
+| `v0.6.0` | version bump and A6 documentation pass |
+
+(note: session 11 and session 13 both used `20260927-01`-`-03`;
+session 11's tags were deleted before the reuse, so the session-11
+tags no longer resolve -- the commit messages are the record)
+
+## Per-test canary notes
+
+(verbatim lift of the focused-canary and full-canary tables from
+the old handoff; one line per test, green/notes)
