@@ -2146,6 +2146,42 @@ long sys_getppid(void) {
 }
 
 /*
+ * Linux x86_64 prctl(2) — syscall 157.
+ *
+ * Multiplexer.  busybox calls it once per invocation with
+ * PR_SET_NAME (15) to set the process's name (comm).  We have
+ * nowhere separate to store it: pcb->name is the exec name, used
+ * by process_dump_all and the sys_execve trace line, and
+ * overwriting it with busybox's comm value ("busybox", or the
+ * applet name) would make our own diagnostics less useful, not
+ * more.
+ *
+ * So PR_SET_NAME is ACCEPTED AND DROPPED: return 0, do not store.
+ * That satisfies busybox, which ignores the return value.  All
+ * other options return -EINVAL, matching Linux's behavior for an
+ * unknown or unsupported option.
+ *
+ * REVISIT: this is deliberately minimal.  A Unix-shaped
+ * implementation would give pcb_t a separate `comm` field (Linux
+ * keeps comm and the exec path distinct), set it here, and show
+ * it in process_dump_all alongside the exec name.  That is
+ * deferred -- see docs/open-issues.md.  The point of this
+ * function today is to stop busybox's per-invocation
+ * "Unknown syscall: 157" noise, not to model prctl.
+ *
+ * PR_SET_NAME = 15.  EINVAL_ = 22.
+ */
+long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
+               unsigned long arg4, unsigned long arg5) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5;
+
+    if (option == 15) {   /* PR_SET_NAME: accept and drop */
+        return 0;
+    }
+    return -(long)EINVAL_;
+}
+
+/*
  * Linux x86_64 setsid(2) — syscall 112.
  *
  * Creates a new session.  donix has no notion of sessions or
@@ -3143,6 +3179,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);

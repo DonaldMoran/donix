@@ -35,6 +35,13 @@
  * Both were guessed from an "Unknown syscall: N" log line
  * rather than read from the table above.  Do not do that.
  *
+ * KNOWN INCOMPLETE (revisit): sys_prctl (157) currently accepts
+ * PR_SET_NAME and returns 0 without storing the name.  donix has
+ * no separate "comm" field; pcb->name is the exec name.  A real
+ * implementation would add a per-process comm field, set it here,
+ * and expose it (e.g. in process_dump_all).  Deferred; see
+ * docs/open-issues.md.
+ *
  * ------------------------------------------------------------
  * CANONICAL NUMBERS — implemented syscalls
  * ------------------------------------------------------------
@@ -69,6 +76,7 @@
  * 107  geteuid           sys_geteuid
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
+ * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
@@ -144,6 +152,7 @@
 #define SYS_GETEUID         107
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
+#define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
@@ -199,7 +208,9 @@ long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_getppid(void);
 long sys_getcwd(char* buf, unsigned long size);
-
+long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
+               unsigned long arg4, unsigned long arg5);
+               
 /*
  * sys_poll — minimal poll(2) for syscall 7.
  *

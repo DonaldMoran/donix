@@ -75,7 +75,17 @@ highest first.
     `/bin/busybox sh`.  A real fix is either an applet symlink
     (item 5) or a shell-level special case; not urgent.  Session
     29 noted.
-
+19. `prctl(2)` (157) is minimal: `PR_SET_NAME` is accepted and
+    dropped, everything else returns `-EINVAL`.  This exists only
+    to silence busybox's per-invocation "Unknown syscall: 157".
+    **Revisit for a Unix-shaped implementation:** Linux keeps a
+    per-process `comm` (set by `PR_SET_NAME`) distinct from the
+    exec path.  donix has only `pcb->name`, the exec name.  A real
+    implementation would add a `comm` field to `pcb_t`, set it in
+    `sys_prctl`, and surface it in `process_dump_all` alongside
+    the exec name.  Deferred.  Session 30 (tag
+    `20260928-21-prctl`).
+    
 ## Deferred cleanups
 
 - Audit `puthex`/`put_dec` helpers in `userland/musl/tests/`.
