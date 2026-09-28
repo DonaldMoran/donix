@@ -151,3 +151,60 @@ really gotchas stay here)
 
 ## Cosmetic / housekeeping
 (existing entries: puthex/put_dec audits; SYS_REBOOT; PMM_ALLOC_DIAG)
+
+## Bare-name resolution has two layers, and the shell is the
+## wrong place for it
+
+**Symptom (session 29):** after busybox moved from `BUSYBOX.ELF`
+at the FAT root to `/bin/busybox`, `busybox ls` from `donix>`
+started failing with:
+
+    sys_execve: f_open(busybox) -> 4
+    EXEC-FAILED
+
+while `ls` and `hello` kept working.  Also, earlier in the same
+session, `/LS.ELF` from `donix>` had failed with:
+
+    sys_execve: f_open(0://LS.ELF.ELF) -> 4
+    EXEC-FAILED
+
+— note the doubled slash and the doubled `.ELF`.
+
+**Root cause, part 1: the shell was rewriting paths.**
+`userland/musl/apps/musl_sh.c` built a `char path[128]` in the
+child by prepending `0:/` and appending `.ELF` to `argv[0]`
+before calling `execve`.  That predates the kernel's path
+resolution work.  For a leading-slash input like `/LS.ELF` it
+produced `0://LS.ELF.ELF`, which FatFs rejects before the
+kernel's own retry can see the original `/LS.ELF`.  **The
+kernel's attempt (b) could never fire, because the shell had
+already mangled the path.**
+
+**Root cause, part 2: bare-name resolution only knew about the
+FAT root.**  `sys_execve`'s bare-name retry
+(`exec_resolve_bare_name`) produced `0:/NAME.ELF` — root only.
+That worked for donix-native binaries (`ls`, `hello`) but not
+for `busybox` once busybox lived at `/bin/busybox`.
+
+**Fix (session 29, tags `20260928-13` and `20260928-14`):**
+
+- **Delete the shell's rewriting.**  `musl_sh` now calls
+  `execve(argv[0], argv, NULL)` and passes `argv[0]` through
+  unchanged.  The kernel does the translation.
+- **Extend attempt (c) to three sub-attempts**, in order:
+  `0:/NAME.ELF` (root, uppercased, `.ELF` appended), then
+  `0:/BIN/NAME`, then `0:/BIN/NAME.ELF`.  Root wins so
+  donix-native binaries shadow same-named `/bin` entries.
+
+**The lesson:** the kernel is the layer that translates a
+Unix-style path to the form FatFs accepts.  The shell should
+pass `argv[0]` through unchanged.  Two layers each trying to
+normalize produces mangled paths (`0://LS.ELF.ELF`) that neither
+layer can recognize.
+
+**Corollary:** this whole block is a **shim for a VFS**.  On
+real Unix, `execve` hands the path to the VFS and the VFS
+resolves it; there is no guessing and no retry.  When a VFS
+lands, delete attempts (b) and (c) and the two `exec_resolve_*`
+helpers.  See `docs/open-issues.md` item 4 and the VFS SHIM
+comment in `sys_execve`.

@@ -2,6 +2,17 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 29 (2026-09-28)
+| Tag | What |
+|-----|------|
+| `20260928-11-handoff-session-29` | handoff: session 29 -- port exploring-copy changes |
+| `20260928-12-kernel-abs-path` | kernel: normalize Unix absolute paths in sys_execve |
+| `20260928-13-musl_sh-passthrough` | musl_sh: pass argv[0] to execve unchanged |
+| `20260928-14-kernel-bin-fallback` | kernel: add /bin fallback to sys_execve bare-name resolution |
+| `20260928-15-busybox-standalone` | busybox: standalone shell mode, exec path /bin/busybox |
+| `20260928-16-image-bin-busybox` | image: stage busybox at /bin/busybox, not BUSYBOX.ELF |
+| `20260928-17-shell-autolaunch` | musl_sh: auto-launch /bin/busybox sh at startup |
+
 ## Session 28 (2026-09-28)
 | Tag | What |
 |-----|------|
@@ -106,7 +117,31 @@ messages carry the narrative)
 session 11's tags were deleted before the reuse, so the session-11
 tags no longer resolve -- the commit messages are the record)
 
-## Per-test canary notes
+## Per-test canary notes (session 29)
 
-(verbatim lift of the focused-canary and full-canary tables from
-the old handoff; one line per test, green/notes)
+Focused canary, boot-into-ash variant (green as of `20260928-17`):
+
+| Row | Result |
+|-----|--------|
+| (boot lands in ash) | ash prompt appears; no `donix>` first |
+| `ls` (in ash) | in-process, no `sys_execve` line |
+| `echo hi` (in ash) | in-process |
+| `exit` (at ash) | returns to `donix>` |
+| `ls` (at donix>) | donix-native `LS.ELF` output |
+| `ls hello-world.txt` | works |
+| `memtest` | works |
+| `musl_fork` | works |
+| `musl_exec2` | works |
+| `musl_wait` | works |
+| `busybox ls` (at donix>) | resolves via /bin fallback (c2) |
+| `busybox ash` (at donix>) | re-enters ash |
+| `hello` (at donix>, after exit) | works |
+
+Known noise, not failures: `Unknown syscall: 157` once per
+busybox invocation (`prctl(PR_SET_NAME)`).  `Unknown syscall:
+107` once at ash startup (`geteuid`) — being closed in session
+30.
+
+Not-a-canary note: `cat hello-world` inside ash fails with
+`No such file or directory`.  busybox `cat` resolves relative to
+`/`, where the file is `HELLO-WORLD.TXT`.  Use the extension.
