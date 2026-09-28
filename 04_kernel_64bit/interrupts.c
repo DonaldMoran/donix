@@ -612,6 +612,22 @@ void isr14_handler(exception_frame_t *frame) {
         }
     }
 
+    /*
+     * User-mode #PF: the fault is the process's problem, not the
+     * kernel's.  Print the diagnostic above (already done), then kill
+     * the faulting process and let the scheduler resume the shell.
+     * This is the Linux model: diagnose, SIGSEGV the task, keep the
+     * machine.  A kernel-mode #PF still falls through to the halt
+     * below -- there is no safe process to kill when the kernel
+     * itself is the thing that faulted.
+     *
+     * The expected-fault path (g_expect_fault == 0x0E) is handled
+     * earlier in the function and never reaches this point.
+     */
+    if (error_code & 4) {
+        fault_kill_current(0x0E);
+    }
+
     while (1) __asm__ volatile("hlt");
 }
 
