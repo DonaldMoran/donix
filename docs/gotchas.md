@@ -1,5 +1,3 @@
-# donix gotchas
-
 Bug writeups, by subsystem.  Lookup material: grep this file when
 you hit a specific problem.  Append-only; new gotchas go here, not
 into `handoff.md`.
@@ -60,7 +58,9 @@ fresh and which are long-settled.
 
   Corrected in tag `20260928-05` (mkdir 83, setsid 112).  The
   previously masked gaps -- `poll(2)` at 7 and `geteuid(2)` at 107 --
-  are now visible and tracked in `docs/open-issues.md`.
+  are now visible and tracked in `docs/open-issues.md`.  `poll(2)`
+  was closed in session 28 (tag `20260928-08`); `geteuid(2)` is the
+  last remaining gap from this audit.
 
   Lesson: any new syscall entry must be checked against the
   canonical Linux x86_64 table,
@@ -77,6 +77,35 @@ fresh and which are long-settled.
   made the divergences above invisible to the musl tests: nothing
   musl calls ever went to 7 or 107 expecting mkdir/setsid.  (Learned
   2026-09-28, session 27.)
+
+- **`poll(fds, 1, -1)` on Linux never returns 0; busybox ash treats
+  0 as end-of-input.**  The first `sys_poll` (session 28) was
+  non-blocking and returned 0 whenever nothing was buffered.
+  busybox ash's line editor (FEATURE_EDITING=y) runs
+  `poll(&pfd, 1, -1)` once per readline iteration and interprets a
+  0 return as "no more input" -- it exits the shell immediately
+  after the first poll.  On real Linux a poll with an infinite
+  timeout cannot return 0, so ash has no code path for it.
+
+  The handler MUST block on fd 0 when `timeout < 0`, using the
+  same `cli` / `state = BLOCKED` / `sti; hlt` sequence `sys_read`
+  uses, so `irq1_handler` -> `process_wake_all_blocked` wakes it
+  on the next keystroke.  The `cli` is load-bearing: without it
+  there is a missed-wakeup window between the `has_data()` check
+  and the `state = BLOCKED` store -- irq1 fires, puts a byte,
+  calls `process_wake_all_blocked`, sees the state is still
+  RUNNING, does nothing; then we set BLOCKED and hlt and nobody
+  ever wakes us.
+
+  Returning `-EINTR` was considered as a cheaper workaround and
+  rejected.  It produces correct behavior for ash by coincidence
+  (ash's error path retries), but lies to any future caller that
+  distinguishes "timeout" from "signal interrupted".
+
+  `timeout >= 0` is still non-blocking in the current handler.
+  No caller uses a finite timeout yet; if one appears, arm a
+  `g_ticks` deadline and loop, per `docs/open-issues.md`.
+  (Learned 2026-09-28, session 28.)
 
 ## Process / scheduler
 (existing entries: fork_copy_frame preserves %r8/%r9; fork eager
@@ -104,7 +133,8 @@ fill_kstat_from_filinfo sharing; getdents64 one-record;
 musl_sh argv[0] normalization; directory ports; ls stats first;
 file_slot_t refcounting; execve bare-name retry; proper errnos;
 sys_access/faccessat; FR_NO_PATH retry; f_stat_with_retry
-sharing; sys_ioctl; busybox FEATURE_EDITING; PREFER_APPLETS)
+sharing; sys_ioctl; busybox FEATURE_EDITING; PREFER_APPLETS;
+blocking poll blocks on fd 0 with timeout < 0)
 
 ## Build system
 (existing entries)

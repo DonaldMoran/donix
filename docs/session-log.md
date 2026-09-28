@@ -1,8 +1,15 @@
-# donix session log
-
 Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
+
+## Session 28 (2026-09-28)
+| Tag | What |
+|-----|------|
+| `20260928-08` | kernel: implement poll(2) -- syscall 7 |
+
+(Note: `20260928-08` was previously an accidental duplicate of
+`20260928-07` on commit `a413c21`.  It was local-only and had no
+log row.  Deleted and re-pointed at the poll commit.)
 
 ## Session 27 (2026-09-28)
 | Tag | What |
