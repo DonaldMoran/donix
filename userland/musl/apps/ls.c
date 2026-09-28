@@ -34,6 +34,36 @@ int main(int argc, char **argv) {
         strcpy(path, "0:/");
     }
 
+    /*
+     * If an explicit argument was given, stat it first.  A regular
+     * file has no directory entries to list; print the file and
+     * exit.  Only fall through to opendir() when the argument is a
+     * directory (or no argument was given, in which case path is
+     * "0:/", which is the root directory).
+     *
+     * Without this, `ls hello-world.txt` calls opendir() on the
+     * file itself.  FatFs returns FR_NO_PATH (5), sys_open returns
+     * -ENOENT, and opendir() fails -- which is what produced the
+     * "[ls] FAIL: opendir(...) failed" line.
+     *
+     * The no-argument case is unchanged: path is "0:/", the root
+     * directory, which opendir() handles.
+     */
+    if (argc >= 2 && argv[1][0] != '\0') {
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            printf("ls: %s: not found\n", argv[1]);
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            /* Single file: print it in the same format the directory
+             * listing uses for a file entry, then exit. */
+            printf("FILE   %s  (%ld bytes)\n", argv[1], (long)st.st_size);
+            return 0;
+        }
+        /* Fall through: it is a directory, list its entries. */
+    }
+
     DIR* d = opendir(path);
     if (!d) {
         printf("[ls] FAIL: opendir(\"%s\") failed\n", path);
@@ -70,10 +100,7 @@ int main(int argc, char **argv) {
             is_dir = S_ISDIR(st.st_mode);
             size   = (long)st.st_size;
         } else {
-            /* stat failed — fall back to d_type from dirent.  d_type
-             * is DT_DIR for directories, DT_REG for files, and is
-             * set correctly by sys_getdents64 from the FAT
-             * attribute.  Size stays 0 in that case. */
+            /* stat failed — fall back to d_type from dirent. */
             is_dir = (e->d_type == DT_DIR);
         }
 

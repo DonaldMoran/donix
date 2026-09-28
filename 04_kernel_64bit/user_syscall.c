@@ -14,6 +14,9 @@
 #include "include/user_space.h"
 #include "ff.h"
 
+/* Defined below, in the execve helpers section. */
+static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
+
 /* Defined in kmain.c — reboots the machine via keyboard controller + ACPI reset port. */
 extern void handle_reboot_sequence(void);
 
@@ -28,6 +31,27 @@ static char g_write_bounce[WRITE_CHUNK];
 /* Maximum number of program headers we accept in an ELF. */
 #define EXEC_MAX_PHDRS 16
 
+/* Common Linux x86_64 errno values used by the file syscalls.
+ *
+ * musl's __syscall_ret converts any return value in the range
+ * -4095..-1 to -errno; anything outside that range, including a
+ * plain -1, is passed through unchanged and then the caller's
+ * errno stays whatever it was, which is a stale value that
+ * produces misleading error messages.  So a syscall that means
+ * to report "file not found" MUST return -ENOENT, not -1.
+ */
+#define EPERM_   1
+#define ENOENT_  2
+#define EIO_     5
+#define EBADF_   9
+#define EAGAIN_  11
+#define ENOMEM_  12
+#define EFAULT_  14
+#define ENOEXEC  8
+#define ECHILD   10
+#define EINVAL_  22
+#define ERANGE_  34
+
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -36,19 +60,31 @@ static char g_write_bounce[WRITE_CHUNK];
  * ============================================================ */
 #define DEBUG_FIL 0
 
+/* Set DEBUG_STAT_TRACE to 1 to log every sys_stat call.  Used to
+ * find out exactly which paths busybox ash's PATH probe stats.
+ * Set to 0 for production. */
+#define DEBUG_STAT_TRACE 0
+
+/* Set DEBUG_WAIT_TRACE to 1 to log every sys_wait4 call and its
+ * return value, and every sys_exit.  Useful when debugging why a
+ * shell is not seeing its children.  Set to 0 for production. */
+#define DEBUG_WAIT_TRACE 0
+
 // ============================================================
 // FILE TABLE SLOT HEADER
 // ============================================================
 //
 // The per-process file_table[] holds file_slot_t*, not raw FIL*.
-// Each slot says whether its obj is a FIL or a DIR.
+// Each slot says whether its obj is a FIL or a DIR, and carries a
+// refcount so that sys_dup2 can share a slot between two fds
+// without either close freeing the other's memory.
 
 #define FILE_KIND_FILE 1
 #define FILE_KIND_DIR  2
 
 typedef struct file_slot_s {
     uint32_t kind;
-    uint32_t _pad;
+    uint32_t refcount;
     void    *obj;
 } file_slot_t;
 
@@ -130,6 +166,125 @@ typedef struct {
 #define KSTAT_IFMT   0170000
 #define KSTAT_IFREG  0100000
 #define KSTAT_IFDIR  0040000
+
+/*
+ * True if `p` names the FAT root directory.
+ *
+ * FatFs's f_stat() does not accept ".", "/", "0:", or "0:/" — it
+ * returns FR_INVALID_NAME for all of them, because it treats the
+ * path as a file name and the root has no file-name form.  musl
+ * and busybox both hand these strings to stat(2):
+ *
+ *   - busybox's `ls` with no argument does stat(".").
+ *   - busybox's `ls /`        does stat("/").
+ *   - busybox's `ls 0:/`      does stat("0:/").
+ *
+ * All four forms denote the same thing on donix, so we synthesize
+ * a directory stat for them instead of calling f_stat.
+ */
+static int path_is_root(const char* p) {
+    if (!p || !*p) return 0;
+    if ((p[0] == '.' || p[0] == '/') && p[1] == '\0') return 1;
+    if (p[0] == '0' && p[1] == ':') {
+        if (p[2] == '\0') return 1;
+        if ((p[2] == '/' || p[2] == '\\') && p[3] == '\0') return 1;
+    }
+    return 0;
+}
+
+/*
+ * Strip leading "./" and "/" components from a FatFs path, in place.
+ *
+ * FatFs accepts "0:/NAME", "0:NAME", and bare "NAME", but rejects
+ * any leading "." or "/".  musl's lstat()/stat() and busybox's
+ * `ls` hand us "./NAME" when the argument is a directory entry
+ * under the current directory, e.g.:
+ *
+ *     ls: ./HELLO-WORLD.TXT: Operation not permitted
+ *
+ * This helper peels off the leading "./" (and repeated "./") and
+ * a leading "/" if present, and leaves the rest alone.  It does
+ * NOT rewrite bare names to "0:/NAME" — the existing code already
+ * handles those, and we deliberately change one thing at a time.
+ *
+ * If the whole path was "." or "./" or "/" or a run of "./"
+ * components, the stripped result is empty; we leave the string
+ * as "." so path_is_root() still recognizes it as the root.
+ */
+static void strip_dot_prefix(char* p) {
+    if (!p || !*p) return;
+
+    char* src = p;
+    while (*src) {
+        if (src[0] == '.' && src[1] == '/') { src += 2; continue; }
+        if (src[0] == '/')                  { src += 1; continue; }
+        break;
+    }
+
+    /* Entire path was "." components — treat as root. */
+    if (*src == '\0') {
+        p[0] = '.';
+        p[1] = '\0';
+        return;
+    }
+
+    /* src >= p always, so an in-place move is safe. */
+    char* dst = p;
+    while (*src) *dst++ = *src++;
+    *dst = '\0';
+}
+
+/*
+ * Map a FatFs FRESULT to a Linux -errno suitable for return
+ * from a syscall.
+ *
+ * Called only on failure (r != FR_OK).  The mapping is
+ * approximate: FatFs does not distinguish as finely as POSIX,
+ * but the two that matter here are FR_NO_FILE / FR_NO_PATH
+ * (-> ENOENT) and FR_INVALID_NAME (also a "does not exist in
+ * this form" signal for our purposes, but arguably EINVAL).
+ *
+ * FR_INVALID_NAME is mapped to ENOENT because busybox ash probes
+ * PATH candidates like "/usr/local/sbin/ls" with stat() and
+ * expects a "not found" answer (ENOENT) for anything it will
+ * not be able to exec.  Reporting EINVAL there makes ash print
+ * "Invalid argument" instead of "not found", which is just as
+ * misleading as the old "Operation not permitted".
+ */
+static long fatfs_errno(FRESULT r) {
+    switch (r) {
+        case FR_OK:            return 0;
+        case FR_NO_FILE:       return -(long)ENOENT_;
+        case FR_NO_PATH:       return -(long)ENOENT_;
+        case FR_INVALID_NAME:  return -(long)ENOENT_;
+        case FR_DENIED:        return -(long)EPERM_;
+        case FR_EXIST:         return -(long)EPERM_;
+        case FR_INVALID_OBJECT:return -(long)EBADF_;
+        case FR_WRITE_PROTECTED:return -(long)EPERM_;
+        case FR_INVALID_DRIVE: return -(long)ENOENT_;
+        case FR_NOT_READY:     return -(long)EIO_;
+        case FR_DISK_ERR:      return -(long)EIO_;
+        case FR_INT_ERR:       return -(long)EIO_;
+        case FR_NOT_ENABLED:   return -(long)EIO_;
+        case FR_NO_FILESYSTEM: return -(long)EIO_;
+        case FR_TIMEOUT:       return -(long)EIO_;
+        case FR_LOCKED:        return -(long)EIO_;
+        case FR_NOT_ENOUGH_CORE:return -(long)EIO_;
+        case FR_TOO_MANY_OPEN_FILES:return -(long)EIO_;
+        case FR_MKFS_ABORTED:  return -(long)EIO_;
+        default:               return -(long)EIO_;
+    }
+}
+
+/* Fill a kernel_stat_t describing the FAT root as a directory. */
+static void fill_kstat_as_root(kernel_stat_t* st) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFDIR | 0755;
+    st->st_size    = 0;
+    st->st_blocks  = 0;
+}
 
 // ============================================================
 // SAFE COPY OPERATIONS
@@ -233,18 +388,40 @@ static int copy_user_string(char* dst, size_t dst_cap, const char* user_src) {
 // ============================================================
 // FILE TABLE HELPERS
 // ============================================================
+
+/*
+ * Release one reference to a file_slot_t.
+ *
+ * Decrements the refcount; frees the slot's obj and the slot itself
+ * only when the count reaches zero.  This is what makes sys_dup2's
+ * aliasing safe: after dup2, two fds share one slot, and closing
+ * either fd must not free memory the other fd still points at.
+ *
+ * Callers that just want to detach an fd without freeing the slot
+ * (e.g. sys_close, which sets file_table[fd] = NULL separately)
+ * use this and then clear their own table entry.
+ */
+static void put_file_slot(file_slot_t* slot) {
+    if (!slot) return;
+    if (slot->refcount > 1) {
+        slot->refcount--;
+        return;
+    }
+    if (slot->kind == FILE_KIND_FILE) {
+        f_close((FIL*)slot->obj);
+    } else if (slot->kind == FILE_KIND_DIR) {
+        f_closedir((DIR*)slot->obj);
+    }
+    kfree(slot->obj);
+    kfree(slot);
+}
+
 static void close_all_files(pcb_t* proc) {
     if (!proc) return;
     for (int i = 3; i < MAX_PROCESS_FILES; i++) {
         file_slot_t* slot = (file_slot_t*)proc->file_table[i];
         if (!slot) continue;
-        if (slot->kind == FILE_KIND_FILE) {
-            f_close((FIL*)slot->obj);
-        } else if (slot->kind == FILE_KIND_DIR) {
-            f_closedir((DIR*)slot->obj);
-        }
-        kfree(slot->obj);
-        kfree(slot);
+        put_file_slot(slot);
         proc->file_table[i] = NULL;
     }
 }
@@ -261,9 +438,9 @@ static int alloc_file_slot(file_slot_t** out_slot) {
 
     file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
     if (!slot) return -1;
-    slot->kind = 0;
-    slot->_pad = 0;
-    slot->obj  = NULL;
+    slot->kind     = 0;
+    slot->refcount = 1;
+    slot->obj      = NULL;
     self->file_table[fd] = slot;
     *out_slot = slot;
     return fd;
@@ -278,26 +455,111 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
     return slot;
 }
 
+
+/*
+ * Linux x86_64 fcntl(2) — syscall 72.
+ *
+ * musl's opendir() calls
+ *     fcntl(fd, F_SETFD, FD_CLOEXEC)
+ * after opening the directory, and treats a failure as fatal: it
+ * closes the fd, frees the DIR, and returns NULL.  busybox's `ls`
+ * then unwinds through its own error path and, in the build we
+ * have, hits a musl a_crash() (an `hlt` in user mode -> #GP).
+ *
+ * We don't implement fd flags.  Return 0 for the query/set-flags
+ * requests musl actually issues, so opendir succeeds.  Everything
+ * else returns -EINVAL.
+ *
+ * F_DUPFD is implemented; F_DUPFD_CLOEXEC aliases it, with the
+ * close-on-exec bit silently dropped (donix does not track it).
+ */
+#define F_DUPFD  0
+#define F_GETFD  1
+#define F_SETFD  2
+#define F_GETFL  3
+#define F_SETFL  4
+#define F_DUPFD_CLOEXEC 1030
+
+long sys_fcntl(int fd, int cmd, unsigned long arg) {
+    file_slot_t* slot = get_file_slot(fd, 0);
+    if (!slot) return -(long)EBADF_;
+
+    switch (cmd) {
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC: {
+            /*
+             * Linux fcntl(F_DUPFD, min): return the lowest free fd
+             * >= min, aliased to the same open file description.
+             *
+             * donix reserves fds 0, 1, 2 for stdin/stdout/stderr, and
+             * get_file_slot() refuses them (fd < 3 returns NULL).  So
+             * an F_DUPFD with min = 0, 1, or 2 must still land on an
+             * fd >= 3; otherwise the caller gets a "valid" return
+             * value it cannot subsequently read or write through.
+             * musl's dup(fd) wrapper is fcntl(fd, F_DUPFD, 0), so this
+             * clamp is on the hot path for busybox sh redirection.
+             *
+             * The new fd shares the file_slot_t with `fd` and takes a
+             * reference, exactly like sys_dup2.  The refcount
+             * machinery is what makes the shared slot safe.
+             *
+             * F_DUPFD_CLOEXEC additionally sets FD_CLOEXEC on the new
+             * fd.  donix does not track FD_CLOEXEC (all fds survive
+             * execve), so the flag is silently dropped — the same
+             * behavior as the F_SETFD case below.
+             */
+            int min = (int)arg;
+            if (min < 0 || min >= MAX_PROCESS_FILES) {
+                return -(long)EINVAL_;
+            }
+            pcb_t* self = process_get_current();
+            if (!self) return -(long)EBADF_;
+
+            int start = min;
+            if (start < 3) start = 3;
+
+            int newfd = -1;
+            for (int i = start; i < MAX_PROCESS_FILES; i++) {
+                if (self->file_table[i] == NULL) { newfd = i; break; }
+            }
+            if (newfd == -1) return -(long)EAGAIN_;
+
+            slot->refcount++;
+            self->file_table[newfd] = slot;
+            return (long)newfd;
+        }
+        case F_GETFD:  return 0;              /* no FD_CLOEXEC set */
+        case F_SETFD:  return 0;              /* ignore the flag   */
+        case F_GETFL:  return 0;              /* O_RDONLY          */
+        case F_SETFL:  return 0;              /* ignore            */
+        default:       return -(long)EINVAL_;
+    }
+}
+
 // ============================================================
 // FILE SYSCALLS
 // ============================================================
 long sys_open(const char* path, int flags) {
     pcb_t* self = process_get_current();
-    if (!self || !path) return -1;
+    if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local_path);
 
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
-    if (fd == -1) return -1;
+    if (fd == -1) return -(long)EIO_;
 
     BYTE mode = 0;
     switch (flags & 0x3) {
         case 0:  mode |= FA_READ;             break;
         case 1:  mode |= FA_WRITE;            break;
         case 2:  mode |= FA_READ | FA_WRITE;  break;
-        default: kfree(slot); self->file_table[fd] = NULL; return -1;
+        default: kfree(slot); self->file_table[fd] = NULL;
+                 return -(long)EINVAL_;
     }
 
     if (flags & 0x0400) {
@@ -311,11 +573,66 @@ long sys_open(const char* path, int flags) {
 
     if (flags & 0x0008) mode |= FA_OPEN_APPEND;
 
+    /*
+     * Linux open(2) is also used to open directories — musl's
+     * opendir() calls open(path, O_RDONLY|O_DIRECTORY) and then
+     * readdir(), which uses getdents64(2).
+     *
+     * FatFs's f_open is not usable for this in two cases:
+     *
+     *   1. The path is a root alias (".", "/", "0:", "0:/").
+     *      f_open returns FR_INVALID_NAME for "." and friends,
+     *      and for "0:/" it can return FR_OK with a FIL that is
+     *      not usable because the root is not a file.
+     *
+     *   2. The caller explicitly asked for a directory with
+     *      O_DIRECTORY, and the path is a real directory.  f_open
+     *      returns FR_INVALID_NAME or FR_NO_FILE, which the old
+     *      fallback then recovered from by calling f_opendir — but
+     *      it did so only after trying f_open first, and the "0:/"
+     *      case above bypassed the fallback entirely because
+     *      f_open returned FR_OK.
+     *
+     * The fix is to route every directory request to f_opendir up
+     * front, and to normalize root aliases to "0:/" (the only form
+     * f_opendir reliably accepts for the root).
+     *
+     * O_DIRECTORY is 0x10000 on Linux x86_64.
+     */
+    #define O_DIRECTORY 0x10000
+    int wants_dir = (flags & O_DIRECTORY) != 0;
+    int is_root   = path_is_root(local_path);
+
+    if (wants_dir || is_root) {
+        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
+        if (!dir_obj) {
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -(long)EIO_;
+        }
+        const char* dir_path = is_root ? "0:/" : local_path;
+        FRESULT dr = f_opendir(dir_obj, dir_path);
+        if (dr == FR_OK) {
+            slot->kind = FILE_KIND_DIR;
+            slot->obj  = dir_obj;
+            return fd;
+        }
+        kfree(dir_obj);
+        serial_print("sys_open: f_opendir FAIL path=");
+        serial_print(dir_path);
+        serial_print(" dr=");
+        serial_print_dec(dr);
+        serial_print("\n");
+        kfree(slot);
+        self->file_table[fd] = NULL;
+        return fatfs_errno(dr);
+    }
+
     FIL* file_obj = (FIL*)kmalloc(sizeof(FIL));
     if (!file_obj) {
         kfree(slot);
         self->file_table[fd] = NULL;
-        return -1;
+        return -(long)EIO_;
     }
 
     FRESULT r = f_open(file_obj, local_path, mode);
@@ -326,23 +643,14 @@ long sys_open(const char* path, int flags) {
     }
 
     /*
-     * f_open failed.  Linux open(2) is also used to open directories
-     * — musl's opendir() calls open(path, O_RDONLY|O_DIRECTORY) and
-     * then readdir(), which uses getdents64(2).  Without this branch,
-     * a failed f_open on a directory path returns -1 and musl's
-     * opendir always fails.
-     *
-     * The newlib ls.elf never hit this because it used the
-     * donix-private opendir syscall, which has since been removed.
-     *
-     * O_DIRECTORY is 0x10000 on Linux x86_64.  FR_INVALID_NAME (6)
-     * and FR_NO_FILE (4) are the FatFs codes f_open returns when
-     * asked to open a directory with file semantics.
+     * f_open failed and the caller did not ask for a directory.
+     * Last-resort fallback: the path might be a directory the
+     * caller opened without O_DIRECTORY.  Try f_opendir; if it
+     * works, hand back a directory slot.  FR_INVALID_NAME (6) and
+     * FR_NO_FILE (4) are what FatFs returns when f_open is asked
+     * to open a directory with file semantics.
      */
-    #define O_DIRECTORY 0x10000
-    int wants_dir = (flags & O_DIRECTORY) != 0;
-
-    if (wants_dir || r == FR_INVALID_NAME || r == FR_NO_FILE) {
+    if (r == FR_INVALID_NAME || r == FR_NO_FILE) {
         DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
         if (dir_obj) {
             FRESULT dr = f_opendir(dir_obj, local_path);
@@ -364,34 +672,76 @@ long sys_open(const char* path, int flags) {
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
-    return -1;
+    return fatfs_errno(r);
 }
 
 long sys_close(int fd) {
     file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -1;
-
-    if (slot->kind == FILE_KIND_FILE) {
-        f_close((FIL*)slot->obj);
-    } else if (slot->kind == FILE_KIND_DIR) {
-        f_closedir((DIR*)slot->obj);
-    } else {
-        return -1;
-    }
-    kfree(slot->obj);
+    if (!slot) return -(long)EBADF_;
 
     pcb_t* self = process_get_current();
     self->file_table[fd] = NULL;
-    kfree(slot);
+    put_file_slot(slot);
     return 0;
+}
+
+/*
+ * Linux x86_64 dup2(2) — syscall 33.
+ *
+ * Duplicate oldfd onto newfd.  If newfd is already open it is
+ * closed first; if oldfd == newfd the call is a no-op that returns
+ * newfd.  Returns newfd on success, -EBADF if oldfd is not open.
+ *
+ * The file_slot_t is SHARED, not copied: after dup2, both fds
+ * point at the same slot, and the slot's refcount is incremented.
+ * Closing either fd drops one reference; the slot's obj and the
+ * slot itself are freed only when the count reaches zero.  This
+ * is what put_file_slot does, and it is what makes
+ *
+ *     open(); dup2(fd, 7); exit();
+ *
+ * safe: exit() closes both fds, the first close drops refcount to
+ * 1, the second frees the slot once.
+ */
+long sys_dup2(int oldfd, int newfd) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EBADF_;
+
+    if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
+    if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
+
+    file_slot_t* old_slot = get_file_slot(oldfd, 0);
+    if (!old_slot) return -(long)EBADF_;
+
+    /* dup2(fd, fd) is a no-op returning fd, not an error. */
+    if (oldfd == newfd) return (long)newfd;
+
+    /*
+     * If newfd was already open, detach it and drop its reference.
+     * put_file_slot frees only when the refcount reaches zero, so
+     * if newfd was aliased to another live fd, the slot survives.
+     */
+    file_slot_t* new_slot = (file_slot_t*)self->file_table[newfd];
+    if (new_slot) {
+        self->file_table[newfd] = NULL;
+        put_file_slot(new_slot);
+    }
+
+    /* Share the slot and take a new reference. */
+    old_slot->refcount++;
+    self->file_table[newfd] = old_slot;
+    return (long)newfd;
 }
 
 long sys_unlink(const char* path) {
     pcb_t* self = process_get_current();
-    if (!self || !path) return -1;
+    if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) return -1;
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local_path);
 
     FRESULT r = f_unlink(local_path);
     if (r != FR_OK) {
@@ -399,7 +749,7 @@ long sys_unlink(const char* path) {
         serial_print(local_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
-        return -1;
+        return fatfs_errno(r);
     }
     return 0;
 }
@@ -439,10 +789,10 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
 }
 
 long sys_fstat(int fd, void* user_stat) {
-    if (!user_stat) return -1;
+    if (!user_stat) return -(long)EFAULT_;
 
     file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -1;
+    if (!slot) return -(long)EBADF_;
 
     kernel_stat_t st;
     FILINFO fno;
@@ -463,15 +813,66 @@ long sys_fstat(int fd, void* user_stat) {
         fno.fattrib = AM_DIR;
         fno.fsize   = 0;
     } else {
-        return -1;
+        return -(long)EBADF_;
     }
 
     fill_kstat_from_filinfo(&st, &fno);
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -1;
+        return -(long)EFAULT_;
     }
     return 0;
+}
+
+/*
+ * Shared f_stat-with-bare-name-retry helper.
+ *
+ * Both sys_stat and sys_access need the same thing: stat the path
+ * as given; if that fails with FR_INVALID_NAME / FR_NO_FILE /
+ * FR_NO_PATH and the path has no ':' (i.e. is not already in FatFs
+ * drive form), resolve the base name to "0:/NAME.ELF" and retry.
+ *
+ * FR_NO_PATH is included because busybox ash's PATH candidates are
+ * "sbin/ls", "usr/bin/ls", etc. -- paths with a directory component
+ * that does not exist on the flat FAT root.  FatFs returns
+ * FR_NO_PATH for those, and without this the retry never fires and
+ * `sh: ls: not found` is the result.  See the session-22 notes.
+ *
+ * On success, *out_fno holds the FILINFO and the function returns
+ * FR_OK.  On failure, returns the last FRESULT.
+ */
+static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
+    FRESULT r = f_stat(path, out_fno);
+
+    if (r == FR_INVALID_NAME || r == FR_NO_FILE || r == FR_NO_PATH) {
+        int has_drive = 0;
+        for (const char* p = path; *p; p++) {
+            if (*p == ':') { has_drive = 1; break; }
+        }
+
+        char resolved[USER_PATH_MAX];
+        if (!has_drive &&
+            exec_resolve_bare_name(path, resolved, sizeof(resolved)) == 0) {
+#if DEBUG_STAT_TRACE
+            serial_print("f_stat retry: '");
+            serial_print(path);
+            serial_print("' -> '");
+            serial_print(resolved);
+            serial_print("' = ");
+            serial_print_dec((uint64_t)r);
+#endif
+            FRESULT r2 = f_stat(resolved, out_fno);
+#if DEBUG_STAT_TRACE
+            serial_print("/");
+            serial_print_dec((uint64_t)r2);
+            serial_print("\n");
+#endif
+            if (r2 == FR_OK) {
+                r = FR_OK;
+            }
+        }
+    }
+    return r;
 }
 
 /*
@@ -482,33 +883,134 @@ long sys_fstat(int fd, void* user_stat) {
  * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
  *
  * The path is passed straight through to FatFs's f_stat, which
- * accepts the same "0:/NAME" form as f_open.  No normalization
- * needed; sys_open does the same and works.
+ * accepts the same "0:/NAME" form as f_open, after strip_dot_prefix
+ * has removed any leading "./" that musl's lstat()/stat() would
+ * otherwise hand us.
  *
- * Returns 0 on success, -1 on failure.  Like sys_fstat, proper
- * negative errno is deferred until a caller actually inspects it.
+ * Failure return is a proper negative errno (via fatfs_errno) so
+ * that callers like busybox ash's PATH search get a sensible
+ * message ("No such file or directory") instead of the default
+ * "Operation not permitted" that musl assigns to a bare -1.
  */
 long sys_stat(const char* user_path, void* user_stat) {
-    if (!user_path || !user_stat) return -1;
+    if (!user_path || !user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
-        return -1;
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(path);
+
+#if DEBUG_STAT_TRACE
+    serial_print("sys_stat: '");
+    serial_print(path);
+    serial_print("'\n");
+#endif
+
+    /* ".", "/", "0:", "0:/" — synthesize a root-directory stat.
+     * f_stat would return FR_INVALID_NAME for all of them. */
+    if (path_is_root(path)) {
+        kernel_stat_t st;
+        fill_kstat_as_root(&st);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
     }
 
     FILINFO fno;
-    FRESULT r = f_stat(path, &fno);
+    FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
-        return -1;
+        return fatfs_errno(r);
     }
 
     kernel_stat_t st;
     fill_kstat_from_filinfo(&st, &fno);
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -1;
+        return -(long)EFAULT_;
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 lstat(2) — syscall 6.
+ *
+ * FAT has no symlinks, so lstat and stat are identical.  musl's
+ * lstat() routes to fstatat(AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW)
+ * which, on x86_64, dispatches to __syscall(SYS_lstat, path, &kst).
+ * Without this, busybox falls back and prints the "Unknown syscall:
+ * 6" line we saw during musl_readdir.
+ */
+long sys_lstat(const char* user_path, void* user_stat) {
+    return sys_stat(user_path, user_stat);
+}
+
+/*
+ * Linux x86_64 access(2) — syscall 21.
+ *
+ * Returns 0 if the path exists and the requested permission bits
+ * are satisfiable, -errno otherwise.  donix does not track UNIX
+ * permissions (FAT has none), so we only check existence: F_OK
+ * (0), R_OK (4), W_OK (2), X_OK (1) all reduce to "does this
+ * path resolve to something on the FAT".
+ *
+ * The path is checked with the same f_stat-with-retry used by
+ * sys_stat, so "ls", "echo", and "/usr/local/sbin/ls" all resolve
+ * the same way they do for stat.
+ *
+ * Why this exists: busybox's find_execable() (libbb/find_execable.c)
+ * calls access(path, X_OK) for each PATH candidate before deciding
+ * whether to execve it.  On donix there is no sys_access, so the
+ * probe hit "Unknown syscall: 21", returned -ENOSYS, and ash
+ * concluded the command did not exist — before ever reaching
+ * sys_stat or sys_execve.  That is why `sh: ls: not found`
+ * appeared even though stat("ls") would now succeed.
+ */
+long sys_access(const char* user_path, int mode) {
+    (void)mode;   /* permissions are not tracked; existence is all */
+
+    if (!user_path) return -(long)EFAULT_;
+
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(path);
+
+#if DEBUG_STAT_TRACE
+    serial_print("sys_access: '");
+    serial_print(path);
+    serial_print("'\n");
+#endif
+
+    /* Root always "exists" as a directory. */
+    if (path_is_root(path)) {
+        return 0;
+    }
+
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 faccessat(2) — syscall 269.
+ *
+ * musl's faccessat() on x86_64 with AT_EACCESS unset does NOT go
+ * straight to syscall 269; it calls access() (21).  But busybox
+ * and glibc-built code may call faccessat directly, and glibc's
+ * faccessat wrapper is __NR_faccessat (269).  Implement it as a
+ * direct alias of sys_access; the dirfd / flags arguments are
+ * ignored, which is correct for the only case we can support
+ * (AT_FDCWD, no flags).
+ */
+long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
+    (void)dirfd; (void)flags;
+    return sys_access(user_path, mode);
 }
 
 // ============================================================
@@ -628,6 +1130,75 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
     return top;
 }
 
+/*
+ * Resolve an execve path to a FatFs-acceptable form.
+ *
+ * `ash` (busybox sh) calls execve with bare names — "ls", "echo" —
+ * or with a PATH-style absolute path like "/usr/bin/ls".  Neither
+ * is a valid FatFs path.  musl_sh, by contrast, already prepends
+ * "0:/" and appends ".ELF" before calling execve, and those paths
+ * go straight through.
+ *
+ * The rule is:
+ *   - If `in` already contains a ':' (drive prefix) or the caller
+ *     asked for a path that clearly has a FatFs form, leave it
+ *     alone.  f_open will handle it or not.
+ *   - If `in` is a bare name (no '/', no ':'), build "0:/NAME.ELF"
+ *     with NAME uppercased to match the FAT layout.
+ *   - If `in` starts with '/', take the last path component (after
+ *     the final '/'), and build "0:/NAME.ELF" the same way.
+ *
+ * Returns 0 on success, -1 if the resolved path would overflow
+ * `out_cap`.
+ */
+static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
+    /* Pick the base name: the substring after the last '/', or the
+     * whole string if there is no '/'. */
+    const char* base = in;
+    for (const char* p = in; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+
+    if (*base == '\0') return -1;   /* path was just "/" or "" */
+
+    /* If the base already ends in ".ELF" (case-insensitive), don't
+     * append it again. */
+    size_t blen = 0;
+    while (base[blen]) blen++;
+    int have_suffix = 0;
+    if (blen >= 4) {
+        char c0 = base[blen - 4];
+        char c1 = base[blen - 3];
+        char c2 = base[blen - 2];
+        char c3 = base[blen - 1];
+        if ((c0 == '.' && (c1 == 'E' || c1 == 'e') &&
+             (c2 == 'L' || c2 == 'l') && (c3 == 'F' || c3 == 'f'))) {
+            have_suffix = 1;
+        }
+    }
+
+    size_t need = 3 /* "0:/" */ + blen + (have_suffix ? 0 : 4) + 1;
+    if (need > out_cap) return -1;
+
+    out[0] = '0';
+    out[1] = ':';
+    out[2] = '/';
+    size_t o = 3;
+    for (size_t i = 0; i < blen; i++) {
+        char c = base[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[o++] = c;
+    }
+    if (!have_suffix) {
+        out[o++] = '.';
+        out[o++] = 'E';
+        out[o++] = 'L';
+        out[o++] = 'F';
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 // ============================================================
 // SYS_EXECVE (59) — Linux execve, in-place
 //
@@ -669,7 +1240,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EFAULT_;
     }
 
     /* ---- 1. Copy the path string. ---- */
@@ -677,12 +1248,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         serial_print("sys_execve: bad path pointer\n");
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EFAULT_;
     }
 
-    /* ---- 2. Open and read the whole ELF file. ---- */
+    /* ---- 2. Open and read the whole ELF file. ----
+     *
+     * First try the path exactly as the caller supplied it.  If
+     * f_open fails, and the path is a bare name or a leading-/
+     * path (i.e. has no ':' anywhere), try the resolved form
+     * "0:/NAME.ELF" with NAME uppercased to match the FAT layout.
+     *
+     * This is the retry that makes busybox ash's execve("ls",...)
+     * work: musl_sh already normalizes before calling execve, but
+     * ash does not, and there is no PATH and no shell rc file that
+     * could do it for us.
+     */
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) {
+        int has_drive = 0;
+        for (const char* p = path; *p; p++) {
+            if (*p == ':') { has_drive = 1; break; }
+        }
+
+        char resolved[USER_PATH_MAX];
+        int can_retry = !has_drive &&
+                        exec_resolve_bare_name(path, resolved,
+                                               sizeof(resolved)) == 0;
+
+        if (can_retry) {
+            FRESULT fr2 = f_open(&file, resolved, FA_READ | FA_OPEN_EXISTING);
+            if (fr2 == FR_OK) {
+                /* Retry succeeded.  Fall through with `file` open. */
+                fr = FR_OK;
+            }
+        }
+    }
+
     if (fr != FR_OK) {
         serial_print("sys_execve: f_open(");
         serial_print(path);
@@ -690,7 +1292,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print_dec(fr);
         serial_print("\n");
         __asm__ volatile("sti");
-        return -1;
+        return fatfs_errno(fr);
     }
 
     Elf64_Ehdr ehdr;
@@ -700,7 +1302,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: short read of ELF header\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
 
     if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
@@ -708,18 +1310,18 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: not an ELF file\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOEXEC;
     }
-    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n");     f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n");  f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n");        f_close(&file); __asm__ volatile("sti"); return -1; }
-    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n");         f_close(&file); __asm__ volatile("sti"); return -1; }
+    if (ehdr.e_ident[4] != 2) { serial_print("sys_execve: not ELFCLASS64\n");     f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_ident[5] != 1) { serial_print("sys_execve: not little-endian\n");  f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_type != 2)     { serial_print("sys_execve: not ET_EXEC\n");        f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
+    if (ehdr.e_machine != 62) { serial_print("sys_execve: not x86-64\n");         f_close(&file); __asm__ volatile("sti"); return -(long)ENOEXEC; }
     if (ehdr.e_phentsize != sizeof(Elf64_Phdr) ||
         ehdr.e_phnum == 0 || ehdr.e_phnum > EXEC_MAX_PHDRS) {
         serial_print("sys_execve: bad program header table\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOEXEC;
     }
 
     FSIZE_t file_size = f_size(&file);
@@ -727,7 +1329,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: file size out of range\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
     uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
     if (!elf_buf) {
@@ -736,14 +1338,14 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print(" bytes\n");
         f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)ENOMEM_;
     }
     fr = f_lseek(&file, 0);
     if (fr != FR_OK) {
         serial_print("sys_execve: rewind failed\n");
         kfree(elf_buf); f_close(&file);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
     UINT total = 0;
     while (total < file_size) {
@@ -757,7 +1359,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             serial_print("\n");
             kfree(elf_buf); f_close(&file);
             __asm__ volatile("sti");
-            return -1;
+            return -(long)EIO_;
         }
         if (br == 0) break;
         total += br;
@@ -767,7 +1369,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         serial_print("sys_execve: short read of file body\n");
         kfree(elf_buf);
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EIO_;
     }
 
     /* ---- 3. Snapshot argv from the OLD address space. ---- */
@@ -785,7 +1387,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("] pointer\n");
                 kfree(elf_buf);
                 __asm__ volatile("sti");
-                return -1;
+                return -(long)EFAULT_;
             }
             if (user_str_va == 0) break;
 
@@ -796,7 +1398,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("] string\n");
                 kfree(elf_buf);
                 __asm__ volatile("sti");
-                return -1;
+                return -(long)EFAULT_;
             }
         }
     }
@@ -1048,7 +1650,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 // ============================================================
 long sys_wait4(long pid, int* user_status, int options) {
     pcb_t* self = process_get_current();
-    if (!self) return -1;
+    if (!self) return -(long)ECHILD;
 
     uint64_t target = (pid <= 0) ? (uint64_t)-1 : (uint64_t)pid;
 
@@ -1077,14 +1679,14 @@ long sys_wait4(long pid, int* user_status, int options) {
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
-                    return -1;
+                    return -(long)EFAULT_;
                 }
             }
             return reaped;
         }
 
         if (!live) {
-            return -1;
+            return -(long)ECHILD;
         }
 
         if (options & WNOHANG) {
@@ -1134,7 +1736,7 @@ long sys_wait4(long pid, int* user_status, int options) {
 long sys_write(int fd, const void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
-    if (!self) return -1;
+    if (!self) return -(long)EBADF_;
 
     if (fd == 1 || fd == 2) {
         size_t remaining = count;
@@ -1142,7 +1744,7 @@ long sys_write(int fd, const void* buf, size_t count) {
         while (remaining > 0) {
             size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
             if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
-                return -1;
+                return -(long)EFAULT_;
             }
             for (size_t i = 0; i < chunk; i++) {
                 char c = g_write_bounce[i];
@@ -1157,19 +1759,19 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (slot) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
-        if (!bounce) return -1;
+        if (!bounce) return -(long)ENOMEM_;
 
         size_t total_written = 0;
         while (total_written < count) {
             size_t chunk = (count - total_written) > 512 ? 512 : (count - total_written);
             if (safe_copy_from_user(bounce, (const uint8_t*)buf + total_written, chunk) != 0) {
                 kfree(bounce);
-                return (total_written > 0) ? (long)total_written : -1;
+                return (total_written > 0) ? (long)total_written : -(long)EFAULT_;
             }
             UINT written;
             if (f_write(file_obj, bounce, chunk, &written) != FR_OK) {
                 kfree(bounce);
-                return (total_written > 0) ? (long)total_written : -1;
+                return (total_written > 0) ? (long)total_written : -(long)EIO_;
             }
             total_written += written;
             if (written < chunk) break;
@@ -1178,7 +1780,7 @@ long sys_write(int fd, const void* buf, size_t count) {
         return (long)total_written;
     }
 
-    return -1;
+    return -(long)EBADF_;
 }
 
 struct iovec {
@@ -1208,13 +1810,13 @@ struct iovec {
 #define DEBUG_WRITEV 0
 
 long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
-    if (!user_iov || iovcnt <= 0) return 0;
-    if (iovcnt > WRITEV_MAX_IOVS) return -22;  /* -EINVAL */
+    if (!user_iov || iovcnt <= 0) return -(long)EINVAL_;
+    if (iovcnt > WRITEV_MAX_IOVS) return -(long)EINVAL_;
 
     struct iovec local[WRITEV_MAX_IOVS];
     size_t bytes = (size_t)iovcnt * sizeof(struct iovec);
     if (safe_copy_from_user(local, user_iov, bytes) != 0) {
-        return -14;  /* -EFAULT */
+        return -(long)EFAULT_;
     }
 
 #if DEBUG_WRITEV
@@ -1247,7 +1849,7 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
-    if (!self) return 0;
+    if (!self) return -(long)EBADF_;
 
     if (fd == 0) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
@@ -1256,7 +1858,7 @@ long sys_read(int fd, void* buf, size_t count) {
             if (kbd_buffer_get(&c)) {
                 __asm__ volatile("sti");
                 if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
-                else return -1;
+                else return -(long)EFAULT_;
                 /*
                  * Return as soon as at least one byte has been copied.
                  *
@@ -1270,6 +1872,14 @@ long sys_read(int fd, void* buf, size_t count) {
                  * shell never noticed because it reads 1 byte at a
                  * time (count == 1), so the loop exited on the
                  * first byte anyway.
+                 *
+                 * The byte is NOT echoed here.  Users of this path
+                 * that want their input echoed (musl_sh, the kernel
+                 * shell) do the echoing themselves.  busybox ash
+                 * with FEATURE_EDITING=y also echoes itself via
+                 * lineedit.c.  Echoing here as well would
+                 * double-echo every keystroke for whichever of
+                 * those programs was currently reading.
                  */
                 break;
             }
@@ -1285,18 +1895,18 @@ long sys_read(int fd, void* buf, size_t count) {
     if (slot) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
-        if (!bounce) return -1;
+        if (!bounce) return -(long)ENOMEM_;
 
         size_t total_read = 0;
         while (total_read < count) {
             size_t chunk = (count - total_read) > 512 ? 512 : (count - total_read);
             UINT read_bytes;
             if (f_read(file_obj, bounce, chunk, &read_bytes) != FR_OK) {
-                kfree(bounce); return -1;
+                kfree(bounce); return -(long)EIO_;
             }
             if (read_bytes == 0) break;
             if (safe_copy_to_user((uint8_t*)buf + total_read, bounce, read_bytes) != 0) {
-                kfree(bounce); return -1;
+                kfree(bounce); return -(long)EFAULT_;
             }
             total_read += read_bytes;
             if (read_bytes < chunk) break;
@@ -1305,7 +1915,7 @@ long sys_read(int fd, void* buf, size_t count) {
         return (long)total_read;
     }
 
-    return 0;
+    return -(long)EBADF_;
 }
 
 /*
@@ -1388,6 +1998,72 @@ long sys_getpid(void) {
 }
 
 /*
+ * Linux x86_64 getppid(2) — syscall 110.
+ *
+ * Returns the calling process's parent pid.  pid 0 in pcb_t means
+ * "no parent" (idle, kernel shell, user shell); Linux returns 1
+ * for the ultimate ancestor, so map 0 to 1 here.  busybox ash
+ * calls this to populate $PPID; the exact value does not matter
+ * for correctness, but it must be a plausible pid.
+ */
+long sys_getppid(void) {
+    pcb_t* current = process_get_current();
+    if (!current) return 1;
+    if (current->parent_pid == 0) return 1;
+    return (long)current->parent_pid;
+}
+
+/*
+ * Linux x86_64 setsid(2) — syscall 107.
+ *
+ * Creates a new session.  donix has no notion of sessions or
+ * process groups; the pragmatic implementation is a no-op that
+ * returns the calling process's pid (the new session id in
+ * Linux's model).  busybox ash calls this at startup to detach
+ * from the controlling terminal and does not depend on any
+ * session semantics beyond a successful return.
+ *
+ * Linux would return -EPERM if the caller is already a process
+ * group leader; that case does not arise here.
+ */
+long sys_setsid(void) {
+    pcb_t* current = process_get_current();
+    if (!current) return -(long)EPERM_;
+    return (long)current->pid;
+}
+
+/*
+ * Linux x86_64 getcwd(2) — syscall 79.
+ *
+ * Return the current working directory as an absolute path.  donix
+ * has a single flat FAT root and no notion of a per-process cwd
+ * that changes, so the answer is always "/".
+ *
+ * Linux ABI: getcwd(buf, size) copies the NUL-terminated path into
+ * buf and returns buf (a pointer, which for our int64 return
+ * convention is the buf address).  If the path does not fit in
+ * size bytes, return -ERANGE.  If buf is NULL, Linux returns a
+ * freshly malloc'd buffer for the GNU extension; donix does not
+ * support that, so -EINVAL.
+ *
+ * busybox ash calls getcwd at startup and uses the result as $PWD.
+ * The path is not dereferenced afterwards on our single-directory
+ * filesystem, so "/" is safe and correct.
+ *
+ * 34 is ERANGE on Linux x86_64.  22 is EINVAL.
+ */
+long sys_getcwd(char* buf, unsigned long size) {
+    if (!buf) return -(long)EINVAL_;
+    if (size < 2) return -(long)ERANGE_;
+
+    const char path[] = "/";
+    if (safe_copy_to_user(buf, path, sizeof(path)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return (long)(uint64_t)buf;
+}
+
+/*
  * Linux x86_64 set_tid_address(2).
  *
  * musl's __libc_start_main calls this during init and uses the
@@ -1410,24 +2086,228 @@ long sys_set_tid_address(int* tidptr) {
 }
 
 /*
- * Linux x86_64 ioctl(2) — minimal stub.
+ * Linux x86_64 ioctl(2) — syscall 16.
  *
- * musl's __stdout_write calls ioctl(1, TCGETS, &tio) to decide
- * whether stdout is a terminal.  If the ioctl fails, musl treats
- * stdout as a regular file and uses fully-buffered stdio, flushing
- * on exit.  That is exactly the behavior we want for donix's serial
- * console, which is not a POSIX tty.
+ * Previously returned -ENOTTY for every request.  That is fine for
+ * musl's __stdout_write probe (stdout is not a tty; buffered stdio
+ * is what donix wants), but it is fatal for busybox ash: ash treats
+ * a failing ioctl(0, TCGETS, ...) as "stdin is not a tty" and, in
+ * that mode, neither prints a prompt nor echoes typed input.  The
+ * shell still runs commands — it is usable blind — but it is not
+ * interactive.
  *
- * Return -ENOTTY (errno 25) for all requests.  The Linux syscall ABI
- * expects negative errno in the return register.
+ * This implementation returns a plausible struct termios for
+ * TCGETS on fd 0 (stdin), 1 (stdout), and 2 (stderr), and accepts
+ * TCSETS / TCSETSW / TCSETSF as no-ops.  It also answers
+ * TIOCGWINSZ with a 24x80 window, because busybox ash probes the
+ * window size -- not TCGETS -- to decide whether stdin is an
+ * interactive terminal.  Everything else still returns -ENOTTY.
  *
- * If a later test genuinely needs a working TCGETS (e.g. busybox's
- * `tput` or `stty`), implement a proper termios response then.
+ * Echo of typed input is NOT done by the kernel.  busybox ash,
+ * built with FEATURE_EDITING=y, does its own echo and line
+ * editing via lineedit.c; musl_sh and the kernel shell echo typed
+ * input themselves.  The kernel hands the raw bytes to the reader
+ * and lets the reader decide what to display.
+ *
+ * The struct termios layout is musl's, from bits/termios.h on
+ * x86_64.  49 bytes, no trailing padding:
+ *
+ *     offset  size  field
+ *       0      4    c_iflag   (tcflag_t = unsigned int)
+ *       4      4    c_oflag
+ *       8      4    c_cflag
+ *      12      4    c_lflag
+ *      16      1    c_line
+ *      17     32    c_cc[32]
+ *      49          total
+ *
+ * The flags we report (ICANON | ECHO | ISIG | IEXTEN, etc.) are
+ * the standard cooked-mode set; ash only reads the flags, not the
+ * control characters, but c_cc[VEOF]/[VERASE]/[VINTR] are filled
+ * in anyway so a future caller that does read them gets sane
+ * values.
+ *
+ * Linux x86_64 ioctl request codes:
+ *     TCGETS     = 0x5401
+ *     TCSETS     = 0x5402
+ *     TCSETSW    = 0x5403
+ *     TCSETSF    = 0x5404
+ *     TIOCGWINSZ = 0x5413
+ *     TIOCSWINSZ = 0x5414
  */
+
 #define ENOTTY 25
+
+/* ioctl request codes (Linux x86_64). */
+#define TCGETS_  0x5401
+#define TCSETS_  0x5402
+#define TCSETSW_ 0x5403
+#define TCSETSF_ 0x5404
+#define TIOCGWINSZ_ 0x5413
+#define TIOCSWINSZ_ 0x5414
+
+/* termios flag bits (musl bits/termios.h, x86_64). */
+#define T_ICRNL  0x0100   /* c_iflag: map CR to NL on input       */
+#define T_OPOST  0x0001   /* c_oflag: enable output processing    */
+#define T_ONLCR  0x0004   /* c_oflag: map NL to CR-NL on output   */
+#define T_CS8    0x0030   /* c_cflag: 8 bits per byte             */
+#define T_CREAD  0x0080   /* c_cflag: enable receiver             */
+#define T_CLOCAL 0x0800   /* c_cflag: ignore modem control lines  */
+#define T_B38400 0x000F   /* c_cflag: baud rate B38400            */
+#define T_ISIG   0x0001   /* c_lflag: enable signals (INTR, etc.) */
+#define T_ICANON 0x0002   /* c_lflag: canonical (line) mode       */
+#define T_ECHO   0x0008   /* c_lflag: echo input characters       */
+#define T_ECHOE  0x0010   /* c_lflag: echo erase as BS-SP-BS      */
+#define T_ECHOK  0x0020   /* c_lflag: echo NL after kill char     */
+#define T_IEXTEN 0x8000   /* c_lflag: enable implementation-defined input */
+
+/* Control-character indices (musl bits/termios.h). */
+#define T_VEOF   0
+#define T_VINTR  3
+#define T_VERASE 0x7F
+
+/*
+ * A plausible cooked-mode termios.  Field-by-field initialization is
+ * used instead of a struct literal so the layout is explicit at the
+ * point of definition; the wire format is what matters, not the C
+ * type, since we memcpy the bytes into user space.
+ *
+ * Total size is 49 bytes (4+4+4+4+1+32), matching musl's struct on
+ * x86_64.  No compiler padding is inserted because every field
+ * except c_line and c_cc is naturally aligned, and c_cc is a byte
+ * array.
+ */
+typedef struct {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+} kernel_termios_t;
+
+static void fill_kernel_termios(kernel_termios_t* tio) {
+    for (size_t i = 0; i < sizeof(*tio); i++) ((uint8_t*)tio)[i] = 0;
+
+    tio->c_iflag = T_ICRNL;
+    tio->c_oflag = T_OPOST | T_ONLCR;
+    tio->c_cflag = T_B38400 | T_CS8 | T_CREAD | T_CLOCAL;
+    tio->c_lflag = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN;
+    tio->c_line  = 0;
+
+    tio->c_cc[T_VEOF]   = 0x04;   /* ^D */
+    tio->c_cc[T_VINTR]  = 0x03;   /* ^C */
+    tio->c_cc[T_VERASE] = 0x7F;   /* DEL */
+}
+
+/*
+ * A plausible window size.  busybox ash probes this (not TCGETS)
+ * to decide whether stdin is an interactive terminal: it calls
+ * ioctl(0, TIOCGWINSZ, &ws) and, if that succeeds with non-zero
+ * rows and columns, prints a prompt and echoes typed input.  If
+ * it fails, ash runs in non-interactive mode -- it still reads
+ * and executes commands, but silently, with no prompt and no
+ * echo.
+ *
+ * The struct is Linux x86_64 struct winsize: four unsigned
+ * shorts, 8 bytes total, no padding.  24x80 is the classic
+ * VT100 default; the pixel fields are zero, which is what Linux
+ * returns for a text console and what ash expects.
+ */
+typedef struct {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+} kernel_winsize_t;
+
+static void fill_kernel_winsize(kernel_winsize_t* ws) {
+    ws->ws_row    = 24;
+    ws->ws_col    = 80;
+    ws->ws_xpixel = 0;
+    ws->ws_ypixel = 0;
+}
+
 long sys_ioctl(int fd, unsigned long request, void* argp) {
-    (void)fd; (void)request; (void)argp;
-    return -(long)ENOTTY;
+    switch (request) {
+        case TCGETS_: {
+            /*
+             * Only fds 0/1/2 are terminals; anything else is a file
+             * or directory and gets -ENOTTY, which is the truth.
+             * argp must be a valid user pointer of at least
+             * sizeof(kernel_termios_t) bytes.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            kernel_termios_t tio;
+            fill_kernel_termios(&tio);
+            if (safe_copy_to_user(argp, &tio, sizeof(tio)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TIOCGWINSZ_: {
+            /*
+             * fd 0 is what ash probes, but answering on 0/1/2 is
+             * harmless and matches the TCGETS handling above.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            kernel_winsize_t ws;
+            fill_kernel_winsize(&ws);
+            if (safe_copy_to_user(argp, &ws, sizeof(ws)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TCSETS_:
+        case TCSETSW_:
+        case TCSETSF_:
+        case TIOCSWINSZ_:
+            /*
+             * Accept and ignore.  donix's console has no settable
+             * line discipline or window size; pretending the write
+             * succeeded is what ash expects and costs nothing.
+             */
+            if (fd != 0 && fd != 1 && fd != 2) {
+                return -(long)ENOTTY;
+            }
+            return 0;
+        default:
+            return -(long)ENOTTY;
+    }
+}
+
+#define MMAP_BASE 0x8010000000ULL
+#define MMAP_END  0x8010400000ULL   /* 4 MB window, per exec_free_and_unmap_user_pages */
+
+/* Find `rounded` bytes of free VA space in the mmap window.
+ * Returns 0 on failure. */
+static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
+    if (rounded == 0 || rounded > (MMAP_END - MMAP_BASE)) return 0;
+
+    for (uint64_t candidate = MMAP_BASE;
+         candidate + rounded <= MMAP_END;
+         candidate += 0x1000) {
+
+        int all_free = 1;
+        for (uint64_t off = 0; off < rounded; off += 0x1000) {
+            if (vmm_get_phys_from_cr3(self->cr3, candidate + off) != 0) {
+                all_free = 0;
+                break;
+            }
+        }
+        if (all_free) return candidate;
+    }
+    return 0;
 }
 
 /*
@@ -1444,7 +2324,6 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
  * MMAP_BASE is 0x8010000000.
  */
 #define ENOMEM 12
-#define MMAP_BASE 0x8010000000ULL
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED     0x10
 
@@ -1453,27 +2332,29 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
     (void)prot;
     (void)offset;
 
-    if (length == 0) return -(long)22;  /* -EINVAL */
+    if (length == 0) return -(long)EINVAL_;
 
     if ((flags & MAP_ANONYMOUS) == 0 || fd != -1) {
-        return -(long)ENOMEM;
+        return -(long)ENOMEM_;
     }
 
     pcb_t* self = process_get_current();
-    if (!self) return -(long)ENOMEM;
+    if (!self) return -(long)ENOMEM_;
+
+    uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
 
     uint64_t base;
     if (flags & MAP_FIXED) {
         base = (uint64_t)addr & ~0xFFFULL;
     } else {
-        base = MMAP_BASE;
+        base = mmap_find_free_slot(self, rounded);
+        if (base == 0) return -(long)ENOMEM_;
     }
-    uint64_t rounded = ((uint64_t)length + 0xFFF) & ~0xFFFULL;
 
     for (uint64_t v = base; v < base + rounded; v += 0x1000) {
         uint64_t phys = pmm_alloc_page_for_elf();
         if (!phys) {
-            return -(long)ENOMEM;
+            return -(long)ENOMEM_;
         }
 
         void* hhdm = (void*)(HHDM_START + phys);
@@ -1551,15 +2432,15 @@ long sys_set_robust_list(void* head, size_t len) {
  * needs real randomness later, implement getrandom against the PIT
  * or RDRAND.
  */
-#define ENOSYS 38
+#define ENOSYS_ 38
 long sys_getrandom(void* buf, size_t buflen, unsigned int flags) {
     (void)buf; (void)buflen; (void)flags;
-    return -(long)ENOSYS;
+    return -(long)ENOSYS_;
 }
 
 long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
     (void)rseq; (void)rseq_len; (void)flags; (void)sig;
-    return -(long)ENOSYS;
+    return -(long)ENOSYS_;
 }
 
 /*
@@ -1599,15 +2480,15 @@ long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
 #define GETDENTS64_MAXREC (GETDENTS64_HDR + 256)
 
 long sys_getdents64(int fd, void* dirp, size_t count) {
-    if (!dirp) return -(long)14;      /* -EFAULT */
-    if (count == 0) return -(long)22; /* -EINVAL */
+    if (!dirp) return -(long)EFAULT_;
+    if (count == 0) return -(long)EINVAL_;
 
     file_slot_t* slot = get_file_slot(fd, FILE_KIND_DIR);
-    if (!slot) return -(long)9;       /* -EBADF */
+    if (!slot) return -(long)EBADF_;
 
     FILINFO fno;
     FRESULT r = f_readdir((DIR*)slot->obj, &fno);
-    if (r != FR_OK) return -(long)5;    /* -EIO */
+    if (r != FR_OK) return -(long)EIO_;
     if (fno.fname[0] == '\0') return 0; /* end of directory */
 
     size_t nlen = 0;
@@ -1622,7 +2503,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
          * musl always passes a buffer large enough, so this is
          * unreachable in practice.
          */
-        return -(long)22; /* -EINVAL */
+        return -(long)EINVAL_;
     }
 
     uint8_t entbuf[GETDENTS64_MAXREC];
@@ -1636,7 +2517,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
     for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
 
     if (safe_copy_to_user(dirp, entbuf, reclen) != 0) {
-        return -(long)14;  /* -EFAULT */
+        return -(long)EFAULT_;
     }
     return (long)reclen;
 }
@@ -1644,29 +2525,29 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 /*
  * Linux x86_64 fork(2) — syscall 57.
  *
- * First cut.  Creates a child that resumes at the parent's user RIP
- * with %rax = 0.  The child inherits a clone of the parent's page
- * table (vmm_clone_page_table), but the leaf physical pages are
- * shared at first; we then eagerly copy the user stack so the
- * parent's later stack writes do not clobber the child's view.
+ * Creates a child that resumes at the parent's user RIP with %rax = 0.
+ * The child inherits a clone of the parent's page table
+ * (vmm_clone_page_table), but the leaf physical pages are shared at
+ * first; we then eagerly copy every writable region the process owns
+ * so the parent's later writes do not clobber the child's view (and
+ * vice versa).
  *
- * Known limitations:
+ * The regions copied, in VA order:
+ *   - ELF image:   [0x400000,      0x600000)      2 MB
+ *   - user stack:  [0x8000000000,  0x8000100000)  64 KB
+ *   - brk heap:    [0x8000200000,  0x8000300000)  1 MB
+ *   - mmap region: [0x8010000000,  0x8010400000)  4 MB
  *
- *   1. ELF segment pages (.text, .data, .bss) are still shared with
- *      the parent after fork.  Writes to .data or .bss in either
- *      process are visible to the other.  This is not a problem for
- *      the immediate use case (fork + execve, where the child
- *      replaces its address space before writing anything), but it
- *      is not correct fork semantics.  Real copy-on-write comes
- *      later.
+ * The ELF image copy is what makes busybox ash's pre-execve window
+ * safe: without it, the child's writes to busybox's globals in .data
+ * landed in the page the parent was still using, corrupting the
+ * parent's FILE/job list and causing a #PF at CR2=0x20 in stdio
+ * teardown.  See session-23 notes.
  *
- *   2. Only the callee-saved registers are preserved in the child.
- *      See process_fork_copy_frame's declaration for the details.
- *
- *   3. The child does not inherit the parent's brk.  It gets the
- *      parent's brk_virt, but the child's ELF pages aren't duplicated
- *      so writes to the brk region in either process alias.  Again,
- *      not a problem for fork + execve.
+ * This is not real copy-on-write: every page in every region is
+ * copied unconditionally, including read-only pages like .text and
+ * .rodata.  A production fix would mark shared PTEs read-only and
+ * only copy on write.  Until then, each fork copies ~6 MB.
  *
  * Runs with interrupts disabled across the whole operation.  A timer
  * tick mid-clone could schedule another process whose allocations
@@ -1678,7 +2559,7 @@ long sys_fork(void) {
     pcb_t* parent = process_get_current();
     if (!parent) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EAGAIN_;
     }
 
     /*
@@ -1690,43 +2571,67 @@ long sys_fork(void) {
     pcb_t* child = process_create(parent->name, parent->entry_point, 0);
     if (!child) {
         __asm__ volatile("sti");
-        return -1;
+        return -(long)EAGAIN_;
     }
     scheduler_ready_queue_remove(child);
 
     /*
-     * Eager user-stack copy.
+     * Eager copy helper.  Walks [start, end), and for each present
+     * page, allocates a fresh physical page, copies the contents,
+     * remaps the child's PTE, and tracks the new page in the child's
+     * elf_page_list.
      *
-     * vmm_clone_page_table shares leaf physical pages, so the child's
-     * user-stack PTEs currently point at the parent's stack pages.
-     * Walk the range, allocate fresh pages, copy the contents, and
-     * remap the child's PTEs.
+     * Factored out so the four region copies below (ELF, stack, brk,
+     * mmap) share one implementation.  On allocation failure it
+     * destroys the child and returns -1; the caller propagates the
+     * error.
      */
+    #define EAGER_COPY_REGION(start_, end_)                              \
+        do {                                                             \
+            for (uint64_t _virt = (start_); _virt < (end_); _virt += 4096) { \
+                uint64_t _parent_phys =                                  \
+                    vmm_get_phys_from_cr3(parent->cr3, _virt);           \
+                if (!_parent_phys) continue;                             \
+                                                                         \
+                uint64_t _new_phys = pmm_alloc_page_for_elf();           \
+                if (!_new_phys) {                                        \
+                    serial_print("sys_fork: out of memory for page\n");  \
+                    process_destroy(child);                              \
+                    __asm__ volatile("sti");                             \
+                    return -(long)ENOMEM_;                               \
+                }                                                        \
+                                                                         \
+                const uint8_t* _src =                                    \
+                    (const uint8_t*)(HHDM_START + _parent_phys);         \
+                uint8_t* _dst =                                          \
+                    (uint8_t*)(HHDM_START + _new_phys);                  \
+                for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i]; \
+                                                                         \
+                uint64_t _map_flags = PT_PRESENT | PT_WRITE | PT_USER;   \
+                vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,        \
+                                    _map_flags);                         \
+                elf_add_page_to_pcb(child, _new_phys);                   \
+            }                                                            \
+        } while (0)
+
+    /* ELF image: .text, .rodata, .data, .bss. */
+    EAGER_COPY_REGION(0x0000000000400000ULL, 0x0000000000600000ULL);
+
+    /* User stack. */
     if (parent->user_stack_virt && parent->user_stack_top) {
-        for (uint64_t virt = parent->user_stack_virt;
-             virt < parent->user_stack_top;
-             virt += 4096) {
-
-            uint64_t parent_phys = vmm_get_phys_from_cr3(parent->cr3, virt);
-            if (!parent_phys) continue;
-
-            uint64_t new_phys = pmm_alloc_page_for_elf();
-            if (!new_phys) {
-                serial_print("sys_fork: out of memory for stack page\n");
-                process_destroy(child);
-                __asm__ volatile("sti");
-                return -1;
-            }
-
-            const uint8_t* src = (const uint8_t*)(HHDM_START + parent_phys);
-            uint8_t* dst = (uint8_t*)(HHDM_START + new_phys);
-            for (uint64_t i = 0; i < 4096; i++) dst[i] = src[i];
-
-            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
-            vmm_map_page_in_cr3(child->cr3, virt, new_phys, map_flags);
-            elf_add_page_to_pcb(child, new_phys);
-        }
+        EAGER_COPY_REGION(parent->user_stack_virt, parent->user_stack_top);
     }
+
+    /* brk heap: only the pages the parent actually touched. */
+    if (parent->brk_virt != 0) {
+        EAGER_COPY_REGION(0x0000008000200000ULL, 0x0000008000300000ULL);
+    }
+
+    /* mmap window: same, only the pages that are present. */
+    EAGER_COPY_REGION(0x0000008010000000ULL, 0x0000008010400000ULL);
+
+    #undef EAGER_COPY_REGION
+
     /*
      * Child inherits the parent's FS base.
      *
@@ -1739,6 +2644,7 @@ long sys_fork(void) {
      * See the fs_base comment in process.h.
      */
     child->fs_base = parent->fs_base;
+
     /*
      * Build the child's iretq-resume frame from the parent's current
      * syscall-entry frame.  This sets the child's %rax to 0, which is
@@ -1748,9 +2654,9 @@ long sys_fork(void) {
 
     /*
      * Child inherits the parent's heap break so its brk region starts
-     * where the parent's was.  The pages themselves are not copied
-     * (see the limitation note above), but brk_virt must match so the
-     * child's subsequent brk calls land in a plausible range.
+     * where the parent's was.  The pages themselves are now copied
+     * (see the eager-copy block above), so writes to the brk region
+     * in either process no longer alias.
      */
     child->brk_virt = parent->brk_virt;
 
@@ -1792,7 +2698,7 @@ long sys_arch_prctl(int code, void* addr) {
         if (self) self->fs_base = (uint64_t)addr;
         return 0;
     }
-    return -1;
+    return -(long)EINVAL_;
 }
 
 
@@ -1814,8 +2720,12 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
+        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
+        case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
+        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
+        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
@@ -1824,11 +2734,15 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
+        case SYS_GETPPID:         return (uint64_t)sys_getppid();
+        case SYS_SETSID:          return (uint64_t)sys_setsid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
@@ -1844,6 +2758,6 @@ uint64_t syscall_dispatch(uint64_t num,
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");
-            return -1;
+            return -(long)ENOSYS_;
     }
 }
