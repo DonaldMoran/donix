@@ -1,12 +1,10 @@
-# donix handoff
-
 Live state only. Read top to bottom when starting a session.
 This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-28 (session 27)
-**Current HEAD:** tag `20260928-06`, branch `dev`
+**Last updated:** 2026-09-28 (session 28)
+**Current HEAD:** tag `20260928-09`, branch `dev`
 **Last milestone:** `v0.6.2` (published)
 **Next milestone:** undecided; candidate `v0.6.3` or `v0.7.0`
 
@@ -39,23 +37,33 @@ musl `ls` port stats its argument before `opendir`.
 Session 25 added `sys_mkdir` and enabled
 `FEATURE_EDITING_HISTORY=256`.
 
-**Session 27 (the big one):** discovered that the kernel's syscall
-table had diverged from the Linux x86_64 ABI in two places --
-`mkdir` was at 7 (Linux: `poll`) and `setsid` was at 107 (Linux:
-`geteuid`).  Both had been guessed from the "Unknown syscall: N"
-diagnostic rather than read from the canonical table, so each
-handler sat at a number no correct caller uses and shadowed a
-different syscall.  Corrected `mkdir` to 83 and `setsid` to 112
-(tag `20260928-05`); busybox `mkdir` now works end to end.  The
-previously masked gaps -- `poll(2)` at 7 and `geteuid(2)` at 107 --
-are now visible and are the next work items.  Also fixed
-`isr14_handler` to kill the faulting process on a user-mode `#PF`
-instead of halting (tag `20260928-04`), and enabled `pwd`, `wc`,
-`mkdir` in the busybox config (tag `20260928-06`).
+Session 27 found that the kernel's syscall table had diverged from
+the Linux x86_64 ABI in two places -- `mkdir` was at 7 (Linux:
+`poll`) and `setsid` was at 107 (Linux: `geteuid`).  Both had been
+guessed from the "Unknown syscall: N" diagnostic rather than read
+from the canonical table, so each handler sat at a number no
+correct caller uses and shadowed a different syscall.  Corrected
+`mkdir` to 83 and `setsid` to 112 (tag `20260928-05`); busybox
+`mkdir` now works end to end.  The previously masked gaps --
+`poll(2)` at 7 and `geteuid(2)` at 107 -- were exposed.
+
+**Session 28: `poll(2)` implemented (syscall 7).**  `busybox ash`
+stays interactive across many commands with no `Unknown syscall: 7`
+noise.  The handler blocks on fd 0 when `timeout < 0`, mirroring
+`sys_read`'s fd-0 path (`cli` / `state = BLOCKED` with
+`BLOCK_KIND_NONE` / `sti; hlt`), and `irq1_handler`'s
+`process_wake_all_blocked` wakes it on the next keystroke.  A
+non-blocking first version was rejected: ash interprets
+`poll(fds, 1, -1)` returning 0 as end-of-input and exits, and on
+real Linux that return combination is unreachable.  Also added
+`kbd_buffer_has_data()` to `keyboard.c` -- a non-destructive
+readability check that must not consume a byte, because the caller
+is about to `read(0)` itself.  Tag `20260928-08` (kernel), then
+`20260928-09` (docs).
 
 ---
 
-## Canary state (focused canary green as of `20260928-06`)
+## Canary state (focused canary green as of `20260928-09`)
 
 The **focused canary** is the default. Run it on every change:
 
@@ -77,7 +85,7 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 `musl_dup2`, `musl_dupfd`, `musl_ids`, `musl_getcwd`,
 `busybox echo`, `busybox pwd`, `busybox wc hello-world.txt`.
 
-All rows green as of `20260928-06`.  Full per-test notes:
+All rows green as of `20260928-09`.  Full per-test notes:
 `docs/session-log.md`.
 
 **Canary rows must not mutate the disk.**  `busybox mkdir` was
@@ -92,58 +100,55 @@ mkdir alone.
 
 **Known expected noise (not canary failures):** running
 `busybox ash` prints `Unknown syscall: 107` once at startup
-(`geteuid`), and every keystroke logs `Unknown syscall: 7`
-(`poll`).  Both are the masked gaps from session 27, now visible
-and tracked; they are the next work items.
+(`geteuid`).  That is the last remaining gap from session 27's
+audit, tracked in `docs/open-issues.md`, and is the next work
+item.  `Unknown syscall: 7` no longer appears -- poll is
+implemented and blocks correctly.
 
 ---
 
 ## Next step (exactly this, then stop)
 
-**Session 28.**
+**Session 29.**
 
-1. **Implement `poll(2)` -- syscall 7 -- minimally.**  busybox
-   ash's line editor calls it once per keystroke to check stdin
-   readability, and every call currently logs `Unknown syscall: 7`.
-   Minimal implementation: answer `POLLIN` on fd 0 when
-   `kbd_buffer_has_data()`, else return 0 (timeout).  The exact
-   argument layout ash passes should be confirmed by temporarily
-   logging `arg0`/`arg1`/`arg2` in a `case 7:` before writing the
-   real handler -- the `<poll.h>` `struct pollfd` is
-   `{int fd; short events; short revents;}`.  One change, one
-   commit, one tag.  Payoff: the per-keystroke noise stops for the
-   right reason.
+1. **Implement `geteuid(2)` -- syscall 107.**  Trivial: return a
+   fixed uid.  1000 is fine (matches the typical Fedora user, and
+   nothing on donix checks it).  This stops the one-time
+   `Unknown syscall: 107` at ash startup.  Add `#define SYS_GETEUID
+   107` to `include/syscall.h`, a `long sys_geteuid(void)` in
+   `user_syscall.c` next to `sys_setsid`, and one `case SYS_GETEUID:`
+   in `syscall_dispatch`.  One change, one commit, one tag.
 
-2. **If time permits, implement `geteuid(2)` -- syscall 107.**
-   Trivial: return a fixed uid.  Stops the one-time
-   `Unknown syscall: 107` at ash startup.  Separate commit.
+2. **If time permits, write the syscall-table audit script.**
+   `docs/open-issues.md` item 4.  The two divergences session 27
+   found were found by accident.  A script that parses
+   `syscall.h`'s `#define SYS_* N` lines and diffs the numbers
+   against the canonical Linux x86_64 table
+   (`arch/x86/entry/syscalls/syscall_64.tbl`) would catch the next
+   one before it burns a session.  Separate commit.
 
-3. Stop.  The user-mode `#PF` test binary, the syscall-table audit,
-   the busybox applet symlinks, and `FEATURE_TAB_COMPLETION` are
-   next-next.
+3. Stop.  The user-mode `#PF` test binary, the busybox applet
+   symlinks, and `FEATURE_TAB_COMPLETION` are next-next.
 
 ---
 
 ## Open issues (top 3; full list in `docs/open-issues.md`)
 
-1. `poll(2)` (syscall 7) not implemented -- ash line editor probes
-   it per keystroke.  The next step above.
-2. `geteuid(2)` (syscall 107) not implemented -- ash calls it once
-   at startup.  Trivial fix; see next step.
-3. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
+1. `geteuid(2)` (syscall 107) not implemented -- ash calls it once
+   at startup.  The next step above.
+2. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
    `isr14_handler`, tag `20260928-04`) is in but unverified
    end-to-end -- needs a test binary that dereferences a bad
    pointer without setting `g_expect_fault`.
+3. Busybox applet symlinks not installed on the FAT volume (bare
+   `mkdir` from ash fails with `mkdir: not found`, only
+   `busybox mkdir` works).
 
-Also open: syscall-table audit against the canonical Linux x86_64
-table (two divergences found by accident; there may be more);
-busybox applet symlinks not installed on the FAT volume (bare
-`mkdir` from ash fails with `mkdir: not found`, only
-`busybox mkdir` works); fork is O(~6 MB) per call; `sys_newfstatat`
-(262) not implemented; `sys_munmap` is a stub; `sys_brk`'s fixed
-`heap_base` and the 4 MB mmap window are latent collisions;
-`musl_wait` emits hundreds of progress dots before its children
-exit.
+Also open: syscall-table audit script (item 4 above); fork is
+O(~6 MB) per call; `sys_newfstatat` (262) not implemented;
+`sys_munmap` is a stub; `sys_brk`'s fixed `heap_base` and the
+4 MB mmap window are latent collisions; `musl_wait` emits
+hundreds of progress dots before its children exit.
 
 ---
 
@@ -169,9 +174,9 @@ needs it.
 - `docs/strategy.md` -- Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
 - `docs/gotchas.md` -- every bug writeup, by subsystem.  Lookup
-  material; grep when you hit a specific problem.  **Session 27
-  added: "Syscall numbers must match the Linux x86_64 ABI; never
-  guess from the diagnostic."**
+  material; grep when you hit a specific problem.  **Session 28
+  added: "poll(fds, 1, -1) never returns 0 on Linux; busybox ash
+  treats 0 as end-of-input."**
 - `docs/session-log.md` -- commit tables (tag-only) and per-test
   canary notes.  Append a row per commit.
 - `docs/open-issues.md` -- full open-issues list and deferred
@@ -187,12 +192,12 @@ needs it.
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Phase B: `busybox ash` is an interactive shell,
-and session 27 found and fixed two syscall-number divergences from
-the Linux ABI (`mkdir` 7->83, `setsid` 107->112) -- which exposed
-that `poll(2)` (7) and `geteuid(2)` (107) were the calls actually
-being made all along.  Next: implement `poll(2)` so ash's line
-editor stops logging `Unknown syscall: 7` per keystroke.**
+`userland/musl/`.  Phase B: `busybox ash` is interactive across
+many commands with no per-keystroke syscall noise -- session 28
+implemented `poll(2)` (syscall 7), which blocks on fd 0 with
+`timeout < 0` using the same `cli`/`BLOCKED`/`sti; hlt` pattern
+`sys_read` uses.  Next: implement `geteuid(2)` (syscall 107) to
+close the last gap from session 27's syscall-number audit.**
 
 ---
 
