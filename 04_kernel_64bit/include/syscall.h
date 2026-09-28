@@ -26,6 +26,7 @@
 #define SYS_STAT            4
 #define SYS_FSTAT           5
 #define SYS_LSTAT           6
+#define SYS_MKDIR           7
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -34,7 +35,7 @@
 #define SYS_RT_SIGPROCMASK  14
 #define SYS_IOCTL           16
 #define SYS_WRITEV          20
-#define SYS_ACCESS     21
+#define SYS_ACCESS          21
 #define SYS_DUP2            33
 #define SYS_GETPID          39
 #define SYS_FORK            57

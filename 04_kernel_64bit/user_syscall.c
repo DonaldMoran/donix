@@ -754,6 +754,60 @@ long sys_unlink(const char* path) {
     return 0;
 }
 
+/*
+ * Linux x86_64 mkdir(2) — syscall 7.
+ *
+ * FatFs has no notion of UNIX permissions, so the mode argument is
+ * ignored.  Path normalization is identical to sys_unlink's:
+ * copy_user_string pulls the path out of user space, then
+ * strip_dot_prefix peels any leading "./" or "/" so FatFs sees a
+ * form it accepts.
+ *
+ * An empty path returns -ENOENT before reaching FatFs.  Linux
+ * returns -ENOENT from mkdir("") too, so this matches the Linux
+ * ABI.  busybox ash's line editor probes mkdir("") once per
+ * keystroke through the normal syscall path (confirmed by tracing
+ * the return address to user_syscall_entry) and ignores the
+ * result; the early return keeps that probe out of the FatFs
+ * path and avoids a per-keystroke diagnostic print.  The probe
+ * was what surfaced the missing syscall -- without mkdir(2), every
+ * interactive busybox sh session printed "Unknown syscall: 7"
+ * between characters.
+ *
+ * FatFs returns FR_EXIST when a directory or file of the same name
+ * already exists; fatfs_errno maps that to -EPERM.  Linux would
+ * return -EEXIST (17).  busybox does not distinguish the two for
+ * its purposes, so the mapping is left alone for now.  If a caller
+ * ever needs -EEXIST, change fatfs_errno's FR_EXIST case to
+ * -(long)17 at that time.
+ */
+long sys_mkdir(const char* path, int mode) {
+    (void)mode;
+
+    pcb_t* self = process_get_current();
+    if (!self || !path) return -(long)EFAULT_;
+
+    char local_path[USER_PATH_MAX];
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local_path);
+
+    if (local_path[0] == '\0') {
+        /* An empty path is not a valid path on any Unix.  Linux
+         * returns -ENOENT from mkdir("").  busybox ash's line
+         * editor probes with mkdir("") once per keystroke and
+         * ignores the result; the explicit early return keeps
+         * that probe out of the FatFs diagnostic path. */
+        return -(long)ENOENT_;
+    }
+
+    FRESULT r = f_mkdir(local_path);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
 
 /*
  * Fill a kernel_stat_t from a FatFs FILINFO.
@@ -2743,6 +2797,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
+        case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
