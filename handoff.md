@@ -538,6 +538,37 @@ Apply each only when a specific problem requires it.
   through it rather than reimplementing the retry.  The helper is
   defined above `sys_stat` in `user_syscall.c`.
 
+- **`sys_ioctl` returns termios and winsize; it does not echo
+  (added 2026-09-27, session 24).**  `sys_ioctl` answers `TCGETS`
+  (0x5401) with a cooked-mode `struct termios` on fds 0/1/2,
+  `TCSETS`/`TCSETSW`/`TCSETSF` (0x5402-0x5404) as no-ops, and
+  `TIOCGWINSZ` (0x5413) with a 24x80 `struct winsize`.  `TIOCGWINSZ`
+  is what busybox ash actually probes to decide stdin is a tty --
+  **not `TCGETS`**.  The `TCSETS*` and `TIOCSWINSZ` handlers accept
+  and ignore.  Everything else returns `-ENOTTY`.
+  **The kernel does not echo typed input.**  Earlier in session 24
+  an echo path was added to `sys_read` behind a `g_stdin_wants_echo`
+  flag set by `TCGETS`; it was reverted because busybox with
+  `FEATURE_EDITING=y` echoes its own input via `lineedit.c` and the
+  two produced a double-echo.  Any future kernel-side echo
+  implementation must coordinate with the reader: either the kernel
+  echoes and the reader does not (true cooked-mode tty), or the
+  reader echoes and the kernel does not (donix today).  Do not do
+  both.
+
+- **busybox must be built with `FEATURE_EDITING=y` (added
+  2026-09-27, session 24).**  `configs/busybox.config` sets
+  `CONFIG_FEATURE_EDITING=y` and
+  `CONFIG_FEATURE_EDITING_MAX_LEN=1024`.  Without `FEATURE_EDITING`,
+  busybox ash does not echo or line-edit its own input and instead
+  relies on the kernel to do it -- which donix's kernel does not.
+  With it, `lineedit.c` handles echo, backspace, and line editing,
+  and typed input is visible.  **`FEATURE_EDITING_ASK_TERMINAL`
+  must stay off**: enabling it makes ash probe the terminal for
+  cursor position at startup, and donix does not answer that probe.
+  **`FEATURE_EDITING_MAX_LEN` must be non-zero** -- a value of 0
+  yields a zero-length input buffer.
+
 ### Build system
 
 - **After every patch, verify the edit actually landed in the
@@ -592,7 +623,13 @@ Apply each only when a specific problem requires it.
   `third_party/busybox/.config` before building.  **Edit only
   `configs/busybox.config`.**  `third_party/busybox/.config` is a
   build artifact that is overwritten on every config change and
-  must never be hand-edited.
+  must never be hand-edited.  **Beware**: a mismatch between the
+  tracked config and the generated one can trigger busybox's
+  auto-`oldconfig`, which walks every new symbol and prompts
+  interactively during `make`.  If that happens, answer with the
+  defaults you want and then run
+  `cp third_party/busybox/.config configs/busybox.config` to sync
+  the tracked copy.  (Learned 2026-09-27, session 24.)
 
 ### Git hygiene (learned 2026-09-24, tag `20260924F`)
 
@@ -624,16 +661,14 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_ioctl` returns `-ENOTTY` for every request, including
-  `TCGETS` (top priority).**  `ash` uses the failure of
-  `ioctl(0, TCGETS, ...)` to decide stdin is not a tty; as a result
-  it does not echo typed input and does not print a prompt.
-  Implementing `TCGETS` (with a plausible termios struct -- ICANON,
-  ECHO, ISIG, etc.) would make `sh` behave like an interactive
-  shell.  Same for `TCSETS`/`TCSETSW`/`TCSETSF`, which can be
-  accepted and ignored.  **This is the next change.**  It is the
-  last thing between the current state and an interactive
-  `busybox sh`.
+- **`sys_mkdir` (7) is not implemented (added 2026-09-27, session
+  24).**  busybox ash's line editor calls `mkdir(2)` once per
+  keystroke, so every interactive `busybox sh` capture is peppered
+  with `Unknown syscall: 7` between each character.  Cosmetic --
+  the shell works fine -- but noisy and worth fixing.  Implement
+  with FatFs's `f_mkdir`: copy the path, `strip_dot_prefix`, call
+  `f_mkdir`, map the `FRESULT` through `fatfs_errno`.  Roughly 15
+  lines.  **This is the next change.**
 
 - **`fork` is O(~6 MB) per call (added 2026-09-27, session 23).**
   The eager copy in `sys_fork` walks and copies every mapped page
@@ -677,9 +712,10 @@ Apply each only when a specific problem requires it.
   close and return `-ENOTDIR`.
 
 - **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
-  seen: 7, 8, 15, 17.  `6` is now implemented as `sys_lstat`;
-  `72` as `fcntl`; `21`/`269` as `access`/`faccessat`.  The
-  remaining four (`7` mkdir, `8` creat, `15` rt_sigreturn,
+  seen: 8, 15, 17.  `6` is now implemented as `sys_lstat`;
+  `72` as `fcntl`; `21`/`269` as `access`/`faccessat`; `7` is now
+  called once per keystroke by busybox ash (see the top bullet in
+  this list).  The remaining three (`8` creat, `15` rt_sigreturn,
   `17` pread64) have not been traced to a caller yet.  The
   `readdir` loop still returns the correct count, so the test is
   green, but the noise is real.
@@ -789,9 +825,8 @@ Apply each only when a specific problem requires it.
     busybox ash
     ```
 
-    Then at the blind `ash` prompt (input is not echoed until
-    `ioctl TCGETS` lands): `ls`, `echo hi`, `exit`.  Then back at
-    `donix>`: `hello`.
+    Then at the `ash` prompt: `ls`, `echo hi`, `exit`.  Then back
+    at `donix>`: `hello`.
 
     This covers every syscall family that has ever broken
     (execve, stat, mmap, brk, fork, wait4, getdents64, readdir,
@@ -858,9 +893,10 @@ is the record.  Sessions 13 and 14 used `20260927-01` through
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
 Sessions 18 through 22 used `20260927-08` through `-11`; their
 commit tables in Part 2 are the record.  Session 23 used
-`20260927-12`; its commit table in Part 2 is the record.  Working
-tags are deleted after their session is consolidated; the SHA in
-the table is what survives.
+`20260927-12`.  Session 24 used `20260927-13` and `-14`; the
+session-24 commit table in Part 2 is the record.  Working tags are
+deleted after their session is consolidated; the SHA in the table is
+what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -879,25 +915,27 @@ tags pushed to the remote.  Do not push working tags.
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Phase B: busybox runs, its banner prints, `dup2`,
-`F_DUPFD`, `setsid`, `getppid`, `getcwd`, `execve`-retry,
-errno-mapping, `file_slot_t` refcounting, `sys_access`, and the
-`FR_NO_PATH` retry in `sys_stat` are all green.  `busybox ash` now
-runs external commands reliably -- `ls`, `echo hi`, multiple in a
-row, then `exit`, all from the same `ash` instance -- because
-`sys_fork` now copies the ELF image region, closing a `.data`
-corruption window that caused a `#PF` in the parent after `wait4`
-returned.  Next: `ioctl TCGETS` for interactive input echo and
-prompt.**
+`userland/musl/`.  Phase B: busybox runs, its banner prints, and
+`busybox ash` is now an interactive shell -- prompt, echo,
+backspace, and line editing all work.  Two changes got us there:
+`sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ` (busybox ash
+probes `TIOCGWINSZ`, not `TCGETS`, to decide stdin is a tty), and
+busybox was rebuilt with `FEATURE_EDITING=y` so `lineedit.c` does
+the shell's own echo.  A kernel-side echo attempt
+(`g_stdin_wants_echo` in `sys_read`) was tried and reverted:
+with both the kernel and `lineedit.c` echoing, every keystroke
+appeared twice.  Next: implement `sys_mkdir` (syscall 7) to
+silence the `Unknown syscall: 7` line busybox's line editor
+produces on every keystroke.**
 
 ---
 
 # Part 2 -- Session Status
 
-**Last updated:** 2026-09-27 (session 23, fork copies ELF image region
--- `busybox ash` runs external commands reliably)
-**Current HEAD:** `4e9c002` (tag `20260927-12`), on branch `dev`,
-twenty-one commits ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 24, ioctl TCGETS/TIOCGWINSZ +
+busybox FEATURE_EDITING -- interactive busybox ash)
+**Current HEAD:** `a4854b3` (tag `20260927-14`), on branch `dev`,
+twenty-four commits ahead of `origin/dev`.
 **Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
 tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -912,40 +950,60 @@ handling), `20260927-02` (build: busybox integration), `20260927-03`
 `20260927-11` (kernel: sys_access/faccessat + FR_NO_PATH in stat
 retry -- busybox sh runs external commands),
 `20260927-12` (kernel: fork copies the ELF image region -- fixes
-busybox ash .data corruption).  All working tags are local-only.
+busybox ash .data corruption),
+`20260927-13` (kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ --
+interactive busybox ash),
+`20260927-14` (busybox: enable FEATURE_EDITING -- ash does its own
+line echo).  All working tags are local-only.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Phase B continues.  `busybox ash` runs external commands
-reliably.**  The `#PF` in the parent `ash` after a forked child
-exited -- which blocked every external command from running a
-second time -- is fixed.  Root cause: `sys_fork` was leaving the
-ELF image region `[0x400000, 0x600000)` shared between parent and
-child, so the child's pre-`execve` writes to busybox's globals in
-`.data` landed in the page the parent was still using, nulling out
-the head of busybox's FILE/job list.  The fix extends the eager
-copy to include the ELF image region.
+**Phase B: `busybox ash` is interactive.**  Prompt, echo, backspace,
+and line editing all work.  Two changes got us there, in sequence:
 
-**One thing remains between the current state and an interactive
-`busybox sh`:**
+1. `sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ`.  The one
+   that mattered for busybox was **`TIOCGWINSZ`**, not `TCGETS`:
+   ash probes the window size on fd 0 to decide whether stdin is
+   a tty.  Returning a 24x80 `struct winsize` is what made it
+   print a prompt and enter its interactive command loop.
+2. Busybox was rebuilt with `FEATURE_EDITING=y`.  That compiles
+   in `lineedit.c`, which does the shell's own input echo.  Before
+   this, ash had no way to echo (it expected the kernel to) and
+   the kernel does not implement a tty line discipline, so typed
+   input was invisible.
 
-1. **`ioctl TCGETS` returns `-ENOTTY`**, so `ash` treats stdin as
-   non-interactive: no prompt, no echo of typed characters.
-   `ash` still parses and runs typed commands, so it is usable
-   blind, but it isn't a real shell yet.  **This is the next
-   change.**
+The kernel-side echo attempt (`g_stdin_wants_echo` in `sys_read`)
+was tried and reverted: with both the kernel and `lineedit.c`
+echoing, every keystroke appeared twice.
+
+**One cosmetic issue remains:** busybox's line editor calls
+`mkdir(2)` (syscall 7) once per keystroke, producing
+`Unknown syscall: 7` between every character.  Harmless but noisy.
+Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
+"Next step" below.
 
 **State of the tree:**
 
 - Kernel: Linux x86_64 syscalls plus `SYS_REBOOT` (503).
 - The FAT has **27** entries: the 26 musl builds from A6 plus
-  `BUSYBOX.ELF`.
+  `BUSYBOX.ELF` (now 137192 bytes, up from 129000 after
+  `FEATURE_EDITING`).
 - The boot shell is still `musl_sh`, loaded from `0:/MUSL_SH.ELF`.
   busybox is invoked from it, not in place of it.
 - The focused canary (see Part 1 "Testing harness") passes on the
   current tree with traces off.
+
+## Session 24 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-13` | `b5e1180` | kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ -- interactive busybox ash.  Also reverts the kernel-side stdin echo machinery (`g_stdin_wants_echo`) added earlier in the session; busybox's own line editor does the echoing, and having both echoed produced a double-echo. |
+| `20260927-14` | `a4854b3` | busybox: enable FEATURE_EDITING -- ash does its own line echo. |
+
+Both tags are working tags (local-only).  The commit messages have
+the full narrative.
 
 ## Session 23 commits, in order
 
@@ -1067,7 +1125,7 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (focused canary green as of `20260927-12`)
+## Canary state (focused canary green as of `20260927-14`)
 
 The **focused canary** is the default.  Run it on every change.
 See Part 1 "Testing harness" for what it covers and when to run
@@ -1082,7 +1140,7 @@ the full list instead.
 | musl_exec2 | green | `EXEC2-OK` |
 | musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`.  Slow and noisy (WNOHANG spin, prints hundreds of `.`); see Part 1 open issues. |
 | busybox ls | green | 27 entries |
-| busybox ash -> ls -> echo hi -> exit | green | Reaches the `ash` command loop; runs `ls` (27 entries), then `echo hi` (`hi`), then `exit` (returns to `donix>`).  Typed input is not echoed until `ioctl TCGETS` lands. |
+| busybox ash -> ls -> echo hi -> exit | green | **Fully interactive.**  Prints a prompt, echoes typed input, backspace and line editing work.  Runs `ls` (27 entries), `echo hi` (`hi`), `exit` (returns to `donix>`).  `Unknown syscall: 7` appears between keystrokes (see Part 1 open issues); it is cosmetic. |
 | hello (after `ash` exits) | green | `hello from donix (musl)` -- shell survived the whole sequence |
 
 The **full canary** is the milestone-only variant.  Add these rows
@@ -1140,54 +1198,43 @@ when cutting a milestone tag or before pushing to `origin/dev`:
 
 ## Next step (exactly this, then stop)
 
-**Session 24 continues Phase B.**
+**Session 25 continues Phase B.**
 
 In priority order:
 
-1. **Implement `ioctl(0, TCGETS, ...)`.**  Return a plausible
-   `struct termios` with `ICANON | ECHO | ISIG | IEXTEN` (and the
-   usual input/output flags) so `ash` believes stdin is a tty.
-   Accept and ignore `TCSETS`/`TCSETSW`/`TCSETSF`.  This makes
-   `ash` echo typed input and print a prompt.  It is the last thing
-   between the current state and an interactive `busybox sh`.
+1. **Implement `sys_mkdir` (syscall 7).**  busybox's line editor
+   calls it once per keystroke, so every interactive `busybox sh`
+   capture is peppered with `Unknown syscall: 7`.  Roughly 15
+   lines: copy the path with `copy_user_string`, `strip_dot_prefix`,
+   call FatFs's `f_mkdir`, map the `FRESULT` through `fatfs_errno`.
+   Dispatch entry: `case SYS_MKDIR:`.  Define `SYS_MKDIR` in the
+   header if it is not already there.  Do **not** combine this with
+   anything else -- one change, one commit.
 
-   The Linux x86_64 `struct termios` layout (per musl's
-   `bits/termios.h`) is:
+   Note: FatFs's `f_mkdir` on the flat FAT root works, but creating
+   a directory named the same as an existing file returns
+   `FR_EXIST`, which `fatfs_errno` maps to `-EPERM`.  That is
+   close enough to `-EEXIST` for busybox's purposes; if it turns
+   out to matter, `fatfs_errno`'s `FR_EXIST` case can be changed to
+   `-EEXIST` (errno 17) at that time.
 
-   ```
-   tcflag_t c_iflag;   // offset 0,  4 bytes
-   tcflag_t c_oflag;   // offset 4,  4 bytes
-   tcflag_t c_cflag;   // offset 8,  4 bytes
-   tcflag_t c_lflag;   // offset 12, 4 bytes
-   cc_t     c_line;    // offset 16, 1 byte
-   cc_t     c_cc[32];  // offset 17, 32 bytes
-   ```
+2. **Re-test `busybox sh`** and confirm `Unknown syscall: 7` no
+   longer appears between characters.  The rest of the interactive
+   behavior should be unchanged.
 
-   `tcflag_t` is `unsigned int` (4 bytes) on x86_64.  The relevant
-   constants (from musl's `bits/termios.h`) are `ICANON = 0x2`,
-   `ECHO = 0x8`, `ISIG = 0x1`, `IEXTEN = 0x8000`,
-   `OPOST = 0x1`, `ONLCR = 0x4`.  A termios with `c_iflag = ICRNL`
-   (0x100), `c_oflag = OPOST | ONLCR` (0x5),
-   `c_cflag = B38400 | CS8 | CREAD | CLOCAL` (0xBF), and
-   `c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN`
-   (0x8A3B) is enough.  The `c_cc` array must have `VEOF` (0),
-   `VERASE` (0x7F), and `VINTR` (3) at their standard offsets,
-   though `ash` typically only checks the flags.
+3. **Then decide on the milestone tag.**  `v0.6.2` (or `v0.7.0`)
+   is the natural candidate once `sys_mkdir` lands and the focused
+   canary is green.  This would be the first published milestone
+   with a fully interactive `busybox sh`.
 
-   The ioctl request codes are: `TCGETS = 0x5401`,
-   `TCSETS = 0x5402`, `TCSETSW = 0x5403`, `TCSETSF = 0x5404`.
-
-2. **Re-test `busybox sh`.**  With `ioctl TCGETS` returning a
-   valid termios, `ash` should print a prompt and echo input.  If
-   it does, `v0.6.2` or `v0.7.0` is the natural milestone tag.
-
-3. **Then decide on the milestone tag.**  Once `busybox sh` is
-   interactive and the full canary passes, that is the point for
-   `v0.6.2` (or `v0.7.0`).
+4. **Optional, next-next:** enable `FEATURE_EDITING_HISTORY`
+   (value 256) and `FEATURE_TAB_COMPLETION` in
+   `configs/busybox.config`.  Both are small and improve
+   interactive use.  Not this session.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `ioctl TCGETS` -- the next change.
+1. `sys_mkdir` (7) -- the next change.
 2. Fork is O(6 MB) per call -- the long-term architectural fix is
    real copy-on-write.
 3. `isr14_handler` -- a user-mode `#PF` currently halts the
@@ -1199,11 +1246,11 @@ In priority order:
 6. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window -- both
    are latent collisions waiting to happen.
 7. `sys_open` accepting `O_DIRECTORY` on non-directories.
-8. The `Unknown syscall: N` cluster in `musl_readdir`.
+8. The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now twenty-one commits
+**Do not push without a plan.**  `dev` is now twenty-four commits
 ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
 merged to `main` at the next milestone, or is pushed immediately is
 a separate decision.  Milestone tags go on the published side; the
@@ -1215,7 +1262,7 @@ same principle applies to Phase B.
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `ioctl TCGETS` -- the next change.
+  - `sys_mkdir` (7) -- the next change.
   - Fork O(6 MB) -- real COW is the long-term fix.
   - `isr14_handler` user-mode fault handling.
   - `sys_newfstatat` (262) -- three-way delegation.
@@ -1223,7 +1270,7 @@ same principle applies to Phase B.
   - `sys_brk` and the mmap window -- per-process state, not fixed
     bases.
   - `sys_open` `O_DIRECTORY` fix.
-  - The `Unknown syscall: N` cluster in `musl_readdir`.
+  - The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
   - `musl_sh` backspace echo (cosmetic; also leaves stale bytes
     in the keyboard buffer).
   - `musl_ids` `put_dec` space (cosmetic).
