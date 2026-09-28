@@ -6,26 +6,112 @@
 /* ============================================================
  * Syscall numbers — Linux x86_64 ABI
  *
- * Numbers 0..~450 are reserved for the Linux x86_64 syscall
- * table.  Every case in syscall_dispatch that shares a number
- * with a Linux syscall musl uses is at that Linux number.
+ * Numbers 0..~472 (plus 512..547 for x32) are reserved for the
+ * Linux x86_64 syscall table.  Every case in syscall_dispatch
+ * that shares a number with a Linux syscall musl uses is at
+ * that Linux number.
  *
  * This file is the source of truth for the kernel's syscall
  * numbering.  When adding or changing an entry, verify the
  * number against the canonical Linux x86_64 table,
- * arch/x86/entry/syscalls/syscall_64.tbl.  Do NOT guess a
- * number from the name of the syscall that appears to be
- * missing: the "Unknown syscall: N" diagnostic names the
- * number the caller used, which may be a different syscall
- * entirely.  (See docs/gotchas.md: mkdir was at 7, which is
- * poll; setsid was at 107, which is geteuid.)
+ * arch/x86/entry/syscalls/syscall_64.tbl:
  *
- * Numbers 500+ are donix-private.  They are for syscalls that
- * exist only in donix and have no Linux equivalent.  As of A5
- * step 5, the only remaining 500+ number is SYS_REBOOT (503).
- * musl never calls it; it is reached only via the newlib
- * userland's reboot() wrapper, which is deleted at A5 step 7,
- * leaving raw syscall 503 as the only way in.
+ *     https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscalls/syscall_64.tbl
+ *
+ * Do NOT guess a number from the name of the syscall that
+ * appears to be missing: the "Unknown syscall: N" diagnostic
+ * names the number the caller used, which may be a different
+ * syscall entirely.  Getting a number wrong is not a
+ * "wrong handler" bug -- it is a SILENT SHADOWING bug.  The
+ * handler sits at a number no correct caller uses (dead code)
+ * AND occupies the number of another syscall that now cannot
+ * be reached.  This has happened twice:
+ *
+ *   - mkdir was at 7.  Linux 7 is poll(2).  Fixed session 27
+ *     (tag 20260928-05): mkdir is 83.
+ *   - setsid was at 107.  Linux 107 is geteuid(2).  Fixed
+ *     session 27: setsid is 112.
+ *
+ * Both were guessed from an "Unknown syscall: N" log line
+ * rather than read from the table above.  Do not do that.
+ *
+ * ------------------------------------------------------------
+ * CANONICAL NUMBERS — implemented syscalls
+ * ------------------------------------------------------------
+ *
+ *   0  read              sys_read
+ *   1  write             sys_write
+ *   2  open              sys_open
+ *   3  close             sys_close
+ *   4  stat              sys_stat          (Linux entry: sys_newstat)
+ *   5  fstat             sys_fstat         (Linux entry: sys_newfstat)
+ *   6  lstat             sys_lstat         (Linux entry: sys_newlstat)
+ *   7  poll              sys_poll
+ *   9  mmap              sys_mmap
+ *  10  mprotect          sys_mprotect      (stub)
+ *  11  munmap            sys_munmap        (stub)
+ *  12  brk               sys_brk
+ *  13  rt_sigaction      sys_rt_sigaction  (stub)
+ *  14  rt_sigprocmask    sys_rt_sigprocmask(stub)
+ *  16  ioctl             sys_ioctl
+ *  20  writev            sys_writev
+ *  21  access            sys_access
+ *  33  dup2              sys_dup2
+ *  39  getpid            sys_getpid
+ *  57  fork              sys_fork
+ *  59  execve            sys_execve
+ *  60  exit              sys_exit
+ *  61  wait4             sys_wait4
+ *  72  fcntl             sys_fcntl
+ *  79  getcwd            sys_getcwd
+ *  83  mkdir             sys_mkdir
+ *  87  unlink            sys_unlink
+ * 110  getppid           sys_getppid
+ * 112  setsid            sys_setsid
+ * 158  arch_prctl        sys_arch_prctl
+ * 217  getdents64        sys_getdents64
+ * 218  set_tid_address   sys_set_tid_address
+ * 231  exit_group        sys_exit_group -> sys_exit
+ * 269  faccessat         sys_faccessat
+ * 273  set_robust_list   sys_set_robust_list
+ * 318  getrandom         sys_getrandom     (stub, -ENOSYS)
+ * 334  rseq              sys_rseq          (stub, -ENOSYS)
+ *
+ * ------------------------------------------------------------
+ * CANONICAL NUMBERS — reserved but not dispatched
+ * ------------------------------------------------------------
+ *
+ * 262  newfstatat        SYS_NEWFSTATAT is defined below, but no
+ *                        case for it exists in syscall_dispatch.
+ *                        musl's fstatat routes through stat/lstat
+ *                        on x86_64 for the common case, so this is
+ *                        not hit yet; a caller passing AT_FDCWD
+ *                        plus flags would reach it.  Wire a handler
+ *                        before removing this note.
+ *
+ * ------------------------------------------------------------
+ * CANONICAL NUMBERS — known gaps (not yet implemented)
+ * ------------------------------------------------------------
+ *
+ *  80  chdir            busybox ash's `cd` calls this.  Currently
+ *                       returns ENOSYS -> "Function not
+ *                       implemented".
+ * 107  geteuid          ash calls once at startup; the kernel logs
+ *                       "Unknown syscall: 107" without it.
+ *
+ * ------------------------------------------------------------
+ * DONIX-PRIVATE NUMBERS (500+)
+ * ------------------------------------------------------------
+ *
+ * These are NOT Linux numbers.  They must never collide with the
+ * canonical table above.  Linux uses 0..472 (common/64) and
+ * 512..547 (x32); donix does not support x32, so 500..511 is
+ * currently safe, but a new private number above 547 would be
+ * safer still.
+ *
+ * 503  reboot            donix-private.  musl never calls it; it
+ *                        is reached only via raw syscall(503).
+ *
  * ============================================================ */
 
 /* --- Linux x86_64 numbers, implemented --- */
@@ -62,7 +148,7 @@
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_EXIT_GROUP      231
-#define SYS_NEWFSTATAT      262
+#define SYS_NEWFSTATAT      262   /* number reserved; no dispatch case yet */
 #define SYS_FACCESSAT       269
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_GETRANDOM       318
@@ -114,20 +200,6 @@ long sys_setsid(void);
 long sys_getppid(void);
 long sys_getcwd(char* buf, unsigned long size);
 
-/*
- * sys_poll — minimal poll(2) for syscall 7.
- *
- * Signatures mirror musl's <poll.h>:
- *     struct pollfd { int fd; short events; short revents; };
- *     typedef unsigned long nfds_t;
- *     int poll(struct pollfd *, nfds_t, int);
- *
- * The handler takes the user pointer and count through the
- * dispatcher, so the C type here is deliberately a mirror
- * struct rather than musl's; see the definition in
- * user_syscall.c.
- */
-struct kernel_pollfd;
 /*
  * sys_poll — minimal poll(2) for syscall 7.
  *
