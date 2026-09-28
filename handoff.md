@@ -675,14 +675,17 @@ Apply each only when a specific problem requires it.
 
 ### Open issues
 
-- **`sys_mkdir` (7) is not implemented (added 2026-09-27, session
-  24).**  busybox ash's line editor calls `mkdir(2)` once per
-  keystroke, so every interactive `busybox sh` capture is peppered
-  with `Unknown syscall: 7` between each character.  Cosmetic --
-  the shell works fine -- but noisy and worth fixing.  Implement
-  with FatFs's `f_mkdir`: copy the path, `strip_dot_prefix`, call
-  `f_mkdir`, map the `FRESULT` through `fatfs_errno`.  Roughly 15
-  lines.  **This is the next change.**
+- **`sys_mkdir` (7) is implemented (added 2026-09-27, session 25).**
+  busybox ash's line editor probes `mkdir("")` once per keystroke
+  through the normal syscall path (confirmed by tracing the
+  syscall's return address to `user_syscall_entry`).  `sys_mkdir`
+  returns `-ENOENT` for the empty path before reaching FatFs,
+  matching Linux, and the probe is silent.  Non-empty paths go to
+  `f_mkdir` with the usual `strip_dot_prefix` / `fatfs_errno`
+  handling.  Note that `fatfs_errno` maps `FR_EXIST` to `-EPERM`,
+  not `-EEXIST` (Linux's value for "directory already exists"); if
+  a caller ever needs the exact Linux errno, change the `FR_EXIST`
+  case at that time.
 
 - **`fork` is O(~6 MB) per call (added 2026-09-27, session 23).**
   The eager copy in `sys_fork` walks and copies every mapped page
@@ -733,11 +736,10 @@ Apply each only when a specific problem requires it.
 - **`Unknown syscall: N` fires during `musl_readdir`.**  Numbers
   seen: 8, 15, 17.  `6` is now implemented as `sys_lstat`;
   `72` as `fcntl`; `21`/`269` as `access`/`faccessat`; `7` is now
-  called once per keystroke by busybox ash (see the top bullet in
-  this list).  The remaining three (`8` creat, `15` rt_sigreturn,
-  `17` pread64) have not been traced to a caller yet.  The
-  `readdir` loop still returns the correct count, so the test is
-  green, but the noise is real.
+  implemented as `sys_mkdir` (session 25).  The remaining three
+  (`8` creat, `15` rt_sigreturn, `17` pread64) have not been traced
+  to a caller yet.  The `readdir` loop still returns the correct
+  count, so the test is green, but the noise is real.
 
 - **`isr14_handler` halts on user-mode faults.**  The `#PF` handler
   checks only `g_expect_fault`; it does not look at `error_code & 4`
@@ -760,6 +762,18 @@ Apply each only when a specific problem requires it.
   with a real side effect.  Fix, if wanted: emit `"\b \b"` only
   when stdout is a real tty, or drop the erase-on-backspace
   entirely and just decrement `n`.
+
+- **busybox ash's line editor emits ANSI escapes the console
+  prints literally (added 2026-09-27, session 25).**  The line
+  editor redraws with `ESC[J` (erase in display) and related
+  sequences on line refresh and backspace.  The VGA/serial
+  console has no ANSI interpreter, so the escapes appear
+  literally in the output and backspace does not visually erase.
+  Cosmetic, but it makes interactive `busybox sh` awkward.  Fix
+  options: (a) add a minimal ANSI handler to `vga.c`/`serial.c`
+  for `ESC[J`, `ESC[K`, `ESC[<n>D`, and `\b \b`; or (b) suppress
+  the redraw path in busybox's line editor.  Option (a) is the
+  right layer.
 
 - **`musl_wait`'s WNOHANG loop spins** (added 2026-09-27, session
   23).  Visible in the capture as hundreds of `.` characters.  The
@@ -902,21 +916,26 @@ Do not renumber or retag existing tags.  The single-letter history
 stays as it is; the new scheme applies only to new tags.
 
 **Working tags vs milestone tags.**  The `YYYYMMDD-NN` tags are
-*working tags*: local-only, one per commit, deleted from the local
-repo once the session's work is consolidated.  Their names and
-commit SHAs are recorded in `migration-tags.txt` (for A1-A5) so the
-mapping survives after the tags are gone.  The A6 working tags were
-deleted without being recorded; the session-11 commit table in Part 2
-is the record.  Sessions 13 and 14 used `20260927-01` through
-`20260927-04`; their commit tables in Part 2 are the record.
-Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
-Sessions 18 through 22 used `20260927-08` through `-11`; their
-commit tables in Part 2 are the record.  Session 23 used
-`20260927-12`.  Session 24 used `20260927-13` through `-17`; the
-session-24 commit table in Part 2 is the record.  Session 24's
-working tags were deleted before `dev` was pushed for the `v0.6.2`
-milestone.  Working tags are deleted after their session is
-consolidated; the SHA in the table is what survives.
+*working tags*: local-only, one per commit, and **kept in the local
+repo** -- do not delete them.  Earlier sessions deleted them after
+consolidating, which made the handoff's SHA columns the only record
+of the mapping and caused repeated lookup pain.  Keeping them costs
+nothing (they are not pushed) and means `git show 20260927-18`
+always resolves.  The SHA columns in the session tables remain the
+canonical record; the tags are a convenience.  Their names and
+SHAs are recorded in `migration-tags.txt` (for A1-A5).
+
+The A6 working tags were deleted before the convention changed;
+the session-11 commit table in Part 2 is the record.  Sessions 13
+and 14 used `20260927-01` through `20260927-04`; their commit
+tables in Part 2 are the record.  Sessions 15, 16, and 17 used
+`20260927-05`, `-06`, and `-07`.  Sessions 18 through 22 used
+`20260927-08` through `-11`; their commit tables in Part 2 are the
+record.  Session 23 used `20260927-12`.  Session 24 used
+`20260927-13` through `-17`; the session-24 commit table in Part 2
+is the record.  Session 24's working tags were deleted before
+`dev` was pushed for the `v0.6.2` milestone.  From session 25
+onward, working tags are **not** deleted.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -936,30 +955,23 @@ tags pushed to the remote.  Do not push working tags.
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: busybox runs, its banner prints, and
-`busybox ash` is now an interactive shell -- prompt, echo,
-backspace, and line editing all work.  Three changes got us there:
-`sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ` (busybox ash
-probes `TIOCGWINSZ`, not `TCGETS`, to decide stdin is a tty);
-busybox was rebuilt with `FEATURE_EDITING=y` so `lineedit.c` does
-the shell's own echo; and the musl `ls` port learned to `stat` its
-argument before calling `opendir`, so `ls <file>` works in both
-`musl_sh` and `busybox ash` (which prefers the external `LS.ELF`
-over its own applet).  A kernel-side echo attempt
-(`g_stdin_wants_echo` in `sys_read`) was tried and reverted:
-with both the kernel and `lineedit.c` echoing, every keystroke
-appeared twice.  `v0.6.2` is cut and published.  Next: implement
-`sys_mkdir` (syscall 7) to silence the `Unknown syscall: 7` line
-busybox's line editor produces on every keystroke.**
+`busybox ash` is an interactive shell -- prompt, echo, backspace,
+and line editing all work.  Session 25 implemented `sys_mkdir`
+(syscall 7): the per-keystroke `Unknown syscall: 7` noise from
+busybox ash's line editor is gone, and `FEATURE_EDITING_HISTORY=256`
+is enabled.  Next: `isr14_handler`, so a user-mode `#PF` kills the
+faulting process instead of halting the console.**
 
 ---
 
 # Part 2 -- Session Status
 
-**Last updated:** 2026-09-27 (session 24, ioctl TCGETS/TIOCGWINSZ +
-busybox FEATURE_EDITING + musl ls single-file -- interactive busybox
-ash and `ls <file>` in both shells; `v0.6.2` cut)
-**Current HEAD:** `6c7b6a4` (tag `20260927-16`), on branch `dev`,
-twenty-six commits ahead of `origin/dev`.
+**Last updated:** 2026-09-27 (session 25, mkdir(2) -- syscall 7;
+per-keystroke `Unknown syscall: 7` noise from busybox ash's line
+editor is gone; `FEATURE_EDITING_HISTORY=256` enabled)
+**Current HEAD:** `699cc41` (tag `20260927-19`), on branch `dev`.
+Ahead of `origin/dev` by `git rev-list --count origin/dev..dev`
+commits (2 as of this session).
 **Last known-good code tag:** `v0.6.2` (`<v0.6.2-merge-sha>`, published).
 Working tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
@@ -981,8 +993,14 @@ interactive busybox ash),
 line echo),
 `20260927-15` (handoff: session 24 -- interactive busybox ash),
 `20260927-16` (musl ls: stat argument before opendir -- list single
-files).  All working tags were local-only and were deleted before the
-`v0.6.2` push.
+files),
+`20260927-17` (handoff: session 24 final -- deleted before the
+`v0.6.2` push),
+`20260927-18` (kernel: implement mkdir(2) -- syscall 7),
+`20260927-19` (busybox: enable FEATURE_EDITING_HISTORY=256).
+Sessions 13 through 24 deleted their working tags after consolidating;
+from session 25 onward they are kept.  See "Tagging convention" in
+Part 1.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
@@ -1011,11 +1029,13 @@ The kernel-side echo attempt (`g_stdin_wants_echo` in `sys_read`)
 was tried and reverted: with both the kernel and `lineedit.c`
 echoing, every keystroke appeared twice.
 
-**One cosmetic issue remains:** busybox's line editor calls
-`mkdir(2)` (syscall 7) once per keystroke, producing
-`Unknown syscall: 7` between every character.  Harmless but noisy.
-Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
-"Next step" below.
+**State after session 25:** `sys_mkdir` is implemented and the
+per-keystroke `Unknown syscall: 7` noise is gone.
+`FEATURE_EDITING_HISTORY=256` is enabled.  Two cosmetic issues
+remain for later: busybox ash's line editor emits ANSI escapes
+(`ESC J` etc.) that the console prints literally, so backspace
+does not visually erase; and the `Unknown syscall: 8/15/17`
+cluster from `musl_readdir` is still unexplained.
 
 **State of the tree:**
 
@@ -1026,6 +1046,16 @@ Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
   busybox is invoked from it, not in place of it.
 - The focused canary (see Part 1 "Testing harness") passes on the
   current tree with traces off.
+
+## Session 25 commits, in order
+
+| Tag | Commit | What |
+|-----|--------|------|
+| `20260927-18` | `c968d81` | kernel: implement mkdir(2) -- syscall 7.  Empty path returns -ENOENT to match Linux; busybox ash's line editor probes mkdir("") once per keystroke through the normal syscall path, and the probe was what surfaced the missing syscall.  Also realigns SYS_ACCESS's value column in `syscall.h` (whitespace-only). |
+| `20260927-19` | `699cc41` | busybox: enable FEATURE_EDITING_HISTORY=256. |
+
+Both tags are working tags (local-only, kept per the new convention).
+
 
 ## Session 24 commits, in order
 
@@ -1159,7 +1189,7 @@ only record of that mapping.
 Sessions 9 (A5) and 10 (doc pass, v0.5.5 publish) are documented in
 [`docs/migration-history.md`](docs/migration-history.md).
 
-## Canary state (focused canary green as of `20260927-16`)
+## Canary state (focused canary green as of `20260927-19`)
 
 The **focused canary** is the default.  Run it on every change.
 See Part 1 "Testing harness" for what it covers and when to run
@@ -1175,7 +1205,7 @@ the full list instead.
 | musl_exec2 | green | `EXEC2-OK` |
 | musl_wait | green | `WAIT-STATUS-OK 42`, `WAIT-WNOHANG-OK`, `WAIT-ANY-1 s=11`, `WAIT-ANY-2 s=22`, `WAIT-ALL-OK`.  Slow and noisy (WNOHANG spin, prints hundreds of `.`); see Part 1 open issues. |
 | busybox ls | green | 27 entries |
-| busybox ash -> ls -> echo hi -> exit | green | **Fully interactive.**  Prints a prompt, echoes typed input, backspace and line editing work.  Runs `ls` (27 entries), `echo hi` (`hi`), `exit` (returns to `donix>`).  `Unknown syscall: 7` appears between keystrokes (see Part 1 open issues); it is cosmetic.  `ls hello-world.txt` inside `ash` also works now. |
+| busybox ash -> ls -> echo hi -> exit | green | **Fully interactive.**  Prints a prompt, echoes typed input, backspace and line editing work.  Runs `ls` (27 entries), `echo hi` (`hi`), `exit` (returns to `donix>`).  Session 25 fixed the per-keystroke `Unknown syscall: 7` noise (`sys_mkdir`).  `ls hello-world.txt` inside `ash` also works. |
 | hello (after `ash` exits) | green | `hello from donix (musl)` -- shell survived the whole sequence |
 
 The **full canary** is the milestone-only variant.  Add these rows
@@ -1233,65 +1263,57 @@ when cutting a milestone tag or before pushing to `origin/dev`:
 
 ## Next step (exactly this, then stop)
 
-**Session 25 continues Phase B.**
+**Session 26 continues Phase B.**
 
 In priority order:
 
-1. **Implement `sys_mkdir` (syscall 7).**  busybox's line editor
-   calls it once per keystroke, so every interactive `busybox sh`
-   capture is peppered with `Unknown syscall: 7`.  Roughly 15
-   lines: copy the path with `copy_user_string`, `strip_dot_prefix`,
-   call FatFs's `f_mkdir`, map the `FRESULT` through `fatfs_errno`.
-   Dispatch entry: `case SYS_MKDIR:`.  Define `SYS_MKDIR` in the
-   header if it is not already there.  Do **not** combine this with
-   anything else -- one change, one commit.
+1. **Fix `isr14_handler` to kill the faulting process on a
+   user-mode `#PF` instead of halting the console.**  Today the
+   handler checks only `g_expect_fault`; it does not distinguish a
+   user-mode fault from a kernel-mode one, so any unexpected
+   user-mode `#PF` ends the boot.  The fix: in `isr14_handler`, if
+   `(error_code & 4)` and `g_expect_fault != 0x0E`, call
+   `sys_exit(-1)` for the faulting process instead of halting.
+   Small, contained, one change, one commit.  The payoff is that
+   every future Phase B debugging session gets cheaper -- a
+   user-mode crash stops requiring a reboot.
 
-   Note: FatFs's `f_mkdir` on the flat FAT root works, but creating
-   a directory named the same as an existing file returns
-   `FR_EXIST`, which `fatfs_errno` maps to `-EPERM`.  That is
-   close enough to `-EEXIST` for busybox's purposes; if it turns
-   out to matter, `fatfs_errno`'s `FR_EXIST` case can be changed to
-   `-EEXIST` (errno 17) at that time.
-
-2. **Re-test `busybox sh`** and confirm `Unknown syscall: 7` no
-   longer appears between characters.  The rest of the interactive
-   behavior should be unchanged.
+2. **Re-test the focused canary** after the handler change.  A
+   user-mode fault that used to halt the boot should now kill the
+   faulting process and return control to `musl_sh`.
 
 3. **The milestone tag is already cut.**  `v0.6.2` landed before
-   this session's end; see the annotated tag message.  The next
-   milestone candidate (`v0.6.3` for a small bump, `v0.7.0` for a
-   `FEATURE_PREFER_APPLETS` flip or similarly broad change) is
-   decided in a future session, not this one.
+   session 25.  The next milestone candidate (`v0.6.3` for a small
+   bump, `v0.7.0` for a `FEATURE_PREFER_APPLETS` flip or similarly
+   broad change) is decided in a future session, not this one.
 
-4. **Optional, next-next:** enable `FEATURE_EDITING_HISTORY`
-   (value 256) and `FEATURE_TAB_COMPLETION` in
-   `configs/busybox.config`.  Both are small and improve
-   interactive use.  Not this session.
+4. **Optional, next-next:** enable `FEATURE_TAB_COMPLETION` in
+   `configs/busybox.config`.  Small and improves interactive use.
+   Not this session.
 
 **Open issues that will surface during Phase B, in priority order:**
 
-1. `sys_mkdir` (7) -- the next change.
+1. `isr14_handler` -- a user-mode `#PF` currently halts the
+   console instead of killing the faulting process.
 2. Fork is O(6 MB) per call -- the long-term architectural fix is
    real copy-on-write.
-3. `isr14_handler` -- a user-mode `#PF` currently halts the
-   console instead of killing the faulting process.
-4. `sys_newfstatat` (262) -- busybox may route through it once
+3. `sys_newfstatat` (262) -- busybox may route through it once
    more applets are enabled.
-5. `sys_munmap` -- a stub returning 0; busybox will eventually
+4. `sys_munmap` -- a stub returning 0; busybox will eventually
    call it and expect real unmapping.
-6. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window -- both
+5. `sys_brk`'s fixed `heap_base` and the 4 MB mmap window -- both
    are latent collisions waiting to happen.
-7. `sys_open` accepting `O_DIRECTORY` on non-directories (kernel-
+6. `sys_open` accepting `O_DIRECTORY` on non-directories (kernel-
    side latent; the musl `ls` port no longer triggers it).
-8. The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
+7. The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
 
 See the "Open issues" section in Part 1 for the full list.
 
 **`v0.6.2` is published.**  `dev` and `main` are in sync at the
 milestone merge.  Future work continues on `dev`; the next
 milestone merge to `main` happens when the next `vX.Y.Z` tag is
-cut.  Working tags stay local and are deleted after each session
-(before the push).
+cut.  Working tags stay local and are **kept in the local repo**
+-- do not delete them.  See "Tagging convention" in Part 1.
 
 ## Open items
 
@@ -1299,7 +1321,6 @@ cut.  Working tags stay local and are deleted after each session
   "Phase B" section and the "Next step" above.
 - **Open issues to chase, in priority order, before or during
   early Phase B:**
-  - `sys_mkdir` (7) -- the next change.
   - Fork O(6 MB) -- real COW is the long-term fix.
   - `isr14_handler` user-mode fault handling.
   - `sys_newfstatat` (262) -- three-way delegation.
@@ -1308,6 +1329,8 @@ cut.  Working tags stay local and are deleted after each session
     bases.
   - `sys_open` `O_DIRECTORY` fix (kernel-side latent).
   - The `Unknown syscall: N` cluster in `musl_readdir` (8, 15, 17).
+  - busybox ash ANSI escapes (`ESC[J` etc.) printed literally by
+    the console; backspace does not visually erase.
   - `musl_sh` backspace echo (cosmetic; also leaves stale bytes
     in the keyboard buffer).
   - `musl_ids` `put_dec` space (cosmetic).
