@@ -5,8 +5,8 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-28 (session 26)
-**Current HEAD:** tag `20260928-03`, branch `dev`
+**Last updated:** 2026-09-28 (session 27)
+**Current HEAD:** tag `20260928-04`, branch `dev`
 **Last milestone:** `v0.6.2` (published)
 **Next milestone:** undecided; candidate `v0.6.3` or `v0.7.0`
 
@@ -42,7 +42,7 @@ enabled `FEATURE_EDITING_HISTORY=256`.
 
 ---
 
-## Canary state (focused canary green as of `20260928-02`)
+## Canary state (focused canary green as of `20260928-04`)
 
 The **focused canary** is the default. Run it on every change:
 
@@ -71,20 +71,23 @@ All rows green as of `20260927-20`.  Full per-test notes:
 
 ## Next step (exactly this, then stop)
 
-**Session 27.**
+**Session 28.**
 
-1. **Fix `isr14_handler` to kill the faulting process on a user-mode
-   `#PF` instead of halting the console.**  Today the handler checks
-   only `g_expect_fault`; it does not distinguish a user-mode fault
-   from a kernel-mode one, so any unexpected user-mode `#PF` ends
-   the boot.  Fix: if `(error_code & 4)` and
-   `g_expect_fault != 0x0E`, call `sys_exit(-1)` for the faulting
-   process instead of halting.  One change, one commit, one tag.
-   Payoff: every future Phase B debugging session stops requiring
-   a reboot after a user-mode crash.
+1. **Write a test binary that triggers an unexpected user-mode
+   `#PF` and confirms the fix from session 27.**  The handler now
+   prints the diagnostic and calls `fault_kill_current(0x0E)`
+   instead of halting, but nothing exercises that path yet.  Add a
+   small musl app (e.g. `userland/musl/apps/badfault.c` or a new
+   `tests/` entry) that dereferences a bad pointer -- `*(volatile
+   int*)0 = 1` or similar -- *without* setting `g_expect_fault`.
+   Run it from `musl_sh` and from `busybox ash`.  Expected: full
+   `=== PAGE FAULT (#PF) ===` diagnostic on serial + VGA, then the
+   process dies and the shell prompt returns.  No reboot.
 
-2. **Re-test the focused canary.**  A user-mode fault that used to
-   halt should now kill the process and return to `musl_sh`.
+2. **If it works, add the row to the focused canary** and re-run
+   the whole focused canary with the new row in place.  If it
+   *doesn't* work -- e.g. the shell doesn't resume, or the exit
+   path corrupts state -- that's the session's real work.
 
 3. Stop.  Milestone decision and `FEATURE_TAB_COMPLETION` are
    next-next.
@@ -93,12 +96,20 @@ All rows green as of `20260927-20`.  Full per-test notes:
 
 ## Open issues (top 3; full list in `docs/open-issues.md`)
 
-1. `isr14_handler` halts on user-mode `#PF` -- the next step above.
+1. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
+   `isr14_handler`, tag `20260928-04`) is unverified end-to-end --
+   the next step above.  Mechanism is in; proof is pending.
 2. Fork is O(~6 MB) per call -- eager copy in `sys_fork`; the
    long-term fix is real copy-on-write.
 3. `sys_newfstatat` (262) not implemented; `sys_munmap` is a stub;
    `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are
    latent collisions.
+
+**Also noted (unverified, not yet in `docs/open-issues.md`):**
+`musl_wait`'s `WAIT-WNOHANG-OK` / `WAIT-ANY` polling emits hundreds
+of `.` progress dots before its children exit, suggesting the
+scheduler is slow to run the child or the poll interval is too
+tight.  Pre-existing, not a `20260928-04` regression.
 
 ---
 
@@ -142,8 +153,9 @@ needs it.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: `busybox ash` is an interactive shell
 with working backspace and line editing -- the VGA console now
-speaks a VT100 subset.  Next: `isr14_handler`, so a user-mode
-`#PF` kills the faulting process instead of halting the console.**
+speaks a VT100 subset.  Next: a test binary that triggers an
+unexpected user-mode `#PF`, to prove the session-27 `isr14_handler`
+fix (kill the faulting process, return to the shell, no reboot).**
 
 ---
 
