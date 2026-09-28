@@ -1,12 +1,10 @@
-# donix
-
 ### donix is not Linux.
 
-It runs Linux binaries. It speaks the Linux syscall ABI. It has `ls`,
-`cat`, `echo`, and a shell that takes `fork`/`execve`/`wait4`
-seriously. But there is no Linux in here. No kernel source from Linus,
-no glibc, no distro. It is a from-scratch x86_64 operating system that
-talks to real, statically linked musl binaries as if they were natively
+It runs Linux binaries. It speaks the Linux syscall ABI. It runs
+**busybox** — the shell, the line editor, the applets, the whole
+thing — on top of a from-scratch x86_64 kernel. No kernel source from
+Linus, no glibc, no distro. It is a small operating system that talks
+to real, statically linked musl binaries as if they were natively
 compiled for it.
 
 It boots on bare metal through 16-bit real mode, 32-bit protected mode,
@@ -68,6 +66,13 @@ That's the point. That's the whole point.
   at a `donix> ` prompt. `cat hello-world.txt` prints the file.
   `echo hi` prints `hi`. `ls` lists the FAT volume. Real programs, real
   syscalls, real output.
+- **Runs busybox.** A static musl-linked busybox 1.36.1 executes on
+  donix: its `ash` shell is interactive (prompt, echo, backspace,
+  line editing), it forks and execs external binaries via `PATH`,
+  and its own applets (`busybox ls`, `busybox echo`) run in-process.
+  This is the strongest evidence that the syscall ABI is right —
+  busybox is a real, widely-deployed program that expects a real
+  Unix kernel underneath it.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is 20 short C files. There is no build system you can't read in
@@ -110,6 +115,13 @@ and how it was built.
 builds musl 1.2.5 from source into a project-local tree, because the
 project needs the exact version and install layout. Step 2 below does
 this for you.
+
+**busybox 1.36.1** — do **not** install your distro's busybox. The
+project builds busybox from source the first time you build a disk
+image, driven by `configs/busybox.config`. The source is cloned into
+`third_party/busybox/` (gitignored). **Network access is required on
+first run** — it clones from `https://git.busybox.net/busybox`. The
+tracked config sets `CONFIG_STATIC=y` and `CONFIG_FEATURE_EDITING=y`.
 
 ---
 
@@ -164,6 +176,8 @@ line inside the `menu()` function, and execute the script. It will:
 2. `make FAT_CONFIG=single` — build the kernel, single-drive layout
 3. `make -C 05_boot_kernel64 hdd-single.img` — build the FAT image,
    which includes compiling every musl userland binary from source
+   and building busybox (first time only; the source is cached in
+   `third_party/busybox/` thereafter)
 4. Boot QEMU and capture the serial output to `capture.txt`
 
 The default uncommented line is the single-drive TCG configuration.
@@ -212,7 +226,11 @@ userland/musl/          musl userland source tree
   apps/                 real userland programs (hello, echo, cat, ls,
                         memtest, musl_sh)
   tests/                diagnostic binaries (musl_min, musl_fork, etc.)
-  Makefile              builds every .c into build/*.elf
+  Makefile              builds every .c into build/*.elf; also builds
+                        busybox from source
+configs/                tracked build configs (busybox.config)
+third_party/            source trees and build prefixes (gitignored):
+                          musl-src/, musl-install/, busybox/, busybox-install/
 toolchain/              musl build and wrapper scripts
 test-files/             files copied into the FAT image
 run                     QEMU launch menu
@@ -249,3 +267,8 @@ not reach into `userland/musl/`; the image Makefile invokes
 ## License
 
 MIT License. Use freely, modify freely, credit appreciated.
+
+Note on third-party components: donix builds against musl (MIT-style)
+and busybox (GPLv2). Neither is vendored into the donix source tree —
+both are fetched from upstream by the build system and live under
+`third_party/` (gitignored). The donix source itself remains MIT.

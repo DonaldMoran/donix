@@ -1,10 +1,8 @@
-# ROADMAP
-
 ### donix — what's next
 
-donix is at **v0.6.0**: it speaks the Linux x86_64 syscall ABI, runs
-static musl-linked binaries, and builds its userland from a tracked
-source tree at `userland/musl/`.
+donix is at **v0.6.2**: it speaks the Linux x86_64 syscall ABI, runs
+static musl-linked binaries, and runs **busybox** — including its
+interactive `ash` shell — on top of a from-scratch kernel.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -14,76 +12,87 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Next: Phase B — busybox against musl
+## Phase B — busybox against musl (done at v0.6.2)
 
-**Status:** planned, not started.
+**Status:** complete.
 
-The kernel speaks the Linux ABI and runs static musl binaries. The
-next milestone is running a real Unix userland: a static **busybox**
-linked against the project-local musl 1.2.5.
+The kernel speaks the Linux ABI, runs static musl binaries, and now
+runs **busybox 1.36.1** against musl 1.2.5. `busybox ash` is an
+interactive shell: prompt, echo, backspace, line editing. It forks
+and execs external binaries via `PATH`; its own applets (`busybox
+ls`, `busybox echo`) run in-process.
 
-### Approach
+What landed, in order:
 
-1. Build busybox against the project-local musl:
+1. busybox integrated into the userland build; config tracked at
+   `configs/busybox.config`.
+2. `fcntl(2)` (with `F_DUPFD`), `dup2(2)` with refcounted slots,
+   `setsid`, `getppid`, `getcwd`, `access`/`faccessat`, and a
+   bare-name retry in `sys_execve`.
+3. Proper negative errnos from file syscalls; `FR_NO_PATH` added to
+   the stat retry so `ash`'s PATH probe works.
+4. `sys_fork` copies the ELF image region so a fork child's
+   pre-`execve` writes don't clobber the parent's `.data`.
+5. `sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ`; busybox ash
+   probes `TIOCGWINSZ`, not `TCGETS`, to decide stdin is a tty.
+6. `FEATURE_EDITING=y` in the busybox config; `lineedit.c` does the
+   shell's own echo.
+7. The musl `ls` port learned to stat its argument before calling
+   `opendir`, so `ls <file>` works in both shells.
 
-   ```
-   cd third_party
-   git clone https://git.busybox.net/busybox
-   cd busybox
-   git checkout 1_36_stable        # or whatever the current stable is
-   make defconfig
-   # Set CONFIG_STATIC=y, CONFIG_PREFIX=/tmp/busybox-install
-   # Use toolchain/musl-gcc.sh as CC
-   make -j$(nproc)
-   make install
-   ```
-
-   The result is `_install/bin/busybox`, a static musl-linked ELF.
-
-2. Stage it: copy to `userland/musl/build/busybox.elf`, add that path
-   to `USERLAND_ELFS` in `05_boot_kernel64/Makefile`, and add a
-   matching `mcopy_one` line so it lands on the FAT as
-   `BUSYBOX.ELF`.
-
-3. From `musl_sh`: `busybox echo hello` (or the correct argv layout —
-   busybox expects `argv[0]` to be the applet name).
-
-4. Watch the `Unknown syscall: N` output. Every unimplemented syscall
-   busybox hits is a candidate for the next kernel commit.
-
-### What to expect
-
-Busybox at startup does much more than the current canary tests: it
-installs signal handlers, reads `/proc` or sysfs, checks terminal
-settings, and uses `fcntl`, `getuid`, `getgid`, `geteuid`, `getegid`,
-`umask`, `rt_sigreturn`, `prctl`, `setrlimit`/`getrlimit`, `uname`, and
-possibly `access`/`faccessat`. Each of those is a small implementation.
-
-Plan Phase B as a sequence of small commits:
-
-1. Get busybox to link (build-script change only, probably).
-2. Get it to reach `main` (may need new syscalls).
-3. Get one applet (`echo` is easiest) to work.
-4. Get a real applet (`ls`, `cat`) working.
-
-Each is its own commit with the existing canary re-run.
+For the narrative, see the `v0.6.2` annotated tag message and the
+session log in [`handoff.md`](handoff.md).
 
 ---
 
-## After Phase B
+## Next: Phase C — broaden busybox coverage
+
+**Status:** planned, not started.
+
+Now that busybox runs as a shell, the next questions are:
+
+1. **What happens when busybox prefers its own applets?** Currently
+   `CONFIG_FEATURE_PREFER_APPLETS` is off, so `ash` execs external
+   binaries from `PATH` — i.e. the project's own `LS.ELF`,
+   `ECHO.ELF`, `CAT.ELF` — rather than busybox's internal applets.
+   Flipping it on exercises busybox's own code much harder and
+   reveals how much of the syscall surface is really covered. This
+   is a *broad* change and would re-test the whole canary; treat it
+   as a milestone candidate on its own.
+2. **Which busybox applets work?** `ls`, `echo`, `cat` work. `mkdir`,
+   `rm`, `cp`, `mv`, `grep`, `sed`, `awk`, `tar` have not been tried.
+3. **Job control.** busybox ash has `ASH_JOB_CONTROL` off in the
+   current config. Enabling it needs signal delivery, process
+   groups, and a foreground/background distinction — none of which
+   the kernel has today.
+
+### Approach
+
+Work through the applet list one at a time, watching for
+`Unknown syscall: N` in the kernel log. Each unimplemented syscall is
+a candidate for its own commit. Prefer broad, easy applets first
+(`mkdir`, `rm`, `cp`) and save anything requiring new subsystems
+(`ps`, `top`, `kill`) for after the kernel has those subsystems.
+
+---
+
+## After Phase C
 
 Small, independent follow-ups, roughly in priority order.
 
+- **`sys_mkdir` (7)** — busybox ash's line editor calls it once per
+  keystroke. Cosmetic; ~15 lines with FatFs's `f_mkdir`. See the
+  handoff's open issues.
+
 ### Syscalls busybox will need
 
-- **`fcntl` (72)** — `F_SETFD`, `F_GETFD`, `F_DUPFD`. A minimal stub
-  returns 0 for flag-set operations and the fd for `F_DUPFD`.
 - **`sys_newfstatat` (262)** — `fstatat(fd, path, st, flags)`.
   Delegates to `sys_stat` when `dirfd == AT_FDCWD` or the path is
   absolute; returns `-ENOSYS` otherwise until there is a per-process
   cwd.
 - **`sys_open` `O_DIRECTORY` fix** — check `fattrib & AM_DIR` in the
-  fallback path; return `-ENOTDIR` if the target is a file.
+  `wants_dir` branch; return `-ENOTDIR` if the target is a file.
+  Kernel-side latent (the musl `ls` port no longer triggers it).
 - **`isr14_handler` user-mode fault handling** — terminate the
   faulting process instead of halting the console. Busybox's first
   segfault will bite this.
@@ -91,11 +100,12 @@ Small, independent follow-ups, roughly in priority order.
 ### Shell features
 
 - **Pipes and redirection** — `cat file > out.txt`,
-  `cat file | grep foo`. Needs `pipe(2)` and `dup2(2)`.
-- **`cd` / relative paths** — `chdir` + per-process cwd. FatFs already
-  supports `f_chdir`.
-- **Environment variables** — extend the argv mechanism with an `envp`
-  array; `getenv`/`setenv` on the userland side.
+  `cat file | grep foo`. Needs `pipe(2)` and `dup2(2)` (the latter
+  already works).
+- **`cd` / relative paths** — `chdir` + per-process cwd. FatFs
+  already supports `f_chdir`.
+- **Environment variables** — extend the argv mechanism with an
+  `envp` array; `getenv`/`setenv` on the userland side.
 
 ### Kernel hardening
 
@@ -103,6 +113,10 @@ Small, independent follow-ups, roughly in priority order.
   data/BSS/stack segments non-executable.
 - **Page-table teardown on process exit** — walk and free the
   user-space portion in `process_reclaim`.
+- **Real copy-on-write for `fork`** — the eager copy is O(6 MB) per
+  fork. Long-term fix: mark shared PTEs read-only, install a `#PF`
+  handler that copies on write. Every busybox applet that forks
+  makes the current cost more visible.
 - **Kernel log routing** — route `sys_execve` and `sys_open`
   diagnostics to serial only, or add a `SYS_KLOG(level)` syscall.
 
@@ -110,8 +124,8 @@ Small, independent follow-ups, roughly in priority order.
 
 - **Boot-time self-test mode** (`-DSELFTEST`) — run the existing 17
   tests at boot and halt.
-- **`make test` target** — boot QEMU headless, run the self-test, grep
-  the serial log.
+- **`make test` target** — boot QEMU headless, run the self-test,
+  grep the serial log.
 - **Spawn regression test** — a kernel-mode child that spawns
   `HELLO.ELF`, waits, and asserts exit status 0.
 - **argv / REPL regression tests** — scripted `echo`/`cat`/`ls`/
@@ -122,8 +136,8 @@ Small, independent follow-ups, roughly in priority order.
 - **Per-process tty / console focus** — prerequisite for multiple
   concurrent shells. Also the natural point to build the ring-buffer
   console (see `docs/MAINTENANCE.md` §4e).
-- **Serial console debug access** — kernel shell over COM1, physically
-  separate from the user keyboard.
+- **Serial console debug access** — kernel shell over COM1,
+  physically separate from the user keyboard.
 - **Framebuffer graphics** — move off VGA text mode.
 - **VFS layer** — virtual filesystem above FatFs, with mount points
   and path resolution.

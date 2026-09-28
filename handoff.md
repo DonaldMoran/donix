@@ -1,5 +1,3 @@
-# donix -- Handoff
-
 This file is the project's **live state**: strategy, current milestone,
 canary, open issues, and session log. Read it top to bottom when
 starting a new session.
@@ -914,10 +912,11 @@ is the record.  Sessions 13 and 14 used `20260927-01` through
 Sessions 15, 16, and 17 used `20260927-05`, `-06`, and `-07`.
 Sessions 18 through 22 used `20260927-08` through `-11`; their
 commit tables in Part 2 are the record.  Session 23 used
-`20260927-12`.  Session 24 used `20260927-13`, `-14`, `-15`, and
-`-16`; the session-24 commit tables in Part 2 are the record.
-Working tags are deleted after their session is consolidated; the
-SHA in the table is what survives.
+`20260927-12`.  Session 24 used `20260927-13` through `-17`; the
+session-24 commit table in Part 2 is the record.  Session 24's
+working tags were deleted before `dev` was pushed for the `v0.6.2`
+milestone.  Working tags are deleted after their session is
+consolidated; the SHA in the table is what survives.
 
 *Milestone tags* (`v0.5.5`, `v0.6.0`, `v0.6.1`, ...) are the only
 tags pushed to the remote.  Do not push working tags.
@@ -948,9 +947,9 @@ argument before calling `opendir`, so `ls <file>` works in both
 over its own applet).  A kernel-side echo attempt
 (`g_stdin_wants_echo` in `sys_read`) was tried and reverted:
 with both the kernel and `lineedit.c` echoing, every keystroke
-appeared twice.  Next: implement `sys_mkdir` (syscall 7) to
-silence the `Unknown syscall: 7` line busybox's line editor
-produces on every keystroke.**
+appeared twice.  `v0.6.2` is cut and published.  Next: implement
+`sys_mkdir` (syscall 7) to silence the `Unknown syscall: 7` line
+busybox's line editor produces on every keystroke.**
 
 ---
 
@@ -958,11 +957,11 @@ produces on every keystroke.**
 
 **Last updated:** 2026-09-27 (session 24, ioctl TCGETS/TIOCGWINSZ +
 busybox FEATURE_EDITING + musl ls single-file -- interactive busybox
-ash and `ls <file>` in both shells)
+ash and `ls <file>` in both shells; `v0.6.2` cut)
 **Current HEAD:** `6c7b6a4` (tag `20260927-16`), on branch `dev`,
 twenty-six commits ahead of `origin/dev`.
-**Last known-good code tag:** `v0.6.1` (`e7f418e`, published).  Working
-tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
+**Last known-good code tag:** `v0.6.2` (`<v0.6.2-merge-sha>`, published).
+Working tags since `v0.6.0`: `20260927-01` (kernel: fcntl, mmap, path
 handling), `20260927-02` (build: busybox integration), `20260927-03`
 (handoff: session 13 status, published as `v0.6.1`), `20260927-04`
 (busybox config tracking; deleted, no longer in `git show-ref`),
@@ -982,14 +981,15 @@ interactive busybox ash),
 line echo),
 `20260927-15` (handoff: session 24 -- interactive busybox ash),
 `20260927-16` (musl ls: stat argument before opendir -- list single
-files).  All working tags are local-only.
+files).  All working tags were local-only and were deleted before the
+`v0.6.2` push.
 **Disaster preserved at:** branch `disaster-20260923A`
 (commit `47262a9`, local only).
 
 ## Current milestone
 
-**Phase B: `busybox ash` is interactive, and `ls <file>` works in
-both shells.**  Three changes got us there:
+**`v0.6.2` -- Phase B: `busybox ash` is interactive, and `ls <file>`
+works in both shells.**  Three changes got us there:
 
 1. `sys_ioctl` learned `TCGETS`/`TCSETS*`/`TIOCGWINSZ`.  The one
    that mattered for busybox was **`TIOCGWINSZ`**, not `TCGETS`:
@@ -1033,13 +1033,11 @@ Implementing `sys_mkdir` via `f_mkdir` will silence it.  See
 |-----|--------|------|
 | `20260927-13` | `b5e1180` | kernel: ioctl TCGETS/TCSETS*/TIOCGWINSZ -- interactive busybox ash.  Also reverts the kernel-side stdin echo machinery (`g_stdin_wants_echo`) added earlier in the session; busybox's own line editor does the echoing, and having both echoed produced a double-echo. |
 | `20260927-14` | `a4854b3` | busybox: enable FEATURE_EDITING -- ash does its own line echo. |
-| `20260927-15` | `f8b7c1d` | handoff: session 24 -- interactive busybox ash. |
+| `20260927-15` | `0fba23b` | handoff: session 24 -- interactive busybox ash. |
 | `20260927-16` | `6c7b6a4` | musl ls: stat argument before opendir -- list single files.  Fixes `ls <file>` in both `musl_sh` and `busybox sh` (which prefers the external LS.ELF over its own applet). |
+| `20260927-17` | `<final-handoff-sha>` | handoff: session 24 -- interactive busybox ash + ls <file> (final handoff before `v0.6.2` cut). |
 
-**Note:** the SHA for `20260927-15` above is a placeholder.  Run
-`git rev-parse 20260927-15` and record the real value in this table
-if it differs.  The session-24 rows are all working tags
-(local-only).  The commit messages have the full narrative.
+**Note:** the SHA for `20260927-17` above is the final handoff commit before the milestone merge.  The session-24 working tags were deleted before `dev` was pushed for `v0.6.2`; the SHAs above are the record.  The commit messages have the full narrative.
 
 ## Session 23 commits, in order
 
@@ -1259,10 +1257,11 @@ In priority order:
    longer appears between characters.  The rest of the interactive
    behavior should be unchanged.
 
-3. **Then decide on the milestone tag.**  `v0.6.2` (or `v0.7.0`)
-   is the natural candidate once `sys_mkdir` lands and the focused
-   canary is green.  This would be the first published milestone
-   with a fully interactive `busybox sh`.
+3. **The milestone tag is already cut.**  `v0.6.2` landed before
+   this session's end; see the annotated tag message.  The next
+   milestone candidate (`v0.6.3` for a small bump, `v0.7.0` for a
+   `FEATURE_PREFER_APPLETS` flip or similarly broad change) is
+   decided in a future session, not this one.
 
 4. **Optional, next-next:** enable `FEATURE_EDITING_HISTORY`
    (value 256) and `FEATURE_TAB_COMPLETION` in
@@ -1288,11 +1287,11 @@ In priority order:
 
 See the "Open issues" section in Part 1 for the full list.
 
-**Do not push without a plan.**  `dev` is now twenty-six commits
-ahead of `origin/dev`.  Whether Phase B lands on `dev` only, gets
-merged to `main` at the next milestone, or is pushed immediately is
-a separate decision.  Milestone tags go on the published side; the
-same principle applies to Phase B.
+**`v0.6.2` is published.**  `dev` and `main` are in sync at the
+milestone merge.  Future work continues on `dev`; the next
+milestone merge to `main` happens when the next `vX.Y.Z` tag is
+cut.  Working tags stay local and are deleted after each session
+(before the push).
 
 ## Open items
 
