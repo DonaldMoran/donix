@@ -1193,25 +1193,28 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
 }
 
 /*
- * Resolve an execve path to a FatFs-acceptable form.
+ * Resolve a bare command name to a root-level path.
  *
- * `ash` (busybox sh) calls execve with bare names — "ls", "echo" —
- * or with a PATH-style absolute path like "/usr/bin/ls".  Neither
- * is a valid FatFs path.  musl_sh, by contrast, already prepends
- * "0:/" and appends ".ELF" before calling execve, and those paths
- * go straight through.
+ * This is sub-attempt (c1) of sys_execve's three-attempt open:
+ * turn a bare name like "ls" into "0:/LS.ELF" — uppercased, with
+ * ".ELF" appended, at the FAT root.  This is what makes ash's
+ * execve("ls", ...) find the donix-native root binary, and what
+ * makes `donix> hello` work from musl_sh without the shell doing
+ * any rewriting of its own.
  *
- * The rule is:
- *   - If `in` already contains a ':' (drive prefix) or the caller
- *     asked for a path that clearly has a FatFs form, leave it
- *     alone.  f_open will handle it or not.
- *   - If `in` is a bare name (no '/', no ':'), build "0:/NAME.ELF"
- *     with NAME uppercased to match the FAT layout.
- *   - If `in` starts with '/', take the last path component (after
- *     the final '/'), and build "0:/NAME.ELF" the same way.
+ * Root is tried before /bin (see exec_resolve_bin_name) so a
+ * donix-native binary shadows a same-named entry in /bin.
+ *
+ * The rule:
+ *   - Take the base name: the substring after the last '/', or
+ *     the whole string if there is no '/'.
+ *   - If the base already ends in ".ELF" (case-insensitive), do
+ *     not append it again.
+ *   - Uppercase the base to match the FAT layout.
+ *   - Prepend "0:/".
  *
  * Returns 0 on success, -1 if the resolved path would overflow
- * `out_cap`.
+ * `out_cap` or if `in` has no base name (was "/" or "").
  */
 static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
     /* Pick the base name: the substring after the last '/', or the
@@ -1252,6 +1255,60 @@ static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
         out[o++] = c;
     }
     if (!have_suffix) {
+        out[o++] = '.';
+        out[o++] = 'E';
+        out[o++] = 'L';
+        out[o++] = 'F';
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/*
+ * Resolve a bare command name to a path under /bin.
+ *
+ * `in` is a bare name like "busybox" (no '/').  Produces:
+ *
+ *   with_suffix == 0:  "0:/BIN/NAME"
+ *   with_suffix == 1:  "0:/BIN/NAME.ELF"
+ *
+ * NAME is uppercased, matching the convention exec_resolve_bare_name
+ * uses.  FatFs is case-insensitive on lookup, so the uppercase form
+ * finds both "busybox" and "BUSYBOX.ELF" on disk.
+ *
+ * Returns 0 on success, -1 on overflow or if `in` is not a bare name.
+ */
+static int exec_resolve_bin_name(const char* in, char* out,
+                                 size_t out_cap, int with_suffix) {
+    /* Callers pass bare names only; reject anything with a slash so
+     * a mistake here does not silently produce a doubled path. */
+    for (const char* p = in; *p; p++) {
+        if (*p == '/') return -1;
+    }
+    if (*in == '\0') return -1;
+
+    size_t blen = 0;
+    while (in[blen]) blen++;
+
+    /* "0:/BIN/" is 7 chars, plus name, plus optional ".ELF", plus NUL. */
+    size_t need = 7 + blen + (with_suffix ? 4 : 0) + 1;
+    if (need > out_cap) return -1;
+
+    out[0] = '0';
+    out[1] = ':';
+    out[2] = '/';
+    out[3] = 'B';
+    out[4] = 'I';
+    out[5] = 'N';
+    out[6] = '/';
+
+    size_t o = 7;
+    for (size_t i = 0; i < blen; i++) {
+        char c = in[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[o++] = c;
+    }
+    if (with_suffix) {
         out[o++] = '.';
         out[o++] = 'E';
         out[o++] = 'L';
@@ -1320,9 +1377,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      *   (a) the path exactly as the caller supplied it;
      *   (b) if the path starts with '/', "0:" + path, preserving
      *       case and suffix -- the Unix-style absolute path form;
-     *   (c) if the path has no ':' at all, the bare-name form
-     *       "0:/NAME.ELF" with NAME uppercased and ".ELF" appended
-     *       -- the form ash uses when it calls execve("ls", ...).
+     *   (c) if the path has no ':' at all, the bare-name form.
+     *       Attempt (c) itself has three sub-attempts: root
+     *       "0:/NAME.ELF", then "/bin/NAME", then "/bin/NAME.ELF".
      *
      * (b) is what makes `/bin/busybox sh` work from the custom
      * musl shell: the kernel was previously handing "/bin/busybox"
@@ -1330,8 +1387,26 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * slash.  The kernel is the layer that should translate a
      * Unix-style path to the FatFs form, not the caller.
      *
-     * (c) is unchanged from before and is what makes ash's bare
-     * names resolve.
+     * (c1) is what makes ash's bare `execve("ls", ...)` resolve to
+     * the donix-native root binary.  (c2) and (c3) are what make
+     * bare `busybox` resolve to /bin/busybox now that the busybox
+     * binary no longer sits at the FAT root.  Root is tried first
+     * so donix-native binaries shadow same-named /bin entries.
+     */
+    /*
+     * VFS SHIM.  The three attempts below stand in for a virtual
+     * filesystem layer that donix does not have yet.  On real
+     * Unix, execve hands the path to the VFS and the VFS resolves
+     * it; there is no guessing and no retry.  Here, FatFs has no
+     * notion of '/', no root directory in the POSIX sense, and no
+     * way to walk a multi-component path, so the kernel does the
+     * translation inline.
+     *
+     * When a VFS lands, DELETE this whole block and make execve
+     * call the VFS resolver once.  Do not add a fourth attempt;
+     * add the VFS instead.  Candidates that must then be removed:
+     * the "0:" + path prepend, exec_resolve_bare_name, and
+     * exec_resolve_bin_name.
      */
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
@@ -1369,17 +1444,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         }
 
         /*
-         * Attempt (c): bare name -> "0:/NAME.ELF".
+         * Attempt (c): bare name.  Three sub-attempts, in order:
          *
-         * This is the retry that makes busybox ash's
-         * execve("ls", ...) work: musl_sh already normalizes
-         * before calling execve, but ash does not, and there is
-         * no PATH and no shell rc file that could do it for us.
+         *   (c1) "0:/NAME.ELF"     -- root, uppercased, .ELF appended.
+         *                             Donix-native binaries win here.
+         *   (c2) "0:/BIN/NAME"     -- /bin, uppercased, no suffix.
+         *                             This is where busybox lives now.
+         *   (c3) "0:/BIN/NAME.ELF" -- /bin, uppercased, .ELF appended.
+         *                             Covers a future /bin/NAME.ELF.
          */
         if (fr != FR_OK && !has_drive) {
             char resolved[USER_PATH_MAX];
+
+            /* (c1) root, uppercased, .ELF appended. */
             if (exec_resolve_bare_name(path, resolved,
                                        sizeof(resolved)) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+
+            /* (c2) /bin, uppercased, as-is (no .ELF). */
+            if (fr != FR_OK &&
+                exec_resolve_bin_name(path, resolved,
+                                      sizeof(resolved), 0) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+
+            /* (c3) /bin, uppercased, .ELF appended. */
+            if (fr != FR_OK &&
+                exec_resolve_bin_name(path, resolved,
+                                      sizeof(resolved), 1) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
                 if (fr2 == FR_OK) {
@@ -1529,12 +1630,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     /* ---- 5. Tear down the old address space, then load the new one. ---- */
-    /*
-     * No scratch CR3.  Everything targets self->cr3.  From this point
-     * on, failures cannot be cleanly recovered (the caller's old
-     * pages are gone), so any failure exits the process.  See the
-     * function comment for the rationale.
-     */
     exec_free_and_unmap_user_pages(self);
     self->user_stack_virt = 0;
     self->user_stack_phys = 0;
@@ -1566,32 +1661,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         uint64_t argv_region_top    = new_user_stack_top;
         uint64_t argv_region_bottom = argv_region_top - 4096;
 
-        /*
-         * Layout on the argv region, low to high:
-         *
-         *   argv_region_bottom + 0               argv[0]
-         *   argv_region_bottom + 8               argv[1]
-         *   ...
-         *   argv_region_bottom + 8*argc          argv NULL terminator
-         *   argv_region_bottom + 8*(argc+1)      envp NULL terminator
-         *   argv_region_bottom + 8*(argc+2)      first argument string
-         *
-         * array_bytes = 8*(argc+1) covers the argv slots plus the
-         * argv NULL terminator.  The envp NULL terminator needs one
-         * MORE slot, at argv_region_bottom + array_bytes.  Strings
-         * must therefore start at argv_region_bottom + array_bytes
-         * + 8, not at argv_region_bottom + array_bytes.
-         *
-         * The previous code put strings_start at
-         * argv_region_bottom + array_bytes, the same address as the
-         * envp NULL write, so the envp NULL zeroed the first 8
-         * bytes of argv[0]'s string.  When argv[0] was long (e.g.
-         * "0:/cat.elf") the collateral damage stopped short of
-         * argv[1]'s string and nothing visible broke.  When argv[0]
-         * was short (e.g. "cat", "echo"), argv[1]'s string began
-         * inside the 8-byte zeroing window and was clobbered — the
-         * child saw an empty argv[1] and silently did nothing.
-         */
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
         uint64_t array_base    = argv_region_bottom;
         uint64_t strings_start = argv_region_bottom + array_bytes + 8;
@@ -1639,9 +1708,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         argv_array_base = array_base;
 
-        /* SysV initial stack: [rsp]=argc, [rsp+8]=argv[0..n-1],
-           then argv NULL, then envp NULL.  We put argc in the 8 bytes
-           immediately below the argv array. */
         rsp_init = argv_region_bottom - 8;
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
@@ -1673,47 +1739,10 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         }
     }
 
-    /* ---- 7. Rewrite the syscall-entry frame. ----
-     *
-     * user_syscall_entry.asm pushed the frame with the first push at
-     * kernel_stack_top - 8.  Offsets we care about:
-     *   -56 = user RIP   (loaded into %rcx, used by sysret)
-     *   -72 = user RSP   (loaded into %r10, moved to %rsp before sysret)
-     *
-     * ktop[-7] = -56, ktop[-9] = -72.  RFLAGS at -64 is left alone:
-     * the new program starts with the same user RFLAGS the old one
-     * had, which is 0x202 for musl.
-     */
+    /* ---- 7. Rewrite the syscall-entry frame. ---- */
     uint64_t* ktop = (uint64_t*)self->kernel_stack_top;
     ktop[-7] = entry;      /* -56: user RIP  */
     ktop[-9] = rsp_init;   /* -72: user RSP  */
-
-    /*
-     * Also pass argc/argv in %rdi/%rsi.
-     *
-     * musl's _start reads the SysV stack layout above and ignores
-     * %rdi/%rsi on entry.  donix's newlib crt0.S (arc2/crt0.S) reads
-     * %rdi/%rsi and ignores the stack layout:
-     *
-     *     mov [rip + argc_saved], rdi
-     *     mov [rip + argv_saved], rsi
-     *
-     * sys_spawn (507) already passes argc/argv in %rdi/%rsi via
-     * frame[9]/frame[10] of the child's initial resume frame.
-     * sys_execve was missing it, so a newlib binary launched via
-     * execve ran with %rdi/%rsi holding the execve call's own
-     * arguments — pointers into the old, torn-down address space.
-     * cat.elf read argv[1] from there, got NULL, and tried to open
-     * "0:/(null)".
-     *
-     * Setting both is harmless for musl (it ignores the registers)
-     * and makes execve work for either kind of binary, which matters
-     * because the newlib userland is still the regression canary and
-     * is launched from musl_sh via execve.
-     *
-     * Frame slots per user_syscall_entry.asm's push order:
-     *   -96 = %rdi, -104 = %rsi.
-     */
     ktop[-12] = (uint64_t)argc;       /* -96: rdi */
     ktop[-13] = argv_array_base;      /* -104: rsi */
 
@@ -1725,7 +1754,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
 
-    /* Manual name copy — no strncpy, we don't want zero-padding. */
     {
         int i = 0;
         while (proc_name[i] && i < PROC_NAME_LEN - 1) {
