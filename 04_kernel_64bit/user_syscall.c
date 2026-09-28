@@ -2232,9 +2232,13 @@ long sys_geteuid(void) {
 /*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
- * Return the current working directory as an absolute path.  donix
- * has a single flat FAT root and no notion of a per-process cwd
- * that changes, so the answer is always "/".
+/*
+ * Linux x86_64 getcwd(2) — syscall 79.
+ *
+ * Return the current working directory: the path stored by
+ * sys_chdir (pcb->cwd), or "/" for a process that has never
+ * called chdir (cwd[0] == '\0', thanks to the zero-init in
+ * process_initialize_pcb).
  *
  * Linux ABI: getcwd(buf, size) copies the NUL-terminated path into
  * buf and returns buf (a pointer, which for our int64 return
@@ -2243,21 +2247,97 @@ long sys_geteuid(void) {
  * freshly malloc'd buffer for the GNU extension; donix does not
  * support that, so -EINVAL.
  *
- * busybox ash calls getcwd at startup and uses the result as $PWD.
- * The path is not dereferenced afterwards on our single-directory
- * filesystem, so "/" is safe and correct.
- *
  * 34 is ERANGE on Linux x86_64.  22 is EINVAL.
  */
 long sys_getcwd(char* buf, unsigned long size) {
     if (!buf) return -(long)EINVAL_;
-    if (size < 2) return -(long)ERANGE_;
 
-    const char path[] = "/";
-    if (safe_copy_to_user(buf, path, sizeof(path)) != 0) {
+    pcb_t* self = process_get_current();
+
+    const char* path = "/";
+    if (self && self->cwd[0] != '\0') {
+        path = self->cwd;
+    }
+
+    size_t len = 0;
+    while (path[len]) len++;
+    if (size < len + 1) return -(long)ERANGE_;
+
+    if (safe_copy_to_user(buf, path, len + 1) != 0) {
         return -(long)EFAULT_;
     }
     return (long)(uint64_t)buf;
+}
+
+/*
+ * Linux x86_64 chdir(2) — syscall 80.
+ *
+ * Change the calling process's current working directory.
+ *
+ * MINIMAL FIRST CUT.  This stores the path in pcb->cwd after
+ * validating that it exists and is a directory, and sys_getcwd
+ * returns the stored value.  It does NOT yet make the other path
+ * syscalls resolve relative paths against the stored cwd -- see
+ * the SCOPE note on pcb->cwd in process.h.  So `cd /bin` succeeds
+ * and `pwd` reports `/bin`, but a subsequent `ls busybox` still
+ * looks at `0:/BUSYBOX` (the root), not `0:/BIN/BUSYBOX`.
+ *
+ * Validation uses f_stat_with_retry, so bare names and leading-
+ * slash paths resolve the same way sys_stat resolves them.  The
+ * path must resolve to a directory (AM_DIR); a file path returns
+ * -ENOTDIR.  If validation fails, cwd is NOT changed.
+ *
+ * The path is stored unsimplified, matching Linux: `cd /bin/../bin`
+ * keeps that exact form, and `pwd` prints it back verbatim.
+ * Root aliases (".", "/", "0:/") are normalized to "/" so getcwd
+ * reports a consistent form.
+ *
+ * 20 is ENOTDIR on Linux x86_64.
+ */
+#ifndef ENOTDIR_
+#define ENOTDIR_ 20
+#endif
+
+long sys_chdir(const char* user_path) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_path) return -(long)EFAULT_;
+
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(path);
+
+    /* Validate: the path must exist and be a directory. */
+    FILINFO fno;
+    if (!path_is_root(path)) {
+        FRESULT r = f_stat_with_retry(path, &fno);
+        if (r != FR_OK) {
+            return fatfs_errno(r);
+        }
+        if (!(fno.fattrib & AM_DIR)) {
+            return -(long)ENOTDIR_;
+        }
+    }
+    /* Root always exists as a directory; no validation needed. */
+
+    /*
+     * Store the path.  A root alias is normalized to "/" so getcwd
+     * reports a consistent form; everything else is stored as
+     * given, unsimplified.
+     */
+    if (path_is_root(path)) {
+        self->cwd[0] = '/';
+        self->cwd[1] = '\0';
+    } else {
+        size_t i = 0;
+        while (path[i] && i < sizeof(self->cwd) - 1) {
+            self->cwd[i] = path[i];
+            i++;
+        }
+        self->cwd[i] = '\0';
+    }
+    return 0;
 }
 
 /*
@@ -3186,6 +3266,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
+        case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);

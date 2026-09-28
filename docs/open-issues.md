@@ -85,7 +85,17 @@ highest first.
     `sys_prctl`, and surface it in `process_dump_all` alongside
     the exec name.  Deferred.  Session 30 (tag
     `20260928-21-prctl`).
-    
+20. `chdir(2)` (80) is a minimal first cut: `sys_chdir` validates
+    and stores the path, `sys_getcwd` returns it, but the
+    path-resolution syscalls (`sys_open`, `sys_stat`,
+    `sys_access`, `sys_execve`) do NOT yet resolve relative paths
+    against `pcb->cwd`.  So `cd /bin` succeeds and `pwd` works,
+    but `cd /bin; ls busybox` still looks for `0:/BUSYBOX` at the
+    root, not `0:/BIN/BUSYBOX`.  **Revisit** when a test needs
+    real relative-path resolution: thread `self->cwd` through the
+    four path syscalls (prepend cwd to a relative path before
+    handing it to FatFs).  Deferred.  Session 30 (tag
+    `20260928-22-chdir`).    
 ## Deferred cleanups
 
 - Audit `puthex`/`put_dec` helpers in `userland/musl/tests/`.

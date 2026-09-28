@@ -71,6 +71,7 @@
  *  61  wait4             sys_wait4
  *  72  fcntl             sys_fcntl
  *  79  getcwd            sys_getcwd
+ *  80  chdir             sys_chdir
  *  83  mkdir             sys_mkdir
  *  87  unlink            sys_unlink
  * 107  geteuid           sys_geteuid
@@ -87,16 +88,12 @@
  * 334  rseq              sys_rseq          (stub, -ENOSYS)
  *
  * ------------------------------------------------------------
- * CANONICAL NUMBERS — reserved but not dispatched
+ * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
  *
- * 262  newfstatat        SYS_NEWFSTATAT is defined below, but no
- *                        case for it exists in syscall_dispatch.
- *                        musl's fstatat routes through stat/lstat
- *                        on x86_64 for the common case, so this is
- *                        not hit yet; a caller passing AT_FDCWD
- *                        plus flags would reach it.  Wire a handler
- *                        before removing this note.
+ * (none currently; the numbered list in docs/open-issues.md
+ * carries deferred items such as newfstatat 262, which has a
+ * reserved number but no dispatch case yet)
  *
  * ------------------------------------------------------------
  * CANONICAL NUMBERS — known gaps (not yet implemented)
@@ -147,6 +144,7 @@
 #define SYS_WAIT4           61
 #define SYS_FCNTL           72
 #define SYS_GETCWD          79
+#define SYS_CHDIR           80
 #define SYS_MKDIR           83
 #define SYS_UNLINK          87
 #define SYS_GETEUID         107
@@ -208,6 +206,7 @@ long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_getppid(void);
 long sys_getcwd(char* buf, unsigned long size);
+long sys_chdir(const char* path);
 long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
                unsigned long arg4, unsigned long arg5);
                
