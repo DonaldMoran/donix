@@ -51,7 +51,9 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ECHILD   10
 #define EINVAL_  22
 #define ERANGE_  34
+#define ENAMETOOLONG_ 36
 
+#define DEBUG_GETCWD 0
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -232,6 +234,193 @@ static void strip_dot_prefix(char* p) {
     char* dst = p;
     while (*src) *dst++ = *src++;
     *dst = '\0';
+}
+
+/*
+ * Resolve a possibly-relative path against the process's cwd.
+ *
+ * The kernel's path syscalls (sys_open, sys_stat, sys_access) all
+ * need this before handing a path to FatFs, because FatFs has no
+ * notion of a process cwd -- it resolves every path against the
+ * FAT root.  Unix semantics require relative paths to resolve
+ * against pcb->cwd instead, and that is what this does.
+ *
+ * Rules, applied in order:
+ *
+ *   - An empty path is copied through unchanged (the caller's
+ *     error handling deals with it).
+ *   - A path that already has a FatFs drive (contains ':') is
+ *     copied through unchanged -- it is already absolute.
+ *   - A path starting with '/' is an absolute Unix path.  It is
+ *     copied through unchanged; the caller (strip_dot_prefix)
+ *     peels the leading '/' before calling FatFs.
+ *   - "." resolves to cwd itself.
+ *   - ".." resolves to the parent of cwd (cwd with its last
+ *     component removed; "/" is its own parent).
+ *   - "../rest" resolves to (parent of cwd) + "/rest".
+ *   - "./rest" resolves to cwd + "/rest".
+ *   - Anything else is relative: cwd + "/" + path.
+ *
+ * The default cwd is "/" (from process_initialize_pcb's memset
+ * leaving cwd[0] == '\0', which this treats as "/").  So with a
+ * never-chdir'd process:
+ *
+ *     "."      -> "/"
+ *     ".."     -> "/"
+ *     "foo"    -> "/foo"
+ *     "./foo"  -> "/foo"
+ *     "../foo" -> "/foo"
+ *     "/foo"   -> "/foo"     (absolute, unchanged)
+ *     "0:/foo" -> "0:/foo"   (FatFs form, unchanged)
+ *
+ * which is exactly what the code did before this helper existed.
+ * Only a non-root cwd changes anything.
+ *
+ * This does NOT collapse interior ".." components.  "a/../b" is
+ * passed through as a relative path and prefixed with cwd; the
+ * kernel does not canonicalize it.  A shell generating paths will
+ * not produce interior "..", so this covers the real cases.  Full
+ * canonicalization is a follow-up.
+ *
+ * Returns 0 on success, -1 if the result would overflow `cap`.
+ */
+static int resolve_against_cwd(pcb_t* self, const char* path,
+                               char* out, size_t cap) {
+    /* cwd, or "/" if the process has never chdir'd. */
+    const char* cwd = "/";
+    if (self && self->cwd[0] != '\0') {
+        cwd = self->cwd;
+    }
+
+    /* Empty path: pass through; caller handles the error. */
+    if (path[0] == '\0') {
+        if (cap < 1) return -1;
+        out[0] = '\0';
+        return 0;
+    }
+
+    /* Already FatFs-absolute (has a drive prefix): pass through. */
+    for (const char* p = path; *p; p++) {
+        if (*p == ':') {
+            size_t i = 0;
+            while (path[i] && i + 1 < cap) { out[i] = path[i]; i++; }
+            if (path[i] != '\0') return -1;
+            out[i] = '\0';
+            return 0;
+        }
+    }
+
+    /* Absolute Unix path: pass through unchanged (caller strips
+     * the leading '/' before calling FatFs). */
+    if (path[0] == '/') {
+        size_t i = 0;
+        while (path[i] && i + 1 < cap) { out[i] = path[i]; i++; }
+        if (path[i] != '\0') return -1;
+        out[i] = '\0';
+        return 0;
+    }
+
+    /* "." alone: the cwd. */
+    if (path[0] == '.' && path[1] == '\0') {
+        size_t i = 0;
+        while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
+        if (cwd[i] != '\0') return -1;
+        out[i] = '\0';
+        return 0;
+    }
+
+    /* ".." or "../...": start from the parent of cwd. */
+    if (path[0] == '.' && path[1] == '.' &&
+        (path[2] == '\0' || path[2] == '/')) {
+
+        /* Compute parent of cwd.  "/" is its own parent. */
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+
+        size_t parent_len = clen;
+        if (clen > 1) {
+            size_t j = clen;
+            while (j > 1 && cwd[j - 1] != '/') j--;
+            if (j <= 1) parent_len = 1;
+            else        parent_len = j - 1;
+        } else {
+            parent_len = 1;   /* cwd was "/" */
+        }
+
+        size_t o = 0;
+        for (size_t i = 0; i < parent_len; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+
+        const char* rem = path + 2;   /* "" or "/..." */
+        if (rem[0] == '/') {
+            if (out[o - 1] != '/') {
+                if (o + 1 >= cap) return -1;
+                out[o++] = '/';
+            }
+            for (size_t i = 1; rem[i]; i++) {
+                if (o + 1 >= cap) return -1;
+                out[o++] = rem[i];
+            }
+        }
+        out[o] = '\0';
+        return 0;
+    }
+
+    /* "./..." -- resolve as cwd + the part after "./". */
+    if (path[0] == '.' && path[1] == '/') {
+        size_t o = 0;
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+        for (size_t i = 0; i < clen; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+        if (out[o - 1] != '/') {
+            if (o + 1 >= cap) return -1;
+            out[o++] = '/';
+        }
+        for (size_t i = 2; path[i]; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = path[i];
+        }
+        out[o] = '\0';
+        return 0;
+    }
+
+    /* Ordinary relative path: cwd + "/" + path. */
+    {
+        size_t o = 0;
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+        for (size_t i = 0; i < clen; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+        if (out[o - 1] != '/') {
+            if (o + 1 >= cap) return -1;
+            out[o++] = '/';
+        }
+        for (size_t i = 0; path[i]; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = path[i];
+        }
+        out[o] = '\0';
+        return 0;
+    }
 }
 
 /*
@@ -544,8 +733,21 @@ long sys_open(const char* path, int flags) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
@@ -944,10 +1146,9 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * through fstatat(AT_FDCWD, path, st, 0) → fstatat_kstat →
  * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
  *
- * The path is passed straight through to FatFs's f_stat, which
- * accepts the same "0:/NAME" form as f_open, after strip_dot_prefix
- * has removed any leading "./" that musl's lstat()/stat() would
- * otherwise hand us.
+ * The path is resolved against the process cwd first (see
+ * resolve_against_cwd), then strip_dot_prefix removes any leading
+ * "./" or "/", then it is handed to FatFs's f_stat.
  *
  * Failure return is a proper negative errno (via fatfs_errno) so
  * that callers like busybox ash's PATH search get a sensible
@@ -958,8 +1159,21 @@ long sys_stat(const char* user_path, void* user_stat) {
     if (!user_path || !user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(process_get_current(), path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(path) - 1) {
+            path[i] = resolved[i];
+            i++;
+        }
+        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
@@ -1017,9 +1231,8 @@ long sys_lstat(const char* user_path, void* user_stat) {
  * (0), R_OK (4), W_OK (2), X_OK (1) all reduce to "does this
  * path resolve to something on the FAT".
  *
- * The path is checked with the same f_stat-with-retry used by
- * sys_stat, so "ls", "echo", and "/usr/local/sbin/ls" all resolve
- * the same way they do for stat.
+ * The path is resolved against the process cwd first, then checked
+ * with the same f_stat-with-retry used by sys_stat.
  *
  * Why this exists: busybox's find_execable() (libbb/find_execable.c)
  * calls access(path, X_OK) for each PATH candidate before deciding
@@ -1035,8 +1248,21 @@ long sys_access(const char* user_path, int mode) {
     if (!user_path) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(process_get_current(), path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(path) - 1) {
+            path[i] = resolved[i];
+            i++;
+        }
+        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
@@ -2232,9 +2458,6 @@ long sys_geteuid(void) {
 /*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
-/*
- * Linux x86_64 getcwd(2) — syscall 79.
- *
  * Return the current working directory: the path stored by
  * sys_chdir (pcb->cwd), or "/" for a process that has never
  * called chdir (cwd[0] == '\0', thanks to the zero-init in
@@ -2261,6 +2484,21 @@ long sys_getcwd(char* buf, unsigned long size) {
 
     size_t len = 0;
     while (path[len]) len++;
+#if DEBUG_GETCWD
+    serial_print("sys_getcwd: buf=0x");
+    serial_print_hex((uint64_t)buf);
+    serial_print(" size=");
+    serial_print_dec((uint64_t)size);
+    serial_print(" cwd='");
+    if (self) serial_print(self->cwd); else serial_print("(no self)");
+    serial_print("' path='");
+    serial_print(path);
+    serial_print("' len=");
+    serial_print_dec((uint64_t)len);
+    serial_print(" ret=0x");
+    serial_print_hex((uint64_t)buf);
+    serial_print("\n");
+#endif
     if (size < len + 1) return -(long)ERANGE_;
 
     if (safe_copy_to_user(buf, path, len + 1) != 0) {
@@ -2306,12 +2544,38 @@ long sys_chdir(const char* user_path) {
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -(long)EFAULT_;
     }
-    strip_dot_prefix(path);
+
+    /*
+     * We need TWO forms of the path:
+     *
+     *   1. The FAT form, for validating with f_stat_with_retry.
+     *      FatFs rejects a leading "/", so strip_dot_prefix is
+     *      applied to a COPY.
+     *   2. The Unix form, for storing as the cwd.  It must be
+     *      ABSOLUTE -- musl's getcwd() validates that the result
+     *      starts with '/', and rejects a relative cwd.  So the
+     *      stored form keeps its leading '/'.
+     *
+     * Before, we stripped once and stored the stripped form, so
+     * `cd /bin` stored "bin" and every getcwd() afterwards failed
+     * (musl saw a non-absolute cwd and bailed to a userspace
+     * fallback that cannot work on donix's flat FAT).
+     */
+    char fat_path[USER_PATH_MAX];
+    {
+        size_t i = 0;
+        while (path[i] && i < sizeof(fat_path) - 1) {
+            fat_path[i] = path[i];
+            i++;
+        }
+        fat_path[i] = '\0';
+    }
+    strip_dot_prefix(fat_path);
 
     /* Validate: the path must exist and be a directory. */
     FILINFO fno;
-    if (!path_is_root(path)) {
-        FRESULT r = f_stat_with_retry(path, &fno);
+    if (!path_is_root(fat_path)) {
+        FRESULT r = f_stat_with_retry(fat_path, &fno);
         if (r != FR_OK) {
             return fatfs_errno(r);
         }
@@ -2319,24 +2583,49 @@ long sys_chdir(const char* user_path) {
             return -(long)ENOTDIR_;
         }
     }
-    /* Root always exists as a directory; no validation needed. */
 
     /*
-     * Store the path.  A root alias is normalized to "/" so getcwd
-     * reports a consistent form; everything else is stored as
-     * given, unsimplified.
+     * Store the cwd in ABSOLUTE Unix form.
+     *
+     * Root aliases (".", "/", "0:/") normalize to "/".  Everything
+     * else is stored with a guaranteed leading '/': if the caller
+     * passed a relative path, resolve_against_cwd has already been
+     * applied by the syscall layer?  No -- chdir is called with the
+     * raw user path.  So we prefix '/' here for relative inputs.
+     *
+     * In practice a shell passes an absolute or "./x"-style path;
+     * for "./x" strip_dot_prefix gave "x", and we store "/x".  That
+     * is the correct absolute form for a cwd of "x" under root.
+     * (donix has no nested cwd beyond /bin today, so this is
+     * sufficient; full relative-cwd resolution is a follow-up.)
      */
-    if (path_is_root(path)) {
+    if (path_is_root(fat_path)) {
         self->cwd[0] = '/';
         self->cwd[1] = '\0';
     } else {
-        size_t i = 0;
-        while (path[i] && i < sizeof(self->cwd) - 1) {
-            self->cwd[i] = path[i];
-            i++;
+        size_t o = 0;
+        /* Ensure a leading '/'. */
+        if (fat_path[0] != '/') {
+            self->cwd[o++] = '/';
         }
-        self->cwd[i] = '\0';
+        for (size_t i = 0; fat_path[i] && o < sizeof(self->cwd) - 1; i++) {
+            self->cwd[o++] = fat_path[i];
+        }
+        self->cwd[o] = '\0';
     }
+
+#if DEBUG_CHDIR
+    {
+        size_t l = 0;
+        while (self->cwd[l]) l++;
+        serial_print("sys_chdir: stored cwd='");
+        serial_print(self->cwd);
+        serial_print("' len=");
+        serial_print_dec((uint64_t)l);
+        serial_print("\n");
+    }
+#endif
+
     return 0;
 }
 
@@ -3164,6 +3453,37 @@ long sys_fork(void) {
      * See the fs_base comment in process.h.
      */
     child->fs_base = parent->fs_base;
+
+
+    /*
+     * Child inherits the parent's cwd.
+     *
+     * The cwd is a per-process property, so fork must propagate it,
+     * exactly like fs_base and brk_virt.  Without this, a forked
+     * child starts with cwd[0] == '\0' (the fresh-PCB default from
+     * process_initialize_pcb's memset), which sys_stat and
+     * sys_open treat as "/".  busybox applets that fork -- `ls`,
+     * `cat`, `echo` when run as separate processes -- would then
+     * see the root as their working directory regardless of what
+     * `cd` set in the parent.
+     *
+     * This is what made `cd /bin; ls` list the root: the shell did
+     * `cd` in its own process (setting pcb->cwd = "/bin"), then
+     * forked a child for `ls`, and the child's empty cwd resolved
+     * "." to "/".
+     *
+     * cwd already survives execve untouched (sys_execve does not
+     * clear it), so this one propagation point covers both fork
+     * and the fork+exec path.
+     */
+    {
+        size_t _i = 0;
+        while (parent->cwd[_i] && _i < sizeof(child->cwd) - 1) {
+            child->cwd[_i] = parent->cwd[_i];
+            _i++;
+        }
+        child->cwd[_i] = '\0';
+    }
 
     /*
      * Build the child's iretq-resume frame from the parent's current
