@@ -8,6 +8,7 @@
 #define PROC_NAME_LEN 32
 #define PROC_STACK_SIZE  16384   // 16KB: syscall entry + nested timer frame + sys_read blocking headroom
 #define MAX_PROCESS_FILES 8
+#define PROC_CWD_MAX 128
 
 // Process states
 typedef enum {
@@ -113,6 +114,28 @@ typedef struct pcb {
      * context_switch.asm reads (which stops at block_kind, 0x158) moves.
      */
     uint64_t fs_base;
+    /*
+     * Per-process current working directory (chdir(2), syscall 80).
+     *
+     * Stored as a NUL-terminated absolute path.  Zero-initialized by
+     * process_initialize_pcb's memset, so cwd[0] == '\0' means "never
+     * called chdir"; sys_getcwd treats that as "/".  sys_chdir writes
+     * a real path here.
+     *
+     * PLACED AT THE END of pcb_t, after fs_base, so no offset that
+     * context_switch.asm reads (which stops at block_kind, 0x158)
+     * moves.  The _Static_assert block in process.c pins everything
+     * through block_kind; nothing after it is asserted, so this is
+     * safe to append.
+     *
+     * SCOPE: this field is written by sys_chdir and read by
+     * sys_getcwd ONLY.  The path-resolution syscalls (sys_open,
+     * sys_stat, sys_access, sys_execve) do NOT yet resolve relative
+     * paths against it -- they still treat every path as
+     * root-relative.  Threading cwd through them is a follow-up;
+     * see docs/open-issues.md.
+     */
+    char cwd[PROC_CWD_MAX];
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

@@ -51,7 +51,9 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ECHILD   10
 #define EINVAL_  22
 #define ERANGE_  34
+#define ENAMETOOLONG_ 36
 
+#define DEBUG_GETCWD 0
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -232,6 +234,193 @@ static void strip_dot_prefix(char* p) {
     char* dst = p;
     while (*src) *dst++ = *src++;
     *dst = '\0';
+}
+
+/*
+ * Resolve a possibly-relative path against the process's cwd.
+ *
+ * The kernel's path syscalls (sys_open, sys_stat, sys_access) all
+ * need this before handing a path to FatFs, because FatFs has no
+ * notion of a process cwd -- it resolves every path against the
+ * FAT root.  Unix semantics require relative paths to resolve
+ * against pcb->cwd instead, and that is what this does.
+ *
+ * Rules, applied in order:
+ *
+ *   - An empty path is copied through unchanged (the caller's
+ *     error handling deals with it).
+ *   - A path that already has a FatFs drive (contains ':') is
+ *     copied through unchanged -- it is already absolute.
+ *   - A path starting with '/' is an absolute Unix path.  It is
+ *     copied through unchanged; the caller (strip_dot_prefix)
+ *     peels the leading '/' before calling FatFs.
+ *   - "." resolves to cwd itself.
+ *   - ".." resolves to the parent of cwd (cwd with its last
+ *     component removed; "/" is its own parent).
+ *   - "../rest" resolves to (parent of cwd) + "/rest".
+ *   - "./rest" resolves to cwd + "/rest".
+ *   - Anything else is relative: cwd + "/" + path.
+ *
+ * The default cwd is "/" (from process_initialize_pcb's memset
+ * leaving cwd[0] == '\0', which this treats as "/").  So with a
+ * never-chdir'd process:
+ *
+ *     "."      -> "/"
+ *     ".."     -> "/"
+ *     "foo"    -> "/foo"
+ *     "./foo"  -> "/foo"
+ *     "../foo" -> "/foo"
+ *     "/foo"   -> "/foo"     (absolute, unchanged)
+ *     "0:/foo" -> "0:/foo"   (FatFs form, unchanged)
+ *
+ * which is exactly what the code did before this helper existed.
+ * Only a non-root cwd changes anything.
+ *
+ * This does NOT collapse interior ".." components.  "a/../b" is
+ * passed through as a relative path and prefixed with cwd; the
+ * kernel does not canonicalize it.  A shell generating paths will
+ * not produce interior "..", so this covers the real cases.  Full
+ * canonicalization is a follow-up.
+ *
+ * Returns 0 on success, -1 if the result would overflow `cap`.
+ */
+static int resolve_against_cwd(pcb_t* self, const char* path,
+                               char* out, size_t cap) {
+    /* cwd, or "/" if the process has never chdir'd. */
+    const char* cwd = "/";
+    if (self && self->cwd[0] != '\0') {
+        cwd = self->cwd;
+    }
+
+    /* Empty path: pass through; caller handles the error. */
+    if (path[0] == '\0') {
+        if (cap < 1) return -1;
+        out[0] = '\0';
+        return 0;
+    }
+
+    /* Already FatFs-absolute (has a drive prefix): pass through. */
+    for (const char* p = path; *p; p++) {
+        if (*p == ':') {
+            size_t i = 0;
+            while (path[i] && i + 1 < cap) { out[i] = path[i]; i++; }
+            if (path[i] != '\0') return -1;
+            out[i] = '\0';
+            return 0;
+        }
+    }
+
+    /* Absolute Unix path: pass through unchanged (caller strips
+     * the leading '/' before calling FatFs). */
+    if (path[0] == '/') {
+        size_t i = 0;
+        while (path[i] && i + 1 < cap) { out[i] = path[i]; i++; }
+        if (path[i] != '\0') return -1;
+        out[i] = '\0';
+        return 0;
+    }
+
+    /* "." alone: the cwd. */
+    if (path[0] == '.' && path[1] == '\0') {
+        size_t i = 0;
+        while (cwd[i] && i + 1 < cap) { out[i] = cwd[i]; i++; }
+        if (cwd[i] != '\0') return -1;
+        out[i] = '\0';
+        return 0;
+    }
+
+    /* ".." or "../...": start from the parent of cwd. */
+    if (path[0] == '.' && path[1] == '.' &&
+        (path[2] == '\0' || path[2] == '/')) {
+
+        /* Compute parent of cwd.  "/" is its own parent. */
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+
+        size_t parent_len = clen;
+        if (clen > 1) {
+            size_t j = clen;
+            while (j > 1 && cwd[j - 1] != '/') j--;
+            if (j <= 1) parent_len = 1;
+            else        parent_len = j - 1;
+        } else {
+            parent_len = 1;   /* cwd was "/" */
+        }
+
+        size_t o = 0;
+        for (size_t i = 0; i < parent_len; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+
+        const char* rem = path + 2;   /* "" or "/..." */
+        if (rem[0] == '/') {
+            if (out[o - 1] != '/') {
+                if (o + 1 >= cap) return -1;
+                out[o++] = '/';
+            }
+            for (size_t i = 1; rem[i]; i++) {
+                if (o + 1 >= cap) return -1;
+                out[o++] = rem[i];
+            }
+        }
+        out[o] = '\0';
+        return 0;
+    }
+
+    /* "./..." -- resolve as cwd + the part after "./". */
+    if (path[0] == '.' && path[1] == '/') {
+        size_t o = 0;
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+        for (size_t i = 0; i < clen; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+        if (out[o - 1] != '/') {
+            if (o + 1 >= cap) return -1;
+            out[o++] = '/';
+        }
+        for (size_t i = 2; path[i]; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = path[i];
+        }
+        out[o] = '\0';
+        return 0;
+    }
+
+    /* Ordinary relative path: cwd + "/" + path. */
+    {
+        size_t o = 0;
+        size_t clen = 0;
+        while (cwd[clen]) clen++;
+        for (size_t i = 0; i < clen; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = cwd[i];
+        }
+        if (o == 0) {
+            if (cap < 2) return -1;
+            out[o++] = '/';
+        }
+        if (out[o - 1] != '/') {
+            if (o + 1 >= cap) return -1;
+            out[o++] = '/';
+        }
+        for (size_t i = 0; path[i]; i++) {
+            if (o + 1 >= cap) return -1;
+            out[o++] = path[i];
+        }
+        out[o] = '\0';
+        return 0;
+    }
 }
 
 /*
@@ -544,8 +733,21 @@ long sys_open(const char* path, int flags) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
@@ -754,6 +956,68 @@ long sys_unlink(const char* path) {
     return 0;
 }
 
+/*
+ * Linux x86_64 mkdir(2) — syscall 83.
+ *
+ * FatFs has no notion of UNIX permissions, so the mode argument is
+ * ignored.  Path normalization is identical to sys_unlink's:
+ * copy_user_string pulls the path out of user space, then
+ * strip_dot_prefix peels any leading "./" or "/" so FatFs sees a
+ * form it accepts.
+ *
+ * An empty path returns -ENOENT before reaching FatFs.  Linux
+ * returns -ENOENT from mkdir("") too, so this matches the Linux
+ * ABI.  The early return is defensive: it keeps an empty-path
+ * call out of the FatFs diagnostic path rather than letting
+ * f_mkdir("") produce a confusing error.
+ *
+ * HISTORY: this function was originally registered at syscall 7
+ * (tag 20260927-18), on the theory that the per-keystroke
+ * "Unknown syscall: 7" noise from busybox ash's line editor was
+ * an mkdir("") probe.  That was a misidentification.  On Linux
+ * x86_64, 7 is poll(2) and mkdir is 83; ash's line editor was
+ * polling stdin for readability once per keystroke, not calling
+ * mkdir.  Implementing mkdir at 7 silenced the noise, and because
+ * the old number was never reached by any correct caller, the
+ * handler was effectively dead code that shadowed poll.  The
+ * number is now 83, matching the Linux ABI, so stock binaries
+ * (busybox) reach it.  The missing poll(2) is tracked in
+ * docs/open-issues.md and is the reason the keystroke noise
+ * returns until poll is implemented.
+ *
+ * FatFs returns FR_EXIST when a directory or file of the same name
+ * already exists; fatfs_errno maps that to -EPERM.  Linux would
+ * return -EEXIST (17).  busybox does not distinguish the two for
+ * its purposes, so the mapping is left alone for now.  If a caller
+ * ever needs -EEXIST, change fatfs_errno's FR_EXIST case to
+ * -(long)17 at that time.
+ */
+long sys_mkdir(const char* path, int mode) {
+    (void)mode;
+
+    pcb_t* self = process_get_current();
+    if (!self || !path) return -(long)EFAULT_;
+
+    char local_path[USER_PATH_MAX];
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local_path);
+
+    if (local_path[0] == '\0') {
+        /* An empty path is not a valid path on any Unix.  Linux
+         * returns -ENOENT from mkdir("") too.  The early return
+         * keeps an empty-path call out of the FatFs diagnostic
+         * path. */
+        return -(long)ENOENT_;
+    }
+
+    FRESULT r = f_mkdir(local_path);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
 
 /*
  * Fill a kernel_stat_t from a FatFs FILINFO.
@@ -882,10 +1146,9 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * through fstatat(AT_FDCWD, path, st, 0) → fstatat_kstat →
  * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
  *
- * The path is passed straight through to FatFs's f_stat, which
- * accepts the same "0:/NAME" form as f_open, after strip_dot_prefix
- * has removed any leading "./" that musl's lstat()/stat() would
- * otherwise hand us.
+ * The path is resolved against the process cwd first (see
+ * resolve_against_cwd), then strip_dot_prefix removes any leading
+ * "./" or "/", then it is handed to FatFs's f_stat.
  *
  * Failure return is a proper negative errno (via fatfs_errno) so
  * that callers like busybox ash's PATH search get a sensible
@@ -896,8 +1159,21 @@ long sys_stat(const char* user_path, void* user_stat) {
     if (!user_path || !user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(process_get_current(), path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(path) - 1) {
+            path[i] = resolved[i];
+            i++;
+        }
+        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
@@ -955,9 +1231,8 @@ long sys_lstat(const char* user_path, void* user_stat) {
  * (0), R_OK (4), W_OK (2), X_OK (1) all reduce to "does this
  * path resolve to something on the FAT".
  *
- * The path is checked with the same f_stat-with-retry used by
- * sys_stat, so "ls", "echo", and "/usr/local/sbin/ls" all resolve
- * the same way they do for stat.
+ * The path is resolved against the process cwd first, then checked
+ * with the same f_stat-with-retry used by sys_stat.
  *
  * Why this exists: busybox's find_execable() (libbb/find_execable.c)
  * calls access(path, X_OK) for each PATH candidate before deciding
@@ -973,8 +1248,21 @@ long sys_access(const char* user_path, int mode) {
     if (!user_path) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(process_get_current(), path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(path) - 1) {
+            path[i] = resolved[i];
+            i++;
+        }
+        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
@@ -1131,25 +1419,28 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
 }
 
 /*
- * Resolve an execve path to a FatFs-acceptable form.
+ * Resolve a bare command name to a root-level path.
  *
- * `ash` (busybox sh) calls execve with bare names — "ls", "echo" —
- * or with a PATH-style absolute path like "/usr/bin/ls".  Neither
- * is a valid FatFs path.  musl_sh, by contrast, already prepends
- * "0:/" and appends ".ELF" before calling execve, and those paths
- * go straight through.
+ * This is sub-attempt (c1) of sys_execve's three-attempt open:
+ * turn a bare name like "ls" into "0:/LS.ELF" — uppercased, with
+ * ".ELF" appended, at the FAT root.  This is what makes ash's
+ * execve("ls", ...) find the donix-native root binary, and what
+ * makes `donix> hello` work from musl_sh without the shell doing
+ * any rewriting of its own.
  *
- * The rule is:
- *   - If `in` already contains a ':' (drive prefix) or the caller
- *     asked for a path that clearly has a FatFs form, leave it
- *     alone.  f_open will handle it or not.
- *   - If `in` is a bare name (no '/', no ':'), build "0:/NAME.ELF"
- *     with NAME uppercased to match the FAT layout.
- *   - If `in` starts with '/', take the last path component (after
- *     the final '/'), and build "0:/NAME.ELF" the same way.
+ * Root is tried before /bin (see exec_resolve_bin_name) so a
+ * donix-native binary shadows a same-named entry in /bin.
+ *
+ * The rule:
+ *   - Take the base name: the substring after the last '/', or
+ *     the whole string if there is no '/'.
+ *   - If the base already ends in ".ELF" (case-insensitive), do
+ *     not append it again.
+ *   - Uppercase the base to match the FAT layout.
+ *   - Prepend "0:/".
  *
  * Returns 0 on success, -1 if the resolved path would overflow
- * `out_cap`.
+ * `out_cap` or if `in` has no base name (was "/" or "").
  */
 static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
     /* Pick the base name: the substring after the last '/', or the
@@ -1190,6 +1481,60 @@ static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
         out[o++] = c;
     }
     if (!have_suffix) {
+        out[o++] = '.';
+        out[o++] = 'E';
+        out[o++] = 'L';
+        out[o++] = 'F';
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/*
+ * Resolve a bare command name to a path under /bin.
+ *
+ * `in` is a bare name like "busybox" (no '/').  Produces:
+ *
+ *   with_suffix == 0:  "0:/BIN/NAME"
+ *   with_suffix == 1:  "0:/BIN/NAME.ELF"
+ *
+ * NAME is uppercased, matching the convention exec_resolve_bare_name
+ * uses.  FatFs is case-insensitive on lookup, so the uppercase form
+ * finds both "busybox" and "BUSYBOX.ELF" on disk.
+ *
+ * Returns 0 on success, -1 on overflow or if `in` is not a bare name.
+ */
+static int exec_resolve_bin_name(const char* in, char* out,
+                                 size_t out_cap, int with_suffix) {
+    /* Callers pass bare names only; reject anything with a slash so
+     * a mistake here does not silently produce a doubled path. */
+    for (const char* p = in; *p; p++) {
+        if (*p == '/') return -1;
+    }
+    if (*in == '\0') return -1;
+
+    size_t blen = 0;
+    while (in[blen]) blen++;
+
+    /* "0:/BIN/" is 7 chars, plus name, plus optional ".ELF", plus NUL. */
+    size_t need = 7 + blen + (with_suffix ? 4 : 0) + 1;
+    if (need > out_cap) return -1;
+
+    out[0] = '0';
+    out[1] = ':';
+    out[2] = '/';
+    out[3] = 'B';
+    out[4] = 'I';
+    out[5] = 'N';
+    out[6] = '/';
+
+    size_t o = 7;
+    for (size_t i = 0; i < blen; i++) {
+        char c = in[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[o++] = c;
+    }
+    if (with_suffix) {
         out[o++] = '.';
         out[o++] = 'E';
         out[o++] = 'L';
@@ -1253,15 +1598,41 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 2. Open and read the whole ELF file. ----
      *
-     * First try the path exactly as the caller supplied it.  If
-     * f_open fails, and the path is a bare name or a leading-/
-     * path (i.e. has no ':' anywhere), try the resolved form
-     * "0:/NAME.ELF" with NAME uppercased to match the FAT layout.
+     * Three attempts, in order:
      *
-     * This is the retry that makes busybox ash's execve("ls",...)
-     * work: musl_sh already normalizes before calling execve, but
-     * ash does not, and there is no PATH and no shell rc file that
-     * could do it for us.
+     *   (a) the path exactly as the caller supplied it;
+     *   (b) if the path starts with '/', "0:" + path, preserving
+     *       case and suffix -- the Unix-style absolute path form;
+     *   (c) if the path has no ':' at all, the bare-name form.
+     *       Attempt (c) itself has three sub-attempts: root
+     *       "0:/NAME.ELF", then "/bin/NAME", then "/bin/NAME.ELF".
+     *
+     * (b) is what makes `/bin/busybox sh` work from the custom
+     * musl shell: the kernel was previously handing "/bin/busybox"
+     * straight to FatFs, which rejects any path with a leading
+     * slash.  The kernel is the layer that should translate a
+     * Unix-style path to the FatFs form, not the caller.
+     *
+     * (c1) is what makes ash's bare `execve("ls", ...)` resolve to
+     * the donix-native root binary.  (c2) and (c3) are what make
+     * bare `busybox` resolve to /bin/busybox now that the busybox
+     * binary no longer sits at the FAT root.  Root is tried first
+     * so donix-native binaries shadow same-named /bin entries.
+     */
+    /*
+     * VFS SHIM.  The three attempts below stand in for a virtual
+     * filesystem layer that donix does not have yet.  On real
+     * Unix, execve hands the path to the VFS and the VFS resolves
+     * it; there is no guessing and no retry.  Here, FatFs has no
+     * notion of '/', no root directory in the POSIX sense, and no
+     * way to walk a multi-component path, so the kernel does the
+     * translation inline.
+     *
+     * When a VFS lands, DELETE this whole block and make execve
+     * call the VFS resolver once.  Do not add a fourth attempt;
+     * add the VFS instead.  Candidates that must then be removed:
+     * the "0:" + path prepend, exec_resolve_bare_name, and
+     * exec_resolve_bin_name.
      */
     FIL file;
     FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
@@ -1271,16 +1642,76 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (*p == ':') { has_drive = 1; break; }
         }
 
-        char resolved[USER_PATH_MAX];
-        int can_retry = !has_drive &&
-                        exec_resolve_bare_name(path, resolved,
-                                               sizeof(resolved)) == 0;
+        /*
+         * Attempt (b): Unix-style absolute path -> "0:" + path.
+         *
+         * Preserves case and any suffix: the caller named an
+         * exact path, so we honor it as written and only add the
+         * drive prefix FatFs requires.  No uppercasing, no
+         * ".ELF" appended.
+         */
+        if (!has_drive && path[0] == '/') {
+            char resolved[USER_PATH_MAX];
+            size_t plen = 0;
+            while (path[plen]) plen++;
+            if (plen + 3 <= sizeof(resolved)) {   /* "0:" + path + NUL */
+                resolved[0] = '0';
+                resolved[1] = ':';
+                for (size_t i = 0; i <= plen; i++) {
+                    resolved[2 + i] = path[i];
+                }
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+            /* if too long, skip (b) and fall through to (c) */
+        }
 
-        if (can_retry) {
-            FRESULT fr2 = f_open(&file, resolved, FA_READ | FA_OPEN_EXISTING);
-            if (fr2 == FR_OK) {
-                /* Retry succeeded.  Fall through with `file` open. */
-                fr = FR_OK;
+        /*
+         * Attempt (c): bare name.  Three sub-attempts, in order:
+         *
+         *   (c1) "0:/NAME.ELF"     -- root, uppercased, .ELF appended.
+         *                             Donix-native binaries win here.
+         *   (c2) "0:/BIN/NAME"     -- /bin, uppercased, no suffix.
+         *                             This is where busybox lives now.
+         *   (c3) "0:/BIN/NAME.ELF" -- /bin, uppercased, .ELF appended.
+         *                             Covers a future /bin/NAME.ELF.
+         */
+        if (fr != FR_OK && !has_drive) {
+            char resolved[USER_PATH_MAX];
+
+            /* (c1) root, uppercased, .ELF appended. */
+            if (exec_resolve_bare_name(path, resolved,
+                                       sizeof(resolved)) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+
+            /* (c2) /bin, uppercased, as-is (no .ELF). */
+            if (fr != FR_OK &&
+                exec_resolve_bin_name(path, resolved,
+                                      sizeof(resolved), 0) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
+            }
+
+            /* (c3) /bin, uppercased, .ELF appended. */
+            if (fr != FR_OK &&
+                exec_resolve_bin_name(path, resolved,
+                                      sizeof(resolved), 1) == 0) {
+                FRESULT fr2 = f_open(&file, resolved,
+                                     FA_READ | FA_OPEN_EXISTING);
+                if (fr2 == FR_OK) {
+                    fr = FR_OK;
+                }
             }
         }
     }
@@ -1425,12 +1856,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     /* ---- 5. Tear down the old address space, then load the new one. ---- */
-    /*
-     * No scratch CR3.  Everything targets self->cr3.  From this point
-     * on, failures cannot be cleanly recovered (the caller's old
-     * pages are gone), so any failure exits the process.  See the
-     * function comment for the rationale.
-     */
     exec_free_and_unmap_user_pages(self);
     self->user_stack_virt = 0;
     self->user_stack_phys = 0;
@@ -1462,32 +1887,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         uint64_t argv_region_top    = new_user_stack_top;
         uint64_t argv_region_bottom = argv_region_top - 4096;
 
-        /*
-         * Layout on the argv region, low to high:
-         *
-         *   argv_region_bottom + 0               argv[0]
-         *   argv_region_bottom + 8               argv[1]
-         *   ...
-         *   argv_region_bottom + 8*argc          argv NULL terminator
-         *   argv_region_bottom + 8*(argc+1)      envp NULL terminator
-         *   argv_region_bottom + 8*(argc+2)      first argument string
-         *
-         * array_bytes = 8*(argc+1) covers the argv slots plus the
-         * argv NULL terminator.  The envp NULL terminator needs one
-         * MORE slot, at argv_region_bottom + array_bytes.  Strings
-         * must therefore start at argv_region_bottom + array_bytes
-         * + 8, not at argv_region_bottom + array_bytes.
-         *
-         * The previous code put strings_start at
-         * argv_region_bottom + array_bytes, the same address as the
-         * envp NULL write, so the envp NULL zeroed the first 8
-         * bytes of argv[0]'s string.  When argv[0] was long (e.g.
-         * "0:/cat.elf") the collateral damage stopped short of
-         * argv[1]'s string and nothing visible broke.  When argv[0]
-         * was short (e.g. "cat", "echo"), argv[1]'s string began
-         * inside the 8-byte zeroing window and was clobbered — the
-         * child saw an empty argv[1] and silently did nothing.
-         */
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
         uint64_t array_base    = argv_region_bottom;
         uint64_t strings_start = argv_region_bottom + array_bytes + 8;
@@ -1535,9 +1934,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         argv_array_base = array_base;
 
-        /* SysV initial stack: [rsp]=argc, [rsp+8]=argv[0..n-1],
-           then argv NULL, then envp NULL.  We put argc in the 8 bytes
-           immediately below the argv array. */
         rsp_init = argv_region_bottom - 8;
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
@@ -1569,47 +1965,10 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         }
     }
 
-    /* ---- 7. Rewrite the syscall-entry frame. ----
-     *
-     * user_syscall_entry.asm pushed the frame with the first push at
-     * kernel_stack_top - 8.  Offsets we care about:
-     *   -56 = user RIP   (loaded into %rcx, used by sysret)
-     *   -72 = user RSP   (loaded into %r10, moved to %rsp before sysret)
-     *
-     * ktop[-7] = -56, ktop[-9] = -72.  RFLAGS at -64 is left alone:
-     * the new program starts with the same user RFLAGS the old one
-     * had, which is 0x202 for musl.
-     */
+    /* ---- 7. Rewrite the syscall-entry frame. ---- */
     uint64_t* ktop = (uint64_t*)self->kernel_stack_top;
     ktop[-7] = entry;      /* -56: user RIP  */
     ktop[-9] = rsp_init;   /* -72: user RSP  */
-
-    /*
-     * Also pass argc/argv in %rdi/%rsi.
-     *
-     * musl's _start reads the SysV stack layout above and ignores
-     * %rdi/%rsi on entry.  donix's newlib crt0.S (arc2/crt0.S) reads
-     * %rdi/%rsi and ignores the stack layout:
-     *
-     *     mov [rip + argc_saved], rdi
-     *     mov [rip + argv_saved], rsi
-     *
-     * sys_spawn (507) already passes argc/argv in %rdi/%rsi via
-     * frame[9]/frame[10] of the child's initial resume frame.
-     * sys_execve was missing it, so a newlib binary launched via
-     * execve ran with %rdi/%rsi holding the execve call's own
-     * arguments — pointers into the old, torn-down address space.
-     * cat.elf read argv[1] from there, got NULL, and tried to open
-     * "0:/(null)".
-     *
-     * Setting both is harmless for musl (it ignores the registers)
-     * and makes execve work for either kind of binary, which matters
-     * because the newlib userland is still the regression canary and
-     * is launched from musl_sh via execve.
-     *
-     * Frame slots per user_syscall_entry.asm's push order:
-     *   -96 = %rdi, -104 = %rsi.
-     */
     ktop[-12] = (uint64_t)argc;       /* -96: rdi */
     ktop[-13] = argv_array_base;      /* -104: rsi */
 
@@ -1621,7 +1980,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
 
-    /* Manual name copy — no strncpy, we don't want zero-padding. */
     {
         int i = 0;
         while (proc_name[i] && i < PROC_NAME_LEN - 1) {
@@ -2014,7 +2372,43 @@ long sys_getppid(void) {
 }
 
 /*
- * Linux x86_64 setsid(2) — syscall 107.
+ * Linux x86_64 prctl(2) — syscall 157.
+ *
+ * Multiplexer.  busybox calls it once per invocation with
+ * PR_SET_NAME (15) to set the process's name (comm).  We have
+ * nowhere separate to store it: pcb->name is the exec name, used
+ * by process_dump_all and the sys_execve trace line, and
+ * overwriting it with busybox's comm value ("busybox", or the
+ * applet name) would make our own diagnostics less useful, not
+ * more.
+ *
+ * So PR_SET_NAME is ACCEPTED AND DROPPED: return 0, do not store.
+ * That satisfies busybox, which ignores the return value.  All
+ * other options return -EINVAL, matching Linux's behavior for an
+ * unknown or unsupported option.
+ *
+ * REVISIT: this is deliberately minimal.  A Unix-shaped
+ * implementation would give pcb_t a separate `comm` field (Linux
+ * keeps comm and the exec path distinct), set it here, and show
+ * it in process_dump_all alongside the exec name.  That is
+ * deferred -- see docs/open-issues.md.  The point of this
+ * function today is to stop busybox's per-invocation
+ * "Unknown syscall: 157" noise, not to model prctl.
+ *
+ * PR_SET_NAME = 15.  EINVAL_ = 22.
+ */
+long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
+               unsigned long arg4, unsigned long arg5) {
+    (void)arg2; (void)arg3; (void)arg4; (void)arg5;
+
+    if (option == 15) {   /* PR_SET_NAME: accept and drop */
+        return 0;
+    }
+    return -(long)EINVAL_;
+}
+
+/*
+ * Linux x86_64 setsid(2) — syscall 112.
  *
  * Creates a new session.  donix has no notion of sessions or
  * process groups; the pragmatic implementation is a no-op that
@@ -2025,6 +2419,16 @@ long sys_getppid(void) {
  *
  * Linux would return -EPERM if the caller is already a process
  * group leader; that case does not arise here.
+ *
+ * HISTORY: this function was originally registered at syscall 107
+ * (tag 20260927-07), because busybox ash's startup logged
+ * "Unknown syscall: 107" and 107 was assumed to be setsid.  It is
+ * not: on Linux x86_64, 107 is geteuid(2) and setsid is 112.  The
+ * handler at 107 was therefore reached by ash's geteuid() call,
+ * which received the caller's pid where it expected a uid.  The
+ * real setsid(2) call from musl (112) went unhandled.  The number
+ * is now 112, matching the Linux ABI.  geteuid(2) at 107 is now
+ * an unhandled gap, tracked in docs/open-issues.md.
  */
 long sys_setsid(void) {
     pcb_t* current = process_get_current();
@@ -2033,11 +2437,31 @@ long sys_setsid(void) {
 }
 
 /*
+ * Linux x86_64 geteuid(2) — syscall 107.
+ *
+ * donix has no users; return a fixed uid.  1000 matches the
+ * typical Fedora user and is what musl and busybox expect to see
+ * as a plausible non-root uid.  Nothing on donix checks the
+ * value; it exists only to stop the once-per-ash-startup
+ * "Unknown syscall: 107" diagnostic.
+ *
+ * HISTORY: session 24 mistakenly implemented setsid at 107,
+ * which meant ash's geteuid() call received the caller's pid
+ * where it expected a uid.  Session 27 (tag 20260928-05) moved
+ * setsid to 112 and exposed the real 107 gap.  This is the
+ * closure of that gap.
+ */
+long sys_geteuid(void) {
+    return 1000;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
- * Return the current working directory as an absolute path.  donix
- * has a single flat FAT root and no notion of a per-process cwd
- * that changes, so the answer is always "/".
+ * Return the current working directory: the path stored by
+ * sys_chdir (pcb->cwd), or "/" for a process that has never
+ * called chdir (cwd[0] == '\0', thanks to the zero-init in
+ * process_initialize_pcb).
  *
  * Linux ABI: getcwd(buf, size) copies the NUL-terminated path into
  * buf and returns buf (a pointer, which for our int64 return
@@ -2046,21 +2470,406 @@ long sys_setsid(void) {
  * freshly malloc'd buffer for the GNU extension; donix does not
  * support that, so -EINVAL.
  *
- * busybox ash calls getcwd at startup and uses the result as $PWD.
- * The path is not dereferenced afterwards on our single-directory
- * filesystem, so "/" is safe and correct.
- *
  * 34 is ERANGE on Linux x86_64.  22 is EINVAL.
  */
 long sys_getcwd(char* buf, unsigned long size) {
     if (!buf) return -(long)EINVAL_;
-    if (size < 2) return -(long)ERANGE_;
 
-    const char path[] = "/";
-    if (safe_copy_to_user(buf, path, sizeof(path)) != 0) {
+    pcb_t* self = process_get_current();
+
+    const char* path = "/";
+    if (self && self->cwd[0] != '\0') {
+        path = self->cwd;
+    }
+
+    size_t len = 0;
+    while (path[len]) len++;
+#if DEBUG_GETCWD
+    serial_print("sys_getcwd: buf=0x");
+    serial_print_hex((uint64_t)buf);
+    serial_print(" size=");
+    serial_print_dec((uint64_t)size);
+    serial_print(" cwd='");
+    if (self) serial_print(self->cwd); else serial_print("(no self)");
+    serial_print("' path='");
+    serial_print(path);
+    serial_print("' len=");
+    serial_print_dec((uint64_t)len);
+    serial_print(" ret=0x");
+    serial_print_hex((uint64_t)buf);
+    serial_print("\n");
+#endif
+    if (size < len + 1) return -(long)ERANGE_;
+
+    if (safe_copy_to_user(buf, path, len + 1) != 0) {
         return -(long)EFAULT_;
     }
     return (long)(uint64_t)buf;
+}
+
+/*
+ * Linux x86_64 chdir(2) — syscall 80.
+ *
+ * Change the calling process's current working directory.
+ *
+ * MINIMAL FIRST CUT.  This stores the path in pcb->cwd after
+ * validating that it exists and is a directory, and sys_getcwd
+ * returns the stored value.  It does NOT yet make the other path
+ * syscalls resolve relative paths against the stored cwd -- see
+ * the SCOPE note on pcb->cwd in process.h.  So `cd /bin` succeeds
+ * and `pwd` reports `/bin`, but a subsequent `ls busybox` still
+ * looks at `0:/BUSYBOX` (the root), not `0:/BIN/BUSYBOX`.
+ *
+ * Validation uses f_stat_with_retry, so bare names and leading-
+ * slash paths resolve the same way sys_stat resolves them.  The
+ * path must resolve to a directory (AM_DIR); a file path returns
+ * -ENOTDIR.  If validation fails, cwd is NOT changed.
+ *
+ * The path is stored unsimplified, matching Linux: `cd /bin/../bin`
+ * keeps that exact form, and `pwd` prints it back verbatim.
+ * Root aliases (".", "/", "0:/") are normalized to "/" so getcwd
+ * reports a consistent form.
+ *
+ * 20 is ENOTDIR on Linux x86_64.
+ */
+#ifndef ENOTDIR_
+#define ENOTDIR_ 20
+#endif
+
+long sys_chdir(const char* user_path) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_path) return -(long)EFAULT_;
+
+    char path[USER_PATH_MAX];
+    if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    /*
+     * We need TWO forms of the path:
+     *
+     *   1. The FAT form, for validating with f_stat_with_retry.
+     *      FatFs rejects a leading "/", so strip_dot_prefix is
+     *      applied to a COPY.
+     *   2. The Unix form, for storing as the cwd.  It must be
+     *      ABSOLUTE -- musl's getcwd() validates that the result
+     *      starts with '/', and rejects a relative cwd.  So the
+     *      stored form keeps its leading '/'.
+     *
+     * Before, we stripped once and stored the stripped form, so
+     * `cd /bin` stored "bin" and every getcwd() afterwards failed
+     * (musl saw a non-absolute cwd and bailed to a userspace
+     * fallback that cannot work on donix's flat FAT).
+     */
+    char fat_path[USER_PATH_MAX];
+    {
+        size_t i = 0;
+        while (path[i] && i < sizeof(fat_path) - 1) {
+            fat_path[i] = path[i];
+            i++;
+        }
+        fat_path[i] = '\0';
+    }
+    strip_dot_prefix(fat_path);
+
+    /* Validate: the path must exist and be a directory. */
+    FILINFO fno;
+    if (!path_is_root(fat_path)) {
+        FRESULT r = f_stat_with_retry(fat_path, &fno);
+        if (r != FR_OK) {
+            return fatfs_errno(r);
+        }
+        if (!(fno.fattrib & AM_DIR)) {
+            return -(long)ENOTDIR_;
+        }
+    }
+
+    /*
+     * Store the cwd in ABSOLUTE Unix form.
+     *
+     * Root aliases (".", "/", "0:/") normalize to "/".  Everything
+     * else is stored with a guaranteed leading '/': if the caller
+     * passed a relative path, resolve_against_cwd has already been
+     * applied by the syscall layer?  No -- chdir is called with the
+     * raw user path.  So we prefix '/' here for relative inputs.
+     *
+     * In practice a shell passes an absolute or "./x"-style path;
+     * for "./x" strip_dot_prefix gave "x", and we store "/x".  That
+     * is the correct absolute form for a cwd of "x" under root.
+     * (donix has no nested cwd beyond /bin today, so this is
+     * sufficient; full relative-cwd resolution is a follow-up.)
+     */
+    if (path_is_root(fat_path)) {
+        self->cwd[0] = '/';
+        self->cwd[1] = '\0';
+    } else {
+        size_t o = 0;
+        /* Ensure a leading '/'. */
+        if (fat_path[0] != '/') {
+            self->cwd[o++] = '/';
+        }
+        for (size_t i = 0; fat_path[i] && o < sizeof(self->cwd) - 1; i++) {
+            self->cwd[o++] = fat_path[i];
+        }
+        self->cwd[o] = '\0';
+    }
+
+#if DEBUG_CHDIR
+    {
+        size_t l = 0;
+        while (self->cwd[l]) l++;
+        serial_print("sys_chdir: stored cwd='");
+        serial_print(self->cwd);
+        serial_print("' len=");
+        serial_print_dec((uint64_t)l);
+        serial_print("\n");
+    }
+#endif
+
+    return 0;
+}
+
+/*
+ * Linux x86_64 poll(2) — syscall 7.
+ *
+ * busybox ash's line editor (FEATURE_EDITING=y) calls poll() once
+ * per readline iteration to wait for stdin readability.  Before
+ * this handler existed, every keystroke logged "Unknown syscall:
+ * 7" -- 7 is poll on Linux x86_64, not mkdir (see
+ * docs/gotchas.md, session 27).
+ *
+ * Semantics implemented here:
+ *   - fd 0 with timeout < 0 (block forever): block the process
+ *     until a byte is buffered, then report POLLIN.
+ *   - fd 0 with timeout >= 0: report POLLIN if a byte is
+ *     buffered, else report 0 (timeout).  Does not actually
+ *     sleep for `timeout` milliseconds; see "Timeout handling"
+ *     below.
+ *   - other fds: revents = POLLNVAL.  We cannot wait on files,
+ *     directories, or pipes, and reporting POLLIN there would be
+ *     a lie the reader could not back with a non-blocking read.
+ *   - events (the caller's interest mask) is ignored.  ash asks
+ *     for POLLIN; a caller asking for POLLOUT on fd 0 would
+ *     still get POLLIN when data is available, which is
+ *     over-eager but harmless -- the caller then reads.
+ *
+ * Returns the number of fds with nonzero revents, or -errno.
+ *
+ * WHY THIS BLOCKS.  The first version of this handler returned 0
+ * unconditionally when nothing was ready.  That was wrong for
+ * the timeout == -1 case, and the failure was immediate and
+ * total: ash's line editor interprets a 0 return from
+ * poll(fds, 1, -1) as end-of-input and exits the shell.  On real
+ * Linux that combination is unreachable -- a poll with an
+ * infinite timeout never returns 0 -- so ash has no code path
+ * for it.  A handler that returns 0 there is technically within
+ * the letter of the poll(2) contract ("return 0 on timeout") but
+ * not within its spirit, and ash falls off a cliff.  The correct
+ * implementation blocks.  A poll with timeout == -1 on a
+ * readable-event fd MUST NOT return until either the fd is
+ * readable or a signal interrupts it.
+ *
+ * TIMEOUT HANDLING.  For timeout >= 0 this handler still does
+ * not actually wait.  A real implementation would arm a
+ * deadline (g_ticks is available; PIT frequency is 500 Hz so
+ * 1 tick == 2 ms) and loop on hlt until the deadline or
+ * readability.  That is more machinery than ash needs -- ash
+ * passes timeout == -1 -- and adding it now would mean writing
+ * and testing a timeout path no current caller exercises.  The
+ * non-blocking behavior for timeout >= 0 matches Linux in the
+ * "data ready" and "would-block past deadline" cases; it
+ * differs only in returning early rather than sleeping.  If a
+ * future caller relies on a real timeout, add it then, with a
+ * test that exercises it.
+ *
+ * INTERRUPT DISCIPLINE.  The blocking loop below mirrors
+ * sys_read's fd-0 path exactly:
+ *
+ *     cli
+ *     if (data) { sti; consume; break; }
+ *     mark BLOCKED
+ *     sti; hlt
+ *
+ * The cli is what makes the check and the state transition
+ * atomic with respect to irq1_handler.  Without it there is a
+ * missed-wakeup window: has_data() returns 0, irq1 fires and
+ * puts a byte and calls process_wake_all_blocked (which sees
+ * our state is still RUNNING and does nothing), and then we set
+ * state = BLOCKED and hlt -- and nobody will wake us, because
+ * the wake already happened.  sys_read got this right; the
+ * blocking poll must too.
+ *
+ * The pid == 1 case is special: process 1 (the kernel shell,
+ * or whatever is running on the idle/kernel stack) must not
+ * BLOCK, because nothing would schedule it back in -- it is
+ * not on the ready queue in the usual way.  It does a bare
+ * sti; hlt; loop instead, which is what sys_read does.  In
+ * practice busybox ash is pid > 1, so this branch is for
+ * safety, not for the current code path.
+ *
+ * Linux x86_64 struct pollfd (musl's <poll.h> and the kernel's
+ * uapi/asm-generic/poll.h agree):
+ *
+ *     offset 0: int   fd
+ *     offset 4: short events
+ *     offset 6: short revents
+ *
+ * 8 bytes total, no padding.  Verified against
+ * third_party/musl-install/include/poll.h.  Do not change this
+ * layout without re-checking that header: busybox compares
+ * revents against the POLL* constants its own musl compiled in,
+ * and a mismatch here would make every revents test silently
+ * false.
+ */
+#define POLLIN_   0x001
+#define POLLNVAL_ 0x020
+
+/* 4 is EINTR on Linux x86_64.  Not currently defined elsewhere
+ * in this file; keep it local to this function's section. */
+#ifndef EINTR_
+#define EINTR_ 4
+#endif
+
+typedef struct {
+    int   fd;
+    short events;
+    short revents;
+} kernel_pollfd_t;
+
+/* Set POLL_TRACE to 1 for one build to log what ash actually
+ * passes, then back to 0.  The trace from the first run
+ * confirmed nfds == 1, timeout == (unsigned)-1, fd == 0,
+ * events == POLLIN.  It is now off by default. */
+#define POLL_TRACE 0
+
+/* Maximum number of pollfds accepted in one call.  ash passes 1.
+ * The bound exists so a bad user pointer cannot make us loop
+ * indefinitely; sixteen is generous and still bounded. */
+#define POLL_MAX_NFDS 16
+
+long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
+    kernel_pollfd_t* user_fds = (kernel_pollfd_t*)user_fds_arg;
+
+#if POLL_TRACE
+    serial_print("poll: a0=0x"); serial_print_hex((uint64_t)user_fds);
+    serial_print(" nfds=");      serial_print_dec((uint64_t)nfds);
+    serial_print(" timeout=");   serial_print_dec((uint64_t)(int64_t)timeout);
+#endif
+
+    if (nfds == 0) {
+#if POLL_TRACE
+        serial_print("\n");
+#endif
+        return 0;
+    }
+    if (!user_fds) {
+#if POLL_TRACE
+        serial_print(" -> EFAULT (null fds)\n");
+#endif
+        return -(long)EFAULT_;
+    }
+    if (nfds > POLL_MAX_NFDS) {
+#if POLL_TRACE
+        serial_print(" -> EINVAL (nfds too large)\n");
+#endif
+        return -(long)EINVAL_;
+    }
+
+    long ready = 0;
+    for (unsigned long i = 0; i < nfds; i++) {
+        kernel_pollfd_t pfd;
+        if (safe_copy_from_user(&pfd, user_fds + i, sizeof(pfd)) != 0) {
+#if POLL_TRACE
+            serial_print(" -> EFAULT (copy_in)\n");
+#endif
+            return -(long)EFAULT_;
+        }
+
+#if POLL_TRACE
+        if (i == 0) {
+            serial_print(" fd0=");  serial_print_dec((uint64_t)(int64_t)pfd.fd);
+            serial_print(" ev0=0x"); serial_print_hex((uint64_t)(uint16_t)pfd.events);
+        }
+#endif
+
+        short revents = 0;
+
+        if (pfd.fd == 0) {
+            /*
+             * Blocking path: timeout < 0 means "wait forever",
+             * and on Linux that is a real wait.  Loop on hlt
+             * until kbd_buffer_has_data() is true.  The cli
+             * around the test is what closes the missed-wakeup
+             * window (see the header comment).
+             *
+             * If the caller passed timeout >= 0 we skip this
+             * block entirely and fall through to the
+             * non-blocking check below: report POLLIN if a
+             * byte is buffered, else report 0.  See "Timeout
+             * handling" in the header comment for why we do
+             * not actually sleep for the timeout duration.
+             */
+            if (timeout < 0) {
+                pcb_t* self = process_get_current();
+                for (;;) {
+                    __asm__ volatile("cli");
+                    if (kbd_buffer_has_data()) {
+                        __asm__ volatile("sti");
+                        break;
+                    }
+                    if (!self) {
+                        /* No current process -- cannot block.
+                         * Drop through; the non-blocking check
+                         * below reports 0.  This is a defensive
+                         * path and should not be reached. */
+                        __asm__ volatile("sti");
+                        break;
+                    }
+                    if (self->pid == 1) {
+                        /* Kernel/idle shell: no one would
+                         * schedule us back in, so do a bare
+                         * hlt and retry, exactly as sys_read
+                         * does on fd 0. */
+                        __asm__ volatile("sti");
+                        __asm__ volatile("hlt");
+                        continue;
+                    }
+                    self->state = PROC_STATE_BLOCKED;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    __asm__ volatile("sti");
+                    __asm__ volatile("hlt");
+                    /* Woken by irq1_handler ->
+                     * process_wake_all_blocked, which sets
+                     * state = READY and re-adds us to the
+                     * ready queue.  Loop and re-check. */
+                }
+            }
+
+            if (kbd_buffer_has_data()) {
+                revents |= POLLIN_;
+                ready++;
+            }
+        } else {
+            revents = POLLNVAL_;
+            ready++;
+        }
+
+        pfd.revents = revents;
+        if (safe_copy_to_user(user_fds + i, &pfd, sizeof(pfd)) != 0) {
+#if POLL_TRACE
+            serial_print(" -> EFAULT (copy_out)\n");
+#endif
+            return -(long)EFAULT_;
+        }
+    }
+
+#if POLL_TRACE
+    serial_print(" -> ready=");
+    serial_print_dec((uint64_t)ready);
+    serial_print("\n");
+#endif
+
+    return ready;
 }
 
 /*
@@ -2645,6 +3454,37 @@ long sys_fork(void) {
      */
     child->fs_base = parent->fs_base;
 
+
+    /*
+     * Child inherits the parent's cwd.
+     *
+     * The cwd is a per-process property, so fork must propagate it,
+     * exactly like fs_base and brk_virt.  Without this, a forked
+     * child starts with cwd[0] == '\0' (the fresh-PCB default from
+     * process_initialize_pcb's memset), which sys_stat and
+     * sys_open treat as "/".  busybox applets that fork -- `ls`,
+     * `cat`, `echo` when run as separate processes -- would then
+     * see the root as their working directory regardless of what
+     * `cd` set in the parent.
+     *
+     * This is what made `cd /bin; ls` list the root: the shell did
+     * `cd` in its own process (setting pcb->cwd = "/bin"), then
+     * forked a child for `ls`, and the child's empty cwd resolved
+     * "." to "/".
+     *
+     * cwd already survives execve untouched (sys_execve does not
+     * clear it), so this one propagation point covers both fork
+     * and the fork+exec path.
+     */
+    {
+        size_t _i = 0;
+        while (parent->cwd[_i] && _i < sizeof(child->cwd) - 1) {
+            child->cwd[_i] = parent->cwd[_i];
+            _i++;
+        }
+        child->cwd[_i] = '\0';
+    }
+
     /*
      * Build the child's iretq-resume frame from the parent's current
      * syscall-entry frame.  This sets the child's %rax to 0, which is
@@ -2723,6 +3563,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
+        case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
@@ -2738,11 +3579,15 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
+        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
+        case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
+        case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);

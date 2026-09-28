@@ -6,32 +6,33 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
+    /*
+     * The path to list, as a string the KERNEL will resolve.
+     *
+     * Do NOT prepend "0:/" here.  The kernel's path syscalls now
+     * resolve relative paths against the process's cwd, so passing
+     * the user's argument through unchanged is both correct and
+     * necessary:
+     *
+     *   ls            -> "."          -> kernel resolves to cwd
+     *   ls foo        -> "foo"        -> cwd/foo
+     *   ls /bin       -> "/bin"       -> absolute, kernel resolves
+     *   ls 0:/foo     -> "0:/foo"     -> FatFs path, passed through
+     *
+     * The old code hardcoded "0:/" for the no-argument case and
+     * prepended "0:/" for the argument case, which forced every
+     * lookup to the FAT root and ignored `cd` entirely.
+     */
     char path[128];
     if (argc >= 2 && argv[1][0] != '\0') {
-        const char* tok = argv[1];
-        int has_prefix = 0;
-        for (const char* p = tok; *p; p++) {
-            if (p[0] == ':' && p[1] == '/') { has_prefix = 1; break; }
+        int i = 0;
+        while (argv[1][i] && i < (int)sizeof(path) - 1) {
+            path[i] = argv[1][i];
+            i++;
         }
-        if (has_prefix) {
-            int i = 0;
-            while (tok[i] && i < (int)sizeof(path) - 1) {
-                path[i] = tok[i];
-                i++;
-            }
-            path[i] = 0;
-        } else {
-            int i = 0;
-            path[i++] = '0';
-            path[i++] = ':';
-            path[i++] = '/';
-            for (const char* p = tok; *p && i < (int)sizeof(path) - 1; p++) {
-                path[i++] = *p;
-            }
-            path[i] = 0;
-        }
+        path[i] = 0;
     } else {
-        strcpy(path, "0:/");
+        strcpy(path, ".");
     }
 
     /*
@@ -39,15 +40,7 @@ int main(int argc, char **argv) {
      * file has no directory entries to list; print the file and
      * exit.  Only fall through to opendir() when the argument is a
      * directory (or no argument was given, in which case path is
-     * "0:/", which is the root directory).
-     *
-     * Without this, `ls hello-world.txt` calls opendir() on the
-     * file itself.  FatFs returns FR_NO_PATH (5), sys_open returns
-     * -ENOENT, and opendir() fails -- which is what produced the
-     * "[ls] FAIL: opendir(...) failed" line.
-     *
-     * The no-argument case is unchanged: path is "0:/", the root
-     * directory, which opendir() handles.
+     * ".", the current directory).
      */
     if (argc >= 2 && argv[1][0] != '\0') {
         struct stat st;
@@ -56,8 +49,6 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (!S_ISDIR(st.st_mode)) {
-            /* Single file: print it in the same format the directory
-             * listing uses for a file entry, then exit. */
             printf("FILE   %s  (%ld bytes)\n", argv[1], (long)st.st_size);
             return 0;
         }
@@ -75,9 +66,12 @@ int main(int argc, char **argv) {
     struct dirent* e;
 
     while ((e = readdir(d)) != 0) {
-        /* Build the full path for stat().  The directory path ends
-         * with '/' (unless the user passed one without it), so a
-         * plain concatenation works. */
+        /*
+         * Build the full path for stat().  With path being a
+         * relative or absolute string the kernel understands, a
+         * plain concatenation with '/' works: "." -> "./name",
+         * "/bin" -> "/bin/name", "0:/foo" -> "0:/foo/name".
+         */
         char entry_path[256];
         size_t plen = strlen(path);
         if (plen > 0 && path[plen - 1] != '/') {
@@ -100,7 +94,6 @@ int main(int argc, char **argv) {
             is_dir = S_ISDIR(st.st_mode);
             size   = (long)st.st_size;
         } else {
-            /* stat failed — fall back to d_type from dirent. */
             is_dir = (e->d_type == DT_DIR);
         }
 

@@ -30,6 +30,42 @@ static uint8_t cursor_attr = 0x00;   // black on black
 // static uint8_t cursor_attr = 0x07;   // light gray on black
 static uint8_t cursor_attr = 0x1E;   // yellow on blue
 
+/*
+ * ANSI/VT100 escape-sequence parser state.
+ *
+ * The console is not a real terminal emulator; we handle only the
+ * small subset of sequences that busybox's line editor emits during
+ * interactive line editing and redraw:
+ *
+ *     ESC [ K        erase from cursor to end of line
+ *     ESC [ J        erase from cursor to end of screen
+ *     ESC [ n D      cursor left n columns
+ *     ESC [ n C      cursor right n columns
+ *     ESC [ m        SGR (color) -- ignored
+ *
+ * Anything else starting with ESC is swallowed silently.  A lone ESC
+ * followed by a non-'[' byte is dropped and the following byte is
+ * treated as ordinary input, matching common terminal behavior for an
+ * unrecognized escape.
+ *
+ * The parser is single-threaded and only reached through
+ * vga_putc_unlocked, which is always called under the print lock.  It
+ * is not reentrant and does not need to be.
+ *
+ * Only the "0J" / "0K" (or bare) variants of the erase sequences are
+ * implemented.  busybox only emits the bare forms.  If a future
+ * caller needs 1J (to cursor), 2J (whole screen), or 2K (whole line),
+ * add those cases in the dispatch below.
+ */
+enum vga_ansi_state {
+    ANSI_NORMAL = 0,
+    ANSI_ESC,       /* saw ESC, waiting for '[' */
+    ANSI_CSI        /* saw ESC '[', accumulating params until final byte */
+};
+
+static enum vga_ansi_state ansi_state = ANSI_NORMAL;
+static int ansi_param = 0;
+static int ansi_have_param = 0;
 
 static int clamp(int value, int min, int max) {
     if (value < min) return min;
@@ -47,8 +83,8 @@ static inline void outb(uint16_t port, uint8_t val) {
  * critical section, so nested lock/unlock pairs are safe.
  *
  * Design:
- *   - vga_putc and vga_update_hardware_cursor are UNLOCKED primitives.
- *     They must be called from within a locked region.
+ *   - vga_putc_unlocked and vga_update_hardware_cursor are UNLOCKED
+ *     primitives.  They must be called from within a locked region.
  *   - Every higher-level function (vga_print, vga_clear, etc.) takes
  *     the lock around its whole operation.
  *
@@ -123,10 +159,54 @@ static void vga_scroll(void) {
 }
 
 /*
- * Unlocked primitive: write one character. Caller must hold the print
- * lock. See vga_putc_locked below for a convenience wrapper.
+ * Unlocked primitives: erase region helpers for the ESC[K / ESC[J
+ * family.  Caller must hold the print lock.
+ *
+ * vga_erase_to_end_of_line wipes from the current cell to the end of
+ * the current row.  vga_erase_to_end_of_screen wipes from the current
+ * cell to the bottom-right corner.
  */
-static void vga_putc_unlocked(char c) {
+
+static void vga_erase_to_end_of_line(void) {
+    volatile uint16_t *vga = VGA_MEM;
+    uint16_t blank = ((uint16_t)cursor_attr << 8) | ' ';
+    int row = clamp(cursor_row, RESERVED_ROWS, VGA_HEIGHT - 1);
+    int col = clamp(cursor_col, 0, VGA_WIDTH - 1);
+    int base = row * VGA_WIDTH;
+    for (int c = col; c < VGA_WIDTH; c++) {
+        int idx = base + c;
+        if (idx >= 0 && idx < (VGA_WIDTH * VGA_HEIGHT)) {
+            vga[idx] = blank;
+        }
+    }
+    vga_update_hardware_cursor();
+}
+
+static void vga_erase_to_end_of_screen(void) {
+    volatile uint16_t *vga = VGA_MEM;
+    uint16_t blank = ((uint16_t)cursor_attr << 8) | ' ';
+    int row = clamp(cursor_row, RESERVED_ROWS, VGA_HEIGHT - 1);
+    int col = clamp(cursor_col, 0, VGA_WIDTH - 1);
+    int start = row * VGA_WIDTH + col;
+    int end = VGA_WIDTH * VGA_HEIGHT;
+    for (int i = start; i < end; i++) {
+        vga[i] = blank;
+    }
+    vga_update_hardware_cursor();
+}
+
+/*
+ * Unlocked primitive: write one character with no escape handling.
+ * Caller must hold the print lock.  Public callers should go through
+ * vga_putc_unlocked, which runs the ANSI parser first.
+ *
+ * '\r' returns the cursor to column 0 without advancing the row.
+ * '\b' moves the cursor left one cell and erases the cell it lands
+ * on.  Note that this is NOT standard VT100 '\b' behavior (which
+ * only moves the cursor); busybox's "\b \b" idiom happens to work
+ * under either.  See docs/gotchas.md for the quirk.
+ */
+static void vga_putc_raw(char c) {
     volatile uint16_t *vga = VGA_MEM;
     
     cursor_row = clamp(cursor_row, RESERVED_ROWS, VGA_HEIGHT - 1);
@@ -139,6 +219,12 @@ static void vga_putc_unlocked(char c) {
             vga_scroll();
             cursor_row = VGA_HEIGHT - 1;
         }
+        vga_update_hardware_cursor();
+        return;
+    }
+
+    if (c == '\r') {
+        cursor_col = 0;
         vga_update_hardware_cursor();
         return;
     }
@@ -174,6 +260,98 @@ static void vga_putc_unlocked(char c) {
             }
         }
         vga_update_hardware_cursor();
+    }
+}
+
+/*
+ * Unlocked primitive: write one character, running the ANSI parser
+ * first.  Caller must hold the print lock.  This is the function the
+ * rest of the file should call.
+ */
+static void vga_putc_unlocked(char c) {
+    switch (ansi_state) {
+    case ANSI_NORMAL:
+        if (c == 0x1B) {           /* ESC */
+            ansi_state = ANSI_ESC;
+            return;
+        }
+        vga_putc_raw(c);
+        return;
+
+    case ANSI_ESC:
+        if (c == '[') {
+            ansi_state = ANSI_CSI;
+            ansi_param = 0;
+            ansi_have_param = 0;
+            return;
+        }
+        /* Unknown escape; drop it and re-feed c as ordinary input. */
+        ansi_state = ANSI_NORMAL;
+        vga_putc_raw(c);
+        return;
+
+    case ANSI_CSI:
+        if (c >= '0' && c <= '9') {
+            ansi_param = ansi_param * 10 + (c - '0');
+            ansi_have_param = 1;
+            return;
+        }
+        if (c == ';') {
+            /* Parameter separator.  We only care about the first
+             * parameter in the sequences we support; reset the
+             * accumulator so the next parameter starts fresh. */
+            ansi_param = 0;
+            ansi_have_param = 0;
+            return;
+        }
+        /* Final byte.  Dispatch and return to NORMAL. */
+        switch (c) {
+        case 'K':   /* erase to end of line */
+            /* Only the "to end" variant (param 0 or absent) is
+             * implemented; 1K and 2K would need extra cases. */
+            vga_erase_to_end_of_line();
+            break;
+        case 'J':   /* erase to end of screen */
+            /* Only the "to end" variant (param 0 or absent) is
+             * implemented; 1J and 2J would need extra cases. */
+            vga_erase_to_end_of_screen();
+            break;
+        case 'D':   /* cursor left n */
+            {
+                int n = ansi_have_param ? ansi_param : 1;
+                if (n < 1) n = 1;
+                int col = cursor_col - n;
+                if (col < 0) col = 0;
+                cursor_col = col;
+                vga_update_hardware_cursor();
+            }
+            break;
+        case 'C':   /* cursor right n */
+            {
+                int n = ansi_have_param ? ansi_param : 1;
+                if (n < 1) n = 1;
+                int col = cursor_col + n;
+                if (col >= VGA_WIDTH) col = VGA_WIDTH - 1;
+                cursor_col = col;
+                vga_update_hardware_cursor();
+            }
+            break;
+        case 'm':   /* SGR (color) -- ignore */
+        case 'H':   /* cursor position -- ignore for now */
+        case 'f':
+        case 'h':   /* mode set -- ignore */
+        case 'l':   /* mode reset -- ignore */
+        case 'A':   /* cursor up -- ignore */
+        case 'B':   /* cursor down -- ignore */
+            break;
+        default:
+            /* Unknown final byte; drop the whole sequence. */
+            break;
+        }
+        ansi_state = ANSI_NORMAL;
+        ansi_param = 0;
+        ansi_have_param = 0;
+        return;
     }
 }
 

@@ -7,21 +7,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char path[64];
-    {
-        int i = 0;
-        path[i++] = '0';
-        path[i++] = ':';
-        path[i++] = '/';
-        for (const char* p = argv[1]; *p; p++) {
-            if (i >= (int)sizeof(path) - 1) {
-                write(2, "cat: path too long\n", 19);
-                return 1;
-            }
-            path[i++] = *p;
-        }
-        path[i] = 0;
-    }
+    /*
+     * Pass the filename through unchanged.  The kernel's open(2)
+     * resolves relative paths against the process's cwd, so:
+     *
+     *   cat foo        -> "foo"        -> cwd/foo
+     *   cat /hello.txt -> "/hello.txt" -> absolute
+     *   cat 0:/foo     -> "0:/foo"     -> FatFs path, passed through
+     *
+     * The old code prepended "0:/", forcing every open to the FAT
+     * root and ignoring `cd`.
+     */
+    const char* path = argv[1];
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
