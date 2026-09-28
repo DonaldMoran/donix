@@ -2175,6 +2175,25 @@ long sys_setsid(void) {
 }
 
 /*
+ * Linux x86_64 geteuid(2) — syscall 107.
+ *
+ * donix has no users; return a fixed uid.  1000 matches the
+ * typical Fedora user and is what musl and busybox expect to see
+ * as a plausible non-root uid.  Nothing on donix checks the
+ * value; it exists only to stop the once-per-ash-startup
+ * "Unknown syscall: 107" diagnostic.
+ *
+ * HISTORY: session 24 mistakenly implemented setsid at 107,
+ * which meant ash's geteuid() call received the caller's pid
+ * where it expected a uid.  Session 27 (tag 20260928-05) moved
+ * setsid to 112 and exposed the real 107 gap.  This is the
+ * closure of that gap.
+ */
+long sys_geteuid(void) {
+    return 1000;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
  * Return the current working directory as an absolute path.  donix
@@ -3124,6 +3143,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;

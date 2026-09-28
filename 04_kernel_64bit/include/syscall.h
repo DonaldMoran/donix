@@ -66,6 +66,7 @@
  *  79  getcwd            sys_getcwd
  *  83  mkdir             sys_mkdir
  *  87  unlink            sys_unlink
+ * 107  geteuid           sys_geteuid
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
  * 158  arch_prctl        sys_arch_prctl
@@ -96,8 +97,6 @@
  *  80  chdir            busybox ash's `cd` calls this.  Currently
  *                       returns ENOSYS -> "Function not
  *                       implemented".
- * 107  geteuid          ash calls once at startup; the kernel logs
- *                       "Unknown syscall: 107" without it.
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -142,6 +141,7 @@
 #define SYS_GETCWD          79
 #define SYS_MKDIR           83
 #define SYS_UNLINK          87
+#define SYS_GETEUID         107
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
 #define SYS_ARCH_PRCTL      158
