@@ -65,6 +65,11 @@ static char g_write_bounce[WRITE_CHUNK];
  * Set to 0 for production. */
 #define DEBUG_STAT_TRACE 0
 
+/* Set DEBUG_WAIT_TRACE to 1 to log every sys_wait4 call and its
+ * return value, and every sys_exit.  Useful when debugging why a
+ * shell is not seeing its children.  Set to 0 for production. */
+#define DEBUG_WAIT_TRACE 0
+
 // ============================================================
 // FILE TABLE SLOT HEADER
 // ============================================================
@@ -823,9 +828,15 @@ long sys_fstat(int fd, void* user_stat) {
  * Shared f_stat-with-bare-name-retry helper.
  *
  * Both sys_stat and sys_access need the same thing: stat the path
- * as given; if that fails with FR_INVALID_NAME / FR_NO_FILE and
- * the path has no ':' (i.e. is not already in FatFs drive form),
- * resolve the base name to "0:/NAME.ELF" and retry.
+ * as given; if that fails with FR_INVALID_NAME / FR_NO_FILE /
+ * FR_NO_PATH and the path has no ':' (i.e. is not already in FatFs
+ * drive form), resolve the base name to "0:/NAME.ELF" and retry.
+ *
+ * FR_NO_PATH is included because busybox ash's PATH candidates are
+ * "sbin/ls", "usr/bin/ls", etc. -- paths with a directory component
+ * that does not exist on the flat FAT root.  FatFs returns
+ * FR_NO_PATH for those, and without this the retry never fires and
+ * `sh: ls: not found` is the result.  See the session-22 notes.
  *
  * On success, *out_fno holds the FILINFO and the function returns
  * FR_OK.  On failure, returns the last FRESULT.
@@ -2326,29 +2337,29 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 /*
  * Linux x86_64 fork(2) — syscall 57.
  *
- * First cut.  Creates a child that resumes at the parent's user RIP
- * with %rax = 0.  The child inherits a clone of the parent's page
- * table (vmm_clone_page_table), but the leaf physical pages are
- * shared at first; we then eagerly copy the user stack so the
- * parent's later stack writes do not clobber the child's view.
+ * Creates a child that resumes at the parent's user RIP with %rax = 0.
+ * The child inherits a clone of the parent's page table
+ * (vmm_clone_page_table), but the leaf physical pages are shared at
+ * first; we then eagerly copy every writable region the process owns
+ * so the parent's later writes do not clobber the child's view (and
+ * vice versa).
  *
- * Known limitations:
+ * The regions copied, in VA order:
+ *   - ELF image:   [0x400000,      0x600000)      2 MB
+ *   - user stack:  [0x8000000000,  0x8000100000)  64 KB
+ *   - brk heap:    [0x8000200000,  0x8000300000)  1 MB
+ *   - mmap region: [0x8010000000,  0x8010400000)  4 MB
  *
- *   1. ELF segment pages (.text, .data, .bss) are still shared with
- *      the parent after fork.  Writes to .data or .bss in either
- *      process are visible to the other.  This is not a problem for
- *      the immediate use case (fork + execve, where the child
- *      replaces its address space before writing anything), but it
- *      is not correct fork semantics.  Real copy-on-write comes
- *      later.
+ * The ELF image copy is what makes busybox ash's pre-execve window
+ * safe: without it, the child's writes to busybox's globals in .data
+ * landed in the page the parent was still using, corrupting the
+ * parent's FILE/job list and causing a #PF at CR2=0x20 in stdio
+ * teardown.  See session-23 notes.
  *
- *   2. Only the callee-saved registers are preserved in the child.
- *      See process_fork_copy_frame's declaration for the details.
- *
- *   3. The child does not inherit the parent's brk.  It gets the
- *      parent's brk_virt, but the child's ELF pages aren't duplicated
- *      so writes to the brk region in either process alias.  Again,
- *      not a problem for fork + execve.
+ * This is not real copy-on-write: every page in every region is
+ * copied unconditionally, including read-only pages like .text and
+ * .rodata.  A production fix would mark shared PTEs read-only and
+ * only copy on write.  Until then, each fork copies ~6 MB.
  *
  * Runs with interrupts disabled across the whole operation.  A timer
  * tick mid-clone could schedule another process whose allocations
@@ -2377,38 +2388,62 @@ long sys_fork(void) {
     scheduler_ready_queue_remove(child);
 
     /*
-     * Eager user-stack copy.
+     * Eager copy helper.  Walks [start, end), and for each present
+     * page, allocates a fresh physical page, copies the contents,
+     * remaps the child's PTE, and tracks the new page in the child's
+     * elf_page_list.
      *
-     * vmm_clone_page_table shares leaf physical pages, so the child's
-     * user-stack PTEs currently point at the parent's stack pages.
-     * Walk the range, allocate fresh pages, copy the contents, and
-     * remap the child's PTEs.
+     * Factored out so the four region copies below (ELF, stack, brk,
+     * mmap) share one implementation.  On allocation failure it
+     * destroys the child and returns -1; the caller propagates the
+     * error.
      */
+    #define EAGER_COPY_REGION(start_, end_)                              \
+        do {                                                             \
+            for (uint64_t _virt = (start_); _virt < (end_); _virt += 4096) { \
+                uint64_t _parent_phys =                                  \
+                    vmm_get_phys_from_cr3(parent->cr3, _virt);           \
+                if (!_parent_phys) continue;                             \
+                                                                         \
+                uint64_t _new_phys = pmm_alloc_page_for_elf();           \
+                if (!_new_phys) {                                        \
+                    serial_print("sys_fork: out of memory for page\n");  \
+                    process_destroy(child);                              \
+                    __asm__ volatile("sti");                             \
+                    return -(long)ENOMEM_;                               \
+                }                                                        \
+                                                                         \
+                const uint8_t* _src =                                    \
+                    (const uint8_t*)(HHDM_START + _parent_phys);         \
+                uint8_t* _dst =                                          \
+                    (uint8_t*)(HHDM_START + _new_phys);                  \
+                for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i]; \
+                                                                         \
+                uint64_t _map_flags = PT_PRESENT | PT_WRITE | PT_USER;   \
+                vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,        \
+                                    _map_flags);                         \
+                elf_add_page_to_pcb(child, _new_phys);                   \
+            }                                                            \
+        } while (0)
+
+    /* ELF image: .text, .rodata, .data, .bss. */
+    EAGER_COPY_REGION(0x0000000000400000ULL, 0x0000000000600000ULL);
+
+    /* User stack. */
     if (parent->user_stack_virt && parent->user_stack_top) {
-        for (uint64_t virt = parent->user_stack_virt;
-             virt < parent->user_stack_top;
-             virt += 4096) {
-
-            uint64_t parent_phys = vmm_get_phys_from_cr3(parent->cr3, virt);
-            if (!parent_phys) continue;
-
-            uint64_t new_phys = pmm_alloc_page_for_elf();
-            if (!new_phys) {
-                serial_print("sys_fork: out of memory for stack page\n");
-                process_destroy(child);
-                __asm__ volatile("sti");
-                return -(long)ENOMEM_;
-            }
-
-            const uint8_t* src = (const uint8_t*)(HHDM_START + parent_phys);
-            uint8_t* dst = (uint8_t*)(HHDM_START + new_phys);
-            for (uint64_t i = 0; i < 4096; i++) dst[i] = src[i];
-
-            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
-            vmm_map_page_in_cr3(child->cr3, virt, new_phys, map_flags);
-            elf_add_page_to_pcb(child, new_phys);
-        }
+        EAGER_COPY_REGION(parent->user_stack_virt, parent->user_stack_top);
     }
+
+    /* brk heap: only the pages the parent actually touched. */
+    if (parent->brk_virt != 0) {
+        EAGER_COPY_REGION(0x0000008000200000ULL, 0x0000008000300000ULL);
+    }
+
+    /* mmap window: same, only the pages that are present. */
+    EAGER_COPY_REGION(0x0000008010000000ULL, 0x0000008010400000ULL);
+
+    #undef EAGER_COPY_REGION
+
     /*
      * Child inherits the parent's FS base.
      *
@@ -2421,6 +2456,7 @@ long sys_fork(void) {
      * See the fs_base comment in process.h.
      */
     child->fs_base = parent->fs_base;
+
     /*
      * Build the child's iretq-resume frame from the parent's current
      * syscall-entry frame.  This sets the child's %rax to 0, which is
@@ -2430,9 +2466,9 @@ long sys_fork(void) {
 
     /*
      * Child inherits the parent's heap break so its brk region starts
-     * where the parent's was.  The pages themselves are not copied
-     * (see the limitation note above), but brk_virt must match so the
-     * child's subsequent brk calls land in a plausible range.
+     * where the parent's was.  The pages themselves are now copied
+     * (see the eager-copy block above), so writes to the brk region
+     * in either process no longer alias.
      */
     child->brk_virt = parent->brk_virt;
 
