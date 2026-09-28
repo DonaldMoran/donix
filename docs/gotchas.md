@@ -7,6 +7,27 @@ into `handoff.md`.
 Each entry is dated when it was learned so you can tell which are
 fresh and which are long-settled.
 
+### Console / VGA
+
+- **`\b` in the VGA driver erases; ANSI says it should only move the
+  cursor.**  `vga_putc_raw` writes a space over the cell to the left
+  and moves the cursor there.  Standard VT100 `\b` leaves the cell
+  alone.  busybox's `"\b \b"` idiom (erase, space, erase) works under
+  either behavior because the operations cancel out, which is why
+  this has not caused a visible bug.  A future program that emits
+  bare `\b` expecting cursor-only movement will misbehave; the fix
+  is to move the erase into the explicit `ESC[K`/`ESC J` paths and
+  make `\b` pure cursor movement.  Not urgent.  (Learned 2026-09-28,
+  session 26.)
+
+- **The VGA console understands a subset of ANSI.**  `ESC[K`,
+  `ESC[J`, `ESC[nD`, `ESC[nC` are handled; `ESC[...m` (SGR) and
+  cursor addressing are ignored; unknown `ESC[...X` sequences are
+  swallowed.  Only the `0J`/`0K` (or bare) erase variants are
+  implemented -- `1J`, `2J`, `2K` are not.  busybox only emits the
+  bare forms.  Parser lives in `vga_putc_unlocked`.  (Added
+  2026-09-28, session 26.)
+
 ## Process / scheduler
 (existing entries: fork_copy_frame preserves %r8/%r9; fork eager
 stack copy; fork inherits fs_base; fork copies ELF image region;

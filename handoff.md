@@ -5,8 +5,8 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-27 (session 25)
-**Current HEAD:** tag `20260927-20`, branch `dev`
+**Last updated:** 2026-09-28 (session 26)
+**Current HEAD:** tag `20260928-03`, branch `dev`
 **Last milestone:** `v0.6.2` (published)
 **Next milestone:** undecided; candidate `v0.6.3` or `v0.7.0`
 
@@ -42,7 +42,7 @@ enabled `FEATURE_EDITING_HISTORY=256`.
 
 ---
 
-## Canary state (focused canary green as of `20260927-20`)
+## Canary state (focused canary green as of `20260928-02`)
 
 The **focused canary** is the default. Run it on every change:
 
@@ -71,7 +71,7 @@ All rows green as of `20260927-20`.  Full per-test notes:
 
 ## Next step (exactly this, then stop)
 
-**Session 26.**
+**Session 27.**
 
 1. **Fix `isr14_handler` to kill the faulting process on a user-mode
    `#PF` instead of halting the console.**  Today the handler checks
@@ -141,9 +141,9 @@ needs it.
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  Phase B: `busybox ash` is an interactive shell
-and `ls <file>` works.  Session 25 implemented `sys_mkdir` and
-enabled history.  Next: `isr14_handler`, so a user-mode `#PF`
-kills the faulting process instead of halting the console.**
+with working backspace and line editing -- the VGA console now
+speaks a VT100 subset.  Next: `isr14_handler`, so a user-mode
+`#PF` kills the faulting process instead of halting the console.**
 
 ---
 

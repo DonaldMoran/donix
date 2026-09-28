@@ -4,6 +4,13 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 26 (2026-09-28)
+| Tag | What |
+|-----|------|
+| `20260928-01` | handoff: split live state from reference material |
+| `20260928-02` | vga: ANSI/VT100 subset parser -- busybox backspace works |
+| `20260928-03` | handoff: session 26 -- vga VT100 subset, backspace fixed |
+
 ## Session 25 (2026-09-27)
 | Tag | What |
 |-----|------|
