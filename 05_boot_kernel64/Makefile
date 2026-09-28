@@ -120,11 +120,23 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/musl_getcwd.elf"    MUSL_GETCWD.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/busybox.elf"        BUSYBOX.ELF
+	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
+
+	@echo "--- staging busybox at /bin/busybox ---"
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin 2>/dev/null || true
+	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
+	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
+	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	        "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox" ; \
+	else \
+	    echo "ERROR: $(USERLAND_BIN)/busybox.elf missing — did the busybox build fail?"; \
+	    exit 1; \
+	fi
 
 	@echo "--- FAT partition contents (hdd-single.img) ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
+	@echo "--- /bin contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin || true
 	@echo "--- verifying FAT boot sector at LBA $(SINGLE_DRIVE_LBA) ---"
 	@dd if=hdd-single.img bs=512 skip=$(SINGLE_DRIVE_LBA) count=1 2>/dev/null | \
 	    xxd | head -2
