@@ -9,8 +9,57 @@ static void puts_raw(const char* s, unsigned long n) {
                      : "rcx", "r11", "memory");
 }
 
+/*
+ * Fork and run `/bin/busybox sh`, waiting for it to exit.
+ *
+ * Called once at startup, before the donix prompt loop.  The
+ * purpose is to drop the user straight into the busybox shell on
+ * boot, with the donix shell one `exit` away.
+ *
+ * If the fork fails, or busybox is missing, or execve fails, the
+ * child prints EXEC-FAILED and exits; wait4 returns in the parent
+ * and we fall through to the donix prompt.  A broken busybox
+ * therefore degrades to "you get the donix shell" rather than a
+ * dead console.
+ *
+ * argv is the explicit `busybox sh` form rather than relying on
+ * busybox's argv[0]-basename applet dispatch.  It is the form the
+ * kernel's execve sees after path resolution, and it is what the
+ * exploring copy used.
+ *
+ * Runs ONCE.  If it ran on every loop iteration, `exit` at ash
+ * would immediately re-enter ash and the donix prompt would be
+ * unreachable.  After ash exits, the user is at `donix>`; typing
+ * `busybox sh` (or `/bin/busybox sh`) re-enters ash.
+ */
+static void run_busybox_sh(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        puts_raw("FORK-FAILED\n", 12);
+        return;
+    }
+    if (pid == 0) {
+        char* argv[3];
+        argv[0] = (char*)"/bin/busybox";
+        argv[1] = (char*)"sh";
+        argv[2] = (char*)0;
+        execve(argv[0], argv, (char**)0);
+        puts_raw("EXEC-FAILED\n", 12);
+        _exit(127);
+    }
+    int status = 0;
+    wait4(pid, &status, 0, (void*)0);
+}
+
 int main(void) {
     char line[256];
+
+    /*
+     * Drop into busybox ash on boot.  When the user types `exit`
+     * at the ash prompt, the child exits, wait4 returns, and we
+     * fall through to the donix prompt below.
+     */
+    run_busybox_sh();
 
     for (;;) {
         puts_raw("donix> ", 7);
@@ -91,7 +140,7 @@ int main(void) {
              * sys_execve now handles both forms the user might
              * type:
              *
-             *   - a bare name like "ls"  -> "0:/LS.ELF" (attempt c)
+             *   - a bare name like "ls"  -> "0:/LS.ELF" (attempt c1)
              *   - an absolute path like "/LS.ELF"
              *                            -> "0:/LS.ELF" (attempt b)
              *
