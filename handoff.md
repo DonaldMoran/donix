@@ -8,10 +8,12 @@ session** -- ask for it when the current task needs it.
 **Last milestone:** `v0.6.3` (published) — the shell is fully usable
 **Next milestone:** undecided; candidates below.
 
-Commits are named by tag only, never by SHA.  Working tags are
-local and permanent -- `git show <tag>` always resolves.  The
-commit record is `docs/session-log.md`; the commit message carries
-the narrative.
+Commits are named by tag only, never by SHA.  **Working tags
+(`2026092x-*`) are local scratch restore points** — they exist while
+a milestone is being developed and are **dropped before the
+milestone is pushed**.  Only `v*` tags go to the remote and are
+permanent.  The commit record is `docs/session-log.md`; the commit
+message carries the narrative.
 
 ---
 
@@ -49,23 +51,24 @@ Also closed this session: `geteuid(2)` (107) and `prctl(2)` (157,
 `PR_SET_NAME` accepted and dropped).  **The serial log is free of
 `Unknown syscall:` lines.**
 
-Session 30 tags (all on 2026-09-28):
+Session 30 commits (all on 2026-09-28; the scratch tags were dropped
+before the `v0.6.3` push — see `docs/session-log.md` for the rows):
 
-| Tag | What |
+| Commit subject | What |
 |---|---|
-| `20260928-20-geteuid` | kernel: geteuid(2) -- syscall 107 |
-| `20260928-21-prctl` | kernel: prctl(2) PR_SET_NAME -- syscall 157 |
-| `20260928-22-chdir` | kernel: chdir(2) -- syscall 80 |
-| `20260928-23-cwd-resolution` | kernel: resolve relative paths against cwd |
-| `20260928-24-userland-cwd` | userland: ls/cat pass paths through |
-| `20260928-25-musl_sh-builtins` | musl_sh: cd/pwd/exit builtins |
+| kernel: implement geteuid(2) -- syscall 107 | returns a fixed uid |
+| kernel: implement prctl(2) PR_SET_NAME -- syscall 157 | accept and drop |
+| kernel: implement chdir(2) -- syscall 80 | stores absolute cwd |
+| kernel: resolve relative paths against cwd | `resolve_against_cwd`; `sys_fork` copies cwd |
+| userland: ls/cat pass paths through | stop prepending `0:/` |
+| musl_sh: cd, pwd, exit builtins | the fallback prompt is usable |
 
 ### Known limitation
 
 `cd ..` at `donix>` fails (`cd: cannot cd to ..`).  The `musl_sh`
 `cd` builtin passes the raw `..` to `chdir`, and FatFs has no `..`
 entry.  **`cd ..` inside ash works** (ash resolves `..` against its
-own `$PWD` first).  See `docs/open-issues.md`.
+own `$PWD` first).  See `docs/open-issues.md` item 2.
 
 ---
 
@@ -76,9 +79,9 @@ own `$PWD` first).  See `docs/open-issues.md`.
 Candidates, roughly in order of value:
 
 1. **The user-mode `#PF` test binary.**  `fault_kill_current(0x0E)`
-   in `isr14_handler` (tag `20260928-04`) is in but unverified
-   end-to-end.  Needs a test binary that dereferences a bad pointer
-   without setting `g_expect_fault`.  Small, closes a real gap.
+   in `isr14_handler` is in but unverified end-to-end.  Needs a
+   test binary that dereferences a bad pointer without setting
+   `g_expect_fault`.  Small, closes a real gap.
 
 2. **`cd ..` at `donix>`.**  Make `builtin_cd` resolve `.`/`..`
    against `getcwd()` before calling `chdir`, or make `sys_chdir`
@@ -101,7 +104,7 @@ Pick one, do it, test it, tag it.  Do not bundle.
 
 ---
 
-## Canary state (focused canary green as of `20260928-25`)
+## Canary state (focused canary green as of `v0.6.3`)
 
 **Boot drops into ash.**  The focused canary reflects that:
 
@@ -156,8 +159,7 @@ trace lines are informational, not errors.
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
 1. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
-   `isr14_handler`, tag `20260928-04`) is in but unverified
-   end-to-end.
+   `isr14_handler`) is in but unverified end-to-end.
 2. `cd ..` at `donix>` fails (the `musl_sh` builtin passes raw
    `..` to FatFs).  ash is unaffected.
 3. **VFS layer (eventual).**  `sys_execve`'s path resolution is a
@@ -203,8 +205,10 @@ needs it.
   candidates to add: the `sys_getcwd` absolute-cwd requirement
   (musl rejects a non-absolute cwd), and the `puts_raw`-vs-`printf`
   newline quirk.
-- `docs/session-log.md` — commit tables (tag-only) and per-test
-  canary notes.
+- `docs/session-log.md` — commit tables and per-test canary notes.
+  Rows are named by tag; scratch tags are dropped before a
+  milestone push, so a row's tag may no longer resolve — the
+  commit message is the record.
 - `docs/open-issues.md` — full open-issues list.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
