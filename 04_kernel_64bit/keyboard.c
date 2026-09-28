@@ -152,6 +152,37 @@ int kbd_buffer_get(char *c) {
     return 1;
 }
 
+/*
+ * Non-destructive readability check.
+ *
+ * Returns 1 iff kbd_buffer_get would succeed on the next call,
+ * 0 otherwise.  This is the exact predicate sys_poll needs: it
+ * must answer "would a read return data?" without consuming the
+ * byte, because the reader (ash's line editor) is about to call
+ * read(0) itself and expects to see that byte.
+ *
+ * The head/tail comparison is the same one kbd_buffer_get uses,
+ * so the two cannot disagree in the absence of a concurrent
+ * writer.  There IS a concurrent writer: irq1_handler runs
+ * asynchronously and can call kbd_buffer_put between the
+ * sys_poll check and the subsequent read.  That interleaving is
+ * safe in both directions:
+ *
+ *   - If has_data() returns 0 and a byte arrives before read,
+ *     read sees it and returns it.  poll's "not ready" answer
+ *     was stale but the reader never lost a byte.
+ *   - If has_data() returns 1 and the byte is still there at
+ *     read, read returns it.  Nothing else consumes it: there
+ *     is exactly one reader (the current process).
+ *
+ * So no cli/sti is needed here.  If a future change makes
+ * kbd_buffer_get consume more than one byte, or adds a second
+ * reader, revisit this.
+ */
+int kbd_buffer_has_data(void) {
+    return kbd_head != kbd_tail;
+}
+
 // FIX 2: Added a high-utility queue flush helper to clear outstanding trailing data arrays
 void keyboard_buffer_flush(void) {
     __asm__ volatile("cli" ::: "memory");

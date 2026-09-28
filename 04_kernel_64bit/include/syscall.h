@@ -36,6 +36,7 @@
 #define SYS_STAT            4
 #define SYS_FSTAT           5
 #define SYS_LSTAT           6
+#define SYS_POLL            7
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -112,5 +113,29 @@ long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_getppid(void);
 long sys_getcwd(char* buf, unsigned long size);
+
+/*
+ * sys_poll — minimal poll(2) for syscall 7.
+ *
+ * Signatures mirror musl's <poll.h>:
+ *     struct pollfd { int fd; short events; short revents; };
+ *     typedef unsigned long nfds_t;
+ *     int poll(struct pollfd *, nfds_t, int);
+ *
+ * The handler takes the user pointer and count through the
+ * dispatcher, so the C type here is deliberately a mirror
+ * struct rather than musl's; see the definition in
+ * user_syscall.c.
+ */
+struct kernel_pollfd;
+/*
+ * sys_poll — minimal poll(2) for syscall 7.
+ *
+ * See the definition in user_syscall.c for the struct pollfd
+ * layout and the semantics.  The parameter is void* here because
+ * the pollfd struct is private to user_syscall.c; the dispatcher
+ * passes arg0 through unchanged, and sys_poll casts internally.
+ */
+long sys_poll(void* user_fds, unsigned long nfds, int timeout);
 
 #endif

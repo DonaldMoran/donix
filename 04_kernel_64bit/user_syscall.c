@@ -2136,6 +2136,249 @@ long sys_getcwd(char* buf, unsigned long size) {
 }
 
 /*
+ * Linux x86_64 poll(2) — syscall 7.
+ *
+ * busybox ash's line editor (FEATURE_EDITING=y) calls poll() once
+ * per readline iteration to wait for stdin readability.  Before
+ * this handler existed, every keystroke logged "Unknown syscall:
+ * 7" -- 7 is poll on Linux x86_64, not mkdir (see
+ * docs/gotchas.md, session 27).
+ *
+ * Semantics implemented here:
+ *   - fd 0 with timeout < 0 (block forever): block the process
+ *     until a byte is buffered, then report POLLIN.
+ *   - fd 0 with timeout >= 0: report POLLIN if a byte is
+ *     buffered, else report 0 (timeout).  Does not actually
+ *     sleep for `timeout` milliseconds; see "Timeout handling"
+ *     below.
+ *   - other fds: revents = POLLNVAL.  We cannot wait on files,
+ *     directories, or pipes, and reporting POLLIN there would be
+ *     a lie the reader could not back with a non-blocking read.
+ *   - events (the caller's interest mask) is ignored.  ash asks
+ *     for POLLIN; a caller asking for POLLOUT on fd 0 would
+ *     still get POLLIN when data is available, which is
+ *     over-eager but harmless -- the caller then reads.
+ *
+ * Returns the number of fds with nonzero revents, or -errno.
+ *
+ * WHY THIS BLOCKS.  The first version of this handler returned 0
+ * unconditionally when nothing was ready.  That was wrong for
+ * the timeout == -1 case, and the failure was immediate and
+ * total: ash's line editor interprets a 0 return from
+ * poll(fds, 1, -1) as end-of-input and exits the shell.  On real
+ * Linux that combination is unreachable -- a poll with an
+ * infinite timeout never returns 0 -- so ash has no code path
+ * for it.  A handler that returns 0 there is technically within
+ * the letter of the poll(2) contract ("return 0 on timeout") but
+ * not within its spirit, and ash falls off a cliff.  The correct
+ * implementation blocks.  A poll with timeout == -1 on a
+ * readable-event fd MUST NOT return until either the fd is
+ * readable or a signal interrupts it.
+ *
+ * TIMEOUT HANDLING.  For timeout >= 0 this handler still does
+ * not actually wait.  A real implementation would arm a
+ * deadline (g_ticks is available; PIT frequency is 500 Hz so
+ * 1 tick == 2 ms) and loop on hlt until the deadline or
+ * readability.  That is more machinery than ash needs -- ash
+ * passes timeout == -1 -- and adding it now would mean writing
+ * and testing a timeout path no current caller exercises.  The
+ * non-blocking behavior for timeout >= 0 matches Linux in the
+ * "data ready" and "would-block past deadline" cases; it
+ * differs only in returning early rather than sleeping.  If a
+ * future caller relies on a real timeout, add it then, with a
+ * test that exercises it.
+ *
+ * INTERRUPT DISCIPLINE.  The blocking loop below mirrors
+ * sys_read's fd-0 path exactly:
+ *
+ *     cli
+ *     if (data) { sti; consume; break; }
+ *     mark BLOCKED
+ *     sti; hlt
+ *
+ * The cli is what makes the check and the state transition
+ * atomic with respect to irq1_handler.  Without it there is a
+ * missed-wakeup window: has_data() returns 0, irq1 fires and
+ * puts a byte and calls process_wake_all_blocked (which sees
+ * our state is still RUNNING and does nothing), and then we set
+ * state = BLOCKED and hlt -- and nobody will wake us, because
+ * the wake already happened.  sys_read got this right; the
+ * blocking poll must too.
+ *
+ * The pid == 1 case is special: process 1 (the kernel shell,
+ * or whatever is running on the idle/kernel stack) must not
+ * BLOCK, because nothing would schedule it back in -- it is
+ * not on the ready queue in the usual way.  It does a bare
+ * sti; hlt; loop instead, which is what sys_read does.  In
+ * practice busybox ash is pid > 1, so this branch is for
+ * safety, not for the current code path.
+ *
+ * Linux x86_64 struct pollfd (musl's <poll.h> and the kernel's
+ * uapi/asm-generic/poll.h agree):
+ *
+ *     offset 0: int   fd
+ *     offset 4: short events
+ *     offset 6: short revents
+ *
+ * 8 bytes total, no padding.  Verified against
+ * third_party/musl-install/include/poll.h.  Do not change this
+ * layout without re-checking that header: busybox compares
+ * revents against the POLL* constants its own musl compiled in,
+ * and a mismatch here would make every revents test silently
+ * false.
+ */
+#define POLLIN_   0x001
+#define POLLNVAL_ 0x020
+
+/* 4 is EINTR on Linux x86_64.  Not currently defined elsewhere
+ * in this file; keep it local to this function's section. */
+#ifndef EINTR_
+#define EINTR_ 4
+#endif
+
+typedef struct {
+    int   fd;
+    short events;
+    short revents;
+} kernel_pollfd_t;
+
+/* Set POLL_TRACE to 1 for one build to log what ash actually
+ * passes, then back to 0.  The trace from the first run
+ * confirmed nfds == 1, timeout == (unsigned)-1, fd == 0,
+ * events == POLLIN.  It is now off by default. */
+#define POLL_TRACE 0
+
+/* Maximum number of pollfds accepted in one call.  ash passes 1.
+ * The bound exists so a bad user pointer cannot make us loop
+ * indefinitely; sixteen is generous and still bounded. */
+#define POLL_MAX_NFDS 16
+
+long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
+    kernel_pollfd_t* user_fds = (kernel_pollfd_t*)user_fds_arg;
+
+#if POLL_TRACE
+    serial_print("poll: a0=0x"); serial_print_hex((uint64_t)user_fds);
+    serial_print(" nfds=");      serial_print_dec((uint64_t)nfds);
+    serial_print(" timeout=");   serial_print_dec((uint64_t)(int64_t)timeout);
+#endif
+
+    if (nfds == 0) {
+#if POLL_TRACE
+        serial_print("\n");
+#endif
+        return 0;
+    }
+    if (!user_fds) {
+#if POLL_TRACE
+        serial_print(" -> EFAULT (null fds)\n");
+#endif
+        return -(long)EFAULT_;
+    }
+    if (nfds > POLL_MAX_NFDS) {
+#if POLL_TRACE
+        serial_print(" -> EINVAL (nfds too large)\n");
+#endif
+        return -(long)EINVAL_;
+    }
+
+    long ready = 0;
+    for (unsigned long i = 0; i < nfds; i++) {
+        kernel_pollfd_t pfd;
+        if (safe_copy_from_user(&pfd, user_fds + i, sizeof(pfd)) != 0) {
+#if POLL_TRACE
+            serial_print(" -> EFAULT (copy_in)\n");
+#endif
+            return -(long)EFAULT_;
+        }
+
+#if POLL_TRACE
+        if (i == 0) {
+            serial_print(" fd0=");  serial_print_dec((uint64_t)(int64_t)pfd.fd);
+            serial_print(" ev0=0x"); serial_print_hex((uint64_t)(uint16_t)pfd.events);
+        }
+#endif
+
+        short revents = 0;
+
+        if (pfd.fd == 0) {
+            /*
+             * Blocking path: timeout < 0 means "wait forever",
+             * and on Linux that is a real wait.  Loop on hlt
+             * until kbd_buffer_has_data() is true.  The cli
+             * around the test is what closes the missed-wakeup
+             * window (see the header comment).
+             *
+             * If the caller passed timeout >= 0 we skip this
+             * block entirely and fall through to the
+             * non-blocking check below: report POLLIN if a
+             * byte is buffered, else report 0.  See "Timeout
+             * handling" in the header comment for why we do
+             * not actually sleep for the timeout duration.
+             */
+            if (timeout < 0) {
+                pcb_t* self = process_get_current();
+                for (;;) {
+                    __asm__ volatile("cli");
+                    if (kbd_buffer_has_data()) {
+                        __asm__ volatile("sti");
+                        break;
+                    }
+                    if (!self) {
+                        /* No current process -- cannot block.
+                         * Drop through; the non-blocking check
+                         * below reports 0.  This is a defensive
+                         * path and should not be reached. */
+                        __asm__ volatile("sti");
+                        break;
+                    }
+                    if (self->pid == 1) {
+                        /* Kernel/idle shell: no one would
+                         * schedule us back in, so do a bare
+                         * hlt and retry, exactly as sys_read
+                         * does on fd 0. */
+                        __asm__ volatile("sti");
+                        __asm__ volatile("hlt");
+                        continue;
+                    }
+                    self->state = PROC_STATE_BLOCKED;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    __asm__ volatile("sti");
+                    __asm__ volatile("hlt");
+                    /* Woken by irq1_handler ->
+                     * process_wake_all_blocked, which sets
+                     * state = READY and re-adds us to the
+                     * ready queue.  Loop and re-check. */
+                }
+            }
+
+            if (kbd_buffer_has_data()) {
+                revents |= POLLIN_;
+                ready++;
+            }
+        } else {
+            revents = POLLNVAL_;
+            ready++;
+        }
+
+        pfd.revents = revents;
+        if (safe_copy_to_user(user_fds + i, &pfd, sizeof(pfd)) != 0) {
+#if POLL_TRACE
+            serial_print(" -> EFAULT (copy_out)\n");
+#endif
+            return -(long)EFAULT_;
+        }
+    }
+
+#if POLL_TRACE
+    serial_print(" -> ready=");
+    serial_print_dec((uint64_t)ready);
+    serial_print("\n");
+#endif
+
+    return ready;
+}
+
+/*
  * Linux x86_64 set_tid_address(2).
  *
  * musl's __libc_start_main calls this during init and uses the
@@ -2795,6 +3038,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
+        case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
