@@ -2501,6 +2501,72 @@ long sys_ftruncate(int fd, long length) {
     return 0;
 }
 
+/*
+ * Linux x86_64 lseek(2) — syscall 8.
+ *
+ * Repositions the read/write cursor on an open file.  Backed by
+ * FatFs's f_lseek() on the FIL's fptr; f_tell() returns the new
+ * position.  sys_ftruncate already uses f_lseek, so the mechanism
+ * is proven.
+ *
+ * ABI:
+ *   arg0  int    fd
+ *   arg1  off_t  offset  (signed 64-bit)
+ *   arg2  int    whence  SEEK_SET(0) / SEEK_CUR(1) / SEEK_END(2)
+ *   returns  the resulting offset from the start of the file,
+ *            or -errno.
+ *
+ * Linux permits seeking past EOF; FatFs does not reliably.  We
+ * clamp the target to [0, file_size] and reject anything outside
+ * with -EINVAL.  Nothing on donix seeks past EOF today; if a
+ * caller appears that needs sparse writes, revisit this.
+ *
+ * WHY THIS EXISTS: busybox `head -n N` calls lseek(fd, 0,
+ * SEEK_END) to size the file before reading.  Without syscall 8
+ * it got -ENOSYS and logged "Unknown syscall: 8" (session 33,
+ * head applet).  The output was still correct because busybox
+ * fell back to sequential reading, but the noise hid real
+ * problems and other applets (tail, cp's size checks) would
+ * exercise lseek harder.
+ *
+ * Linux x86_64 syscall numbers: lseek is 8 (see
+ * arch/x86/entry/syscalls/syscall_64.tbl).  It was previously
+ * unimplemented -- not shadowed at another number, just absent.
+ */
+#define SEEK_SET_ 0
+#define SEEK_CUR_ 1
+#define SEEK_END_ 2
+
+long sys_lseek(int fd, long offset, int whence) {
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+
+    FIL* file_obj = (FIL*)slot->obj;
+
+    FSIZE_t size = f_size(file_obj);
+    FSIZE_t cur  = f_tell(file_obj);
+
+    long target;
+    switch (whence) {
+        case SEEK_SET_:  target = offset;                    break;
+        case SEEK_CUR_:  target = (long)cur + offset;        break;
+        case SEEK_END_:  target = (long)size + offset;       break;
+        default:         return -(long)EINVAL_;
+    }
+
+    /* Clamp to [0, size].  See the header comment: Linux allows
+     * seeking past EOF, FatFs does not; reject rather than
+     * silently truncate. */
+    if (target < 0 || (FSIZE_t)target > size) {
+        return -(long)EINVAL_;
+    }
+
+    FRESULT r = f_lseek(file_obj, (FSIZE_t)target);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    return (long)f_tell(file_obj);
+}
+
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
@@ -3952,6 +4018,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
+        case SYS_LSEEK:           return (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);

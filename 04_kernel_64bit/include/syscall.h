@@ -54,6 +54,7 @@
  *   5  fstat             sys_fstat         (Linux entry: sys_newfstat)
  *   6  lstat             sys_lstat         (Linux entry: sys_newlstat)
  *   7  poll              sys_poll
+ *   8  lseek             sys_lseek
  *   9  mmap              sys_mmap
  *  10  mprotect          sys_mprotect      (stub)
  *  11  munmap            sys_munmap        (stub)
@@ -127,6 +128,7 @@
 #define SYS_FSTAT           5
 #define SYS_LSTAT           6
 #define SYS_POLL            7
+#define SYS_LSEEK           8
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -209,6 +211,7 @@ long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
 long sys_rmdir(const char* path);
 long sys_ftruncate(int fd, long length);
+long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
