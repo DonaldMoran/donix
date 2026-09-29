@@ -1,10 +1,11 @@
 ### donix — what's next
 
-donix is at **v0.6.3**: it speaks the Linux x86_64 syscall ABI, runs
-static musl-linked binaries, and boots straight into **busybox `ash`**
-on top of a from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect
-a real per-process working directory, in both shells, across `fork`
-and `execve`.
+donix speaks the Linux x86_64 syscall ABI, runs static musl-linked
+binaries, and boots straight into **busybox `ash`** on top of a
+from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
+per-process working directory, in both shells, across `fork` and
+`execve`. The console is a VT100 emulator, so full-screen software
+runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -14,7 +15,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, and v0.6.3
+## Done — Phases A through B, v0.6.3, and the terminal
 
 For the record, so this file does not re-plan finished work:
 
@@ -28,20 +29,32 @@ For the record, so this file does not re-plan finished work:
   `fork` and `execve`, `ls`/`cat` path pass-through, and `cd`/`pwd`
   builtins in `musl_sh`. The serial log is free of `Unknown syscall:`
   lines.
+- **The terminal** — full VT100/ANSI emulation in `vga.c`: CSI
+  parsing, cursor addressing, SGR, the erase/insert/delete families,
+  and a software alternate screen. `keyboard.c` delivers ESC,
+  Backspace, and Enter the way Unix software expects. Correct Linux
+  `open(2)` flag translation plus `ftruncate`, `utimes`, `futimesat`,
+  and `utimensat` complete the file-creation path. `vi` works
+  end to end.
 
 The narratives are in the `v0.6.3` annotated tag, `docs/session-log.md`,
 and `handoff.md`.
 
 ---
 
-## Next: pick a direction
+## Next: v0.6.4 — the basics
 
-The shell is usable. What comes next is a set of small, independent
-items and two larger subsystem questions. Pick one, do it, test it,
-tag it — the project's one-change-at-a-time discipline applies.
+The bar for this milestone is that **the basics all work**: create,
+read, write, and remove files; create, enter, and remove directories;
+`cd` up and down from both shells; and a process that faults is killed
+cleanly. Full-screen software already runs. The remaining items are:
 
-### Small, close gaps
-
+- **`rm` / `unlink`.**  `SYS_UNLINK` (87) has no dispatch case, and
+  `CONFIG_RM` is off.  Add the syscall (FatFs `f_unlink`), then turn
+  the applet on.  Test by create-then-remove.
+- **`rmdir`.**  Same shape as `unlink`: `SYS_RMDIR` (84), FatFs
+  `f_unlink` with an empty-directory check, then `CONFIG_RMDIR=y`.
+  Do this after `unlink` so the pattern is established first.
 - **`cd ..` at `donix>`.**  The `musl_sh` `cd` builtin passes the raw
   `..` to `chdir`, and FatFs has no `..` entry, so it fails.  Two
   clean fixes: (a) `builtin_cd` resolves `.`/`..` against `getcwd()`
@@ -51,8 +64,22 @@ tag it — the project's one-change-at-a-time discipline applies.
 - **User-mode `#PF` test binary.**  `fault_kill_current(0x0E)` in
   `isr14_handler` is in but unverified end-to-end.  A test binary
   that dereferences a bad pointer without setting `g_expect_fault`
-  closes the loop.  This is the item the ROADMAP used to call "the
-  `isr14` fault path"; the handler exists, the test does not.
+  closes the loop.
+
+Once these are done and the documentation is updated, this becomes
+`v0.6.4`.  One change at a time; pick one, do it, test it.
+
+---
+
+## After v0.6.4: pick a direction
+
+The shell is usable and full-screen software runs. What comes next is
+a set of small, independent items and several larger subsystem
+questions. Pick one, do it, test it, tag it — the project's
+one-change-at-a-time discipline applies.
+
+### Small, close gaps
+
 - **`newfstatat` (262).**  Number reserved, no dispatch case.  musl
   routes `fstatat` through `stat`/`lstat` on x86_64 for the common
   case, so it is not hit yet; a caller passing `AT_FDCWD` plus flags
@@ -62,19 +89,23 @@ tag it — the project's one-change-at-a-time discipline applies.
 - **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
   `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
   Latent today (nothing triggers it), but correct to close.
+- **Ctrl-`[` as ESC.**  Deferred during the terminal work;
+  `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
+  The literal ESC key is enough for vi, but terminal users expect the
+  alias.
 
 ### Broaden busybox coverage
 
 Busybox is the boot shell now, but only a handful of applets have
-been exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`.  The
-untried ones — `rm`, `rmdir`, `cp`, `mv`, `grep`, `sed`, `awk`,
-`tar` — are where the syscall surface gets tested hardest.
+been exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`, `touch`,
+`vi`.  The untried ones — `cp`, `mv`, `grep`, `sed`, `awk`, `tar` —
+are where the syscall surface gets tested hardest.
 
 Work through them one at a time, watching for `Unknown syscall: N` in
-the serial log.  Each missing syscall is its own commit.  The write
-path (`rm`, `rmdir`) is worth doing early: it would let `mkdir` become
-a standing canary row (paired mkdir + rmdir), which today it cannot
-be because nothing cleans up after it.
+the serial log.  Each missing syscall is its own commit.  With
+`unlink` and `rmdir` in place, a paired create/remove canary row
+becomes possible; today it is not, because nothing cleans up after a
+`mkdir`.
 
 `ps`, `top`, `kill`, and job control need subsystems the kernel does
 not have yet (process introspection, signal delivery, process groups)
@@ -122,6 +153,10 @@ Independent of the shell work.  Roughly in order of value.
 - **Kernel log routing.**  Route `sys_execve`/`sys_open` diagnostics
   to serial only, or add a `SYS_KLOG(level)` syscall.  The trace
   lines are informational today but will get noisy as more runs.
+- **Real FatFs timestamp storage.**  The three timestamp syscalls
+  (`utimes`, `futimesat`, `utimensat`) return 0 without storing
+  anything.  Enough for `touch` and vi; not enough for a tool that
+  reads timestamps back.
 
 ### Testing infrastructure
 

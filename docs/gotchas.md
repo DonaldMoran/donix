@@ -16,15 +16,102 @@ fresh and which are long-settled.
   bare `\b` expecting cursor-only movement will misbehave; the fix
   is to move the erase into the explicit `ESC[K`/`ESC J` paths and
   make `\b` pure cursor movement.  Not urgent.  (Learned 2026-09-28,
-  session 26.)
+  session 26.  Still true after the session-31 parser rewrite --
+  `vga_putc_raw`'s `\b` handling was not changed.)
 
-- **The VGA console understands a subset of ANSI.**  `ESC[K`,
-  `ESC[J`, `ESC[nD`, `ESC[nC` are handled; `ESC[...m` (SGR) and
-  cursor addressing are ignored; unknown `ESC[...X` sequences are
-  swallowed.  Only the `0J`/`0K` (or bare) erase variants are
-  implemented -- `1J`, `2J`, `2K` are not.  busybox only emits the
-  bare forms.  Parser lives in `vga_putc_unlocked`.  (Added
-  2026-09-28, session 26.)
+- **The VGA console is a VT100 emulator (session 31).**  `vga.c` has
+  a full CSI parser: four states (`ANSI_NORMAL`, `ANSI_ESC`,
+  `ANSI_ESC_CHARSET`, `ANSI_CSI`), a parameter array
+  (`params[]`, up to 8), a private-marker flag, and an intermediates
+  array.  Final-byte dispatch covers
+  `A B C D E F G H f J K L M P @ X S T Z m h l n c`: cursor motion,
+  cursor addressing, all three modes each of `J`/`K`,
+  insert/delete line/char, scroll, SGR, private mode set/reset, DSR,
+  and DA.  SGR handles `0 1 7 22 27 30-37 39 40-47 49` (bold,
+  reverse video, standard 8 fg / 8 bg).  A software alternate screen
+  handles `?1049` (save + clear), `?1047` (save only), and `?25`
+  (cursor visibility).  (Replaces the session-26 entry that said SGR
+  and cursor addressing were ignored and only `0J`/`0K` were
+  implemented.  That was true of the old minimal parser; the parser
+  was replaced in session 31.  Learned 2026-09-28, session 31.)
+
+- **`ESC ( B`-style charset-select sequences used to leak to the
+  screen as `(B`.**  The old parser had no state for the byte after
+  `ESC (`, so it fell through to `vga_putc_raw` and printed the `(`
+  and the designator.  The session-31 parser adds
+  `ANSI_ESC_CHARSET`, entered on `ESC (`, `ESC )`, `ESC *`, or
+  `ESC +`, which swallows exactly one designator byte.  If you see a
+  stray `(B` on screen from a new program, this state is the place
+  to look.  (Learned 2026-09-28, session 31.)
+
+- **`?` is a private marker, not a CSI intermediate.**  In
+  `ESC[?1049h`, the `?` must be recorded in `p.private_marker` and
+  must NOT be pushed into `p.intermediates[]`.  `csi_dispatch` bails
+  out early when `p.n_intermediates > 0` (intermediates mark
+  sequences we do not implement), so pushing `?` there would make
+  every private-mode sequence -- including `?1049h` for the
+  alternate screen and `?25l` for cursor hide -- unreachable, and
+  they would be reported as `[vga] unhandled CSI: ?1049 (with
+  intermediates)`.  The `h`/`l` dispatch checks `private_marker` and
+  routes to `vga_set_private_mode`.  (Learned 2026-09-28, session
+  31.)
+
+- **Alt-screen on VGA text mode cannot be a pointer swap.**  VGA
+  text mode has exactly one framebuffer, at physical `0xB8000`.  The
+  CRT controller scans that address unconditionally; there is no
+  second hardware buffer to point it at.  An "alternate screen" is
+  therefore simulated by save/restore: `?1049h` copies `0xB8000`
+  into a BSS array (`alt_screen[]`), then clears the visible screen;
+  `?1049l` copies the array back and restores the saved cursor
+  position.  A pointer-swap approach was tried and failed -- the
+  screen goes dead, because the CRT controller keeps reading
+  `0xB8000` regardless of what any software pointer says.  (Learned
+  2026-09-28, session 31.)
+
+- **`VGA_TRACE_UNHANDLED` and `VGA_REPLY_TO_QUERIES` must be 0 for a
+  tag.**  Both live at the top of `vga.c`.  `VGA_TRACE_UNHANDLED=1`
+  emits `[vga] unhandled CSI: ...` lines to the serial port for any
+  CSI sequence that parses but does not dispatch -- the single most
+  useful tool when bringing up a new curses program, but noise in a
+  shipped build.  `VGA_REPLY_TO_QUERIES=1` makes the console answer
+  DSR (`ESC[6n`) with `ESC[r;cR` and DA (`ESC[c`) with `ESC[?1;0c`
+  on the serial port.  Both were set to 0 before the `v0.6.4`/vi
+  verification run and that run passed, so leave them at 0.  If
+  `CONFIG_FEATURE_VI_ASK_TERMINAL` is turned on in the busybox
+  config, vi will send `ESC[6n` at startup and wait; the reply
+  tunable must go back to 1 first or vi stalls at launch.  (Learned
+  2026-09-28, session 31.)
+
+### Keyboard
+
+- **An unassigned scancode in `scancode_ascii[]` silently drops the
+  key.**  `scancode_to_ascii` returns 0 for an unassigned scancode,
+  and `kbd_buffer_put` has a NUL guard that drops 0 bytes (it exists
+  to filter hardware break-code noise).  So "table entry missing"
+  and "no key pressed" are indistinguishable downstream, and the key
+  appears to do nothing.  **`scancode_ascii[0x01]` (ESC) was
+  unassigned**, which is why no full-screen program could leave
+  insert mode before session 31 -- pressing ESC produced 0, the
+  guard dropped it, and vi never saw the byte.  The fix is the one
+  line `scancode_ascii[0x01] = 0x1B;` in `keyboard_init`.  Any
+  future "this key does nothing" report should check this table
+  first.  (Learned 2026-09-28, session 31.)
+
+- **Backspace must be DEL (0x7F), not BS (0x08).**  Unix software
+  (busybox vi/ash/less, ncurses) treats `0x7F` as Backspace and
+  `0x08` as Ctrl+H, a distinct command.  `keyboard_init` sets
+  `scancode_ascii[0x0E] = 0x7F`.  Emitting `0x08` makes Backspace
+  insert a literal `^H` in editors instead of deleting.  (Learned
+  2026-09-28, session 31.)
+
+- **Enter must be CR (`\r`), not LF (`\n`).**  A terminal in raw
+  mode -- which vi sets -- delivers CR; cooked mode translates CR to
+  LF via `ICRNL` for line-oriented readers like the shell.  If the
+  keyboard emitted LF directly, raw-mode programs would see LF where
+  they expect CR and command lines would not terminate.
+  `keyboard_init` sets `scancode_ascii[0x1C] = '\r'`.  The donix
+  shell still works because it reads in cooked mode.  (Learned
+  2026-09-28, session 31.)
 
 ### Syscall ABI
 
@@ -59,8 +146,9 @@ fresh and which are long-settled.
   Corrected in tag `20260928-05` (mkdir 83, setsid 112).  The
   previously masked gaps -- `poll(2)` at 7 and `geteuid(2)` at 107 --
   are now visible and tracked in `docs/open-issues.md`.  `poll(2)`
-  was closed in session 28 (tag `20260928-08`); `geteuid(2)` is the
-  last remaining gap from this audit.
+  was closed in session 28 (tag `20260928-08`); `geteuid(2)` was
+  closed in session 30.  Session 30 also moved `setsid` to 112 and
+  fixed `geteuid` at 107.
 
   Lesson: any new syscall entry must be checked against the
   canonical Linux x86_64 table,
@@ -107,6 +195,64 @@ fresh and which are long-settled.
   `g_ticks` deadline and loop, per `docs/open-issues.md`.
   (Learned 2026-09-28, session 28.)
 
+- **`open(2)` flag bits: `O_CREAT` is 0x40, not 0x200.**  The
+  original `sys_open` tested the wrong bits and as a result never
+  set a FatFs creation flag for `open(O_RDWR|O_CREAT)` -- what
+  `touch`, vi's `:wq`, `cp`, and every file-creating program issues.
+  FatFs tried to open an existing file, found none, and returned
+  `FR_NO_FILE`.  The trace that proved it:
+
+      sys_open: f_open FAIL path=don.txt flags=0x8042 mode=0x03 r=4
+
+  `flags=0x8042` is `O_RDWR|O_CREAT|O_LARGEFILE`; `mode=0x03` is
+  `FA_READ|FA_WRITE` with no create bit.  The old check was
+  `flags & 0x0200` (which is `O_TRUNC`) instead of `flags & 0x0040`
+  (`O_CREAT`).
+
+  Correct Linux x86_64 flags (from `include/uapi/asm-generic/fcntl.h`):
+
+      0x0001  O_WRONLY
+      0x0002  O_RDWR
+      0x0040  O_CREAT     <-- old code tested 0x0200
+      0x0080  O_EXCL      <-- old code tested 0x0800
+      0x0200  O_TRUNC     <-- old code tested 0x0400
+      0x0400  O_APPEND    <-- old code tested 0x0008
+      0x8000  O_LARGEFILE (ignore)
+      0x10000 O_DIRECTORY
+
+  FatFs modes: `FA_READ 0x01`, `FA_WRITE 0x02`, `FA_CREATE_NEW
+  0x04`, `FA_CREATE_ALWAYS 0x08`, `FA_OPEN_ALWAYS 0x10`,
+  `FA_OPEN_APPEND 0x30`.  FatFs expresses the creation choice as a
+  single mode value, so precedence matters:
+
+      O_CREAT && O_EXCL      -> FA_CREATE_NEW
+      O_CREAT && O_TRUNC     -> FA_CREATE_ALWAYS
+      O_CREAT                -> FA_OPEN_ALWAYS
+      O_TRUNC (no O_CREAT)   -> FA_CREATE_ALWAYS
+      otherwise              -> FA_OPEN_EXISTING
+      O_APPEND               -> additionally OR in FA_OPEN_APPEND
+
+  The whole `sys_open` was rewritten in session 31; do not patch
+  just the flag block, since the path-resolution, `strip_dot_prefix`,
+  root-alias, and directory-fallback logic must stay consistent with
+  the flag logic.  (Learned 2026-09-28, session 31.)
+
+- **`r=4` from FatFs is `FR_NO_FILE`, and it is often correct.**
+  On vi launch you will see:
+
+      sys_open: f_open FAIL path=don.txt flags=0x8000 mode=0x01 r=4
+
+  `flags=0x8000` is `O_LARGEFILE|O_RDONLY`, `mode=0x01` is
+  `FA_READ`, `r=4` is `FR_NO_FILE`.  vi is opening a nonexistent
+  file for read; FatFs correctly reports no such file; vi correctly
+  falls back to new-file mode.  **Do not try to silence this line.**
+  Full FatFs result codes, for reference: 0=OK, 1=INT_ERR,
+  2=NOT_READY, 3=NO_FILE, 4=NO_PATH, 5=INVALID_NAME, 6=DENIED,
+  7=EXIST, 8=INVALID_OBJECT, 9=WRITE_PROTECTED, 10=INVALID_DRIVE,
+  11=NOT_ENABLED, 12=NO_FILESYSTEM, 13=MKFS_ABORTED, 14=TIMEOUT,
+  15=LOCKED, 16=NOT_ENOUGH_CORE, 17=TOO_MANY_OPEN_FILES.  (Learned
+  2026-09-28, session 31.)
+
 ## Process / scheduler
 (existing entries: fork_copy_frame preserves %r8/%r9; fork eager
 stack copy; fork inherits fs_base; fork copies ELF image region;
@@ -134,7 +280,9 @@ musl_sh argv[0] normalization; directory ports; ls stats first;
 file_slot_t refcounting; execve bare-name retry; proper errnos;
 sys_access/faccessat; FR_NO_PATH retry; f_stat_with_retry
 sharing; sys_ioctl; busybox FEATURE_EDITING; PREFER_APPLETS;
-blocking poll blocks on fd 0 with timeout < 0)
+blocking poll blocks on fd 0 with timeout < 0; session 31:
+ftruncate seeks then truncates; utimes/futimesat/utimensat are
+no-op stubs that verify the path exists)
 
 ## Build system
 (existing entries)
@@ -206,5 +354,5 @@ layer can recognize.
 real Unix, `execve` hands the path to the VFS and the VFS
 resolves it; there is no guessing and no retry.  When a VFS
 lands, delete attempts (b) and (c) and the two `exec_resolve_*`
-helpers.  See `docs/open-issues.md` item 4 and the VFS SHIM
+helpers.  See `docs/open-issues.md` item 5 and the VFS SHIM
 comment in `sys_execve`.

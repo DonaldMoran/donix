@@ -143,6 +143,7 @@
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
 #define SYS_FCNTL           72
+#define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80
 #define SYS_MKDIR           83
@@ -158,6 +159,9 @@
 #define SYS_NEWFSTATAT      262   /* number reserved; no dispatch case yet */
 #define SYS_FACCESSAT       269
 #define SYS_SET_ROBUST_LIST 273
+#define SYS_UTIMES          235
+#define SYS_FUTIMESAT       261
+#define SYS_UTIMENSAT       280
 #define SYS_GETRANDOM       318
 #define SYS_RSEQ            334
 

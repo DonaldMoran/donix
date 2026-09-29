@@ -757,23 +757,96 @@ long sys_open(const char* path, int flags) {
 
     BYTE mode = 0;
     switch (flags & 0x3) {
-        case 0:  mode |= FA_READ;             break;
-        case 1:  mode |= FA_WRITE;            break;
-        case 2:  mode |= FA_READ | FA_WRITE;  break;
-        default: kfree(slot); self->file_table[fd] = NULL;
-                 return -(long)EINVAL_;
+        case 0:  mode |= FA_READ;             break;   /* O_RDONLY */
+        case 1:  mode |= FA_WRITE;            break;   /* O_WRONLY */
+        case 2:  mode |= FA_READ | FA_WRITE;  break;   /* O_RDWR   */
+        default: /* O_ACCMODE == 3 is invalid */
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -(long)EINVAL_;
     }
 
-    if (flags & 0x0400) {
+    /*
+     * Translate Linux open(2) flags to FatFs open mode.
+     *
+     * Linux x86_64 flag bits (include/uapi/asm-generic/fcntl.h):
+     *
+     *   0x0001   O_WRONLY
+     *   0x0002   O_RDWR
+     *   0x0040   O_CREAT
+     *   0x0080   O_EXCL
+     *   0x0200   O_TRUNC
+     *   0x0400   O_APPEND
+     *   0x8000   O_LARGEFILE   (ignored here; we are already 64-bit)
+     *   0x10000  O_DIRECTORY   (handled further below)
+     *
+     * FatFs mode bits (ff.h):
+     *
+     *   0x01  FA_READ
+     *   0x02  FA_WRITE
+     *   0x04  FA_CREATE_NEW
+     *   0x08  FA_CREATE_ALWAYS
+     *   0x10  FA_OPEN_ALWAYS
+     *   0x30  FA_OPEN_APPEND
+     *
+     * The previous translation in this file tested the wrong bits
+     * and as a result never set any creation flag for the common
+     * open(O_RDWR|O_CREAT) that touch(1), vi's :wq path, cp(1),
+     * and every other file-creating program issues.  FatFs then
+     * tried to open an existing file, found none, and returned
+     * FR_NO_FILE.  See the trace:
+     *
+     *   sys_open: f_open FAIL path=don.txt flags=0x8042 mode=0x03 r=4
+     *
+     * flags=0x8042 is O_RDWR|O_CREAT|O_LARGEFILE; mode=0x03 is just
+     * FA_READ|FA_WRITE, with no create bit.  The create request was
+     * being silently dropped because the check was `flags & 0x0200`
+     * (which is O_TRUNC) rather than `flags & 0x0040` (which is
+     * O_CREAT).
+     *
+     * FatFs expresses the creation choice as a single mode value,
+     * not as independent bits, so the order of precedence matters.
+     */
+    int o_creat  = (flags & 0x0040) != 0;   /* O_CREAT  */
+    int o_excl   = (flags & 0x0080) != 0;   /* O_EXCL   */
+    int o_trunc  = (flags & 0x0200) != 0;   /* O_TRUNC  */
+    int o_append = (flags & 0x0400) != 0;   /* O_APPEND */
+
+    if (o_creat && o_excl) {
+        /* O_CREAT|O_EXCL: fail if the file already exists.
+         * FA_CREATE_NEW does exactly that: create only if
+         * missing, return FR_EXIST otherwise.  This is the
+         * correct mapping for mkstemp(3) and for callers that
+         * need a guarantee the file did not previously exist. */
+        mode |= FA_CREATE_NEW;
+    } else if (o_creat && o_trunc) {
+        /* O_CREAT|O_TRUNC: create if missing, truncate if
+         * present.  FA_CREATE_ALWAYS does both.  This is what
+         * `vi :wq`, `cp`, and `touch` on a missing file
+         * actually issue. */
         mode |= FA_CREATE_ALWAYS;
-    } else if (flags & 0x0200) {
-        if (flags & 0x0800) mode |= FA_CREATE_NEW;
-        else                mode |= FA_OPEN_ALWAYS;
+    } else if (o_creat) {
+        /* O_CREAT alone: create if missing, leave existing
+         * content untouched.  FA_OPEN_ALWAYS is exactly this. */
+        mode |= FA_OPEN_ALWAYS;
+    } else if (o_trunc) {
+        /* O_TRUNC without O_CREAT: POSIX calls this undefined;
+         * Linux truncates an existing file and fails if it does
+         * not exist.  FatFs has no exact equivalent.  We use
+         * FA_CREATE_ALWAYS, which truncates existing files and
+         * (unlike Linux) also creates missing ones.  Nothing in
+         * busybox or musl relies on the "fail if missing" part
+         * of the Linux semantics; a caller that does would need
+         * an explicit stat first. */
+        mode |= FA_CREATE_ALWAYS;
     } else {
+        /* No creation or truncation flag: open existing only. */
         mode |= FA_OPEN_EXISTING;
     }
 
-    if (flags & 0x0008) mode |= FA_OPEN_APPEND;
+    if (o_append) {
+        mode |= FA_OPEN_APPEND;
+    }
 
     /*
      * Linux open(2) is also used to open directories — musl's
@@ -868,9 +941,14 @@ long sys_open(const char* path, int flags) {
 
     serial_print("sys_open: f_open FAIL path=");
     serial_print(local_path);
+    serial_print(" flags=0x");
+    serial_print_hex((uint64_t)flags);
+    serial_print(" mode=0x");
+    serial_print_hex((uint64_t)mode);
     serial_print(" r=");
     serial_print_dec(r);
     serial_print("\n");
+
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
@@ -1283,6 +1361,62 @@ long sys_access(const char* user_path, int mode) {
         return fatfs_errno(r);
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 utimensat(2) — syscall 280.
+ *
+ * touch(1) and other tools use this to set file timestamps.
+ * donix does not persist timestamps; FAT stores modification
+ * time in a coarse 2-second-resolution field that we do not
+ * currently write.  The correct minimal implementation is to
+ * verify the path exists and return 0.
+ *
+ * Reporting success without storing is what makes `touch`
+ * usable now; reporting -ENOSYS makes busybox fall through its
+ * whole fallback chain (utimensat -> utimes -> futimesat) and
+ * print "Function not implemented".
+ *
+ * AT_FDCWD is -100; dirfd is ignored.  The flags argument may
+ * carry AT_SYMLINK_NOFOLLOW, which is meaningless on FAT (no
+ * symlinks).  Both are accepted and ignored.
+ */
+long sys_utimensat(int dirfd, const char* path, const void* times, int flags) {
+    (void)times; (void)flags; (void)dirfd;
+
+    /* NULL path with a valid dirfd is the futimens(fd) form,
+     * which we do not support. */
+    if (!path) return -(long)EINVAL_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local);
+
+    /* Root always "exists". */
+    if (path_is_root(local)) return 0;
+
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(local, &fno);
+    if (r != FR_OK) return fatfs_errno(r);
+    return 0;
+}
+
+/*
+ * Linux x86_64 utimes(2) — syscall 235.
+ * Legacy timeval form.  Same no-op semantics as utimensat.
+ */
+long sys_utimes(const char* path, const void* times) {
+    return sys_utimensat(-100, path, times, 0);
+}
+
+/*
+ * Linux x86_64 futimesat(2) — syscall 261.
+ * Older glibc form.  Same no-op semantics.
+ */
+long sys_futimesat(int dirfd, const char* path, const void* times) {
+    return sys_utimensat(dirfd, path, times, 0);
 }
 
 /*
@@ -2202,6 +2336,43 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
         if ((size_t)n < local[i].iov_len) break;  /* short write — stop */
     }
     return total;
+}
+
+/*
+ * Linux x86_64 ftruncate(2) — syscall 77.
+ *
+ * Confirmed against arch/x86/entry/syscalls/syscall_64.tbl:
+ *   77  common  ftruncate  sys_ftruncate
+ *
+ * vi's save path calls this to set the file size exactly after
+ * writing, because the underlying FAT layer may have padded the
+ * final write to a sector boundary.  On the current build FatFs
+ * already updates the directory entry to the exact fptr at
+ * f_close, so the file size in `ls -l` was correct without this
+ * — but the syscall fires on every :wq and logging "Unknown
+ * syscall: 77" on every save is noise that hides real problems.
+ *
+ * FatFs's f_truncate() truncates the file to fp->fptr, so we
+ * seek first, then truncate.  Both operations must succeed on a
+ * FIL opened FA_WRITE.
+ *
+ * Linux clamps negative lengths to EINVAL.  We do the same.
+ */
+long sys_ftruncate(int fd, long length) {
+    if (length < 0) return -(long)EINVAL_;
+
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+
+    FIL* file_obj = (FIL*)slot->obj;
+
+    FRESULT r = f_lseek(file_obj, (FSIZE_t)length);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    r = f_truncate(file_obj);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    return 0;
 }
 
 long sys_read(int fd, void* buf, size_t count) {
@@ -3558,6 +3729,7 @@ uint64_t syscall_dispatch(uint64_t num,
         /* --- Linux x86_64 numbers --- */
         case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
+        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
@@ -3596,7 +3768,10 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
         case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
         case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
-
+        case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
+        case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
+        case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
+        
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
 
