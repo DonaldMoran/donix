@@ -607,7 +607,7 @@ static void put_file_slot(file_slot_t* slot) {
 
 static void close_all_files(pcb_t* proc) {
     if (!proc) return;
-    for (int i = 3; i < MAX_PROCESS_FILES; i++) {
+    for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         file_slot_t* slot = (file_slot_t*)proc->file_table[i];
         if (!slot) continue;
         put_file_slot(slot);
@@ -642,6 +642,30 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
     if (!slot) return NULL;
     if (kind != 0 && slot->kind != kind) return NULL;
     return slot;
+}
+
+/*
+ * Like get_file_slot, but accepts fds 0, 1, and 2.
+ *
+ * The general get_file_slot() refuses fds < 3, because the
+ * "normal" file syscalls (dup2, fcntl, fstat, readdir) must not
+ * treat stdin/stdout/stderr as ordinary open files.  But
+ * redirection -- busybox ash's `<`, `>`, `2>` -- works by
+ * opening a file and calling dup2() to install it as fd 0, 1,
+ * or 2.  After that, read(0, ...) and write(1, ...) MUST
+ * consult file_table[0] / file_table[1] rather than falling
+ * through to the keyboard/screen.
+ *
+ * sys_read, sys_write, and sys_close use this helper for the
+ * fd<3 cases; everything else keeps using get_file_slot.
+ *
+ * Returns NULL if the fd is out of range, or holds no slot.
+ * Does not check slot->kind -- the caller does.
+ */
+static file_slot_t* get_file_slot_any(int fd) {
+    pcb_t* self = process_get_current();
+    if (!self || fd < 0 || fd >= MAX_PROCESS_FILES) return NULL;
+    return (file_slot_t*)self->file_table[fd];
 }
 
 
@@ -913,7 +937,7 @@ long sys_open(const char* path, int flags) {
     FRESULT r = f_open(file_obj, local_path, mode);
     if (r == FR_OK) {
         slot->kind = FILE_KIND_FILE;
-        slot->obj  = file_obj;
+        slot->obj  = file_obj;    
         return fd;
     }
 
@@ -956,7 +980,8 @@ long sys_open(const char* path, int flags) {
 }
 
 long sys_close(int fd) {
-    file_slot_t* slot = get_file_slot(fd, 0);
+    file_slot_t* slot = get_file_slot_any(fd);
+    
     if (!slot) return -(long)EBADF_;
 
     pcb_t* self = process_get_current();
@@ -1010,6 +1035,7 @@ long sys_dup2(int oldfd, int newfd) {
     /* Share the slot and take a new reference. */
     old_slot->refcount++;
     self->file_table[newfd] = old_slot;
+       
     return (long)newfd;
 }
 
@@ -2356,7 +2382,18 @@ long sys_write(int fd, const void* buf, size_t count) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EBADF_;
 
-    if (fd == 1 || fd == 2) {
+    /*
+     * fd 1 and 2 are the screen ONLY when nothing has been dup2'd
+     * onto them.  `echo hi > file` opens the file and calls
+     * dup2(file_fd, 1); after that, write(1, ...) must write the
+     * file, not the screen.  The old code went straight to the
+     * screen path and ignored file_table[1], so `>` silently
+     * discarded the redirect.
+     */
+    file_slot_t* std_slot = get_file_slot_any(fd); 
+    
+    if ((fd == 1 || fd == 2) &&
+        (!std_slot || std_slot->kind != FILE_KIND_FILE)) {
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
@@ -2373,8 +2410,8 @@ long sys_write(int fd, const void* buf, size_t count) {
         return (long)count;
     }
 
-    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
-    if (slot) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
         if (!bounce) return -(long)ENOMEM_;
@@ -2572,7 +2609,17 @@ long sys_read(int fd, void* buf, size_t count) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EBADF_;
 
-    if (fd == 0) {
+    /*
+     * fd 0 is the keyboard ONLY when nothing has been dup2'd onto
+     * it.  busybox ash's `<` redirection opens a file and calls
+     * dup2(file_fd, 0); after that, read(0, ...) must read the
+     * file, not the keyboard.  The old code went straight to the
+     * keyboard path and ignored file_table[0], so `cat < file`
+     * blocked forever on keyboard input.
+     */
+    file_slot_t* fd0_slot = get_file_slot_any(0);
+    
+    if (fd == 0 && (!fd0_slot || fd0_slot->kind != FILE_KIND_FILE)) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
         while (bytes_read < count) {
             __asm__ volatile("cli");
@@ -2612,8 +2659,8 @@ long sys_read(int fd, void* buf, size_t count) {
         return (long)bytes_read;
     }
 
-    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
-    if (slot) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
         if (!bounce) return -(long)ENOMEM_;
@@ -3819,7 +3866,8 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 long sys_fork(void) {
     __asm__ volatile("cli");
 
-    pcb_t* parent = process_get_current();
+    pcb_t* parent = process_get_current(); 
+    
     if (!parent) {
         __asm__ volatile("sti");
         return -(long)EAGAIN_;
@@ -3937,6 +3985,34 @@ long sys_fork(void) {
             _i++;
         }
         child->cwd[_i] = '\0';
+    }
+
+    /*
+     * Child inherits the parent's open fds.
+     *
+     * process_create zeroed the child's file_table[], but fork
+     * must give the child the same open fds as the parent.  This
+     * is what makes `cmd < file` work: the shell opens the file,
+     * dup2()s it onto fd 0, then forks and execs the command.  If
+     * the child starts with an empty table, fd 0 is NULL in the
+     * child, its read(0) falls through to the keyboard, and the
+     * command blocks forever.  Same for `>`: fd 1 must carry the
+     * parent's redirected file into the child.
+     *
+     * Each slot is SHARED, not copied: the child's fd and the
+     * parent's fd point at the same file_slot_t, and the refcount
+     * is incremented for the new reference -- exactly as dup2
+     * shares a slot.  Closing either fd drops one reference; the
+     * slot is freed only when the last reference goes away.
+     *
+     * fds 0, 1, 2 are included: the parent may have dup2'd a file
+     * onto them, and the child must see the same redirection.
+     */
+    for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
+        file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
+        if (!_slot) continue;
+        _slot->refcount++;
+        child->file_table[_fd] = _slot;
     }
 
     /*
