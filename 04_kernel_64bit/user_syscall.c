@@ -1123,6 +1123,104 @@ long sys_rmdir(const char* path) {
 }
 
 /*
+ * Linux x86_64 rename(2) — syscall 82.
+ *
+ * Rename (move) a file or directory.  This is the first
+ * two-path syscall in donix: both oldpath and newpath must be
+ * resolved against the process cwd, then stripped of any leading
+ * "./" or "/", exactly as the one-path syscalls do.  The same
+ * pattern will be needed for link(2) and symlink(2) when they
+ * land.
+ *
+ * ABI:
+ *   arg0  const char*  oldpath
+ *   arg1  const char*  newpath
+ *   returns  0 on success, -errno on failure.
+ *
+ * FatFs semantics (see ff.h f_rename):
+ *   - f_rename does NOT replace an existing destination.  Linux
+ *     rename(2) DOES replace.  If newpath exists, f_rename
+ *     returns FR_EXIST, which fatfs_errno maps to -EPERM.  So
+ *     `mv a b` where b already exists fails rather than
+ *     overwriting.  This is a deliberate first cut: safer, and
+ *     nothing in the current applet set relies on the replace
+ *     behavior.  A future caller that needs Linux semantics can
+ *     unlink the destination first, then rename -- but that loses
+ *     the atomicity of rename, so it is a decision, not a fix.
+ *
+ *   - On FAT16, f_rename only works within a directory.  Renaming
+ *     `dir/a` to `dir/b` works; `dir/a` to `other/b` fails.
+ *     Linux rename(2) allows cross-directory moves.  For donix's
+ *     flat FAT root this covers `mv a b`; a cross-directory move
+ *     is a known limitation, tracked in docs/open-issues.md.
+ *
+ * Errors: -EFAULT for a bad user pointer, -ENAMETOOLONG if a
+ * resolved path overflows, otherwise the FatFs errno mapping
+ * (FR_NO_FILE -> -ENOENT, FR_EXIST -> -EPERM, etc.).
+ */
+long sys_rename(const char* user_oldpath, const char* user_newpath) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_oldpath || !user_newpath) return -(long)EFAULT_;
+
+    char old_path[USER_PATH_MAX];
+    char new_path[USER_PATH_MAX];
+    char old_resolved[USER_PATH_MAX];
+    char new_resolved[USER_PATH_MAX];
+
+    /* Copy both paths out of user space. */
+    if (copy_user_string(old_path, sizeof(old_path), user_oldpath) != 0) {
+        return -(long)EFAULT_;
+    }
+    if (copy_user_string(new_path, sizeof(new_path), user_newpath) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    /* Resolve both against the process cwd. */
+    if (resolve_against_cwd(self, old_path, old_resolved,
+                            sizeof(old_resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    if (resolve_against_cwd(self, new_path, new_resolved,
+                            sizeof(new_resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+
+    /* Copy the resolved forms back into the working buffers. */
+    {
+        size_t i = 0;
+        while (old_resolved[i] && i < sizeof(old_path) - 1) {
+            old_path[i] = old_resolved[i];
+            i++;
+        }
+        old_path[i] = '\0';
+    }
+    {
+        size_t i = 0;
+        while (new_resolved[i] && i < sizeof(new_path) - 1) {
+            new_path[i] = new_resolved[i];
+            i++;
+        }
+        new_path[i] = '\0';
+    }
+
+    /* Strip leading "./" and "/" that FatFs rejects. */
+    strip_dot_prefix(old_path);
+    strip_dot_prefix(new_path);
+
+    FRESULT r = f_rename(old_path, new_path);
+    if (r != FR_OK) {
+        serial_print("sys_rename: f_rename FAIL old=");
+        serial_print(old_path);
+        serial_print(" new=");
+        serial_print(new_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
  * Linux x86_64 mkdir(2) — syscall 83.
  *
  * FatFs has no notion of UNIX permissions, so the mode argument is
@@ -4115,6 +4213,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
+        case SYS_RENAME:          return (uint64_t)sys_rename((const char*)arg0, (const char*)arg1);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);

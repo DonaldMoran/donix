@@ -75,6 +75,7 @@
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
+ *  82  rename            sys_rename
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
@@ -149,6 +150,7 @@
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80
+#define SYS_RENAME          82
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
@@ -221,6 +223,7 @@ long sys_getppid(void);
 long sys_uname(void* user_buf);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
+long sys_rename(const char* oldpath, const char* newpath);
 long sys_utimes(const char* path, const void* times);
 long sys_futimesat(int dirfd, const char* path, const void* times);
 long sys_utimensat(int dirfd, const char* path, const void* times,
