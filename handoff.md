@@ -3,14 +3,14 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-29 (session 33 â†’ pre-session 34)
-**Current HEAD:** tag `20260930-busybox-od`, branch `dev`
-**Last milestone:** `v0.6.4` (published) â€” **the basics are done**
-**Next milestone:** `v0.6.5` candidate â€” session 33 is large enough
-to tag (see below)
+**Last updated:** 2026-09-29 (session 34 → pre-session 35)
+**Current HEAD:** tag `20260930-busybox-uniq`, branch `dev`
+**Last milestone:** `v0.6.4` (published) — **the basics are done**
+**Next milestone:** `v0.6.5` candidate — sessions 33 and 34
+together are large enough to tag (see below)
 
 Commits are named by tag only, never by SHA.  **Working tags
-(`2026092x-*`) are local scratch restore points** â€” they exist while
+(`2026092x-*`) are local scratch restore points** — they exist while
 a milestone is being developed and are **dropped before the
 milestone is pushed**.  Only `v*` tags go to the remote and are
 permanent.  The commit record is `docs/session-log.md`; the commit
@@ -46,133 +46,83 @@ anything.
 The two trees share the same top-level layout.  The C sources for
 the kernel live under a numbered subdirectory in each:
 
-- `/home/noneya/code/donix/04_kernel_64bit/` â€” real project
+- `/home/noneya/code/donix/04_kernel_64bit/` — real project
   kernel sources.
-- `/home/noneya/code/testme/04_kernel_64bit/` â€” experimental tree
+- `/home/noneya/code/testme/04_kernel_64bit/` — experimental tree
   kernel sources.
 
 Both trees use `04_kernel_64bit/` for the kernel source.  Verify
-by file name before porting â€” do not trust the number alone.
+by file name before porting — do not trust the number alone.
 `05_boot_kernel64/` holds the boot chain assembly and the image
 builder, not the kernel C sources.
 
 ---
 
-## Where we are â€” session 33, scripts run, redirection works
+## Where we are — session 34, low fds first-class, `uniq` works
 
-**Eighteen commits on `dev`, all scratch-tagged, all unpushed.**
-The last is `88a504d` (`busybox: enable text utilities ...`).
+**Twenty-one commits on `dev`, all scratch-tagged, all unpushed.**
+The last is `9307141` (`busybox: enable uniq applet`).
 
-Session 33 opened with "make shell scripts run" and closed with a
-working shell, working redirection, and a broad busybox command
-set.  Four threads:
+Session 34 opened with "investigate `uniq`" and closed with `uniq`
+working and a kernel fix that turned out to be the actual bug.  Two
+threads:
 
-### Thread 1 -- script execution
-
-| Tag | What |
-|---|---|
-| `20260929-max-process-files-64` | `MAX_PROCESS_FILES` 8 â†’ 64 |
-| `20260929-execve-script-fallback` | execve strips `./` before open; returns `ENOEXEC` for short non-ELF |
-
-**`MAX_PROCESS_FILES` 8 â†’ 64.**  At 8, busybox ash's script
-fork+exec path fails with `sh: 3: Invalid argument`; at 64 the
-same script prints its output.  Controlled: same build, same
-script, only the constant varied.  Cost +448 B/pcb; assembly-safe
-(`file_table` sits past `block_kind`, which `context_switch.asm`
-pins).
-
-**`sys_execve` two fixes.**  (1) Normalize the path with
-`strip_dot_prefix` before the first `f_open`, so `./test.sh` no
-longer fails with `FR_INVALID_NAME` at the open.  (2) Return
-`ENOEXEC`, not `EIO`, for a short non-ELF read, so ash falls back
-to running the script through `sh`.
-
-Result: `./test.sh`, `sh test.sh`, and `busybox sh test.sh` from
-`donix>` all print the script output.
-
-### Thread 2 -- two new syscalls
+### Thread 1 — low fds (0/1/2) are first-class
 
 | Tag | What |
 |---|---|
-| `20260929-uname` | `uname(2)` 63 + busybox applet |
-| `20260929-lseek` | `lseek(2)` 8 |
+| `20260930-low-fd-io` | console sentinels; lowest-free-fd `open`; `dup2`/`fcntl` accept 0/1/2 |
 
-**`uname` is not needed for scripting.**  The experimental tree's
-comment attributing `sh: 3: Invalid argument` to a missing `uname`
-was wrong -- that string came from fd exhaustion.  `uname` is a
-correctness port.
+`uniq FILE` hangs because `alloc_file_slot` started at fd 3.  busybox
+`uniq` does `close(0); open(file)` and expects `open` to return fd 0;
+on donix it returned fd 3, so `stdin` stayed pointed at the closed
+fd 0 and `read(0, ...)` fell through to the keyboard path in
+`sys_read` and blocked forever.  Three interlocking changes:
 
-**`lseek` was surfaced by `head -n N`,** which seeks to `SEEK_END`
-to size the file.  Without it: `Unknown syscall: 8` after correct
-output.
+1. **Console sentinels.**  `process_create` installs a
+   `FILE_KIND_CONSOLE` slot in fds 0/1/2 so a fresh process's stdio
+   fds are occupied and `open(2)` returns fd 3, matching Linux.
+   `sys_read`/`sys_write` treat a console slot as keyboard/screen;
+   `put_file_slot` frees it without `f_close`.
 
-### Thread 3 -- shell redirection (the biggest fix of the session)
+2. **Lowest-free-fd `open`.**  `alloc_file_slot` starts at fd 0.
+   With sentinels in place this returns 3 for a fresh process and 0
+   only after `close(0)` — the `uniq` idiom.
 
-| Tag | What |
-|---|---|
-| `20260930-redirect` | inherit fds across fork; honor dup2'd fds 0/1/2; close them on exit |
+3. **`dup2`/`fcntl` accept low fds.**  `sys_dup2` and the `F_DUPFD` /
+   `F_DUPFD_CLOEXEC` cases of `sys_fcntl` use `get_file_slot_any`
+   (accepts 0/1/2).  Without this, ash's redirect save/restore failed
+   with `EBADF` once an earlier redirect had freed a low fd, so the
+   *second* redirect in a shell broke.  The other `fcntl` subcommands
+   still refuse `fd < 3`.
 
-`cmd < file` and `cmd > file` did not work.  Temporary serial
-traces found **three interlocking bugs**, all in one commit:
+Full writeup with the trace: `docs/gotchas.md`, "Low fds (0/1/2) are
+first-class."
 
-1. **`sys_read`/`sys_write` hard-coded fds 0/1/2.**  `sys_read`
-   sent `fd == 0` to the keyboard; `sys_write` sent `fd == 1 || 2`
-   to the screen -- both *before* consulting `file_table[]`.  After
-   ash's `dup2(file_fd, 0)`, `read(0, ...)` still read the
-   keyboard (`cat < file` hung).  After `dup2(file_fd, 1)`,
-   `write(1, ...)` still wrote the screen (the file stayed empty).
-2. **`sys_fork` never copied `file_table[]`.**  A forked child
-   started with no fds.  ash opens the redirect file, `dup2`s it
-   onto fd 0, then forks and execs -- the child saw fd 0 as NULL.
-   Fixed by copying every open slot and bumping its refcount.
-3. **`close_all_files` started at `i = 3`.**  fds 0/1/2 were never
-   closed on exit, so a redirect-created file's refcount never
-   reached 0, `f_close` never ran, and FatFs never committed the
-   directory entry -- `cat out.txt` after `echo hi > out.txt` read
-   an empty file.
-
-Plus a new `get_file_slot_any()` helper that accepts fds 0-2; the
-general `get_file_slot()` keeps its `fd >= 3` guard.
-
-Verified: `cat < hello-world.txt` prints the file and returns;
-`echo hi > out.txt` is silent; `cat out.txt` prints `hi`.
-
-### Thread 4 -- busybox applets
-
-Twelve applets enabled across two commits, each **probed first**:
-
-| Tag | Applet(s) |
-|---|---|
-| `20260929-busybox-head` | `head` |
-| `20260929-busybox-tail` | `tail` |
-| `20260929-busybox-cp` | `cp` |
-| `20260929-busybox-grep` | `grep` |
-| `20260929-busybox-sed` | `sed` |
-| `20260930-busybox-text-utils` | `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp` |
-
-All tested and confirmed working.  `wc`, `echo`, `cat`, `ls`,
-`pwd`, `mkdir`, `rm`, `rmdir`, `touch`, `vi` were already enabled
-from earlier sessions.
-
-### Docs commits
+### Thread 2 — busybox
 
 | Tag | What |
 |---|---|
-| `20260929-docs-session-33` | first docs pass (script execution) |
-| `20260929-docs-session-33-complete` | second docs pass (uname, lseek, five applets) |
+| `20260930-busybox-uniq` | `CONFIG_UNIQ=y` |
 
-This session-end pass (the third) extends both `gotchas.md` and
-`session-log.md` for the redirection fix and the text-utilities
-batch, and rewrites this file.
+The applet's hang was the kernel fd bug, not an applet bug.  With low
+fds first-class it works in both the FILE-argument and
+redirected-stdin forms.
+
+### Docs commit
+
+| Tag | What |
+|---|---|
+| `20260930-docs-session-34` | this pass: gotchas, open-issues, session-log, handoff |
 
 ### Known failures, deliberately off
 
-- **`uniq`** -- hangs on any invocation, with or without `-c`.
-  Cause unknown; needs a trace-first investigation.  `CONFIG_UNIQ`
-  is off.
-- **`od`** -- needs `readv(2)` (19), which donix lacks.
-  `CONFIG_OD` is off.
-- **`diff`** -- deliberately off; larger surface area.
+- **`diff`** — deliberately off; larger surface area.
+- **`chmod`, `ln`, `mount`/`umount`** — need `chmod(2)` (90),
+  `link(2)`/`symlink(2)` (86/88), and `mount(2)` respectively.
+- **`uniq`** — **no longer on this list.**  It was never an applet
+  bug; it was the kernel fd bug fixed in `20260930-low-fd-io`.  The
+  applet is enabled and tested.
 
 ### Known limitation: `musl_sh`
 
@@ -181,55 +131,63 @@ redirection.  All tests involving `<`, `>`, `|`, `&&`, `;`, or
 quoting must be run from ash (`busybox sh` from `donix>`, or the
 auto-launched ash at boot).  See `docs/gotchas.md`.
 
+Note this includes `uniq -c < file`: from `donix>` the `<` reaches
+`uniq` as a literal argument, which is why the `donix>` run in the
+canary shows `uniq: can't open '<'`.  That is the `musl_sh` gap, not
+an `uniq` bug.
+
+### Known limitation: no `pipe(2)`
+
+`|` does not work in any shell — not ash, not `donix>`.  The shell
+never creates the pipe; `|` reaches the applet as a literal argv
+argument.  Not an applet bug; `pipe(2)` is simply absent.  See
+`docs/open-issues.md`.
+
 ### Not carried forward from `testme`
 
-The extra `busybox.config` applets that need kernel work
-(`chmod`, `ln`, `mount`/`umount`), `FEATURE_ALLOW_EXEC` (proven
-unnecessary), and `env` (cosmetic -- `envp` is ignored by
-`sys_execve`).  `testme` still has these; they are deliberately
-left out.
+The extra `busybox.config` applets that need kernel work, plus
+`FEATURE_ALLOW_EXEC` (proven unnecessary) and `env` (cosmetic —
+`envp` is ignored by `sys_execve`).  `testme` still has these; they
+are deliberately left out.
 
 ---
 
-## NEXT SESSION â€” pick a direction
+## NEXT SESSION — pick a direction
 
-Session 33 was large (13 commits).  No committed next milestone.
+Session 34 was two commits.  No committed next milestone.
 
-**Recommended first: `uniq`.**  It hangs on any invocation, with
-or without `-c`.  Cause unknown; needs a trace-first
-investigation.  Add temporary `serial_print` lines (the `[read]`
-pattern from the redirection work) to see what syscalls `uniq`
-makes before it blocks.  Probably a missing syscall or a
-busybox-internal loop on EOF.  Its own session.
-
-**Then: `pipe(2)`.**  This is the biggest remaining gap in the
+**Recommended first: `pipe(2)`.**  The biggest remaining gap in the
 shell.  Without it, `|` reaches applets as a literal argument.
 `pipe(2)` is syscall 22; the implementation needs a pipe object,
-per-fd read/write ends, and scheduler integration for blocking
-on an empty/full pipe.  Bigger than anything since the
-redirection fix.  Worth its own session.
+per-fd read/write ends, and scheduler integration for blocking on an
+empty/full pipe.  Bigger than anything since the redirection fix.
+Worth its own session.
 
 **Small, close gaps:**
 
-1. **`newfstatat` (262)** -- reserved number, no dispatch case.
-2. **`sys_open` `O_DIRECTORY` fix** -- return `-ENOTDIR` when the
+1. **`newfstatat` (262)** — reserved number, no dispatch case.
+2. **`sys_open` `O_DIRECTORY` fix** — return `-ENOTDIR` when the
    target is a file.
-3. **Ctrl-`[` as ESC** -- `scancode_to_ascii` has no Ctrl
-   parameter yet.
-4. **`sys_utimensat` cwd resolution** -- found in session 32; it
+3. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
+   yet.
+4. **`sys_utimensat` cwd resolution** — found in session 32; it
    calls `strip_dot_prefix` but not `resolve_against_cwd`.
-5. **`musl_sh` quote stripping + redirection parsing** -- the two
-   userland gaps surfaced this session.  A tokenizer fix,
-   userland-only.
+5. **`musl_sh` quote stripping + redirection parsing** — the two
+   userland gaps.  A tokenizer fix, userland-only.
+6. **`sys_fcntl` fd < 3 for the other subcommands** — a small
+   extension of the session-34 work.  `F_GETFL`, `F_SETFL`,
+   `F_GETFD`, `F_SETFD` still refuse `fd < 3`; Linux allows them on
+   a redirected fd.  Not on any current path.
 
 **More applets, once `pipe(2)` lands:** `awk`, `find` (needs
 `newfstatat`), `tar`, `diff`.  `chmod` (90), `ln` (86/88), and
 `mount` still need their own syscalls.
 
-**Or tag `v0.6.5`.**  Session 33 is a coherent milestone:
-"scripts run; redirection works; broad busybox command set."  If
-tagged, drop all 13 `20260929-*` / `20260930-*` scratch tags
-first, tag `v0.6.5`, rewrite this file, push.
+**Or tag `v0.6.5`.**  Sessions 33 and 34 together are a coherent
+milestone: "scripts run; redirection works; low fds are first-class;
+broad busybox command set including `uniq`."  If tagged, drop all
+`20260929-*` and `20260930-*` scratch tags first, tag `v0.6.5`,
+rewrite this file, push.
 
 Pick **one**, do it, test it, tag it.  One change at a time.
 
@@ -237,10 +195,9 @@ Pick **one**, do it, test it, tag it.  One change at a time.
 
 ## Canary state
 
-**The focused canary is green as of
-`20260930-busybox-text-utils`.**  Full table in
-`docs/session-log.md`.  Script execution, redirection, and the
-applet one-offs are verification, not canary rows -- the canary
+**The focused canary is green as of `20260930-busybox-uniq`.**  Full
+table in `docs/session-log.md`.  Script execution, redirection, and
+the applet one-offs are verification, not canary rows — the canary
 must not mutate the disk.
 
     # on boot, ash is already running
@@ -270,41 +227,58 @@ must not mutate the disk.
     # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
 
+**New read-only rows (added session 34), run from ash:**
+
+    uniq hello-world.txt
+    uniq -c < hello-world.txt
+
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
 
 **Do NOT add a `donix>` redirection row.**  `musl_sh` does not
-parse `<` or `>`.  Redirection tests go through ash.
+parse `<` or `>`.
+
+**Do NOT run `uniq -c < file` from `donix>`.**  It is an ash-only
+test; from `donix>` the `<` reaches `uniq` as a literal argument and
+`uniq` reports `can't open '<'`.
+
+**Do NOT add a pipe (`|`) row.**  `pipe(2)` is not implemented;
+`|` reaches the applet as a literal argument in both shells.
 
 The **full canary** (milestone-only) adds: `echo`, `cat`,
-`musl_stat`, `musl_min`, `musl_malloc`, `musl_printf`,
-`musl_exec`, `musl_readdir`, `musl_r10probe`, `brk_verify`,
-`brkraw`, `brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`,
-`musl_getcwd`, `busybox echo`, `busybox wc hello-world.txt`.
+`musl_stat`, `musl_min`, `musl_malloc`, `musl_printf`, `musl_exec`,
+`musl_readdir`, `musl_r10probe`, `brk_verify`, `brkraw`,
+`brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`, `musl_getcwd`,
+`busybox echo`, `busybox wc hello-world.txt`.
 
-**Canary rows must not mutate the disk.**  The new read-only
-applets (`head`, `tail`, `grep`, `sed`, `cut`, `sort`, `stat`,
-`cmp`, `wc`) could be added as canary rows.  `tee`, `cp`, and the
-redirection tests mutate, so they stay one-offs.
+**Canary rows must not mutate the disk.**  The new read-only applets
+(`head`, `tail`, `grep`, `sed`, `cut`, `sort`, `stat`, `cmp`, `wc`,
+`od`, `uniq`) could be added as canary rows.  `tee`, `cp`, `mv`, and
+the redirection tests mutate, so they stay one-offs.
 
 **Expected noise:** none.  The serial log has no `Unknown syscall:`
-lines.  Two informational lines are expected:
-`EXIT: pid=N state=1 parent=2 qhead=N` (a forked busybox shell's
-own exit) and `EXIT-FALLBACK: switching to idle, ...` (in
-`musl_fork` when the child is the last runnable process).  The
+lines and (with the trace off) no `[fd]` lines.  Two informational
+lines are expected: `EXIT: pid=N state=1 parent=2 qhead=N` (a forked
+busybox shell's own exit) and `EXIT-FALLBACK: switching to idle, ...`
+(in `musl_fork` when the child is the last runnable process).  The
 `sys_open: f_open FAIL path=etc/...` lines from `busybox stat` are
-expected -- those files do not exist and `stat` falls back cleanly.
+expected — those files do not exist and `stat` falls back cleanly.
+The `sys_rename: f_rename FAIL ...` line from `busybox mv` on a
+failed rename is expected — same style of diagnostic `sys_unlink` and
+`sys_rmdir` carry, and only prints on failure.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
 1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are both shims.  When a
-   VFS lands, delete them.
-2. **`pipe(2)` is absent** -- `|` does not work in any shell.
+   resolution and `resolve_against_cwd` are both shims.  When a VFS
+   lands, delete them; do not extend.
+2. **`pipe(2)` is absent** — `|` does not work in any shell.
    The biggest remaining gap.
-3. **`uniq` hangs.**  Cause unknown; trace-first.
+3. **`sys_fcntl` refuses fd < 3** for subcommands other than
+   `F_DUPFD`/`F_DUPFD_CLOEXEC`.  Deliberate; a small extension of
+   the session-34 work rather than a new problem.
 4. **`musl_sh` does not strip quotes or parse redirection.**
    Userland-only fix.
 5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need
@@ -334,18 +308,17 @@ Paths, with the correct roots.
 Config and source locations (relative to whichever root is being
 edited; both trees have the same top-level layout):
 
-- `configs/busybox.config` â€” tracked canonical busybox config.
+- `configs/busybox.config` — tracked canonical busybox config.
   Enabled applets: `cat`, `cp`, `cut`, `echo`, `head`, `ls`,
   `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `sort`, `stat`,
-  `tail`, `tee`, `test`, `touch`, `tr`, `uname`, `wc`, `cmp`,
-  `grep`, `sed`, `vi`, plus `ash`.  Off (with reasons): `uniq`
-  (hangs), `diff` (deliberate), `chmod`/`ln`/`mount` (need
-  kernel work).
-- `userland/musl/` â€” tracked musl userland (`apps/`, `tests/`).
+  `tail`, `tee`, `test`, `touch`, `tr`, `uname`, `uniq`, `wc`,
+  `cmp`, `grep`, `sed`, `vi`, plus `ash`.  Off (with reasons):
+  `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel work).
+- `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
-  â€” gitignored; rebuild with `./toolchain/install_musl.sh`.
-- `toolchain/{install_musl.sh,musl-gcc.sh}` â€” tracked.
+  — gitignored; rebuild with `./toolchain/install_musl.sh`.
+- `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
 
 Kernel sources:
 
@@ -354,9 +327,9 @@ Kernel sources:
 
 Scratch copies from earlier exploring:
 
-- `/home/noneya/code/x/` â€” an older scratch copy.  Fully ported;
+- `/home/noneya/code/x/` — an older scratch copy.  Fully ported;
   safe to delete whenever.
-- `/home/noneya/code/y/` â€” a second scratch copy used for a
+- `/home/noneya/code/y/` — a second scratch copy used for a
   bisection experiment.  Safe to delete.
 
 **`testme` still has unported changes** from the session-33 work:
@@ -374,17 +347,17 @@ Not needed to start a session; ask for a file when the current task
 needs it.  Paths below are relative to a tree root
 (`/home/noneya/code/donix/` or `/home/noneya/code/testme/`).
 
-- `docs/strategy.md` â€” Phase A/B plan, rules, files-not-to-touch,
+- `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` â€” every bug writeup, by subsystem.
-- `docs/session-log.md` â€” commit tables and per-test canary notes.
+- `docs/gotchas.md` — every bug writeup, by subsystem.
+- `docs/session-log.md` — commit tables and per-test canary notes.
   Rows are named by tag; scratch tags are dropped before a
-  milestone push, so a row's tag may no longer resolve â€” the
+  milestone push, so a row's tag may no longer resolve — the
   commit message is the record.
-- `docs/open-issues.md` â€” full open-issues list.
-- `docs/migration-history.md`, `docs/dons-os-history.md` â€”
+- `docs/open-issues.md` — full open-issues list.
+- `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
-- `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` â€” the first two
+- `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
 
 ---
@@ -393,13 +366,11 @@ needs it.  Paths below are relative to a tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Session 33: shell scripts run, shell
-redirection works, and the busybox file/text utilities (head,
-tail, cp, grep, sed, cut, sort, stat, tee, test, tr, cmp) work,
-on top of two new syscalls (uname 63, lseek 8).  Thirteen
-commits, all scratch-tagged, unpushed.  Session 34: do `mv` via
-`rename(2)` -- the deferred "bigger payoff" item -- or tag
-`v0.6.5`.  One change at a time.**
+`userland/musl/`.  Session 34: low fds (0/1/2) are first-class --
+console sentinels, lowest-free-fd `open`, `dup2`/`fcntl` accept
+0/1/2 -- and busybox `uniq` works.  Twenty-one commits, all
+scratch-tagged, unpushed.  Session 35: implement `pipe(2)` -- the
+biggest remaining gap -- or tag `v0.6.5`.  One change at a time.**
 
 ---
 
