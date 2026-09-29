@@ -69,6 +69,7 @@
  *  59  execve            sys_execve
  *  60  exit              sys_exit
  *  61  wait4             sys_wait4
+ *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
@@ -141,6 +142,7 @@
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
+#define SYS_UNAME           63
 #define SYS_FCNTL           72
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
@@ -213,6 +215,7 @@ long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_geteuid(void);
 long sys_getppid(void);
+long sys_uname(void* user_buf);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
 long sys_utimes(const char* path, const void* times);

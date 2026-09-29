@@ -2753,6 +2753,72 @@ long sys_geteuid(void) {
 }
 
 /*
+ * Linux x86_64 uname(2) — syscall 63.
+ *
+ * Fills a struct utsname with fixed fields.  Every field is
+ * _UTSNAME_LENGTH (65) bytes, NUL-terminated, in this order:
+ *
+ *   sysname    "Linux"       -- what busybox checks to pick the
+ *                               Linux code path over BSD or other
+ *   nodename   "donix"       -- hostname; anything reasonable
+ *   release    "6.0.0"       -- kernel version; digits and dots
+ *                               only, so version parsers do not
+ *                               choke
+ *   version    "#1 donix"    -- free-form build string
+ *   machine    "x86_64"      -- architecture; checkers branch on
+ *                               this to pick word size
+ *   domainname "(none)"      -- NIS domain; everyone prints this
+ *
+ * The exact values are less important than the shape: sysname
+ * must be "Linux" so glibc/musl/busybox pick their Linux
+ * behavior, and machine must be "x86_64" so anything doing
+ * architecture-specific work gets the right answer.  The
+ * remaining fields are informational.
+ *
+ * Without this syscall, `busybox uname` prints an error.  It is
+ * NOT required for shell script execution -- the session-33
+ * script fixes are independent of this.
+ */
+struct donix_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static void set_utsname_field(char* dst, const char* src) {
+    int i = 0;
+    while (src[i] && i < 64) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+long sys_uname(void* user_buf) {
+    if (!user_buf) return -(long)EFAULT_;
+
+    struct donix_utsname u;
+    /* Zero every byte so the fields beyond the NUL we write are
+     * deterministic.  Some callers memcmp the whole struct. */
+    for (size_t i = 0; i < sizeof(u); i++) ((uint8_t*)&u)[i] = 0;
+
+    set_utsname_field(u.sysname,    "Linux");
+    set_utsname_field(u.nodename,   "donix");
+    set_utsname_field(u.release,    "6.0.0");
+    set_utsname_field(u.version,    "#1 donix");
+    set_utsname_field(u.machine,    "x86_64");
+    set_utsname_field(u.domainname, "(none)");
+
+    if (safe_copy_to_user(user_buf, &u, sizeof(u)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
  * Return the current working directory: the path stored by
@@ -3901,6 +3967,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_UNAME:           return (uint64_t)sys_uname((void*)arg0);
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
