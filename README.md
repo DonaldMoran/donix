@@ -62,12 +62,16 @@ That's the point. That's the whole point.
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
-  `fstat`, `chdir`, `getcwd` — the numbers and semantics match Linux
-  x86_64. musl's `printf`, `malloc`, and `opendir` work unmodified.
+  `fstat`, `chdir`, `getcwd`, `geteuid`, `prctl`, `ftruncate`,
+  `utimensat`, `unlink`, `rmdir` — the numbers and semantics match
+  Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
+  unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
-  are real; `cd /bin; ls` lists `/bin`; the change survives `fork` and
-  `execve`. Relative paths (`.`, `..`, `./x`, plain names) resolve
-  against the cwd in `sys_open`, `sys_stat`, and `sys_access`.
+  are real; `cd /bin; ls` lists `/bin`; `cd ..` walks back up; the
+  change survives `fork` and `execve`. Relative paths (`.`, `..`,
+  `./x`, plain names) resolve against the cwd in every path-taking
+  syscall — `sys_open`, `sys_stat`, `sys_access`, `sys_chdir`,
+  `sys_unlink`, `sys_mkdir`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
   backspace, line editing, history), its applets (`ls`, `cat`, `echo`,
@@ -77,6 +81,11 @@ That's the point. That's the whole point.
   This is the strongest evidence that the syscall ABI is right —
   busybox expects a real Unix kernel underneath it, and on donix it
   gets one.
+- **Has a real terminal.** The console is a VT100 emulator: full CSI
+  parsing, cursor addressing, SGR colors, the erase, insert, and
+  delete families, and a software alternate screen. Full-screen
+  software gets what it expects. `vi don.txt`, edit, `:wq`, then
+  `cat don.txt` reads it back.
 - **Has a second, minimal shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
@@ -137,6 +146,26 @@ tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`, and
 ---
 
 ## Getting started
+
+### Quick start
+
+If your host already has the tools listed under **What you need** —
+including `/opt/cross/bin/x86_64-elf-gcc` — the whole install is:
+
+```sh
+git clone https://github.com/DonaldMoran/donix.git donix
+cd donix
+./toolchain/install_musl.sh
+
+git clone https://git.busybox.net/busybox third_party/busybox
+git -C third_party/busybox checkout 1_36_1
+rm -f third_party/busybox/.config third_party/busybox/.config.old
+cp configs/busybox.config third_party/busybox/.config
+
+./run
+```
+
+The rest of this section explains what those commands do.
 
 ### 1. Install the host tools
 

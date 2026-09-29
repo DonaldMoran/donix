@@ -757,23 +757,96 @@ long sys_open(const char* path, int flags) {
 
     BYTE mode = 0;
     switch (flags & 0x3) {
-        case 0:  mode |= FA_READ;             break;
-        case 1:  mode |= FA_WRITE;            break;
-        case 2:  mode |= FA_READ | FA_WRITE;  break;
-        default: kfree(slot); self->file_table[fd] = NULL;
-                 return -(long)EINVAL_;
+        case 0:  mode |= FA_READ;             break;   /* O_RDONLY */
+        case 1:  mode |= FA_WRITE;            break;   /* O_WRONLY */
+        case 2:  mode |= FA_READ | FA_WRITE;  break;   /* O_RDWR   */
+        default: /* O_ACCMODE == 3 is invalid */
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -(long)EINVAL_;
     }
 
-    if (flags & 0x0400) {
+    /*
+     * Translate Linux open(2) flags to FatFs open mode.
+     *
+     * Linux x86_64 flag bits (include/uapi/asm-generic/fcntl.h):
+     *
+     *   0x0001   O_WRONLY
+     *   0x0002   O_RDWR
+     *   0x0040   O_CREAT
+     *   0x0080   O_EXCL
+     *   0x0200   O_TRUNC
+     *   0x0400   O_APPEND
+     *   0x8000   O_LARGEFILE   (ignored here; we are already 64-bit)
+     *   0x10000  O_DIRECTORY   (handled further below)
+     *
+     * FatFs mode bits (ff.h):
+     *
+     *   0x01  FA_READ
+     *   0x02  FA_WRITE
+     *   0x04  FA_CREATE_NEW
+     *   0x08  FA_CREATE_ALWAYS
+     *   0x10  FA_OPEN_ALWAYS
+     *   0x30  FA_OPEN_APPEND
+     *
+     * The previous translation in this file tested the wrong bits
+     * and as a result never set any creation flag for the common
+     * open(O_RDWR|O_CREAT) that touch(1), vi's :wq path, cp(1),
+     * and every other file-creating program issues.  FatFs then
+     * tried to open an existing file, found none, and returned
+     * FR_NO_FILE.  See the trace:
+     *
+     *   sys_open: f_open FAIL path=don.txt flags=0x8042 mode=0x03 r=4
+     *
+     * flags=0x8042 is O_RDWR|O_CREAT|O_LARGEFILE; mode=0x03 is just
+     * FA_READ|FA_WRITE, with no create bit.  The create request was
+     * being silently dropped because the check was `flags & 0x0200`
+     * (which is O_TRUNC) rather than `flags & 0x0040` (which is
+     * O_CREAT).
+     *
+     * FatFs expresses the creation choice as a single mode value,
+     * not as independent bits, so the order of precedence matters.
+     */
+    int o_creat  = (flags & 0x0040) != 0;   /* O_CREAT  */
+    int o_excl   = (flags & 0x0080) != 0;   /* O_EXCL   */
+    int o_trunc  = (flags & 0x0200) != 0;   /* O_TRUNC  */
+    int o_append = (flags & 0x0400) != 0;   /* O_APPEND */
+
+    if (o_creat && o_excl) {
+        /* O_CREAT|O_EXCL: fail if the file already exists.
+         * FA_CREATE_NEW does exactly that: create only if
+         * missing, return FR_EXIST otherwise.  This is the
+         * correct mapping for mkstemp(3) and for callers that
+         * need a guarantee the file did not previously exist. */
+        mode |= FA_CREATE_NEW;
+    } else if (o_creat && o_trunc) {
+        /* O_CREAT|O_TRUNC: create if missing, truncate if
+         * present.  FA_CREATE_ALWAYS does both.  This is what
+         * `vi :wq`, `cp`, and `touch` on a missing file
+         * actually issue. */
         mode |= FA_CREATE_ALWAYS;
-    } else if (flags & 0x0200) {
-        if (flags & 0x0800) mode |= FA_CREATE_NEW;
-        else                mode |= FA_OPEN_ALWAYS;
+    } else if (o_creat) {
+        /* O_CREAT alone: create if missing, leave existing
+         * content untouched.  FA_OPEN_ALWAYS is exactly this. */
+        mode |= FA_OPEN_ALWAYS;
+    } else if (o_trunc) {
+        /* O_TRUNC without O_CREAT: POSIX calls this undefined;
+         * Linux truncates an existing file and fails if it does
+         * not exist.  FatFs has no exact equivalent.  We use
+         * FA_CREATE_ALWAYS, which truncates existing files and
+         * (unlike Linux) also creates missing ones.  Nothing in
+         * busybox or musl relies on the "fail if missing" part
+         * of the Linux semantics; a caller that does would need
+         * an explicit stat first. */
+        mode |= FA_CREATE_ALWAYS;
     } else {
+        /* No creation or truncation flag: open existing only. */
         mode |= FA_OPEN_EXISTING;
     }
 
-    if (flags & 0x0008) mode |= FA_OPEN_APPEND;
+    if (o_append) {
+        mode |= FA_OPEN_APPEND;
+    }
 
     /*
      * Linux open(2) is also used to open directories — musl's
@@ -868,9 +941,14 @@ long sys_open(const char* path, int flags) {
 
     serial_print("sys_open: f_open FAIL path=");
     serial_print(local_path);
+    serial_print(" flags=0x");
+    serial_print_hex((uint64_t)flags);
+    serial_print(" mode=0x");
+    serial_print_hex((uint64_t)mode);
     serial_print(" r=");
     serial_print_dec(r);
     serial_print("\n");
+
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
@@ -940,14 +1018,76 @@ long sys_unlink(const char* path) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
     FRESULT r = f_unlink(local_path);
     if (r != FR_OK) {
         serial_print("sys_unlink: f_unlink FAIL path=");
+        serial_print(local_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 rmdir(2) — syscall 84.
+ *
+ * Remove an empty directory.  FatFs's f_unlink handles both files
+ * and empty directories; for a non-empty directory it returns
+ * FR_DENIED, which fatfs_errno maps to -EPERM.  Linux returns
+ * -ENOTEMPTY (39) for that case.  busybox's rmdir reports the
+ * failure either way; if a caller ever needs the exact errno,
+ * special-case FR_DENIED in a dedicated check.
+ *
+ * Path resolution matches sys_unlink: copy the user string, resolve
+ * against the cwd (so `rmdir x` in a non-root cwd removes that
+ * directory, not a root one of the same name), strip the leading
+ * "./" or "/", then call f_unlink.
+ */
+long sys_rmdir(const char* path) {
+    pcb_t* self = process_get_current();
+    if (!self || !path) return -(long)EFAULT_;
+
+    char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
+    }
+    strip_dot_prefix(local_path);
+
+    FRESULT r = f_unlink(local_path);
+    if (r != FR_OK) {
+        serial_print("sys_rmdir: f_unlink FAIL path=");
         serial_print(local_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
@@ -999,8 +1139,21 @@ long sys_mkdir(const char* path, int mode) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
@@ -1283,6 +1436,62 @@ long sys_access(const char* user_path, int mode) {
         return fatfs_errno(r);
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 utimensat(2) — syscall 280.
+ *
+ * touch(1) and other tools use this to set file timestamps.
+ * donix does not persist timestamps; FAT stores modification
+ * time in a coarse 2-second-resolution field that we do not
+ * currently write.  The correct minimal implementation is to
+ * verify the path exists and return 0.
+ *
+ * Reporting success without storing is what makes `touch`
+ * usable now; reporting -ENOSYS makes busybox fall through its
+ * whole fallback chain (utimensat -> utimes -> futimesat) and
+ * print "Function not implemented".
+ *
+ * AT_FDCWD is -100; dirfd is ignored.  The flags argument may
+ * carry AT_SYMLINK_NOFOLLOW, which is meaningless on FAT (no
+ * symlinks).  Both are accepted and ignored.
+ */
+long sys_utimensat(int dirfd, const char* path, const void* times, int flags) {
+    (void)times; (void)flags; (void)dirfd;
+
+    /* NULL path with a valid dirfd is the futimens(fd) form,
+     * which we do not support. */
+    if (!path) return -(long)EINVAL_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    strip_dot_prefix(local);
+
+    /* Root always "exists". */
+    if (path_is_root(local)) return 0;
+
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(local, &fno);
+    if (r != FR_OK) return fatfs_errno(r);
+    return 0;
+}
+
+/*
+ * Linux x86_64 utimes(2) — syscall 235.
+ * Legacy timeval form.  Same no-op semantics as utimensat.
+ */
+long sys_utimes(const char* path, const void* times) {
+    return sys_utimensat(-100, path, times, 0);
+}
+
+/*
+ * Linux x86_64 futimesat(2) — syscall 261.
+ * Older glibc form.  Same no-op semantics.
+ */
+long sys_futimesat(int dirfd, const char* path, const void* times) {
+    return sys_utimensat(dirfd, path, times, 0);
 }
 
 /*
@@ -2204,6 +2413,43 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
     return total;
 }
 
+/*
+ * Linux x86_64 ftruncate(2) — syscall 77.
+ *
+ * Confirmed against arch/x86/entry/syscalls/syscall_64.tbl:
+ *   77  common  ftruncate  sys_ftruncate
+ *
+ * vi's save path calls this to set the file size exactly after
+ * writing, because the underlying FAT layer may have padded the
+ * final write to a sector boundary.  On the current build FatFs
+ * already updates the directory entry to the exact fptr at
+ * f_close, so the file size in `ls -l` was correct without this
+ * — but the syscall fires on every :wq and logging "Unknown
+ * syscall: 77" on every save is noise that hides real problems.
+ *
+ * FatFs's f_truncate() truncates the file to fp->fptr, so we
+ * seek first, then truncate.  Both operations must succeed on a
+ * FIL opened FA_WRITE.
+ *
+ * Linux clamps negative lengths to EINVAL.  We do the same.
+ */
+long sys_ftruncate(int fd, long length) {
+    if (length < 0) return -(long)EINVAL_;
+
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+
+    FIL* file_obj = (FIL*)slot->obj;
+
+    FRESULT r = f_lseek(file_obj, (FSIZE_t)length);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    r = f_truncate(file_obj);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    return 0;
+}
+
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
@@ -2427,8 +2673,8 @@ long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
  * handler at 107 was therefore reached by ash's geteuid() call,
  * which received the caller's pid where it expected a uid.  The
  * real setsid(2) call from musl (112) went unhandled.  The number
- * is now 112, matching the Linux ABI.  geteuid(2) at 107 is now
- * an unhandled gap, tracked in docs/open-issues.md.
+ * is now 112, matching the Linux ABI.  The 107 gap was closed in
+ * session 30, when sys_geteuid was implemented (see below).
  */
 long sys_setsid(void) {
     pcb_t* current = process_get_current();
@@ -2512,23 +2758,35 @@ long sys_getcwd(char* buf, unsigned long size) {
  *
  * Change the calling process's current working directory.
  *
- * MINIMAL FIRST CUT.  This stores the path in pcb->cwd after
- * validating that it exists and is a directory, and sys_getcwd
- * returns the stored value.  It does NOT yet make the other path
- * syscalls resolve relative paths against the stored cwd -- see
- * the SCOPE note on pcb->cwd in process.h.  So `cd /bin` succeeds
- * and `pwd` reports `/bin`, but a subsequent `ls busybox` still
- * looks at `0:/BUSYBOX` (the root), not `0:/BIN/BUSYBOX`.
+ * This stores an absolute path in pcb->cwd after validating that it
+ * exists and is a directory, and sys_getcwd returns the stored value.
+ * The relative-path story is split across two layers:
  *
- * Validation uses f_stat_with_retry, so bare names and leading-
- * slash paths resolve the same way sys_stat resolves them.  The
- * path must resolve to a directory (AM_DIR); a file path returns
- * -ENOTDIR.  If validation fails, cwd is NOT changed.
+ *   - This function only *stores* the cwd.  It does not itself
+ *     rewrite the path relative to anything; the caller's path is
+ *     normalized to absolute Unix form and saved.
  *
- * The path is stored unsimplified, matching Linux: `cd /bin/../bin`
- * keeps that exact form, and `pwd` prints it back verbatim.
- * Root aliases (".", "/", "0:/") are normalized to "/" so getcwd
- * reports a consistent form.
+ *   - The path-taking syscalls that must honor the cwd call
+ *     resolve_against_cwd BEFORE strip_dot_prefix: sys_open,
+ *     sys_stat, and sys_access all do.  That is what makes
+ *     `cd /bin; ls busybox` look at `0:/BIN/BUSYBOX` instead of
+ *     `0:/BUSYBOX`.
+ *
+ *   - sys_unlink and sys_mkdir do NOT call resolve_against_cwd yet;
+ *     they only strip the leading "./" or "/".  So a remove or mkdir
+ *     in a non-root cwd resolves against the FAT root instead of the
+ *     cwd.  This is a known gap, tracked in docs/open-issues.md, and
+ *     is part of the v0.6.4 basics work.
+ *
+ * Validation uses f_stat_with_retry, so bare names and leading-slash
+ * paths resolve the same way sys_stat resolves them.  The path must
+ * resolve to a directory (AM_DIR); a file path returns -ENOTDIR.  If
+ * validation fails, cwd is NOT changed.
+ *
+ * The stored form is unsimplified, matching Linux: `cd /bin/../bin`
+ * keeps that exact form, and `pwd` prints it back verbatim.  Root
+ * aliases (".", "/", "0:/") are normalized to "/" so getcwd reports
+ * a consistent form.
  *
  * 20 is ENOTDIR on Linux x86_64.
  */
@@ -2546,26 +2804,46 @@ long sys_chdir(const char* user_path) {
     }
 
     /*
-     * We need TWO forms of the path:
+     * Resolve the path against the current cwd before anything else.
      *
-     *   1. The FAT form, for validating with f_stat_with_retry.
-     *      FatFs rejects a leading "/", so strip_dot_prefix is
-     *      applied to a COPY.
-     *   2. The Unix form, for storing as the cwd.  It must be
-     *      ABSOLUTE -- musl's getcwd() validates that the result
-     *      starts with '/', and rejects a relative cwd.  So the
-     *      stored form keeps its leading '/'.
+     * This is what makes `cd ..` and `cd .` work from the donix
+     * shell.  musl_sh's cd builtin passes the raw argument straight
+     * to chdir -- unlike ash, which resolves `..` against its own
+     * $PWD first -- so without this step the kernel would hand ".."
+     * to FatFs, which has no `..` directory entry, and chdir would
+     * fail with ENOENT.
      *
-     * Before, we stripped once and stored the stripped form, so
-     * `cd /bin` stored "bin" and every getcwd() afterwards failed
-     * (musl saw a non-absolute cwd and bailed to a userspace
-     * fallback that cannot work on donix's flat FAT).
+     * resolve_against_cwd produces an ABSOLUTE Unix path:
+     *
+     *     "."      -> cwd
+     *     ".."     -> parent of cwd
+     *     "../x"   -> parent of cwd + "/x"
+     *     "./x"    -> cwd + "/x"
+     *     "x"      -> cwd + "/x"
+     *     "/x"     -> "/x"          (already absolute, unchanged)
+     *     "0:/x"   -> "0:/x"        (FatFs form, unchanged)
+     *
+     * The result is absolute, so it can be stored as the new cwd
+     * directly -- no separate "Unix form" step is needed.  It may
+     * still carry a leading '/' or "./" that FatFs rejects, so a
+     * copy is stripped for validation.
+     */
+    char resolved[USER_PATH_MAX];
+    if (resolve_against_cwd(self, path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+
+    /*
+     * FAT form: strip the leading '/' and "./" components that
+     * FatFs rejects.  Applied to a copy so the resolved absolute
+     * form survives for the cwd store below.
      */
     char fat_path[USER_PATH_MAX];
     {
         size_t i = 0;
-        while (path[i] && i < sizeof(fat_path) - 1) {
-            fat_path[i] = path[i];
+        while (resolved[i] && i < sizeof(fat_path) - 1) {
+            fat_path[i] = resolved[i];
             i++;
         }
         fat_path[i] = '\0';
@@ -2588,28 +2866,21 @@ long sys_chdir(const char* user_path) {
      * Store the cwd in ABSOLUTE Unix form.
      *
      * Root aliases (".", "/", "0:/") normalize to "/".  Everything
-     * else is stored with a guaranteed leading '/': if the caller
-     * passed a relative path, resolve_against_cwd has already been
-     * applied by the syscall layer?  No -- chdir is called with the
-     * raw user path.  So we prefix '/' here for relative inputs.
+     * else comes from `resolved`, which is already absolute: a
+     * relative input has been resolved against the old cwd by
+     * resolve_against_cwd above, so there is no need to prefix '/'.
      *
-     * In practice a shell passes an absolute or "./x"-style path;
-     * for "./x" strip_dot_prefix gave "x", and we store "/x".  That
-     * is the correct absolute form for a cwd of "x" under root.
-     * (donix has no nested cwd beyond /bin today, so this is
-     * sufficient; full relative-cwd resolution is a follow-up.)
+     * musl's getcwd() validates that the result starts with '/',
+     * and rejects a relative cwd; resolve_against_cwd guarantees
+     * that leading '/', which is why the store can copy it directly.
      */
     if (path_is_root(fat_path)) {
         self->cwd[0] = '/';
         self->cwd[1] = '\0';
     } else {
         size_t o = 0;
-        /* Ensure a leading '/'. */
-        if (fat_path[0] != '/') {
-            self->cwd[o++] = '/';
-        }
-        for (size_t i = 0; fat_path[i] && o < sizeof(self->cwd) - 1; i++) {
-            self->cwd[o++] = fat_path[i];
+        for (size_t i = 0; resolved[i] && o < sizeof(self->cwd) - 1; i++) {
+            self->cwd[o++] = resolved[i];
         }
         self->cwd[o] = '\0';
     }
@@ -3555,18 +3826,15 @@ uint64_t syscall_dispatch(uint64_t num,
 
     switch (num) {
 
-        /* --- Linux x86_64 numbers --- */
+        /* --- Linux x86_64 numbers, strictly ascending --- */
         case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
-        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
+        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
-        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
-        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
-        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
@@ -3575,25 +3843,33 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
-        case SYS_GETPPID:         return (uint64_t)sys_getppid();
-        case SYS_SETSID:          return (uint64_t)sys_setsid();
-        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
-        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
+        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
+        case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
+        case SYS_GETPPID:         return (uint64_t)sys_getppid();
+        case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
+        case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
+        case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
+        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
+        case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
         case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
         case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
 

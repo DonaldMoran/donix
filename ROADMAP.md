@@ -1,10 +1,13 @@
 ### donix — what's next
 
-donix is at **v0.6.3**: it speaks the Linux x86_64 syscall ABI, runs
-static musl-linked binaries, and boots straight into **busybox `ash`**
-on top of a from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect
-a real per-process working directory, in both shells, across `fork`
-and `execve`.
+donix speaks the Linux x86_64 syscall ABI, runs static musl-linked
+binaries, and boots straight into **busybox `ash`** on top of a
+from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
+per-process working directory, in both shells, across `fork` and
+`execve`. The console is a VT100 emulator, so full-screen software
+runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
+Files and directories can be created and removed; a faulting
+process is killed cleanly.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -14,7 +17,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, and v0.6.3
+## Done — Phases A through B, and v0.6.4
 
 For the record, so this file does not re-plan finished work:
 
@@ -26,55 +29,56 @@ For the record, so this file does not re-plan finished work:
 - **v0.6.3** — a real working directory. `chdir`/`getcwd`, relative
   path resolution in `sys_open`/`sys_stat`/`sys_access`, cwd across
   `fork` and `execve`, `ls`/`cat` path pass-through, and `cd`/`pwd`
-  builtins in `musl_sh`. The serial log is free of `Unknown syscall:`
-  lines.
+  builtins in `musl_sh`.
+- **v0.6.4 — the basics.** Full VT100/ANSI emulation in `vga.c`
+  (CSI parsing, cursor addressing, SGR, erase/insert/delete, a
+  software alternate screen); `keyboard.c` delivers ESC, DEL, and
+  CR the way Unix software expects; correct Linux `open(2)` flag
+  translation plus `ftruncate`, `utimes`, `futimesat`, and
+  `utimensat`; `rm` and `rmdir`; `cd ..` at `donix>`; a user-mode
+  `#PF` (and ring-3 `#GP`) kills the process rather than the kernel.
 
-The narratives are in the `v0.6.3` annotated tag, `docs/session-log.md`,
+The narratives are in the `v0.6.4` annotated tag, `docs/session-log.md`,
 and `handoff.md`.
 
 ---
 
-## Next: pick a direction
+## After v0.6.4: pick a direction
 
-The shell is usable. What comes next is a set of small, independent
-items and two larger subsystem questions. Pick one, do it, test it,
-tag it — the project's one-change-at-a-time discipline applies.
+The basics work and full-screen software runs. What comes next is a
+set of small, independent items and several larger subsystem
+questions. Pick one, do it, test it, tag it — the project's
+one-change-at-a-time discipline applies.
 
 ### Small, close gaps
 
-- **`cd ..` at `donix>`.**  The `musl_sh` `cd` builtin passes the raw
-  `..` to `chdir`, and FatFs has no `..` entry, so it fails.  Two
-  clean fixes: (a) `builtin_cd` resolves `.`/`..` against `getcwd()`
-  before calling `chdir`; (b) `sys_chdir` resolves through
-  `resolve_against_cwd` the way the other path syscalls now do.
-  (b) is more Unix-shaped.  `cd ..` inside ash already works.
-- **User-mode `#PF` test binary.**  `fault_kill_current(0x0E)` in
-  `isr14_handler` is in but unverified end-to-end.  A test binary
-  that dereferences a bad pointer without setting `g_expect_fault`
-  closes the loop.  This is the item the ROADMAP used to call "the
-  `isr14` fault path"; the handler exists, the test does not.
 - **`newfstatat` (262).**  Number reserved, no dispatch case.  musl
   routes `fstatat` through `stat`/`lstat` on x86_64 for the common
   case, so it is not hit yet; a caller passing `AT_FDCWD` plus flags
   would reach it.  Delegates to `sys_stat` when `dirfd == AT_FDCWD`
-  or the path is absolute; it can now resolve relative paths against
-  cwd, so this is a small wrapper rather than a stub.
+  or the path is absolute; with cwd resolution now in `sys_stat`,
+  this is a small wrapper rather than a stub.
 - **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
   `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
   Latent today (nothing triggers it), but correct to close.
+- **`sys_utimensat` cwd resolution.**  Found in session 32: it calls
+  `strip_dot_prefix` but not `resolve_against_cwd`, like `sys_unlink`
+  and `sys_mkdir` did before session 32 fixed them.  Same one-line
+  fix.
+- **Ctrl-`[` as ESC.**  Deferred during the terminal work;
+  `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
+  The literal ESC key is enough for vi, but terminal users expect the
+  alias.
 
 ### Broaden busybox coverage
 
-Busybox is the boot shell now, but only a handful of applets have
-been exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`.  The
-untried ones — `rm`, `rmdir`, `cp`, `mv`, `grep`, `sed`, `awk`,
+Busybox is the boot shell now, but only some applets have been
+exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`, `touch`, `vi`,
+`rm`, `rmdir`.  The untried ones — `cp`, `mv`, `grep`, `sed`, `awk`,
 `tar` — are where the syscall surface gets tested hardest.
 
 Work through them one at a time, watching for `Unknown syscall: N` in
-the serial log.  Each missing syscall is its own commit.  The write
-path (`rm`, `rmdir`) is worth doing early: it would let `mkdir` become
-a standing canary row (paired mkdir + rmdir), which today it cannot
-be because nothing cleans up after it.
+the serial log.  Each missing syscall is its own commit.
 
 `ps`, `top`, `kill`, and job control need subsystems the kernel does
 not have yet (process introspection, signal delivery, process groups)
@@ -122,6 +126,10 @@ Independent of the shell work.  Roughly in order of value.
 - **Kernel log routing.**  Route `sys_execve`/`sys_open` diagnostics
   to serial only, or add a `SYS_KLOG(level)` syscall.  The trace
   lines are informational today but will get noisy as more runs.
+- **Real FatFs timestamp storage.**  The three timestamp syscalls
+  (`utimes`, `futimesat`, `utimensat`) return 0 without storing
+  anything.  Enough for `touch` and vi; not enough for a tool that
+  reads timestamps back.
 
 ### Testing infrastructure
 
