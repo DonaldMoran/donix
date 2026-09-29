@@ -2804,26 +2804,46 @@ long sys_chdir(const char* user_path) {
     }
 
     /*
-     * We need TWO forms of the path:
+     * Resolve the path against the current cwd before anything else.
      *
-     *   1. The FAT form, for validating with f_stat_with_retry.
-     *      FatFs rejects a leading "/", so strip_dot_prefix is
-     *      applied to a COPY.
-     *   2. The Unix form, for storing as the cwd.  It must be
-     *      ABSOLUTE -- musl's getcwd() validates that the result
-     *      starts with '/', and rejects a relative cwd.  So the
-     *      stored form keeps its leading '/'.
+     * This is what makes `cd ..` and `cd .` work from the donix
+     * shell.  musl_sh's cd builtin passes the raw argument straight
+     * to chdir -- unlike ash, which resolves `..` against its own
+     * $PWD first -- so without this step the kernel would hand ".."
+     * to FatFs, which has no `..` directory entry, and chdir would
+     * fail with ENOENT.
      *
-     * Before, we stripped once and stored the stripped form, so
-     * `cd /bin` stored "bin" and every getcwd() afterwards failed
-     * (musl saw a non-absolute cwd and bailed to a userspace
-     * fallback that cannot work on donix's flat FAT).
+     * resolve_against_cwd produces an ABSOLUTE Unix path:
+     *
+     *     "."      -> cwd
+     *     ".."     -> parent of cwd
+     *     "../x"   -> parent of cwd + "/x"
+     *     "./x"    -> cwd + "/x"
+     *     "x"      -> cwd + "/x"
+     *     "/x"     -> "/x"          (already absolute, unchanged)
+     *     "0:/x"   -> "0:/x"        (FatFs form, unchanged)
+     *
+     * The result is absolute, so it can be stored as the new cwd
+     * directly -- no separate "Unix form" step is needed.  It may
+     * still carry a leading '/' or "./" that FatFs rejects, so a
+     * copy is stripped for validation.
+     */
+    char resolved[USER_PATH_MAX];
+    if (resolve_against_cwd(self, path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+
+    /*
+     * FAT form: strip the leading '/' and "./" components that
+     * FatFs rejects.  Applied to a copy so the resolved absolute
+     * form survives for the cwd store below.
      */
     char fat_path[USER_PATH_MAX];
     {
         size_t i = 0;
-        while (path[i] && i < sizeof(fat_path) - 1) {
-            fat_path[i] = path[i];
+        while (resolved[i] && i < sizeof(fat_path) - 1) {
+            fat_path[i] = resolved[i];
             i++;
         }
         fat_path[i] = '\0';
@@ -2841,32 +2861,26 @@ long sys_chdir(const char* user_path) {
             return -(long)ENOTDIR_;
         }
     }
-     /*
+
+    /*
      * Store the cwd in ABSOLUTE Unix form.
      *
      * Root aliases (".", "/", "0:/") normalize to "/".  Everything
-     * else gets a guaranteed leading '/'.  chdir is handed the raw
-     * user path -- the syscall layer does not pre-resolve it -- so a
-     * relative input like "./x" has already been reduced to "x" by
-     * strip_dot_prefix above, and we store it as "/x".
+     * else comes from `resolved`, which is already absolute: a
+     * relative input has been resolved against the old cwd by
+     * resolve_against_cwd above, so there is no need to prefix '/'.
      *
-     * Because donix has no nested cwd beyond /bin today, prefixing
-     * '/' is sufficient for every path a shell actually passes.  A
-     * caller in a nested cwd passing "../sibling" would not get full
-     * relative resolution here; that is a follow-up, noted in
-     * docs/open-issues.md.
+     * musl's getcwd() validates that the result starts with '/',
+     * and rejects a relative cwd; resolve_against_cwd guarantees
+     * that leading '/', which is why the store can copy it directly.
      */
     if (path_is_root(fat_path)) {
         self->cwd[0] = '/';
         self->cwd[1] = '\0';
     } else {
         size_t o = 0;
-        /* Ensure a leading '/'. */
-        if (fat_path[0] != '/') {
-            self->cwd[o++] = '/';
-        }
-        for (size_t i = 0; fat_path[i] && o < sizeof(self->cwd) - 1; i++) {
-            self->cwd[o++] = fat_path[i];
+        for (size_t i = 0; resolved[i] && o < sizeof(self->cwd) - 1; i++) {
+            self->cwd[o++] = resolved[i];
         }
         self->cwd[o] = '\0';
     }
