@@ -3,10 +3,10 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-28 (session 31 → pre-session 32)
-**Current HEAD:** tag `v0.6.3`, branch `dev`
-**Last milestone:** `v0.6.3` (published) — the shell is fully usable
-**Next milestone:** `v0.6.4` — **the basics are done** (see the list below)
+**Last updated:** 2026-09-29 (session 32 → pre-session 33)
+**Current HEAD:** tag `v0.6.4`, branch `dev`
+**Last milestone:** `v0.6.4` (published) — **the basics are done**
+**Next milestone:** none yet — pick a direction (see below)
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026092x-*`) are local scratch restore points** — they exist while
@@ -50,29 +50,22 @@ the kernel live under a numbered subdirectory in each:
 - `/home/noneya/code/testme/04_kernel_64bit/` — experimental tree
   kernel sources.
 
-**Both trees use `04_kernel_64bit/` for the kernel source.**  The
-numbering was historically inconsistent; as of session 31 the two
-match.  Still verify before porting — locate the four files
-(`vga.c`, `keyboard.c`, `user_syscall.c`, `include/syscall.h`) by
-name rather than trusting the number.  There is also a
-`05_boot_kernel64/` directory in each tree: it holds the boot
-chain assembly and the image builder, not the kernel C sources.
+Both trees use `04_kernel_64bit/` for the kernel source.  Verify
+by file name before porting — do not trust the number alone.
+`05_boot_kernel64/` holds the boot chain assembly and the image
+builder, not the kernel C sources.
 
 ---
 
-## Where we are — the Session 31 port is done
+## Where we are — `v0.6.4`, the basics are done
 
-**The VT100/vi work is ported and verified on the real project.**
-Session 31 copied five files from the experimental tree to the
-real project and verified the full vi round-trip end to end.
-Nothing is committed yet; the tree is dirty at `v0.6.3` and the
-port is the uncommitted change set.
+**The basics all work.**  Session 31 ported the VT100/vi work and
+session 32 finished the remaining basics items.  Everything below
+is on `dev` at tag `v0.6.4`.
 
-### What was ported (session 31)
+### What landed in session 31 (the VT100/vi port)
 
-The diff survey found **five files differ** and **two are
-identical**.  Identical files were not copied; the five that
-differ were.
+Five files copied from the experimental tree to the real project:
 
 | File | Change |
 |---|---|
@@ -85,35 +78,56 @@ differ were.
 Not copied (identical in both trees): `include/vga.h`,
 `fatfs/ffconf.h`.
 
-**Corrections to the previous handoff, worth keeping:**
+**Corrections to the pre-session-31 handoff, worth keeping:**
 
-- The prior handoff claimed `configs/busybox.config` in the real
-  tree had **already been updated** for Session 31. It had
-  **not** — donix still had `CONFIG_VI` and `CONFIG_TOUCH` off.
-  The config was updated as part of the port.
-- The prior handoff described a **four-file** port. It was
-  **five**: `include/syscall.h` was missing from the list. The
-  `SYS_FTRUNCATE` / `SYS_UTIMES` / `SYS_FUTIMESAT` / `SYS_UTIMENSAT`
-  macros live there, and `user_syscall.c` will not compile
-  without them.
+- That handoff claimed `configs/busybox.config` in the real tree had
+  **already been updated** for Session 31. It had **not** — donix
+  still had `CONFIG_VI` and `CONFIG_TOUCH` off.  The config was
+  updated as part of the port.
+- That handoff described a **four-file** port. It was **five**:
+  `include/syscall.h` was missing from the list. The
+  `SYS_FTRUNCATE` / `SYS_UTIMES` / `SYS_FUTIMESAT` /
+  `SYS_UTIMENSAT` macros live there, and `user_syscall.c` will not
+  compile without them.
 
-### Verification (session 31)
+### What landed in session 32 (the basics)
 
-Full vi round-trip on the real project, serial log captured:
+| Item | What |
+|---|---|
+| `rm` | `sys_unlink` + `sys_mkdir` now call `resolve_against_cwd`; `CONFIG_RM=y` |
+| `rmdir` | `SYS_RMDIR` (84) handler + dispatch; `CONFIG_RMDIR=y` |
+| `cd ..` at `donix>` | `sys_chdir` now calls `resolve_against_cwd` |
+| `#PF` test | `userland/musl/tests/fault_pf.c`; user-mode `#PF` kills the process |
+| `#GP` fix | `isr13_handler` kills ring-3 `#GP` (was halting the kernel) |
+| kernel shell | `kmain_shell_loop` reads DEL/CR, matching `keyboard.c` |
+
+The `#GP` fix came from the first `fault_pf` run: the test used a
+non-canonical address (`0xDEADBEEF0000`), which raises `#GP`, not
+`#PF`, and the kernel halted instead of killing the process.  The
+handler now keys its ring test on `CS & 3`, not the error code —
+`#GP`'s error code is 0 for the non-canonical case and carries no
+ring information.  `#PF` keeps its `error_code & 4` test, which is
+correct for that vector.
+
+### Verification (session 32)
+
+All of the following were run on the real project with a captured
+serial log and **zero `Unknown syscall:` lines**:
 
 ```
-vi don.txt          # launches; alt-screen (?1049h); ~ rows painted
-i                   # insert mode
-This is a new test in donix!
-ESC                 # leaves insert mode
-:wq                 # saves; 'don.txt' 1L, 29C; alt-screen (?1049l)
-ls                  # don.txt present
-cat don.txt         # prints "This is a new test in donix!"
-```
+# vi round-trip
+vi don.txt; i; This is a test!; ESC; :wq
+cat don.txt                  # prints the text
 
-Earlier in the session, `touch don2.txt` was also verified to
-create a file that `ls` then lists. **Zero `Unknown syscall:`
-lines** in any of these runs.
+# file and directory removal
+touch a.txt; rm a.txt; ls a.txt          # gone
+mkdir y; touch y/f; rmdir y              # fails: directory not empty
+rm y/f; rmdir y                          # succeeds
+mkdir z; cd z; mkdir w; rmdir w; cd ..; rmdir z   # cwd-relative, works
+
+# fault kill
+fault_pf                     # #PF diagnostic, process killed, shell returns
+```
 
 The startup `sys_open: f_open FAIL path=don.txt flags=0x8000
 mode=0x01 r=4` on vi launch is **expected and correct** — vi
@@ -121,117 +135,49 @@ opens a nonexistent file for read (`O_RDONLY`, `FA_READ`), FatFs
 returns `FR_NO_FILE`, and vi falls back to new-file mode. Do not
 try to silence it.
 
-### The two VGA tunables are currently 0
+### The two VGA tunables are 0
 
-`vga.c` ships with:
-
-```
-#define VGA_TRACE_UNHANDLED   0
-#define VGA_REPLY_TO_QUERIES  0
-```
-
-Set to **1** during development for diagnostics (`[vga] unhandled
-CSI:` lines on the serial port, and DSR/DA replies). Both were
-flipped to 0 before the final verification run, and that run
-passed with them off. **Leave them at 0.**
-
-If `CONFIG_FEATURE_VI_ASK_TERMINAL` is ever turned on in the
-busybox config, vi will send `ESC[6n` at startup and wait for a
-reply. `VGA_REPLY_TO_QUERIES` must go back to 1 first, or vi
-will stall at launch.
-
-### Still uncommitted
-
-Nothing in this port is committed. The tree is dirty at `v0.6.3`.
-The plan is to commit as **`v0.6.4`** once the basics list below
-is finished and the documentation is updated.  `kmain.c` will
-need its version string bumped to match; the project owner will
-do that when the time comes.
-
-### Known limitation (unchanged)
-
-`cd ..` at `donix>` fails (`cd: cannot cd to ..`).  The `musl_sh`
-`cd` builtin passes the raw `..` to `chdir`, and FatFs has no `..`
-entry.  **`cd ..` inside ash works** (ash resolves `..` against
-its own `$PWD` first).  This is now an item on the basics list —
-see below.
+`vga.c` ships with `VGA_TRACE_UNHANDLED 0` and
+`VGA_REPLY_TO_QUERIES 0`.  Set to 1 during development for
+diagnostics; leave at 0.  If `CONFIG_FEATURE_VI_ASK_TERMINAL` is
+ever turned on, `VGA_REPLY_TO_QUERIES` must go back to 1 or vi
+stalls at launch waiting for a DSR reply.
 
 ---
 
-## The milestone: `v0.6.4` — the basics
+## NEXT SESSION — pick a direction
 
-`v0.7.0` was previously proposed as "vi is usable".  The project
-owner has redefined the milestone: **`v0.6.4` is "the basics are
-done"**, and vi is one item inside that, not the whole milestone.
+`v0.6.4` closed the basics.  There is no committed next milestone.
+The candidate list (full text in `ROADMAP.md`, "After v0.6.4"):
 
-The basics are:
+Small, close gaps:
 
-1. **Create, read, write files.** Done — `touch`, `cat`, redirection.
-2. **Create directories.** Done — `mkdir` exists and works.
-3. **Remove files.** **Missing.** `rm`/`unlink` are off in the
-   busybox config, and `SYS_UNLINK` (87) has no dispatch case.
-4. **Remove directories.** **Missing.** `CONFIG_RMDIR` is off,
-   and `SYS_RMDIR` (84) has no dispatch case. Kept off
-   deliberately in session 31 because the kernel side does not
-   exist; leaving it on would ship a `rmdir` applet that fails
-   at runtime and could produce `Unknown syscall:` noise.
-5. **`cd` up and down from both shells.** Partial. `cd ..` works
-   inside ash; it fails at `donix>`. See the known limitation
-   above.
-6. **A process that faults is killed cleanly.** The
-   `fault_kill_current(0x0E)` path in `isr14_handler` is in but
-   unverified end-to-end. Needs a test binary that dereferences a
-   bad pointer without setting `g_expect_fault`.
-7. **Full-screen software runs.** Done — session 31, vi verified.
+1. **`newfstatat` (262)** — reserved number, no dispatch case.
+   Small wrapper over `sys_stat` now that cwd resolution exists.
+2. **`sys_open` `O_DIRECTORY` fix** — return `-ENOTDIR` when the
+   target is a file.  Latent today, correct to close.
+3. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
+   yet.  Deferred during the terminal work.
 
-Items 3, 4, 5, and 6 remain.  Items 1, 2, and 7 are done.
+Broaden busybox coverage — `cp`, `mv`, `grep`, `sed`, `awk`, `tar`.
+Each missing syscall is its own commit.  Watch for
+`Unknown syscall: N`.
 
-**Nothing else should be added to this list in this session.** If
-a candidate arises, record it in `docs/open-issues.md` for after
-the milestone.
+Larger: pipes and redirection (`pipe(2)`), environment variables
+(`envp`), the VFS layer (`sys_execve`'s three-attempt block and
+`resolve_against_cwd` are both shims), kernel hardening (real COW,
+munmap, page-table teardown).
 
----
-
-## NEXT SESSION — do this first
-
-**Session 32.  Pick one of the remaining basics items and finish
-it.  One at a time, as always.**
-
-Suggested order, smallest first:
-
-1. **`cd ..` at `donix>`** (item 5).  Make `builtin_cd` resolve
-   `.`/`..` against `getcwd()` before calling `chdir`, or make
-   `sys_chdir` resolve through `resolve_against_cwd` the way the
-   path syscalls do.  Small; well understood.
-2. **`unlink` / `rm`** (item 3).  Two halves: add `SYS_UNLINK`
-   (87) dispatch to a `sys_unlink` that calls FatFs `f_unlink`,
-   and turn `CONFIG_RM=y` back on in `configs/busybox.config`.
-   Test by creating and removing a file.
-3. **`rmdir`** (item 4).  Same shape as `unlink`: `SYS_RMDIR`
-   (84) dispatch, FatFs `f_unlink` with an empty-directory check,
-   and `CONFIG_RMDIR=y`.  Wait until `unlink` works so the
-   pattern is established.
-4. **The user-mode `#PF` test binary** (item 6).  Larger than
-   the others; needs a new userland test that faults on purpose
-   and confirms the process is killed without taking the kernel
-   down.
-
-Pick **one**, do it, test it, and record it. Do not bundle.
-
-When all four are done and the README / handoff / docs are
-updated and `kmain.c`'s version string is bumped, commit as
-`v0.6.4` with a message naming the milestone.
+Pick **one**, do it, test it, tag it.  One change at a time.
 
 ---
 
 ## Canary state
 
-**The focused canary below is green as of `v0.6.3`.**  The session
-31 port has not been committed yet, so the canary is still
-recorded against `v0.6.3`, but everything in it passes on the
-current dirty tree too.  The vi round-trip above is a one-off
-verification of the port, not a canary row — the canary must not
-mutate the disk, and vi save does.
+**The focused canary below is green as of `v0.6.4`.**  The vi
+round-trip and `fault_pf` are one-off verifications, not canary
+rows — the canary must not mutate the disk, and vi save and
+`fault_pf` both do.
 
     # on boot, ash is already running
     pwd                         # /
@@ -260,9 +206,9 @@ mutate the disk, and vi save does.
     # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
 
-**Do NOT add `cd ..` at `donix>` as a canary row** -- it fails (see
-Known limitation).  `cd ..` inside ash is fine.  Once item 5 on
-the basics list is fixed, this note can be revisited.
+**`cd ..` at `donix>` now works** and can be added as a canary row
+in the next session's run.  It was a known failure through
+`v0.6.3`; `sys_chdir`'s `resolve_against_cwd` call fixed it.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
@@ -273,41 +219,36 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 `brkraw`, `brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`,
 `musl_getcwd`, `busybox echo`, `busybox wc hello-world.txt`.
 
-**Canary rows must not mutate the disk.**  No standing `mkdir`
-row; `rmdir`/`unlink` do not exist yet to clean up.  Once
-`unlink` and `rmdir` land, a paired create/remove canary row
-becomes possible and should be added.
+**Canary rows must not mutate the disk.**  A paired
+`mkdir`/`rmdir` row is now possible — `rmdir` exists — but it
+still mutates, so it stays out of the canary.  Use it as a
+one-off verification instead.
 
 **Expected noise:** none.  The serial log has no `Unknown syscall:`
-lines as of this milestone.  The `sys_execve: pid=... (name)`
-trace lines are informational, not errors.
+lines.  `sys_execve: pid=... (name)` trace lines are informational.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **`unlink` / `rm` missing.**  `SYS_UNLINK` (87) has no
-   dispatch case; `CONFIG_RM` is off.  On the basics list.
-2. **`rmdir` missing.**  `SYS_RMDIR` (84) has no dispatch case;
-   `CONFIG_RMDIR` is off (deliberately — see session 31 notes).
-   On the basics list.
-3. **`cd ..` at `donix>` fails** (the `musl_sh` builtin passes
-   raw `..` to FatFs).  ash is unaffected.  On the basics list.
-4. The user-mode `#PF` kill path (`fault_kill_current(0x0E)` in
-   `isr14_handler`) is in but unverified end-to-end.  On the
-   basics list.
-5. **VFS layer (eventual).**  `sys_execve`'s path resolution is a
-   shim for a filesystem layer donix does not have.  When it
-   lands, delete the shim; do not extend it.
+1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
+   resolution and `resolve_against_cwd` are both shims for a
+   filesystem layer donix does not have.  When a VFS lands, delete
+   them; do not extend.
+2. `newfstatat` (262) — reserved number, no dispatch case.
+3. `sys_open` accepts non-directories with `O_DIRECTORY`.  Return
+   `-ENOTDIR` when the target is a file.
+4. Fork is O(~6 MB) per call — real COW is the long-term fix.
+5. `sys_munmap` is a stub returning 0.
 
-Also open: `newfstatat` (262) has a reserved number but no
-dispatch case; busybox applet symlinks not installed; syscall-table
-audit script (the table itself was audited in session 30 and is
-correct; the script would keep it correct); fork is O(~6 MB) per
-call; `sys_munmap` is a stub; `sys_brk`'s fixed `heap_base` and
-the 4 MB mmap window are latent collisions; `musl_wait` emits
-hundreds of progress dots; real FatFs timestamp storage (the three
-timestamp syscalls added in session 31 return 0 without storing).
+Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
+are latent collisions; real FatFs timestamp storage (the three
+timestamp syscalls return 0 without storing); `prctl` is minimal
+(`PR_SET_NAME` accepted and dropped); `sys_utimensat` also lacks
+`resolve_against_cwd` (found in session 32, not on the basics
+list); busybox applet symlinks not installed; syscall-table audit
+script; `musl_sh` echoes garbage on backspace; `musl_wait`'s
+WNOHANG loop spins.
 
 ---
 
@@ -322,10 +263,7 @@ Config and source locations (relative to whichever root is being
 edited; both trees have the same top-level layout):
 
 - `configs/busybox.config` — tracked canonical busybox config.
-  **Updated in session 31** to enable `CONFIG_VI=y` (with
-  `FEATURE_VI_MAX_LEN=4096` and the `FEATURE_VI_*` set),
-  `CONFIG_TOUCH=y`.  **`CONFIG_RMDIR` is deliberately off** — the
-  kernel side does not exist yet.
+  Enables `CONFIG_VI`, `CONFIG_TOUCH`, `CONFIG_RM`, `CONFIG_RMDIR`.
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
@@ -356,17 +294,7 @@ needs it.  Paths below are relative to a tree root
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  Session
-  31 candidates to add (not yet written):
-  - The `sys_getcwd` absolute-cwd requirement (musl rejects a
-    non-absolute cwd).
-  - The `puts_raw`-vs-`printf` newline quirk.
-  - The `open(2)` flag-bit mismatch (`O_CREAT=0x40`, not `0x200`;
-    `O_TRUNC=0x200`, not `0x400`; `O_APPEND=0x400`, not `0x8`).
-  - The ESC-key scancode table gap (`scancode_ascii[0x01]` was
-    unassigned, so ESC produced 0 and was dropped by the buffer's
-    NUL guard).
-  - The alt-screen-cannot-be-a-pointer-swap fact on VGA text mode.
+- `docs/gotchas.md` — every bug writeup, by subsystem.
 - `docs/session-log.md` — commit tables and per-test canary notes.
   Rows are named by tag; scratch tags are dropped before a
   milestone push, so a row's tag may no longer resolve — the
@@ -383,12 +311,11 @@ needs it.  Paths below are relative to a tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  The shell is fully usable and vi works — the
-VT100/vi port from the experimental tree landed in session 31 and
-is verified, but is not yet committed.  Session 32: finish the
-basics list (`rm`, `rmdir`, `cd ..` at `donix>`, the user-mode
-`#PF` test), then commit as `v0.6.4`.  Do not pick any candidate
-outside the basics list until the list is done.**
+`userland/musl/`.  `v0.6.4`: the basics are done — create, read,
+write, remove files and directories; `cd` up and down from both
+shells; full-screen software runs; a faulting process is killed
+cleanly.  Session 33: pick one item from ROADMAP.md's "After
+v0.6.4" list and do it.  One change at a time.**
 
 ---
 

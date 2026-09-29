@@ -63,12 +63,15 @@ That's the point. That's the whole point.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
   `fstat`, `chdir`, `getcwd`, `geteuid`, `prctl`, `ftruncate`,
-  `utimensat` — the numbers and semantics match Linux x86_64. musl's
-  `printf`, `malloc`, and `opendir` work unmodified.
+  `utimensat`, `unlink`, `rmdir` — the numbers and semantics match
+  Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
+  unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
-  are real; `cd /bin; ls` lists `/bin`; the change survives `fork` and
-  `execve`. Relative paths (`.`, `..`, `./x`, plain names) resolve
-  against the cwd in `sys_open`, `sys_stat`, and `sys_access`.
+  are real; `cd /bin; ls` lists `/bin`; `cd ..` walks back up; the
+  change survives `fork` and `execve`. Relative paths (`.`, `..`,
+  `./x`, plain names) resolve against the cwd in every path-taking
+  syscall — `sys_open`, `sys_stat`, `sys_access`, `sys_chdir`,
+  `sys_unlink`, `sys_mkdir`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
   backspace, line editing, history), its applets (`ls`, `cat`, `echo`,

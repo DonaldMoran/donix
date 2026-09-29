@@ -2,6 +2,37 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 32 (2026-09-29)
+| Tag | What |
+|-----|------|
+| `20260928A` | session 31: port VT100/vi work from experimental tree (scratch) |
+| `20260928B` | session 31: syscall.h cleanup, numeric dispatch order, comment fixes |
+| `20260928C` | basics: rm works; unlink/mkdir resolve paths against cwd |
+| `20260928D` | basics: rmdir works; SYS_RMDIR(84) + handler + CONFIG_RMDIR=y |
+| `20260928E` | basics: cd .. works at donix>; chdir resolves against cwd |
+| `20260928F` | tests: fault_pf verifies user-mode #PF and #GP kill both processes |
+| `20260928G` | kmain: kernel shell reads DEL/CR, matching keyboard.c |
+| `v0.6.4` | milestone: the basics are done |
+
+**Milestone `v0.6.4` — the basics.**  Create, read, write, and
+remove files and directories; `cd` up and down from both shells;
+full-screen software runs; a faulting process is killed cleanly.
+
+Session 31 ported the VT100/vi work from the experimental tree
+(five files: `keyboard.c`, `vga.c`, `user_syscall.c`,
+`include/syscall.h`, `configs/busybox.config`).  Session 32 finished
+the remaining basics: `rm`, `rmdir`, `cd ..` at `donix>`, and the
+user-mode `#PF` test.  The `#PF` test found a second bug — the
+ring-3 `#GP` path halted the kernel instead of killing the process
+— fixed in `isr13_handler` by keying the ring test on `CS & 3`
+rather than the error code.  A third fix: `kmain_shell_loop` read
+the old BS/LF bytes and had to be updated to DEL/CR after the
+session-31 keyboard change.
+
+All scratch tags (`20260928A`–`G`) were dropped before the
+`v0.6.4` push, so the rows above may no longer resolve; the commit
+messages carry the narrative.
+
 ## Session 30 (2026-09-28)
 | Tag | What |
 |-----|------|
@@ -16,14 +47,10 @@ already records.  Working tags are local and permanent.
 **Milestone `v0.6.3`** — `cd`, `pwd`, `ls`, `cat` respect the
 working directory in both shells (`musl_sh` and busybox ash),
 across `fork` and `execve`.  The serial log is free of
-`Unknown syscall:` lines.  Three fixes made cwd work end to end:
-`resolve_against_cwd` in `sys_open`/`sys_stat`/`sys_access`,
-`sys_fork` copying `cwd`, and `sys_chdir` storing an absolute
-path.  `ls.c`/`cat.c` stopped prepending `0:/`.  `musl_sh` gained
-`cd`/`pwd`/`exit` builtins.
+`Unknown syscall:` lines.
 
-**Known limitation at this milestone:** `cd ..` at `donix>` fails
-(the builtin passes raw `..` to FatFs); `cd ..` inside ash works.
+**Known limitation at this milestone:** `cd ..` at `donix>` failed
+(the builtin passed raw `..` to FatFs); fixed in `v0.6.4`.
 
 ## Session 29 (2026-09-28)
 | Tag | What |
@@ -140,10 +167,9 @@ messages carry the narrative)
 session 11's tags were deleted before the reuse, so the session-11
 tags no longer resolve -- the commit messages are the record)
 
-## Per-test canary notes (session 30, v0.6.3)
+## Per-test canary notes (session 32, v0.6.4)
 
-Focused canary, boot-into-ash, cwd-aware (green as of
-`20260928-25`):
+Focused canary, boot-into-ash, cwd-aware (green as of `v0.6.4`):
 
 | Row | Result |
 |-----|--------|
@@ -160,9 +186,22 @@ Focused canary, boot-into-ash, cwd-aware (green as of
 | `pwd` (donix>) | `/bin` |
 | `ls` (donix>) | `busybox` (donix-native ls) |
 | `cat busybox` (donix>) | reads /bin/busybox |
+| `cd ..` (donix>) | no error — **now works** (fixed in v0.6.4) |
+| `pwd` (donix>) | `/` |
 | `cd /` (donix>) | no error |
 | `pwd` (donix>) | `/` |
 | `busybox pwd` (donix>) | `/bin` after `cd /bin` |
 
-No `Unknown syscall:` lines anywhere.  `cd ..` at `donix>` is a
-known failure and is NOT a canary row.
+No `Unknown syscall:` lines anywhere.  `cd ..` at `donix>` is now
+a passing row (it failed at `v0.6.3`).
+
+One-off verifications (not canary rows — they mutate the disk or
+crash the process):
+
+- vi round-trip: `vi don.txt`, edit, `:wq`, `cat don.txt` reads
+  the text back.
+- `touch a.txt; rm a.txt`; `mkdir y; touch y/f; rmdir y` fails
+  (non-empty); `rm y/f; rmdir y` succeeds.
+- `mkdir z; cd z; mkdir w; rmdir w; cd ..; rmdir z` — nested cwd
+  create/remove.
+- `fault_pf` — user-mode `#PF`, process killed, shell returns.

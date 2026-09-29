@@ -6,6 +6,8 @@ from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
 per-process working directory, in both shells, across `fork` and
 `execve`. The console is a VT100 emulator, so full-screen software
 runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
+Files and directories can be created and removed; a faulting
+process is killed cleanly.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -15,7 +17,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, v0.6.3, and the terminal
+## Done — Phases A through B, and v0.6.4
 
 For the record, so this file does not re-plan finished work:
 
@@ -27,54 +29,24 @@ For the record, so this file does not re-plan finished work:
 - **v0.6.3** — a real working directory. `chdir`/`getcwd`, relative
   path resolution in `sys_open`/`sys_stat`/`sys_access`, cwd across
   `fork` and `execve`, `ls`/`cat` path pass-through, and `cd`/`pwd`
-  builtins in `musl_sh`. The serial log is free of `Unknown syscall:`
-  lines.
-- **The terminal** — full VT100/ANSI emulation in `vga.c`: CSI
-  parsing, cursor addressing, SGR, the erase/insert/delete families,
-  and a software alternate screen. `keyboard.c` delivers ESC,
-  Backspace, and Enter the way Unix software expects. Correct Linux
-  `open(2)` flag translation plus `ftruncate`, `utimes`, `futimesat`,
-  and `utimensat` complete the file-creation path. `vi` works
-  end to end.
+  builtins in `musl_sh`.
+- **v0.6.4 — the basics.** Full VT100/ANSI emulation in `vga.c`
+  (CSI parsing, cursor addressing, SGR, erase/insert/delete, a
+  software alternate screen); `keyboard.c` delivers ESC, DEL, and
+  CR the way Unix software expects; correct Linux `open(2)` flag
+  translation plus `ftruncate`, `utimes`, `futimesat`, and
+  `utimensat`; `rm` and `rmdir`; `cd ..` at `donix>`; a user-mode
+  `#PF` (and ring-3 `#GP`) kills the process rather than the kernel.
 
-The narratives are in the `v0.6.3` annotated tag, `docs/session-log.md`,
+The narratives are in the `v0.6.4` annotated tag, `docs/session-log.md`,
 and `handoff.md`.
-
----
-
-## Next: v0.6.4 — the basics
-
-The bar for this milestone is that **the basics all work**: create,
-read, write, and remove files; create, enter, and remove directories;
-`cd` up and down from both shells; and a process that faults is killed
-cleanly. Full-screen software already runs. The remaining items are:
-
-- **`rm` / `unlink`.**  `SYS_UNLINK` (87) has no dispatch case, and
-  `CONFIG_RM` is off.  Add the syscall (FatFs `f_unlink`), then turn
-  the applet on.  Test by create-then-remove.
-- **`rmdir`.**  Same shape as `unlink`: `SYS_RMDIR` (84), FatFs
-  `f_unlink` with an empty-directory check, then `CONFIG_RMDIR=y`.
-  Do this after `unlink` so the pattern is established first.
-- **`cd ..` at `donix>`.**  The `musl_sh` `cd` builtin passes the raw
-  `..` to `chdir`, and FatFs has no `..` entry, so it fails.  Two
-  clean fixes: (a) `builtin_cd` resolves `.`/`..` against `getcwd()`
-  before calling `chdir`; (b) `sys_chdir` resolves through
-  `resolve_against_cwd` the way the other path syscalls now do.
-  (b) is more Unix-shaped.  `cd ..` inside ash already works.
-- **User-mode `#PF` test binary.**  `fault_kill_current(0x0E)` in
-  `isr14_handler` is in but unverified end-to-end.  A test binary
-  that dereferences a bad pointer without setting `g_expect_fault`
-  closes the loop.
-
-Once these are done and the documentation is updated, this becomes
-`v0.6.4`.  One change at a time; pick one, do it, test it.
 
 ---
 
 ## After v0.6.4: pick a direction
 
-The shell is usable and full-screen software runs. What comes next is
-a set of small, independent items and several larger subsystem
+The basics work and full-screen software runs. What comes next is a
+set of small, independent items and several larger subsystem
 questions. Pick one, do it, test it, tag it — the project's
 one-change-at-a-time discipline applies.
 
@@ -84,11 +56,15 @@ one-change-at-a-time discipline applies.
   routes `fstatat` through `stat`/`lstat` on x86_64 for the common
   case, so it is not hit yet; a caller passing `AT_FDCWD` plus flags
   would reach it.  Delegates to `sys_stat` when `dirfd == AT_FDCWD`
-  or the path is absolute; it can now resolve relative paths against
-  cwd, so this is a small wrapper rather than a stub.
+  or the path is absolute; with cwd resolution now in `sys_stat`,
+  this is a small wrapper rather than a stub.
 - **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
   `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
   Latent today (nothing triggers it), but correct to close.
+- **`sys_utimensat` cwd resolution.**  Found in session 32: it calls
+  `strip_dot_prefix` but not `resolve_against_cwd`, like `sys_unlink`
+  and `sys_mkdir` did before session 32 fixed them.  Same one-line
+  fix.
 - **Ctrl-`[` as ESC.**  Deferred during the terminal work;
   `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
   The literal ESC key is enough for vi, but terminal users expect the
@@ -96,16 +72,13 @@ one-change-at-a-time discipline applies.
 
 ### Broaden busybox coverage
 
-Busybox is the boot shell now, but only a handful of applets have
-been exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`, `touch`,
-`vi`.  The untried ones — `cp`, `mv`, `grep`, `sed`, `awk`, `tar` —
-are where the syscall surface gets tested hardest.
+Busybox is the boot shell now, but only some applets have been
+exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`, `touch`, `vi`,
+`rm`, `rmdir`.  The untried ones — `cp`, `mv`, `grep`, `sed`, `awk`,
+`tar` — are where the syscall surface gets tested hardest.
 
 Work through them one at a time, watching for `Unknown syscall: N` in
-the serial log.  Each missing syscall is its own commit.  With
-`unlink` and `rmdir` in place, a paired create/remove canary row
-becomes possible; today it is not, because nothing cleans up after a
-`mkdir`.
+the serial log.  Each missing syscall is its own commit.
 
 `ps`, `top`, `kill`, and job control need subsystems the kernel does
 not have yet (process introspection, signal delivery, process groups)
