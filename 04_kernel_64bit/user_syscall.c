@@ -1048,6 +1048,55 @@ long sys_unlink(const char* path) {
 }
 
 /*
+ * Linux x86_64 rmdir(2) — syscall 84.
+ *
+ * Remove an empty directory.  FatFs's f_unlink handles both files
+ * and empty directories; for a non-empty directory it returns
+ * FR_DENIED, which fatfs_errno maps to -EPERM.  Linux returns
+ * -ENOTEMPTY (39) for that case.  busybox's rmdir reports the
+ * failure either way; if a caller ever needs the exact errno,
+ * special-case FR_DENIED in a dedicated check.
+ *
+ * Path resolution matches sys_unlink: copy the user string, resolve
+ * against the cwd (so `rmdir x` in a non-root cwd removes that
+ * directory, not a root one of the same name), strip the leading
+ * "./" or "/", then call f_unlink.
+ */
+long sys_rmdir(const char* path) {
+    pcb_t* self = process_get_current();
+    if (!self || !path) return -(long)EFAULT_;
+
+    char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
+    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+        return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
+    }
+    strip_dot_prefix(local_path);
+
+    FRESULT r = f_unlink(local_path);
+    if (r != FR_OK) {
+        serial_print("sys_rmdir: f_unlink FAIL path=");
+        serial_print(local_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
  * Linux x86_64 mkdir(2) — syscall 83.
  *
  * FatFs has no notion of UNIX permissions, so the mode argument is
@@ -3792,6 +3841,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
+        case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();

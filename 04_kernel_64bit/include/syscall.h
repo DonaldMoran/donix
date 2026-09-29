@@ -74,6 +74,7 @@
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
  *  83  mkdir             sys_mkdir
+ *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
  * 107  geteuid           sys_geteuid       (returns fixed uid 1000)
  * 110  getppid           sys_getppid
@@ -94,12 +95,6 @@
  * ------------------------------------------------------------
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
- *
- *  84  rmdir             no sys_rmdir, no dispatch case.  FatFs
- *                        has f_unlink; the work is the handler
- *                        plus the empty-directory check, plus
- *                        CONFIG_RMDIR=y.  On the v0.6.4 basics
- *                        list.  (See docs/open-issues.md.)
  *
  *  262 newfstatat        number reserved; no dispatch case.
  *                        musl routes fstatat through stat/lstat
@@ -151,6 +146,7 @@
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80
 #define SYS_MKDIR           83
+#define SYS_RMDIR           84
 #define SYS_UNLINK          87
 #define SYS_GETEUID         107
 #define SYS_GETPPID         110
@@ -209,6 +205,7 @@ long sys_open(const char* path, int flags);
 long sys_close(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
+long sys_rmdir(const char* path);
 long sys_ftruncate(int fd, long length);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
