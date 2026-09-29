@@ -2,6 +2,36 @@ Append-only.  One row per commit, named by tag only -- never by
 SHA.  Git resolves tags; the handoff never duplicates what git
 already records.  Working tags are local and permanent.
 
+## Session 33 (2026-09-29)
+| Tag | What |
+|-----|------|
+| `20260929-max-process-files-64` | process: raise MAX_PROCESS_FILES 8 -> 64; `sh script.sh` works |
+| `20260929-execve-script-fallback` | execve: strip `./` before open; return ENOEXEC for short non-ELF; `./script.sh` works |
+
+**Shell scripts run.**  Two commits, both on `dev`, both scratch-
+tagged (local, dropped before the next `v*` push):
+
+- `MAX_PROCESS_FILES` 8 -> 64.  At 8, busybox ash's script
+  fork+exec path fails with `sh: 3: Invalid argument`; at 64 the
+  same script prints its output.  Controlled: same build, same
+  script, only the constant varied.  Cost +448 B/pcb; assembly-safe
+  (offset past `block_kind`).
+
+- `sys_execve`: two coordinated fixes.  (1) Normalize the path
+  with `strip_dot_prefix` before the first `f_open`, so `./test.sh`
+  no longer fails with `FR_INVALID_NAME` at the open.  (2) Return
+  `ENOEXEC`, not `EIO`, for a short non-ELF read, so ash falls back
+  to running the script through `sh`.
+
+Result: `./test.sh`, `sh test.sh`, and `busybox sh test.sh` from
+`donix>` all print the script output.  Verified by the focused
+canary (below) plus the three one-off script invocations.  No
+`Unknown syscall:` lines.
+
+Not ported from the experimental tree: `uname(2)` and the extra
+`busybox.config` applets.  Neither is needed for script execution;
+both remain candidates for a later milestone.
+
 ## Session 32 (2026-09-29)
 | Tag | What |
 |-----|------|
@@ -167,9 +197,10 @@ messages carry the narrative)
 session 11's tags were deleted before the reuse, so the session-11
 tags no longer resolve -- the commit messages are the record)
 
-## Per-test canary notes (session 32, v0.6.4)
+## Per-test canary notes (session 33)
 
-Focused canary, boot-into-ash, cwd-aware (green as of `v0.6.4`):
+Focused canary, boot-into-ash, cwd-aware — green as of the
+`20260929-execve-script-fallback` commit:
 
 | Row | Result |
 |-----|--------|
@@ -186,22 +217,37 @@ Focused canary, boot-into-ash, cwd-aware (green as of `v0.6.4`):
 | `pwd` (donix>) | `/bin` |
 | `ls` (donix>) | `busybox` (donix-native ls) |
 | `cat busybox` (donix>) | reads /bin/busybox |
-| `cd ..` (donix>) | no error — **now works** (fixed in v0.6.4) |
+| `cd ..` (donix>) | no error |
 | `pwd` (donix>) | `/` |
 | `cd /` (donix>) | no error |
 | `pwd` (donix>) | `/` |
-| `busybox pwd` (donix>) | `/bin` after `cd /bin` |
+| `ls hello-world.txt` (donix>) | found |
+| `memtest` | PASS |
+| `musl_fork` | A/P/C, clean EXIT |
+| `musl_exec2` | three execs, EXEC2-OK |
+| `musl_wait` | WAIT-STATUS-OK 42, WAIT-WNOHANG-OK, WAIT-ANY-1/2, WAIT-ALL-OK |
+| `busybox ls` (donix>) | full root listing |
+| `busybox pwd` (donix>) | `/` |
+| `busybox ash` (donix>) | ash prompt; `pwd`, `cd /bin`, `pwd`, `ls`, `exit` |
 
-No `Unknown syscall:` lines anywhere.  `cd ..` at `donix>` is now
-a passing row (it failed at `v0.6.3`).
+No `Unknown syscall:` lines anywhere.  Two informational-only
+lines appear and are expected:
+
+- `EXIT: pid=N state=1 parent=2 qhead=N` for the forked busybox
+  shell's own exit (existing shell-exit path, unchanged).
+- `EXIT-FALLBACK: switching to idle, ...` in `musl_fork` when the
+  child is the last runnable process (existing fallback).
 
 One-off verifications (not canary rows — they mutate the disk or
 crash the process):
 
-- vi round-trip: `vi don.txt`, edit, `:wq`, `cat don.txt` reads
+- **Script execution, three ways** (new this session):
+  - `./test.sh` → `Hello, world` (kernel: `sys_execve: not an ELF
+    file` → ash fallback → fork+sh → child runs script).
+  - `sh test.sh` → `Hello, world`.
+  - `busybox sh test.sh` from `donix>` → `Hello, world`.
+- vi round-trip: `vi test.sh`, edit, `:wq`, `cat test.sh` reads
   the text back.
-- `touch a.txt; rm a.txt`; `mkdir y; touch y/f; rmdir y` fails
-  (non-empty); `rm y/f; rmdir y` succeeds.
-- `mkdir z; cd z; mkdir w; rmdir w; cd ..; rmdir z` — nested cwd
-  create/remove.
 - `fault_pf` — user-mode `#PF`, process killed, shell returns.
+- `mkdir`/`rmdir` create/remove, nested cwd create/remove (from
+  the `v0.6.4` notes; unchanged).

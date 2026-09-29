@@ -3,13 +3,13 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-29 (session 32 → pre-session 33)
-**Current HEAD:** tag `v0.6.4`, branch `dev`
-**Last milestone:** `v0.6.4` (published) — **the basics are done**
-**Next milestone:** none yet — pick a direction (see below)
+**Last updated:** 2026-09-29 (session 33 â†’ pre-session 34)
+**Current HEAD:** tag `20260929-execve-script-fallback`, branch `dev`
+**Last milestone:** `v0.6.4` (published) â€” **the basics are done**
+**Next milestone:** none yet â€” `v0.6.5` candidate below
 
 Commits are named by tag only, never by SHA.  **Working tags
-(`2026092x-*`) are local scratch restore points** — they exist while
+(`2026092x-*`) are local scratch restore points** â€” they exist while
 a milestone is being developed and are **dropped before the
 milestone is pushed**.  Only `v*` tags go to the remote and are
 permanent.  The commit record is `docs/session-log.md`; the commit
@@ -45,128 +45,151 @@ anything.
 The two trees share the same top-level layout.  The C sources for
 the kernel live under a numbered subdirectory in each:
 
-- `/home/noneya/code/donix/04_kernel_64bit/` — real project
+- `/home/noneya/code/donix/04_kernel_64bit/` â€” real project
   kernel sources.
-- `/home/noneya/code/testme/04_kernel_64bit/` — experimental tree
+- `/home/noneya/code/testme/04_kernel_64bit/` â€” experimental tree
   kernel sources.
 
 Both trees use `04_kernel_64bit/` for the kernel source.  Verify
-by file name before porting — do not trust the number alone.
+by file name before porting â€” do not trust the number alone.
 `05_boot_kernel64/` holds the boot chain assembly and the image
 builder, not the kernel C sources.
 
 ---
 
-## Where we are — `v0.6.4`, the basics are done
+## Where we are â€” session 33, shell scripts run
 
-**The basics all work.**  Session 31 ported the VT100/vi work and
-session 32 finished the remaining basics items.  Everything below
-is on `dev` at tag `v0.6.4`.
+**Shell scripts execute.**  Session 33 landed two commits on `dev`,
+both scratch-tagged, both unpushed:
 
-### What landed in session 31 (the VT100/vi port)
-
-Five files copied from the experimental tree to the real project:
-
-| File | Change |
+| Tag | What |
 |---|---|
-| `04_kernel_64bit/keyboard.c` | ESC (0x01→0x1B), Backspace (0x0E→0x7F), Enter (0x1C→CR) |
-| `04_kernel_64bit/vga.c` | full VT100/ANSI CSI parser, alt-screen, SGR |
-| `04_kernel_64bit/user_syscall.c` | `open(2)` flag fix + 4 new syscalls |
-| `04_kernel_64bit/include/syscall.h` | 4 new `SYS_*` defines (77, 235, 261, 280) |
-| `configs/busybox.config` | `CONFIG_VI=y`, `CONFIG_TOUCH=y`, full `FEATURE_VI_*` |
+| `20260929-max-process-files-64` | `MAX_PROCESS_FILES` 8 â†’ 64; `sh script.sh` works |
+| `20260929-execve-script-fallback` | execve strips `./` before open; returns `ENOEXEC` for short non-ELF; `./script.sh` works |
 
-Not copied (identical in both trees): `include/vga.h`,
-`fatfs/ffconf.h`.
+Both scratch tags are local and **must be dropped before the next
+`v*` push**.
 
-**Corrections to the pre-session-31 handoff, worth keeping:**
+### What landed in session 33
 
-- That handoff claimed `configs/busybox.config` in the real tree had
-  **already been updated** for Session 31. It had **not** — donix
-  still had `CONFIG_VI` and `CONFIG_TOUCH` off.  The config was
-  updated as part of the port.
-- That handoff described a **four-file** port. It was **five**:
-  `include/syscall.h` was missing from the list. The
-  `SYS_FTRUNCATE` / `SYS_UTIMES` / `SYS_FUTIMESAT` /
-  `SYS_UTIMENSAT` macros live there, and `user_syscall.c` will not
-  compile without them.
+**Commit 1 â€” `MAX_PROCESS_FILES` 8 â†’ 64** (`include/process.h`).
+Sizes `void* file_table[MAX_PROCESS_FILES]` in `pcb_t`.  At 8,
+busybox ash's script fork+exec path fails with
+`sh: 3: Invalid argument`; at 64 the same script prints its
+output.  Controlled: same build, same script, only the constant
+varied.  Cost +448 B/pcb (56 pointers Ã— 8); ~14 KB across the
+32-entry process table if static.  Assembly-safe: `file_table`
+sits *after* `block_kind`, and `context_switch.asm` reads offsets
+only up to `block_kind` (0x158), which `process.c`'s
+`_Static_assert` pins.
 
-### What landed in session 32 (the basics)
+**Commit 2 â€” `sys_execve` script fallback** (`user_syscall.c`).
+Two coordinated fixes in one function:
 
-| Item | What |
-|---|---|
-| `rm` | `sys_unlink` + `sys_mkdir` now call `resolve_against_cwd`; `CONFIG_RM=y` |
-| `rmdir` | `SYS_RMDIR` (84) handler + dispatch; `CONFIG_RMDIR=y` |
-| `cd ..` at `donix>` | `sys_chdir` now calls `resolve_against_cwd` |
-| `#PF` test | `userland/musl/tests/fault_pf.c`; user-mode `#PF` kills the process |
-| `#GP` fix | `isr13_handler` kills ring-3 `#GP` (was halting the kernel) |
-| kernel shell | `kmain_shell_loop` reads DEL/CR, matching `keyboard.c` |
+1. **Normalize the path** with `strip_dot_prefix` before the first
+   `f_open`, into a local `exec_path[USER_PATH_MAX]`.  FatFs
+   rejects a leading `./` with `FR_INVALID_NAME`, so `./test.sh`
+   failed at the open (`sys_execve: f_open(./test.sh) -> 6`)
+   before any retry could run.  The original `path` is kept for
+   `proc_name` and the diagnostic.  Every open attempt uses
+   `exec_path`.
+2. **Return `ENOEXEC`, not `EIO`, for a short non-ELF read.**  A
+   shell script is shorter than the 64-byte ELF header; the old
+   `got != sizeof(ehdr)` check returned `EIO` before the magic
+   test, and ash does not fall back to an interpreter on `EIO`.
+   Now: `fr != FR_OK` â†’ `EIO`; `got < 4` or magic mismatch â†’
+   `ENOEXEC`; short ELF header â†’ `ENOEXEC`; empty file â†’ `ENOEXEC`;
+   file too large â†’ `EIO`.
 
-The `#GP` fix came from the first `fault_pf` run: the test used a
-non-canonical address (`0xDEADBEEF0000`), which raises `#GP`, not
-`#PF`, and the kernel halted instead of killing the process.  The
-handler now keys its ring test on `CS & 3`, not the error code —
-`#GP`'s error code is 0 for the non-canonical case and carries no
-ring information.  `#PF` keeps its `error_code & 4` test, which is
-correct for that vector.
+Both were needed, and each is individually attributable.  The
+`exec_path` change makes the **open** succeed; the `ENOEXEC`
+change makes the **fallback** run; `MAX_PROCESS_FILES` lets ash
+**complete the fork+exec**.
 
-### Verification (session 32)
+### Verification (session 33)
 
-All of the following were run on the real project with a captured
-serial log and **zero `Unknown syscall:` lines**:
+Focused canary green (full table in `docs/session-log.md`,
+"Per-test canary notes (session 33)").  No `Unknown syscall:`
+lines.  The three script invocations, all printing the script
+output:
 
 ```
-# vi round-trip
-vi don.txt; i; This is a test!; ESC; :wq
-cat don.txt                  # prints the text
+$ ./test.sh
+sys_execve: not an ELF file
+sys_execve: pid=5 entry=... argc=2 ... (busybox)
+Hello, world
+EXIT: pid=6 state=2 parent=5 qhead=5
+EXIT: pid=5 state=2 parent=3 qhead=(empty)
 
-# file and directory removal
-touch a.txt; rm a.txt; ls a.txt          # gone
-mkdir y; touch y/f; rmdir y              # fails: directory not empty
-rm y/f; rmdir y                          # succeeds
-mkdir z; cd z; mkdir w; rmdir w; cd ..; rmdir z   # cwd-relative, works
+$ sh test.sh
+sys_execve: pid=7 entry=... argc=2 ... (busybox)
+Hello, world
+EXIT: pid=8 state=2 parent=7 qhead=7
+EXIT: pid=7 state=2 parent=3 qhead=(empty)
 
-# fault kill
-fault_pf                     # #PF diagnostic, process killed, shell returns
+donix> busybox sh test.sh
+sys_execve: pid=9 entry=... argc=3 ... (busybox)
+Hello, world
 ```
 
-The startup `sys_open: f_open FAIL path=don.txt flags=0x8000
-mode=0x01 r=4` on vi launch is **expected and correct** — vi
-opens a nonexistent file for read (`O_RDONLY`, `FA_READ`), FatFs
-returns `FR_NO_FILE`, and vi falls back to new-file mode. Do not
-try to silence it.
+The `sys_open: f_open FAIL path=test.sh ... r=4` line on `vi
+test.sh` is the expected vi-opens-nonexistent-file path -- do not
+silence it (see `docs/gotchas.md`).
 
-### The two VGA tunables are 0
+**Not ported from the experimental tree:** `uname(2)` (syscall
+63) and the extra `busybox.config` applets (cp, mv, grep, sed,
+chmod, ln, head, tail, test, mount, umount, env, ASH_* features).
+Neither is needed for script execution.  Both remain candidates
+for a later milestone.
 
-`vga.c` ships with `VGA_TRACE_UNHANDLED 0` and
-`VGA_REPLY_TO_QUERIES 0`.  Set to 1 during development for
-diagnostics; leave at 0.  If `CONFIG_FEATURE_VI_ASK_TERMINAL` is
-ever turned on, `VGA_REPLY_TO_QUERIES` must go back to 1 or vi
-stalls at launch waiting for a DSR reply.
+### The `sh: N: ...` messages are not diagnostic
+
+Ash's `sh: 3: Invalid argument` and `sh: ./test.sh: not found` are
+generic; they do not name the failing syscall.  Two unrelated bugs
+produced `Invalid argument` this week (fd exhaustion and a
+`uname` `-ENOSYS`).  Read the kernel trace, not the shell message:
+
+```
+sys_execve: f_open(<path>) -> <FRESULT>   open stage failed
+sys_execve: not an ELF file               open OK, format rejected
+sys_execve: pid=... entry=... (name)      exec succeeded
+Unknown syscall: N                         missing handler
+```
+
+Full writeup in `docs/gotchas.md`.
 
 ---
 
-## NEXT SESSION — pick a direction
+## NEXT SESSION â€” pick a direction
 
-`v0.6.4` closed the basics.  There is no committed next milestone.
-The candidate list (full text in `ROADMAP.md`, "After v0.6.4"):
+Session 33 closed script execution.  No committed next milestone.
+The candidate list (`ROADMAP.md`, "After v0.6.4"):
 
-Small, close gaps:
+**Small, close gaps:**
 
-1. **`newfstatat` (262)** — reserved number, no dispatch case.
+1. **`newfstatat` (262)** â€” reserved number, no dispatch case.
    Small wrapper over `sys_stat` now that cwd resolution exists.
-2. **`sys_open` `O_DIRECTORY` fix** — return `-ENOTDIR` when the
+2. **`sys_open` `O_DIRECTORY` fix** â€” return `-ENOTDIR` when the
    target is a file.  Latent today, correct to close.
-3. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
+3. **Ctrl-`[` as ESC** â€” `scancode_to_ascii` has no Ctrl parameter
    yet.  Deferred during the terminal work.
+4. **`sys_utimensat` cwd resolution** â€” found in session 32; it
+   calls `strip_dot_prefix` but not `resolve_against_cwd`, so it
+   resolves against the FAT root in a non-root cwd.
 
-Broaden busybox coverage — `cp`, `mv`, `grep`, `sed`, `awk`, `tar`.
-Each missing syscall is its own commit.  Watch for
-`Unknown syscall: N`.
+**Broaden busybox coverage** â€” `cp`, `mv`, `grep`, `sed`, `awk`,
+`tar`.  The `busybox.config` additions from the experimental tree
+enable several of these already; each missing syscall is its own
+commit.  Watch for `Unknown syscall: N`.
 
-Larger: pipes and redirection (`pipe(2)`), environment variables
-(`envp`), the VFS layer (`sys_execve`'s three-attempt block and
-`resolve_against_cwd` are both shims), kernel hardening (real COW,
-munmap, page-table teardown).
+**Consider tagging `v0.6.5`** â€” session 33 is a coherent
+milestone ("shell scripts run").  If tagged, drop both scratch
+tags first, rewrite this file, and push.
+
+**Larger:** pipes and redirection (`pipe(2)`), environment
+variables (`envp`), the VFS layer (`sys_execve`'s three-attempt
+block and `resolve_against_cwd` are both shims), kernel hardening
+(real COW, munmap, page-table teardown).
 
 Pick **one**, do it, test it, tag it.  One change at a time.
 
@@ -174,10 +197,12 @@ Pick **one**, do it, test it, tag it.  One change at a time.
 
 ## Canary state
 
-**The focused canary below is green as of `v0.6.4`.**  The vi
-round-trip and `fault_pf` are one-off verifications, not canary
-rows — the canary must not mutate the disk, and vi save and
-`fault_pf` both do.
+**The focused canary is green as of
+`20260929-execve-script-fallback`.**  Full table in
+`docs/session-log.md`.  `./test.sh`, `sh test.sh`, and
+`fault_pf` are one-off verifications, not canary rows -- the
+canary must not mutate the disk, and script execution, vi save,
+and `fault_pf` all do.
 
     # on boot, ash is already running
     pwd                         # /
@@ -201,14 +226,10 @@ rows — the canary must not mutate the disk, and vi save and
     musl_exec2
     musl_wait
     busybox ls
-    busybox pwd                 # /bin (after cd /bin)
+    busybox pwd                 # / (after cd /)
     busybox ash
     # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
-
-**`cd ..` at `donix>` now works** and can be added as a canary row
-in the next session's run.  It was a known failure through
-`v0.6.3`; `sys_chdir`'s `resolve_against_cwd` call fixed it.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
@@ -220,12 +241,15 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 `musl_getcwd`, `busybox echo`, `busybox wc hello-world.txt`.
 
 **Canary rows must not mutate the disk.**  A paired
-`mkdir`/`rmdir` row is now possible — `rmdir` exists — but it
-still mutates, so it stays out of the canary.  Use it as a
-one-off verification instead.
+`mkdir`/`rmdir` row is possible but still mutates, so it stays out
+of the canary.  Use it as a one-off verification instead.
 
 **Expected noise:** none.  The serial log has no `Unknown syscall:`
 lines.  `sys_execve: pid=... (name)` trace lines are informational.
+Two other lines are informational and expected:
+`EXIT: pid=N state=1 parent=2 qhead=N` (a forked busybox shell's
+own exit) and `EXIT-FALLBACK: switching to idle, ...` (in
+`musl_fork` when the child is the last runnable process).
 
 ---
 
@@ -235,19 +259,18 @@ lines.  `sys_execve: pid=... (name)` trace lines are informational.
    resolution and `resolve_against_cwd` are both shims for a
    filesystem layer donix does not have.  When a VFS lands, delete
    them; do not extend.
-2. `newfstatat` (262) — reserved number, no dispatch case.
+2. `newfstatat` (262) â€” reserved number, no dispatch case.
 3. `sys_open` accepts non-directories with `O_DIRECTORY`.  Return
    `-ENOTDIR` when the target is a file.
-4. Fork is O(~6 MB) per call — real COW is the long-term fix.
-5. `sys_munmap` is a stub returning 0.
+4. `sys_utimensat` lacks `resolve_against_cwd` (found session 32).
+5. Fork is O(~6 MB) per call â€” real COW is the long-term fix.
 
-Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
-are latent collisions; real FatFs timestamp storage (the three
-timestamp syscalls return 0 without storing); `prctl` is minimal
-(`PR_SET_NAME` accepted and dropped); `sys_utimensat` also lacks
-`resolve_against_cwd` (found in session 32, not on the basics
-list); busybox applet symlinks not installed; syscall-table audit
-script; `musl_sh` echoes garbage on backspace; `musl_wait`'s
+Also open: `sys_munmap` is a stub returning 0; `sys_brk`'s fixed
+`heap_base` and the 4 MB mmap window are latent collisions; real
+FatFs timestamp storage (the three timestamp syscalls return 0
+without storing); `prctl` is minimal (`PR_SET_NAME` accepted and
+dropped); busybox applet symlinks not installed; syscall-table
+audit script; `musl_sh` echoes garbage on backspace; `musl_wait`'s
 WNOHANG loop spins.
 
 ---
@@ -262,13 +285,13 @@ Paths, with the correct roots.
 Config and source locations (relative to whichever root is being
 edited; both trees have the same top-level layout):
 
-- `configs/busybox.config` — tracked canonical busybox config.
+- `configs/busybox.config` â€” tracked canonical busybox config.
   Enables `CONFIG_VI`, `CONFIG_TOUCH`, `CONFIG_RM`, `CONFIG_RMDIR`.
-- `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
+- `userland/musl/` â€” tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
-  — gitignored; rebuild with `./toolchain/install_musl.sh`.
-- `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
+  â€” gitignored; rebuild with `./toolchain/install_musl.sh`.
+- `toolchain/{install_musl.sh,musl-gcc.sh}` â€” tracked.
 
 Kernel sources:
 
@@ -277,10 +300,16 @@ Kernel sources:
 
 Scratch copies from earlier exploring:
 
-- `/home/noneya/code/x/` — an older scratch copy.  Fully ported;
+- `/home/noneya/code/x/` â€” an older scratch copy.  Fully ported;
   safe to delete whenever.
-- `/home/noneya/code/y/` — a second scratch copy used for a
+- `/home/noneya/code/y/` â€” a second scratch copy used for a
   bisection experiment.  Safe to delete.
+
+**`testme` still has unported changes** from the session-33 work:
+`include/syscall.h` (+`SYS_UNAME` 63), `user_syscall.c` (`sys_uname`
++ dispatch case), `configs/busybox.config` (extra applets), and
+`include/process.h` (the 8â†’64 already ported).  The `uname` and
+config changes are deliberately left unported; see above.
 
 Docs live under `docs/` in each tree; see below.
 
@@ -292,17 +321,17 @@ Not needed to start a session; ask for a file when the current task
 needs it.  Paths below are relative to a tree root
 (`/home/noneya/code/donix/` or `/home/noneya/code/testme/`).
 
-- `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
+- `docs/strategy.md` â€” Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.
-- `docs/session-log.md` — commit tables and per-test canary notes.
+- `docs/gotchas.md` â€” every bug writeup, by subsystem.
+- `docs/session-log.md` â€” commit tables and per-test canary notes.
   Rows are named by tag; scratch tags are dropped before a
-  milestone push, so a row's tag may no longer resolve — the
+  milestone push, so a row's tag may no longer resolve â€” the
   commit message is the record.
-- `docs/open-issues.md` — full open-issues list.
-- `docs/migration-history.md`, `docs/dons-os-history.md` —
+- `docs/open-issues.md` â€” full open-issues list.
+- `docs/migration-history.md`, `docs/dons-os-history.md` â€”
   historical narrative (A1-A6, pre-fork).
-- `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
+- `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` â€” the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
 
 ---
@@ -311,11 +340,12 @@ needs it.  Paths below are relative to a tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  `v0.6.4`: the basics are done — create, read,
-write, remove files and directories; `cd` up and down from both
-shells; full-screen software runs; a faulting process is killed
-cleanly.  Session 33: pick one item from ROADMAP.md's "After
-v0.6.4" list and do it.  One change at a time.**
+`userland/musl/`.  Session 33: shell scripts run â€” `sh script`,
+`./script`, and `busybox sh script` all work, via a per-process fd
+table raised to 64 and two coordinated `sys_execve` fixes (strip
+`./` before open; return `ENOEXEC` for short non-ELF).  Session
+34: pick one item from ROADMAP.md's "After v0.6.4" list, or tag
+`v0.6.5`.  One change at a time.**
 
 ---
 

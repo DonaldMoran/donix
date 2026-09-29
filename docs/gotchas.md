@@ -264,6 +264,77 @@ fresh and which are long-settled.
   Any new path-taking syscall must follow the three-step pattern
   `sys_open` uses.  (Learned 2026-09-29, session 32.)
 
+- **Ash's `sh: N: Invalid argument` and `sh: N: not found` are
+  generic messages; the kernel trace is the reliable signal.**  Both
+  strings come from busybox ash, not the kernel, and neither
+  identifies the failing syscall.  Two different bugs in the same
+  week produced `sh: 3: Invalid argument`:
+
+    - fd-table exhaustion in the fork+exec path (see the
+      `MAX_PROCESS_FILES` entry under Process / scheduler), and
+    - an unrelated `uname(2)` returning `-ENOSYS` that the
+      experimental tree worked around.
+
+  Only one of those was the actual cause on the production tree.
+  Likewise `sh: ./test.sh: not found` reports *any* execve failure,
+  including `ENOENT` from a failed `f_open` -- the file can exist
+  and still produce "not found."
+
+  When an execve or script run misbehaves, read the kernel's own
+  trace lines, not the shell message:
+
+      sys_execve: f_open(<path>) -> <FRESULT>   open stage failed
+      sys_execve: not an ELF file               open OK, format rejected
+      sys_execve: pid=... entry=... (name)      exec succeeded, program running
+      Unknown syscall: N                         missing handler
+
+  `FRESULT` values are listed in the `r=4` entry above; `6` is
+  `FR_INVALID_NAME` (path form FatFs rejects), `4` is `FR_NO_FILE`
+  (genuinely absent).  (Learned 2026-09-29, session 33.)
+
+- **`execve` of a short non-ELF file must return `ENOEXEC`, not
+  `EIO`, or the shell will not fall back to an interpreter.**  A
+  shell script is shorter than the 64-byte ELF header, so the old
+  header-read check
+
+      if (fr != FR_OK || got != sizeof(ehdr)) { ...; return EIO_; }
+
+  failed the `got` test *before* the ELF-magic test could run, and
+  returned `EIO`.  busybox ash treats `EIO` as "I/O error" and gives
+  up; it only falls back to running the file through `sh` when
+  `execve` returns `ENOEXEC`.
+
+  The correct shape, now in `sys_execve`:
+
+      if (fr != FR_OK)                        -> EIO   (real I/O failure)
+      if (got < 4 || magic mismatch)          -> ENOEXEC
+      if (got != sizeof(ehdr))                -> ENOEXEC (short ELF)
+      if (file_size == 0)                     -> ENOEXEC (empty file)
+      if (file_size > 4 MiB)                  -> EIO   (resource limit)
+
+  What matters is whether the bytes we *did* read start with the ELF
+  magic: if not, this is not an ELF and the caller's shell must be
+  told so with `ENOEXEC` so it can try an interpreter.  (Learned
+  2026-09-29, session 33.)
+
+- **FatFs rejects a leading `./` with `FR_INVALID_NAME`; strip it
+  before the first `f_open` in `sys_execve`.**  The path-taking
+  syscalls (`sys_open`, `sys_stat`, `sys_access`) already normalize
+  with `strip_dot_prefix`, but `sys_execve` used to hand the
+  caller's path straight to `f_open`.  So `./test.sh` failed at the
+  open:
+
+      sys_execve: f_open(./test.sh) -> 6      (FR_INVALID_NAME)
+
+  and never reached the format check.  The fix is to copy the path
+  into a local `exec_path[USER_PATH_MAX]`, call `strip_dot_prefix`
+  on that copy, and use it for every open attempt in `sys_execve`
+  (the initial `f_open`, the `has_drive` scan, attempt (b), and the
+  three `exec_resolve_*` calls).  The original `path` is kept for
+  the `proc_name` extraction and the diagnostic print.  `sh test.sh`
+  worked before this fix only because ash happened to pass a bare
+  name with no `./`.  (Learned 2026-09-29, session 33.)
+
 ### Exceptions / faults
 
 - **A user-mode `#PF` error code carries the ring in bit 2; a `#GP`
@@ -306,6 +377,28 @@ execve updates frame RIP/RSP; execve atomic; process_create bakes
 entry_point; scheduler queue idempotency; wake_all_blocked skip;
 yield removes BLOCKED; exit empty-queue fallback)
 
+- **`MAX_PROCESS_FILES` is a hard cap on per-process fds, and
+  busybox ash can exceed 8 during a script fork+exec.**  The
+  constant sizes `void* file_table[MAX_PROCESS_FILES]` in `pcb_t`.
+  It was 8 through `v0.6.4`; `sh test.sh` failed there with
+  `sh: 3: Invalid argument` because ash could not complete the
+  fork+exec of the script interpreter.  Raising it to 64 fixed
+  that.  Controlled: same build, same script, only the constant
+  varied -- at 8 it fails, at 64 it succeeds.
+
+  Cost: `file_table` is a `void*[N]`, so 8 -> 64 grows each PCB by
+  448 bytes (56 pointers * 8).  Across `MAX_PROCESSES` 32 that is
+  ~14 KB if the process table is static.  Assembly-safe:
+  `file_table` sits *after* `block_kind`, and `context_switch.asm`
+  reads offsets only up to `block_kind` (0x158), which the
+  `_Static_assert` block in `process.c` pins.  No context-switch
+  offset moves when this constant changes.
+
+  Note that the fd-exhaustion symptom is `sh: N: Invalid argument`
+  -- the same string as an unrelated `uname(2)` failure.  See the
+  generic-ash-messages entry under Syscall ABI.  (Learned
+  2026-09-29, session 33.)
+
 ## Scheduler queue discipline
 (existing entries)
 
@@ -329,7 +422,8 @@ sharing; sys_ioctl; busybox FEATURE_EDITING; PREFER_APPLETS;
 blocking poll blocks on fd 0 with timeout < 0; ftruncate seeks
 then truncates; utimes/futimesat/utimensat are no-op stubs that
 verify the path exists; sys_chdir resolves against cwd; rmdir
-mirrors unlink with f_unlink)
+mirrors unlink with f_unlink; execve strips ./ before open;
+execve returns ENOEXEC for short non-ELF)
 
 ## Build system
 (existing entries)
