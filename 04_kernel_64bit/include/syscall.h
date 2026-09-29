@@ -70,11 +70,12 @@
  *  60  exit              sys_exit
  *  61  wait4             sys_wait4
  *  72  fcntl             sys_fcntl
+ *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
  *  83  mkdir             sys_mkdir
- *  87  unlink            sys_unlink
- * 107  geteuid           sys_geteuid
+ *  87  unlink            sys_unlink        (dispatched; applet off)
+ * 107  geteuid           sys_geteuid       (returns fixed uid 1000)
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
@@ -82,8 +83,11 @@
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
  * 231  exit_group        sys_exit_group -> sys_exit
+ * 235  utimes            sys_utimes        (session 31; no-op stub)
+ * 261  futimesat         sys_futimesat     (session 31; no-op stub)
  * 269  faccessat         sys_faccessat
  * 273  set_robust_list   sys_set_robust_list
+ * 280  utimensat         sys_utimensat     (session 31; no-op stub)
  * 318  getrandom         sys_getrandom     (stub, -ENOSYS)
  * 334  rseq              sys_rseq          (stub, -ENOSYS)
  *
@@ -91,17 +95,17 @@
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
  *
- * (none currently; the numbered list in docs/open-issues.md
- * carries deferred items such as newfstatat 262, which has a
- * reserved number but no dispatch case yet)
+ *  84  rmdir             no sys_rmdir, no dispatch case.  FatFs
+ *                        has f_unlink; the work is the handler
+ *                        plus the empty-directory check, plus
+ *                        CONFIG_RMDIR=y.  On the v0.6.4 basics
+ *                        list.  (See docs/open-issues.md.)
  *
- * ------------------------------------------------------------
- * CANONICAL NUMBERS — known gaps (not yet implemented)
- * ------------------------------------------------------------
- *
- *  80  chdir            busybox ash's `cd` calls this.  Currently
- *                       returns ENOSYS -> "Function not
- *                       implemented".
+ *  262 newfstatat        number reserved; no dispatch case.
+ *                        musl routes fstatat through stat/lstat
+ *                        on x86_64 for the common case, so it is
+ *                        not hit yet.  A caller passing
+ *                        AT_FDCWD plus flags would reach it.
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -156,11 +160,11 @@
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_EXIT_GROUP      231
+#define SYS_UTIMES          235
+#define SYS_FUTIMESAT       261
 #define SYS_NEWFSTATAT      262   /* number reserved; no dispatch case yet */
 #define SYS_FACCESSAT       269
 #define SYS_SET_ROBUST_LIST 273
-#define SYS_UTIMES          235
-#define SYS_FUTIMESAT       261
 #define SYS_UTIMENSAT       280
 #define SYS_GETRANDOM       318
 #define SYS_RSEQ            334
@@ -198,22 +202,29 @@ long sys_write(int fd, const void* buf, size_t count);
 void sys_exit(int status);
 long sys_read(int fd, void* buf, size_t count);
 long sys_mprotect(void* addr, size_t len, int prot);
+long sys_munmap(void* addr, size_t length);
 void* sys_brk(void* addr);
 
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
+long sys_ftruncate(int fd, long length);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
+long sys_geteuid(void);
 long sys_getppid(void);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
+long sys_utimes(const char* path, const void* times);
+long sys_futimesat(int dirfd, const char* path, const void* times);
+long sys_utimensat(int dirfd, const char* path, const void* times,
+                   int flags);
 long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
                unsigned long arg4, unsigned long arg5);
-               
+
 /*
  * sys_poll — minimal poll(2) for syscall 7.
  *

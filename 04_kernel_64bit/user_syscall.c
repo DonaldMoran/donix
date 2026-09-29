@@ -2598,8 +2598,8 @@ long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
  * handler at 107 was therefore reached by ash's geteuid() call,
  * which received the caller's pid where it expected a uid.  The
  * real setsid(2) call from musl (112) went unhandled.  The number
- * is now 112, matching the Linux ABI.  geteuid(2) at 107 is now
- * an unhandled gap, tracked in docs/open-issues.md.
+ * is now 112, matching the Linux ABI.  The 107 gap was closed in
+ * session 30, when sys_geteuid was implemented (see below).
  */
 long sys_setsid(void) {
     pcb_t* current = process_get_current();
@@ -2683,23 +2683,35 @@ long sys_getcwd(char* buf, unsigned long size) {
  *
  * Change the calling process's current working directory.
  *
- * MINIMAL FIRST CUT.  This stores the path in pcb->cwd after
- * validating that it exists and is a directory, and sys_getcwd
- * returns the stored value.  It does NOT yet make the other path
- * syscalls resolve relative paths against the stored cwd -- see
- * the SCOPE note on pcb->cwd in process.h.  So `cd /bin` succeeds
- * and `pwd` reports `/bin`, but a subsequent `ls busybox` still
- * looks at `0:/BUSYBOX` (the root), not `0:/BIN/BUSYBOX`.
+ * This stores an absolute path in pcb->cwd after validating that it
+ * exists and is a directory, and sys_getcwd returns the stored value.
+ * The relative-path story is split across two layers:
  *
- * Validation uses f_stat_with_retry, so bare names and leading-
- * slash paths resolve the same way sys_stat resolves them.  The
- * path must resolve to a directory (AM_DIR); a file path returns
- * -ENOTDIR.  If validation fails, cwd is NOT changed.
+ *   - This function only *stores* the cwd.  It does not itself
+ *     rewrite the path relative to anything; the caller's path is
+ *     normalized to absolute Unix form and saved.
  *
- * The path is stored unsimplified, matching Linux: `cd /bin/../bin`
- * keeps that exact form, and `pwd` prints it back verbatim.
- * Root aliases (".", "/", "0:/") are normalized to "/" so getcwd
- * reports a consistent form.
+ *   - The path-taking syscalls that must honor the cwd call
+ *     resolve_against_cwd BEFORE strip_dot_prefix: sys_open,
+ *     sys_stat, and sys_access all do.  That is what makes
+ *     `cd /bin; ls busybox` look at `0:/BIN/BUSYBOX` instead of
+ *     `0:/BUSYBOX`.
+ *
+ *   - sys_unlink and sys_mkdir do NOT call resolve_against_cwd yet;
+ *     they only strip the leading "./" or "/".  So a remove or mkdir
+ *     in a non-root cwd resolves against the FAT root instead of the
+ *     cwd.  This is a known gap, tracked in docs/open-issues.md, and
+ *     is part of the v0.6.4 basics work.
+ *
+ * Validation uses f_stat_with_retry, so bare names and leading-slash
+ * paths resolve the same way sys_stat resolves them.  The path must
+ * resolve to a directory (AM_DIR); a file path returns -ENOTDIR.  If
+ * validation fails, cwd is NOT changed.
+ *
+ * The stored form is unsimplified, matching Linux: `cd /bin/../bin`
+ * keeps that exact form, and `pwd` prints it back verbatim.  Root
+ * aliases (".", "/", "0:/") are normalized to "/" so getcwd reports
+ * a consistent form.
  *
  * 20 is ENOTDIR on Linux x86_64.
  */
@@ -2754,21 +2766,20 @@ long sys_chdir(const char* user_path) {
             return -(long)ENOTDIR_;
         }
     }
-
-    /*
+     /*
      * Store the cwd in ABSOLUTE Unix form.
      *
      * Root aliases (".", "/", "0:/") normalize to "/".  Everything
-     * else is stored with a guaranteed leading '/': if the caller
-     * passed a relative path, resolve_against_cwd has already been
-     * applied by the syscall layer?  No -- chdir is called with the
-     * raw user path.  So we prefix '/' here for relative inputs.
+     * else gets a guaranteed leading '/'.  chdir is handed the raw
+     * user path -- the syscall layer does not pre-resolve it -- so a
+     * relative input like "./x" has already been reduced to "x" by
+     * strip_dot_prefix above, and we store it as "/x".
      *
-     * In practice a shell passes an absolute or "./x"-style path;
-     * for "./x" strip_dot_prefix gave "x", and we store "/x".  That
-     * is the correct absolute form for a cwd of "x" under root.
-     * (donix has no nested cwd beyond /bin today, so this is
-     * sufficient; full relative-cwd resolution is a follow-up.)
+     * Because donix has no nested cwd beyond /bin today, prefixing
+     * '/' is sufficient for every path a shell actually passes.  A
+     * caller in a nested cwd passing "../sibling" would not get full
+     * relative resolution here; that is a follow-up, noted in
+     * docs/open-issues.md.
      */
     if (path_is_root(fat_path)) {
         self->cwd[0] = '/';
@@ -3726,19 +3737,15 @@ uint64_t syscall_dispatch(uint64_t num,
 
     switch (num) {
 
-        /* --- Linux x86_64 numbers --- */
+        /* --- Linux x86_64 numbers, strictly ascending --- */
         case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
-        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
-        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
+        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
-        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
-        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
-        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
@@ -3747,31 +3754,35 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
+        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
-        case SYS_GETPPID:         return (uint64_t)sys_getppid();
-        case SYS_SETSID:          return (uint64_t)sys_setsid();
-        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
-        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
+        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
+        case SYS_GETPPID:         return (uint64_t)sys_getppid();
+        case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
-        case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
-        case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
-        case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
+        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
+        case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
         case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
-        
+        case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
+        case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
+
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); return 0;
 

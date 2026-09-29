@@ -72,7 +72,17 @@ milestone's basics list.
 18. `prctl(2)` (157) is minimal: `PR_SET_NAME` accepted and
     dropped.  A Unix-shaped implementation would add a
     per-process `comm` field.  Session 30.
-
+19. - **[v0.6.4]** `sys_unlink` and `sys_mkdir` do not resolve relative
+    paths against the cwd.  Both call `strip_dot_prefix` but not
+    `resolve_against_cwd`, unlike `sys_open` / `sys_stat` /
+    `sys_access`.  So `rm foo.txt` or `mkdir foo` in a non-root cwd
+    resolves against the FAT root, not the cwd.  The fix is to add
+    the same `resolve_against_cwd` call the other three path syscalls
+    make, before `strip_dot_prefix`.  Fold into the `rm`/`unlink`
+    work: turn on `CONFIG_RM`, add cwd resolution to both handlers,
+    test with `cd /bin; mkdir x; rmdir`-style paths.  (Found session
+    31 while auditing comments.)
+  
 ## Constraints to remember (not work items)
 
 - **`VGA_REPLY_TO_QUERIES` is 0.**  If
