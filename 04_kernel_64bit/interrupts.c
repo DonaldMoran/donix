@@ -500,7 +500,9 @@ void isr13_handler(exception_frame_t *frame) {
     }
     serial_print("  --- end frame dump ---\n");
     serial_unlock();
-
+    if ((fault_cs & 3) == 3) {
+        fault_kill_current(0x0D);
+    }
     while (1) __asm__ volatile("hlt");
 }
 
