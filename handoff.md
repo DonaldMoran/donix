@@ -4,7 +4,7 @@ Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
 **Last updated:** 2026-09-29 (session 33 â†’ pre-session 34)
-**Current HEAD:** tag `20260930-busybox-text-utils`, branch `dev`
+**Current HEAD:** tag `20260930-busybox-od`, branch `dev`
 **Last milestone:** `v0.6.4` (published) â€” **the basics are done**
 **Next milestone:** `v0.6.5` candidate â€” session 33 is large enough
 to tag (see below)
@@ -60,7 +60,7 @@ builder, not the kernel C sources.
 
 ## Where we are â€” session 33, scripts run, redirection works
 
-**Thirteen commits on `dev`, all scratch-tagged, all unpushed.**
+**Eighteen commits on `dev`, all scratch-tagged, all unpushed.**
 The last is `88a504d` (`busybox: enable text utilities ...`).
 
 Session 33 opened with "make shell scripts run" and closed with a
@@ -195,40 +195,19 @@ left out.
 
 Session 33 was large (13 commits).  No committed next milestone.
 
-**Recommended first: `mv` via `rename(2)`.**  This was the
-"bigger payoff" item deferred from earlier in session 33.  It is
-real kernel work, not a config toggle:
+**Recommended first: `uniq`.**  It hangs on any invocation, with
+or without `-c`.  Cause unknown; needs a trace-first
+investigation.  Add temporary `serial_print` lines (the `[read]`
+pattern from the redirection work) to see what syscalls `uniq`
+makes before it blocks.  Probably a missing syscall or a
+busybox-internal loop on EOF.  Its own session.
 
-- **`rename(2)` is syscall 82.**  `arg0 = oldpath`,
-  `arg1 = newpath`, returns 0 or `-errno`.
-- It is the **first two-path syscall** -- both `oldpath` and
-  `newpath` must go through `resolve_against_cwd` then
-  `strip_dot_prefix`.  That pattern will be reused for `link`
-  and `symlink`.
-- **FatFs wrinkle:** `f_rename` does **not** replace an existing
-  destination -- it returns `FR_EXIST`, which `fatfs_errno` maps
-  to `-EPERM`.  Linux `rename` replaces.  First cut: match FatFs
-  (don't replace), document the difference.  Add unlink-then-
-  rename later if needed.
-- **FatFs wrinkle 2:** `f_rename` on FAT16 only works within a
-  directory.  Cross-directory rename fails.  Fine for the
-  common `mv a b` case; note the limitation.
-- **Plan:** commit `sys_rename` first (kernel only), then
-  `CONFIG_MV=y` and test `mv hello-world.txt hi.txt` -- same
-  two-commit pattern as `lseek` + `head`.
-
-**Then: `readv` (19) + `od`.**  Small, self-contained.  `readv`
-is the mirror of `writev` (20), which exists:
-- Copy the iov array through `safe_copy_from_user` (same
-  discipline as `writev`).
-- Loop over `sys_read`, accumulate; return short count on a
-  short read.
-- Then re-enable `CONFIG_OD` and commit.
-
-**Then: `uniq`.**  Unknown cause.  Trace-first: add temporary
-`serial_print` lines (or reuse the `[read]` pattern) to see what
-syscalls `uniq` makes before it hangs.  Probably a missing
-syscall or a busybox-internal loop on EOF.
+**Then: `pipe(2)`.**  This is the biggest remaining gap in the
+shell.  Without it, `|` reaches applets as a literal argument.
+`pipe(2)` is syscall 22; the implementation needs a pipe object,
+per-fd read/write ends, and scheduler integration for blocking
+on an empty/full pipe.  Bigger than anything since the
+redirection fix.  Worth its own session.
 
 **Small, close gaps:**
 
@@ -243,10 +222,9 @@ syscall or a busybox-internal loop on EOF.
    userland gaps surfaced this session.  A tokenizer fix,
    userland-only.
 
-**Larger:** pipes and redirection (`pipe(2)`), environment
-variables (`envp`), the VFS layer (`sys_execve`'s three-attempt
-block and `resolve_against_cwd` are both shims), kernel hardening
-(real COW, munmap, page-table teardown).
+**More applets, once `pipe(2)` lands:** `awk`, `find` (needs
+`newfstatat`), `tar`, `diff`.  `chmod` (90), `ln` (86/88), and
+`mount` still need their own syscalls.
 
 **Or tag `v0.6.5`.**  Session 33 is a coherent milestone:
 "scripts run; redirection works; broad busybox command set."  If
@@ -322,15 +300,15 @@ expected -- those files do not exist and `stat` falls back cleanly.
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
 1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are both shims for a
-   filesystem layer donix does not have.  When a VFS lands, delete
-   them; do not extend.
-2. **`mv` needs `rename(2)` (82); `ln` needs `link`/`symlink`;**
-   `chmod` needs `chmod(2)` (90).  Each is its own syscall.
-3. **`od` needs `readv(2)` (19).**  Mirror of `writev` (20).
-4. **`uniq` hangs.**  Cause unknown; trace-first.
-5. **`musl_sh` does not strip quotes or parse redirection.**
-   Userland-only fix.  See `docs/gotchas.md`.
+   resolution and `resolve_against_cwd` are both shims.  When a
+   VFS lands, delete them.
+2. **`pipe(2)` is absent** -- `|` does not work in any shell.
+   The biggest remaining gap.
+3. **`uniq` hangs.**  Cause unknown; trace-first.
+4. **`musl_sh` does not strip quotes or parse redirection.**
+   Userland-only fix.
+5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need
+   their own syscalls.**  Deliberate FatFs-limitation first cuts.
 
 Also open: `newfstatat` (262) reserved, no dispatch case;
 `sys_open` accepts non-directories with `O_DIRECTORY`; Ctrl- `[`
@@ -358,11 +336,11 @@ edited; both trees have the same top-level layout):
 
 - `configs/busybox.config` â€” tracked canonical busybox config.
   Enabled applets: `cat`, `cp`, `cut`, `echo`, `head`, `ls`,
-  `mkdir`, `pwd`, `rm`, `rmdir`, `sort`, `stat`, `tail`, `tee`,
-  `test`, `touch`, `tr`, `uname`, `wc`, `cmp`, `grep`, `sed`,
-  `vi`, plus `ash`.  Off (with reasons): `uniq` (hangs), `od`
-  (needs `readv`), `diff` (deliberate), `mv`/`ln`/`chmod`/`mount`
-  (need kernel work).
+  `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `sort`, `stat`,
+  `tail`, `tee`, `test`, `touch`, `tr`, `uname`, `wc`, `cmp`,
+  `grep`, `sed`, `vi`, plus `ash`.  Off (with reasons): `uniq`
+  (hangs), `diff` (deliberate), `chmod`/`ln`/`mount` (need
+  kernel work).
 - `userland/musl/` â€” tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`

@@ -494,6 +494,76 @@ fresh and which are long-settled.
   rejected (`-EINVAL`) rather than silently truncated.  (Learned
   2026-09-29, session 33.)
 
+- **`rename(2)` (82) is the first two-path syscall.**  Both
+  `oldpath` and `newpath` go through `resolve_against_cwd` then
+  `strip_dot_prefix`, the same three-step pattern `sys_open` uses,
+  applied twice.  The same pattern will be needed for `link(2)` and
+  `symlink(2)`.  Two FatFs differences from Linux are **deliberate
+  first cuts**, not bugs:
+
+    - `f_rename` does **not** replace an existing destination -- it
+      returns `FR_EXIST`, which `fatfs_errno` maps to `-EPERM`.
+      Linux `rename` replaces.  So `mv a b` where `b` exists fails
+      rather than overwriting.  Verified: both files survive.  A
+      future caller needing Linux semantics would unlink the
+      destination first, losing atomicity -- a decision, not a fix.
+    - `f_rename` on FAT16 only works **within a directory**.
+      Cross-directory rename fails with `FR_NO_PATH` (`r=5`).
+      Linux allows it.  Fine for `mv a b`; a known limitation.
+
+  (Learned 2026-09-29, session 33.)
+
+- **`readv(2)` (19) is the mirror of `writev(2)` (20).**  Same
+  `struct iovec`, same iov-copy discipline (the iov array must go
+  through `safe_copy_from_user`, never be dereferenced directly),
+  same `WRITEV_MAX_IOVS` cap.  The only differences: it loops over
+  `sys_read` instead of `sys_write`, and a short read stops the
+  loop.  It was surfaced by busybox `od`, which calls `readv` to
+  read the file it formats; without syscall 19, `od` got `-ENOSYS`
+  and logged `Unknown syscall: 19`.  (Learned 2026-09-29, session
+  33.)
+
+- **A new applet may need a new syscall: probe first, kernel commit
+  first, applet commit second.**  Session 33 hit this pattern three
+  times:
+
+    | Applet | Missing syscall | Kernel commit | Applet commit |
+    |---|---|---|---|
+    | `head` | `lseek` (8) | `20260929-lseek` | `20260929-busybox-head` |
+    | `mv` | `rename` (82) | `20260930-rename` | `20260930-busybox-mv` |
+    | `od` | `readv` (19) | `20260930-readv` | `20260930-busybox-od` |
+
+  The discipline: enable the applet, rebuild, run it, and read the
+  serial log for `Unknown syscall:`.  If one appears, disable the
+  applet, add the syscall as its own kernel commit, test the syscall
+  is at least dormant-clean, then re-enable the applet in a second
+  commit.  Two commits, two tags, clean attribution.  (Learned
+  2026-09-29, session 33.)
+
+- **`pipe(2)` is not implemented, so `|` does not work in any
+  shell.**  A command like `cmd | head` reaches the applet with `|`,
+  `head`, etc. as literal argv arguments -- the shell never creates a
+  pipe.  busybox `od -c file | head 5` failed this way: `od` tried to
+  open files named `head` and `5`, both failed, and `od` dumped the
+  file anyway.  Not an applet or readv bug -- the pipe syscall is
+  simply absent.  Tracked in `docs/open-issues.md`.  (Learned
+  2026-09-29, session 33.)
+
+- **`lseek(2)` (8) was simply absent; `head -n N` surfaced it.**
+  Not shadowed, not misnumbered -- there was no `#define`, no
+  handler, no dispatch case.  `busybox head -n N` calls
+  `lseek(fd, 0, SEEK_END)` to size the file before reading; without
+  syscall 8 it got `-ENOSYS` and logged `Unknown syscall: 8` after
+  printing the correct output (busybox falls back to sequential
+  reading).  The output was right; the noise was not.  Implemented
+  in session 33, backed by FatFs's `f_lseek` on the FIL's `fptr`
+  and `f_tell` for the result.  `SEEK_SET`/`CUR`/`END` map to
+  absolute offsets; the result is clamped to `[0, file_size]`
+  because FatFs cannot seek past EOF and Linux can -- callers that
+  need sparse writes do not exist on donix yet, so the seek is
+  rejected (`-EINVAL`) rather than silently truncated.  (Learned
+  2026-09-29, session 33.)
+  
 ### Exceptions / faults
 
 - **A user-mode `#PF` error code carries the ring in bit 2; a `#GP`

@@ -18,9 +18,13 @@ already records.  Working tags are local and permanent.
 | `20260929-docs-session-33-complete` | docs: session 33 complete -- busybox applets, uname, lseek |
 | `20260930-redirect` | kernel: inherit fds across fork; honor dup2'd fds 0/1/2; close them on exit |
 | `20260930-busybox-text-utils` | busybox: enable text utilities (cut, sort, stat, tee, test, tr, cmp) |
+| `20260930-rename` | kernel: implement rename(2) -- syscall 82; first two-path syscall |
+| `20260930-busybox-mv` | busybox: enable mv applet |
+| `20260930-readv` | kernel: implement readv(2) -- syscall 19; mirror of writev |
+| `20260930-busybox-od` | busybox: enable od applet |
 
 **Shell scripts run; busybox file utilities enabled; shell
-redirection works.**  Thirteen commits on `dev`, all scratch-tagged
+redirection works.**  Eighteen commits on `dev`, all scratch-tagged
 (local, dropped before the next `v*` push).
 
 ### Thread 1 -- script execution
@@ -112,6 +116,30 @@ Two applets are **deliberately off**:
   commit, then re-enable `od`.
 
 `diff` is also off -- deliberately, larger surface area.
+
+### Thread 5 -- rename, mv, readv, od (the coda)
+
+Four more commits after the third docs pass:
+
+- `20260930-rename` -- `rename(2)` (82), the first two-path
+  syscall.  Both paths resolve against cwd.  Two FatFs
+  differences from Linux: no-replace (returns `-EPERM` where
+  Linux overwrites) and same-directory-only (cross-directory
+  fails with `FR_NO_PATH`).  Both deliberate.
+- `20260930-busybox-mv` -- `mv` applet.
+- `20260930-readv` -- `readv(2)` (19), mirror of `writev(2)`
+  (20).  Surfaced by `od`.
+- `20260930-busybox-od` -- `od` applet.
+
+Verified: `mv hello-world.txt hi.txt` renames; `mv hi.txt
+no-such-dir/x` fails cleanly; `mv a.txt b.txt` with `b`
+existing fails with `-EPERM` and both files survive;
+`busybox od -c hello-world.txt` prints the hex/char dump
+(final byte count `0000264` = 180 decimal).
+
+Three times now the pattern held: a new applet surfaced a
+missing syscall (`head`/`lseek`, `mv`/`rename`, `od`/`readv`),
+and each was a kernel commit followed by a config commit.
 
 ### Known limitation surfaced this session
 
