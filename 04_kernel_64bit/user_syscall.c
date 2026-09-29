@@ -83,6 +83,40 @@ static char g_write_bounce[WRITE_CHUNK];
 
 #define FILE_KIND_FILE 1
 #define FILE_KIND_DIR  2
+/*
+ * A console slot.  fds 0, 1, and 2 start life holding one of these
+ * (see process.c's process_create) so that open(2) returns fd 3 for
+ * a process that has not closed anything, matching Linux, where
+ * stdio fds are always occupied at startup.
+ *
+ * A console slot carries no obj -- slot->obj is NULL and stays NULL.
+ * sys_read/sys_write recognize it by kind and take their existing
+ * keyboard/screen path; put_file_slot frees it without calling
+ * f_close.  Nothing else in this file treats FILE_KIND_CONSOLE as a
+ * real open file.
+ */
+#define FILE_KIND_CONSOLE 3
+
+/* Set to 1 for one build to trace the fd lifecycle of ash's
+ * redirection.  Turn back to 0 before committing. */
+#define DEBUG_FD_TRACE 0
+
+#if DEBUG_FD_TRACE
+static const char* kind_name(uint32_t k) {
+    switch (k) {
+        case FILE_KIND_FILE:    return "FILE";
+        case FILE_KIND_DIR:     return "DIR";
+        case FILE_KIND_CONSOLE: return "CONSOLE";
+        default:                return "?";
+    }
+}
+#define FDTRACE(...) do { \
+    serial_print("[fd] pid="); serial_print_dec((uint64_t)process_get_current()->pid); \
+    serial_print(" "); __VA_ARGS__; serial_print("\n"); \
+} while (0)
+#else
+#define FDTRACE(...) do {} while (0)
+#endif
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -598,11 +632,52 @@ static void put_file_slot(file_slot_t* slot) {
     }
     if (slot->kind == FILE_KIND_FILE) {
         f_close((FIL*)slot->obj);
+        kfree(slot->obj);
     } else if (slot->kind == FILE_KIND_DIR) {
         f_closedir((DIR*)slot->obj);
+        kfree(slot->obj);
+    } else if (slot->kind == FILE_KIND_CONSOLE) {
+        /* obj is NULL; nothing to close or free. */
     }
-    kfree(slot->obj);
     kfree(slot);
+}
+
+/*
+ * Allocate a console sentinel slot for fd 0, 1, or 2.
+ *
+ * The slot has no obj; sys_read/sys_write dispatch on kind, not on
+ * obj, for console fds.  Returns NULL on kmalloc failure, in which
+ * case the caller leaves the fd NULL and it behaves the way it did
+ * before sentinels existed.
+ */
+static file_slot_t* alloc_console_slot(void) {
+    file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
+    if (!slot) return NULL;
+    slot->kind     = FILE_KIND_CONSOLE;
+    slot->refcount = 1;
+    slot->obj      = NULL;
+    return slot;
+}
+
+/*
+ * Install console sentinels in fds 0, 1, and 2 of a new process.
+ *
+ * See include/user_syscall.h for the contract.  Called from
+ * process_create after the file_table[] zeroing loop.  Idempotent
+ * in the sense that it overwrites whatever is in 0/1/2, but it is
+ * only ever called on a freshly zeroed table.
+ */
+void user_syscall_init_console_fds(struct pcb* pcb) {
+    if (!pcb) return;
+    for (int fd = 0; fd <= 2; fd++) {
+        /*
+         * On failure, alloc_console_slot returns NULL and the fd
+         * stays NULL.  NULL fd 0/1/2 already takes the keyboard/
+         * screen path in sys_read/sys_write, so this degrades to
+         * the pre-sentinel behavior rather than breaking.
+         */
+        ((pcb_t*)pcb)->file_table[fd] = alloc_console_slot();
+    }
 }
 
 static void close_all_files(pcb_t* proc) {
@@ -615,16 +690,51 @@ static void close_all_files(pcb_t* proc) {
     }
 }
 
+/*
+* open(2) must return the LOWEST free fd, including 0, 1, and
+* 2 when they are free.  This is Linux/POSIX semantics and
+* real programs depend on it.  busybox `uniq FILE` does:
+*
+*     close(STDIN_FILENO);              // frees fd 0
+*     xopen(input_filename, O_RDONLY);  // expects fd 0 back
+*
+* and then reads from stdin (fd 0).  Before this change the
+* search started at fd 3, so the open landed on fd 3, stdin
+* stayed pointed at the now-closed fd 0, read(0, ...) fell
+* through to the keyboard path in sys_read, and the applet
+* blocked forever waiting for a keystroke that never came.
+* That was the `uniq` "hang".
+*
+* fds 0/1/2 are not permanently reserved, but a fresh process
+* starts with all three HELD by console sentinels (see
+* user_syscall_init_console_fds, called from process_create).
+* So the first open() of a fresh process returns fd 3 -- the
+* sentinels are occupied -- and fd 0/1/2 only become available
+* again after the program explicitly closes them, exactly as
+* on Linux.  Without the sentinels a fresh process would get
+* fd 0 back from its first open(), which breaks shell
+* redirection bookkeeping (ash saves and restores stdio fds).
+*
+* This does NOT relax the fd<3 guard in get_file_slot().
+* That guard remains the default for the file syscalls.  Two
+* callers opt out explicitly, because a redirected stdio fd
+* is a real open file there:
+*
+*   - sys_dup2 uses get_file_slot_any so `dup2(file_fd, 0/1/2)`
+*     and its restore twin `dup2(saved, 0/1/2)` work.
+*   - sys_fcntl uses get_file_slot_any for F_DUPFD and
+*     F_DUPFD_CLOEXEC only, so a shell can save stdio.  Its
+*     other subcommands still call get_file_slot and refuse
+*     fd < 3.  The new fd from F_DUPFD still lands on fd >= 3.
+*/
 static int alloc_file_slot(file_slot_t** out_slot) {
     pcb_t* self = process_get_current();
     if (!self) return -1;
-
     int fd = -1;
-    for (int i = 3; i < MAX_PROCESS_FILES; i++) {
+    for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         if (self->file_table[i] == NULL) { fd = i; break; }
     }
     if (fd == -1) return -1;
-
     file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
     if (!slot) return -1;
     slot->kind     = 0;
@@ -647,17 +757,28 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
 /*
  * Like get_file_slot, but accepts fds 0, 1, and 2.
  *
- * The general get_file_slot() refuses fds < 3, because the
- * "normal" file syscalls (dup2, fcntl, fstat, readdir) must not
- * treat stdin/stdout/stderr as ordinary open files.  But
- * redirection -- busybox ash's `<`, `>`, `2>` -- works by
- * opening a file and calling dup2() to install it as fd 0, 1,
- * or 2.  After that, read(0, ...) and write(1, ...) MUST
- * consult file_table[0] / file_table[1] rather than falling
- * through to the keyboard/screen.
+ * The general get_file_slot() refuses fds < 3.  That guard is the
+ * default because most file syscalls must not treat stdin/stdout/
+ * stderr as ordinary open files.  But redirection -- busybox ash's
+ * `<`, `>`, `2>` -- works by opening a file and calling dup2() to
+ * install it as fd 0, 1, or 2.  After that, those low fds hold
+ * real files, and the syscalls involved in the redirect dance must
+ * see them:
  *
- * sys_read, sys_write, and sys_close use this helper for the
- * fd<3 cases; everything else keeps using get_file_slot.
+ *   - sys_read and sys_write, so read(0, ...) and write(1, ...)
+ *     consult file_table[0] / file_table[1] instead of falling
+ *     through to the keyboard/screen.
+ *   - sys_close, so a redirect-created file's refcount reaches
+ *     zero and FatFs commits the directory entry.
+ *   - sys_dup2, so dup2(file_fd, 1) and the restore dup2(saved, 1)
+ *     work -- without this a second redirect in the same shell
+ *     failed with EBADF once an earlier redirect had freed a low fd.
+ *   - sys_fcntl, for F_DUPFD and F_DUPFD_CLOEXEC only, so a shell
+ *     can save stdio before redirecting it.
+ *
+ * Everything else -- fstat, getdents64, lseek, ftruncate, and the
+ * other fcntl subcommands -- keeps using get_file_slot and refuses
+ * fd < 3.
  *
  * Returns NULL if the fd is out of range, or holds no slot.
  * Does not check slot->kind -- the caller does.
@@ -694,8 +815,18 @@ static file_slot_t* get_file_slot_any(int fd) {
 #define F_DUPFD_CLOEXEC 1030
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
-    file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -(long)EBADF_;
+    file_slot_t* slot;
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        slot = get_file_slot_any(fd);
+    } else {
+        slot = get_file_slot(fd, 0);
+    }
+    if (!slot) {
+        FDTRACE({ serial_print("fcntl fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" cmd="); serial_print_dec((uint64_t)cmd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     switch (cmd) {
         case F_DUPFD:
@@ -739,6 +870,9 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
 
             slot->refcount++;
             self->file_table[newfd] = slot;
+            FDTRACE({ serial_print("fcntl DUPFD fd="); serial_print_dec((uint64_t)fd);
+                      serial_print(" min="); serial_print_dec((uint64_t)min);
+                      serial_print(" -> "); serial_print_dec((uint64_t)newfd); });
             return (long)newfd;
         }
         case F_GETFD:  return 0;              /* no FD_CLOEXEC set */
@@ -914,6 +1048,9 @@ long sys_open(const char* path, int flags) {
         if (dr == FR_OK) {
             slot->kind = FILE_KIND_DIR;
             slot->obj  = dir_obj;
+            FDTRACE({ serial_print("open  "); serial_print(dir_path);
+                      serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                      serial_print(" kind=DIR"); });
             return fd;
         }
         kfree(dir_obj);
@@ -938,6 +1075,9 @@ long sys_open(const char* path, int flags) {
     if (r == FR_OK) {
         slot->kind = FILE_KIND_FILE;
         slot->obj  = file_obj;    
+        FDTRACE({ serial_print("open  "); serial_print(local_path);
+                  serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" kind=FILE"); });
         return fd;
     }
 
@@ -957,6 +1097,9 @@ long sys_open(const char* path, int flags) {
                 kfree(file_obj);
                 slot->kind = FILE_KIND_DIR;
                 slot->obj  = dir_obj;
+                FDTRACE({ serial_print("open  "); serial_print(local_path);
+                          serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                          serial_print(" kind=DIR (fallback)"); });
                 return fd;
             }
             kfree(dir_obj);
@@ -976,15 +1119,24 @@ long sys_open(const char* path, int flags) {
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
+    FDTRACE({ serial_print("open  FAIL "); serial_print(local_path);
+              serial_print(" r="); serial_print_dec(r); });
     return fatfs_errno(r);
 }
 
 long sys_close(int fd) {
     file_slot_t* slot = get_file_slot_any(fd);
-    
-    if (!slot) return -(long)EBADF_;
+
+    if (!slot) {
+        FDTRACE({ serial_print("close fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     pcb_t* self = process_get_current();
+    FDTRACE({ serial_print("close fd="); serial_print_dec((uint64_t)fd);
+              serial_print(" kind="); serial_print(kind_name(slot->kind));
+              serial_print(" -> 0"); });
     self->file_table[fd] = NULL;
     put_file_slot(slot);
     return 0;
@@ -1015,8 +1167,13 @@ long sys_dup2(int oldfd, int newfd) {
     if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
     if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
 
-    file_slot_t* old_slot = get_file_slot(oldfd, 0);
-    if (!old_slot) return -(long)EBADF_;
+    file_slot_t* old_slot = get_file_slot_any(oldfd);
+    if (!old_slot) {
+        FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
+                  serial_print(" new="); serial_print_dec((uint64_t)newfd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     /* dup2(fd, fd) is a no-op returning fd, not an error. */
     if (oldfd == newfd) return (long)newfd;
@@ -1035,7 +1192,11 @@ long sys_dup2(int oldfd, int newfd) {
     /* Share the slot and take a new reference. */
     old_slot->refcount++;
     self->file_table[newfd] = old_slot;
-       
+
+    FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
+              serial_print(" new="); serial_print_dec((uint64_t)newfd);
+              serial_print(" kind="); serial_print(kind_name(old_slot->kind));
+              serial_print(" -> "); serial_print_dec((uint64_t)newfd); });
     return (long)newfd;
 }
 
