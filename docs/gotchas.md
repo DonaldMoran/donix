@@ -364,6 +364,136 @@ fresh and which are long-settled.
   build, read sequentially and never hit it.  (Learned 2026-09-29,
   session 33.)
 
+- **fds 0, 1, and 2 must consult `file_table[]` before falling back
+  to the console.**  This is the session-33 redirection bug, and it
+  is the single richest bug in the project so far.  `sys_read`
+  hard-coded `fd == 0` to the keyboard, and `sys_write` hard-coded
+  `fd == 1 || fd == 2` to the screen, **before** ever looking at
+  `file_table[fd]`.  That is correct when nothing has been
+  `dup2`'d onto those fds, which was true for the entire project
+  up to session 33.  But shell redirection works by exactly that
+  mechanism:
+
+      ash  < file :  open(file) -> fd 3,  dup2(3, 0),  close(3),  exec
+      ash  > file :  open(file) -> fd 3,  dup2(3, 1),  close(3),  exec
+
+  After `dup2(file_fd, 0)`, `read(0, ...)` must read the file.  The
+  old `sys_read` read the keyboard instead, so `cat < file` blocked
+  forever waiting for a keystroke.  After `dup2(file_fd, 1)`,
+  `write(1, ...)` must write the file.  The old `sys_write` wrote
+  the screen instead, so `echo hi > file` printed to the console
+  and left the file empty.
+
+  The fix: a new helper `get_file_slot_any(fd)` that accepts fds
+  0-2 (the general `get_file_slot` still refuses `fd < 3`, so
+  `fcntl`/`dup2`/`fstat`/`ftruncate`/`lseek`/`getdents64` are
+  unaffected).  `sys_read` consults it for fd 0 and takes the file
+  path when a FILE slot is present; `sys_write` consults it for
+  fd 1/2 likewise.  (Learned 2026-09-29, session 33.)
+
+- **`sys_fork` must copy `file_table[]` and bump every slot's
+  refcount.**  Also session 33.  `process_create` runs
+  `process_initialize_pcb`, which `memset`s the whole PCB --
+  including `file_table[]`.  A fresh process correctly starts with
+  no fds.  But `fork` is not a fresh process: POSIX requires the
+  child to inherit the parent's open fds.  `sys_fork` never copied
+  the table, so a forked child started with every fd NULL.
+
+  The symptom was invisible until redirection: ash opens the
+  redirect file, `dup2`s it onto fd 0, then **forks** and execs the
+  command.  The child's `read(0, ...)` found `file_table[0] == NULL`
+  even after the parent's `dup2`, because the child never got the
+  table.  The trace showed it exactly:
+
+      [open] fd=3 path=hello-world.txt
+      [dup2] old=3 new=0
+      [close] fd=3 slot=FFFF900000000030
+      [fork] parent=3
+      sys_execve: pid=4 ... argc=1 ...
+      [exec] fd0=0000000000000000        <- fd 0 is NULL in the child
+      [read] fd=0 count=4096 slot0=0000000000000000 k0=0   <- reads keyboard, hangs
+
+  The fix: after `process_create`, loop `file_table[]` from 0 to
+  `MAX_PROCESS_FILES`, and for each non-NULL parent slot,
+  `slot->refcount++` and `child->file_table[_fd] = slot`.  Slots are
+  **shared**, not copied -- exactly as `dup2` shares a slot -- and
+  each holder takes a reference.  `close` on either side drops one
+  reference; the slot is freed only at refcount 0.  (Learned
+  2026-09-29, session 33.)
+
+- **`close_all_files` must start at fd 0, not fd 3.**  Also session
+  33, and the third leg of the redirection bug.  `close_all_files`
+  loops over a process's fds on exit.  It used to start at `i = 3`,
+  on the assumption that fds 0/1/2 are "the console" and hold no
+  slot.  That assumption is broken by redirection: after
+  `dup2(file_fd, 1)`, fd 1 holds a real FILE slot.
+
+  The failure was subtle and only visible on the *second* command:
+
+      $ echo hi > out.txt        <- writes 3 bytes to fd 1 (the file)
+      $ cat out.txt              <- reads an EMPTY file
+
+  Why empty: the child (`echo`) exits, `close_all_files` skips fd 1,
+  so the slot's refcount never reaches 0, so `put_file_slot` never
+  calls `f_close`.  FatFs commits a file's directory entry at
+  `f_close`; without it, the file is created but its size and data
+  are not written back.  `cat` opens an empty file.  With the loop
+  starting at 0, fd 1 is closed, refcount hits 0, `f_close` runs,
+  and the entry is committed.
+
+  Note the ordering trap: this bug only shows up when a redirect-
+  created file is read back **in a later process**.  Reading the
+  file from the same shell (e.g. `cat` inside the same pipeline)
+  could still see the uncommitted data in FatFs's cache.  (Learned
+  2026-09-29, session 33.)
+
+- **The `[read] fd=0 slot0=... k0=N` trace pattern is the tool for
+  "is fd 0 a file or the keyboard?"**  Session 33 found the
+  redirection bugs by adding temporary `serial_print` lines at the
+  top of `sys_read`, `sys_write`, `sys_open`, `sys_close`,
+  `sys_dup2`, `sys_execve`, and `sys_fork`.  The `sys_read` line --
+  printing `fd`, `count`, the raw pointer at `file_table[0]`, and
+  its kind (`k0 == 1` means `FILE_KIND_FILE`) -- immediately showed
+  that fd 0 was NULL in the child even after a successful `dup2` in
+  the parent.  That is what pointed at `sys_fork`.
+
+  Pattern: when fd behavior is in question, trace the slot pointer
+  and kind at the entry of every fd-touching syscall.  A NULL
+  pointer where one is expected names the syscall that dropped it;
+  a non-NULL pointer with the wrong kind names a type mismatch.
+  Remove the traces before committing -- the `v0.6.x` builds carry
+  none.  (`[writev]` at the top of `sys_writev` is a permanent
+  debug hook inside `#if DEBUG_WRITEV`; `[REBOOT]` in
+  `kernel_do_reboot` is a real diagnostic.  Both stay.)  (Learned
+  2026-09-29, session 33.)
+
+- **`uname(2)` (63) is a standard syscall; its absence is not the
+  cause of shell script failures.**  The experimental tree added
+  `uname` alongside the real script-execution fixes and its comment
+  attributed `sh: 3: Invalid argument` to a missing `uname`.  That
+  attribution was wrong -- the failure was fd exhaustion (see the
+  `MAX_PROCESS_FILES` entry), and `sh: 3: Invalid argument` is
+  ash's generic `EINVAL` message, produced by more than one cause.
+  `uname` was a coincidental passenger.  It was ported in session
+  33 for correctness -- `busybox uname` and `uname -a` now work --
+  but it is not required for script execution.  (Learned 2026-09-29,
+  session 33.)
+
+- **`lseek(2)` (8) was simply absent; `head -n N` surfaced it.**
+  Not shadowed, not misnumbered -- there was no `#define`, no
+  handler, no dispatch case.  `busybox head -n N` calls
+  `lseek(fd, 0, SEEK_END)` to size the file before reading; without
+  syscall 8 it got `-ENOSYS` and logged `Unknown syscall: 8` after
+  printing the correct output (busybox falls back to sequential
+  reading).  The output was right; the noise was not.  Implemented
+  in session 33, backed by FatFs's `f_lseek` on the FIL's `fptr`
+  and `f_tell` for the result.  `SEEK_SET`/`CUR`/`END` map to
+  absolute offsets; the result is clamped to `[0, file_size]`
+  because FatFs cannot seek past EOF and Linux can -- callers that
+  need sparse writes do not exist on donix yet, so the seek is
+  rejected (`-EINVAL`) rather than silently truncated.  (Learned
+  2026-09-29, session 33.)
+
 ### Exceptions / faults
 
 - **A user-mode `#PF` error code carries the ring in bit 2; a `#GP`
@@ -453,7 +583,10 @@ then truncates; utimes/futimesat/utimensat are no-op stubs that
 verify the path exists; sys_chdir resolves against cwd; rmdir
 mirrors unlink with f_unlink; execve strips ./ before open;
 execve returns ENOEXEC for short non-ELF; lseek is 8, absent
-until session 33, seeks via f_lseek and returns f_tell)
+until session 33, seeks via f_lseek and returns f_tell; uname is
+63, absent until session 33; read/write consult file_table[] for
+fds 0/1/2; fork copies file_table[]; close_all_files starts at
+fd 0)
 
 ## Build system
 (existing entries)
@@ -461,35 +594,55 @@ until session 33, seeks via f_lseek and returns f_tell)
 ## Musl userland tree
 (existing entries)
 
-## musl_sh does not strip shell quotes
+## musl_sh does not strip shell quotes, and does not parse redirection
 
-`userland/musl/apps/musl_sh.c` (`donix>`'s shell) does not
-implement quote removal.  A command typed at `donix>` with single
-or double quotes reaches the child program with the quote
-characters still in the argv string.  busybox `sed` then reports
+Two related limitations of `donix>` (the `musl_sh` shell), both
+noted in session 33:
+
+**Quoting.**  `userland/musl/apps/musl_sh.c` does not implement
+quote removal.  A command typed at `donix>` with single or double
+quotes reaches the child program with the quote characters still in
+the argv string.  busybox `sed` then reports
 
     sed: unsupported command '
 
 because its first argument is literally `'1p'` (with the leading
 quote), not `1p`.
 
-**Symptom:** `donix> busybox sed -n '1p' file` fails; the same
-command from `busybox ash` (where quote removal works) succeeds.
+**Redirection.**  `musl_sh` does not parse `<`, `>`, `>>`, `2>`,
+or `|`.  It passes those characters through as literal argv
+arguments.  So
+
+    donix> cat < hello-world.txt
+
+execs `cat` with `argc=3` -- `cat`, `<`, `hello-world.txt` -- and
+`cat` tries to open a file literally named `<`, which fails.
+busybox `cat` then opens the *second* argument (`hello-world.txt`)
+and prints it, which makes the failure look like a partial success.
+
+**In both cases, the fix is userland-only -- a real tokenizer in
+`musl_sh`.  No kernel change is involved.**  The kernel's
+redirection support (the session-33 fd fixes) is what *enables*
+ash's `<`/`>`; it does nothing for `musl_sh`, which never emits the
+`dup2` calls in the first place.
 
 **Workarounds:**
-  - Run the command through `busybox ash`: `donix> busybox sh`,
-    then `sed -n '1p' file` at the ash prompt.
-  - Or omit the quotes where the shell would accept it and the
-    program does not need them: `donix> busybox sed -n 1p file`.
-    (Note that omitting quotes can change semantics: `sed 1p file`
-    without `-n` prints every line *plus* line 1 again, because
-    sed's default-print behavior still applies.  Quote-free is
-    not always equivalent.)
+  - Run quote- and redirect-dependent commands through
+    `busybox ash`: `donix> busybox sh`, then use the normal syntax
+    at the ash prompt.  ash parses quoting and redirection
+    correctly.
+  - Or, for quoting only, omit the quotes where the shell would
+    accept it and the program does not need them: `donix> busybox
+    sed -n 1p file`.  Note that omitting quotes can change
+    semantics: `sed 1p file` without `-n` prints every line *plus*
+    line 1 again, because sed's default-print behavior still
+    applies.
 
-**This is a musl_sh limitation, not a kernel or busybox issue.**
-A real fix is quote removal in `musl_sh`'s tokenizer; until then,
-quote-dependent commands go through ash.  Tracked in
-`docs/open-issues.md`.  (Learned 2026-09-29, session 33.)
+**Rule of thumb: any test involving `<`, `>`, `|`, `&&`, `;`, or
+quoting must be run from ash, not from `donix>`.**  This was the
+source of a long false trail in session 33 -- `cat < file` at
+`donix>` never had a chance, and the only valid test was from ash.
+Tracked in `docs/open-issues.md`.  (Learned 2026-09-29, session 33.)
 
 ## Git hygiene
 (cross-reference: full text in docs/strategy.md)

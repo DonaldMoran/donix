@@ -15,10 +15,15 @@ already records.  Working tags are local and permanent.
 | `20260929-busybox-cp` | busybox: enable cp applet |
 | `20260929-busybox-grep` | busybox: enable grep applet |
 | `20260929-busybox-sed` | busybox: enable sed applet |
+| `20260929-docs-session-33-complete` | docs: session 33 complete -- busybox applets, uname, lseek |
+| `20260930-redirect` | kernel: inherit fds across fork; honor dup2'd fds 0/1/2; close them on exit |
+| `20260930-busybox-text-utils` | busybox: enable text utilities (cut, sort, stat, tee, test, tr, cmp) |
 
-**Shell scripts run; busybox file utilities enabled.**  Ten
-commits on `dev`, all scratch-tagged (local, dropped before the
-next `v*` push).
+**Shell scripts run; busybox file utilities enabled; shell
+redirection works.**  Thirteen commits on `dev`, all scratch-tagged
+(local, dropped before the next `v*` push).
+
+### Thread 1 -- script execution
 
 Three kernel fixes made script execution work:
 
@@ -36,7 +41,7 @@ Three kernel fixes made script execution work:
 Result: `./test.sh`, `sh test.sh`, and `busybox sh test.sh` from
 `donix>` all print the script output.
 
-Then two kernel syscalls added, each surfaced by an applet:
+### Thread 2 -- two new syscalls
 
 - `uname(2)` -- 63.  Not needed for scripting; the experimental
   tree's comment attributing the script failure to a missing
@@ -46,32 +51,80 @@ Then two kernel syscalls added, each surfaced by an applet:
   `SEEK_END` to size the file.  Without it: `Unknown syscall: 8`
   after correct output.  Backed by `f_lseek` / `f_tell`;
   `SEEK_SET`/`CUR`/`END` mapped to absolute offsets; result
-  clamped to `[0, file_size]` (FatFs cannot seek past EOF, Linux
-  can; nothing needs it yet).
+  clamped to `[0, file_size]`.
 
-Then six applets enabled, each probed first for `Unknown
-syscall:` noise:
+### Thread 3 -- shell redirection (the big one)
 
-| Applet | Kernel support needed |
-|---|---|
-| `head` | `lseek` (added above) |
-| `tail` | `lseek` `SEEK_END` with negative offset |
-| `cp` | none -- plain read/write |
-| `grep` | none -- sequential read, no mmap |
-| `sed` | none -- sequential read/write |
+`cmd < file` and `cmd > file` did not work.  Diagnosis with
+temporary serial traces found **three interlocking bugs**, all
+fixed in one commit (`20260930-redirect`):
 
-Not ported from the experimental tree: the extra
-`busybox.config` applets that need kernel work (`chmod`, `ln`,
-`mv`, `mount`) and `FEATURE_ALLOW_EXEC` (proven unnecessary).
-The `uname` and `busybox.config` changes from testme are now
-either ported (`uname`) or deliberately left out (the applets
-needing syscalls donix lacks).
+1. **`sys_read` / `sys_write` hard-coded fds 0/1/2.**  `sys_read`
+   sent `fd == 0` to the keyboard; `sys_write` sent `fd == 1 || 2`
+   to the screen -- both *before* consulting `file_table[]`.  After
+   ash's `dup2(file_fd, 0)` for `<`, `read(0, ...)` still read the
+   keyboard (`cat < file` hung forever).  After `dup2(file_fd, 1)`
+   for `>`, `write(1, ...)` still wrote the screen (the file was
+   never written).
+2. **`sys_fork` never copied `file_table[]`.**  `process_create`
+   zeroes the child's PCB, so a forked child started with no fds.
+   ash opens the redirect file, `dup2`s it onto fd 0, then forks
+   and execs -- the child saw fd 0 as NULL.  Fixed by copying every
+   open slot and bumping its refcount, exactly as `dup2` shares a
+   slot.
+3. **`close_all_files` started at `i = 3`.**  fds 0/1/2 were never
+   closed on exit, so a redirect-created file's refcount never
+   reached 0, so `f_close` never ran, so FatFs never committed the
+   directory entry -- `cat out.txt` after `echo hi > out.txt` read
+   an empty file.
 
-**Note on `musl_sh` quoting:** `donix>` (musl_sh) does not strip
-shell quotes, so `busybox sed -n '1p' file` fails from there
-with `sed: unsupported command '`.  The same command works from
-`busybox ash` or without the quotes.  See `docs/gotchas.md`,
-"musl_sh does not strip shell quotes."
+Plus a new `get_file_slot_any()` helper that accepts fds 0-2; the
+general `get_file_slot()` keeps its `fd >= 3` guard.
+
+Verified: `cat < hello-world.txt` prints the file and returns;
+`echo hi > out.txt` is silent; `cat out.txt` prints `hi`.
+
+### Thread 4 -- busybox applets
+
+Twelve applets enabled across two commits.  Each was **probed
+first** for `Unknown syscall:` noise, per the session-33 pattern.
+
+| Tag | Applet(s) | Kernel work needed |
+|---|---|---|
+| `20260929-busybox-head` | `head` | `lseek` (added above) |
+| `20260929-busybox-tail` | `tail` | `lseek(SEEK_END)` |
+| `20260929-busybox-cp` | `cp` | none |
+| `20260929-busybox-grep` | `grep` | none |
+| `20260929-busybox-sed` | `sed` | none |
+| `20260930-busybox-text-utils` | `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp` | none |
+
+All tested and confirmed working.  `wc`, `echo`, `cat`, `ls`,
+`pwd`, `mkdir`, `rm`, `rmdir`, `touch`, `vi` were already enabled
+from earlier sessions.
+
+Two applets are **deliberately off**:
+
+- **`uniq`** -- hangs on any invocation, with or without `-c`.
+  Cause unknown; needs a trace-first investigation.  Its own
+  session.
+- **`od`** -- needs `readv(2)` (syscall 19), which donix lacks.
+  `readv` is the mirror of `writev` (20), which exists.  Its own
+  commit, then re-enable `od`.
+
+`diff` is also off -- deliberately, larger surface area.
+
+### Known limitation surfaced this session
+
+**`musl_sh` (`donix>`) does not strip shell quotes and does not
+parse redirection.**  `busybox sed -n '1p' file` fails from there
+with `sed: unsupported command '`.  `cat < hello-world.txt` execs
+`cat` with `argc=3` (`cat`, `<`, `hello-world.txt`) and `cat` tries
+to open a literal `<`.  Both work correctly from ash.  See
+`docs/gotchas.md`, "musl_sh does not strip shell quotes, and does
+not parse redirection," and `docs/open-issues.md`.
+
+**Rule of thumb: any test involving `<`, `>`, `|`, `&&`, `;`, or
+quoting must be run from ash, not from `donix>`.**
 
 ## Session 32 (2026-09-29)
 | Tag | What |
@@ -241,7 +294,7 @@ tags no longer resolve -- the commit messages are the record)
 ## Per-test canary notes (session 33)
 
 Focused canary, boot-into-ash, cwd-aware — green as of
-`20260929-busybox-sed`:
+`20260930-busybox-text-utils`:
 
 | Row | Result |
 |-----|--------|
@@ -282,11 +335,16 @@ lines appear and are expected:
 One-off verifications (not canary rows — they mutate the disk or
 crash the process):
 
-- **Script execution, three ways** (new in session 33):
+- **Script execution, three ways**:
   - `./test.sh` → `Hello, world` (kernel: `sys_execve: not an ELF
     file` → ash fallback → fork+sh → child runs script).
   - `sh test.sh` → `Hello, world`.
   - `busybox sh test.sh` from `donix>` → `Hello, world`.
+- **Shell redirection** (session 33, `20260930-redirect`), run from
+  ash:
+  - `cat < hello-world.txt` → prints the file, returns.
+  - `echo hi > out.txt` → silent; `cat out.txt` → `hi`;
+    `ls out.txt` → found.
 - **`uname`**: `busybox uname` → `Linux`; `busybox uname -a` →
   `Linux donix 6.0.0 #1 donix x86_64`.
 - **`head`**: `busybox head -n 3` / `-n 1` / default against
@@ -302,8 +360,28 @@ crash the process):
   `sed 's/fatcat/FATCAT/'` from ash → expected output.  From
   `donix>` the quotes must be omitted (musl_sh does not strip
   quotes); `sed -n 1p` works.
+- **Text utilities batch** (session 33,
+  `20260930-busybox-text-utils`), run from ash:
+  - `echo hello` → `hello`
+  - `cut -c 1-5 hello-world.txt` → first 5 columns per line
+  - `sort hello-world.txt` → ASCII-ordered lines
+  - `stat hello-world.txt` → full stat output (expected
+    `/etc/passwd` etc. `f_open FAIL` noise)
+  - `test 1 -eq 1 && echo YES` → `YES`
+  - `tr a-z A-Z < hello-world.txt` → uppercase
+  - `tee copy2.txt < hello-world.txt` → writes AND prints;
+    `cat copy2.txt` matches
+  - `cmp hello-world.txt hello-world.txt` → no output (identical)
 - vi round-trip: `vi test.sh`, edit, `:wq`, `cat test.sh` reads
   the text back.
 - `fault_pf` — user-mode `#PF`, process killed, shell returns.
 - `mkdir`/`rmdir` create/remove, nested cwd create/remove (from
   the `v0.6.4` notes; unchanged).
+
+**Known failures in this session, left off deliberately:**
+
+- `uniq hello-world.txt` — hangs on any invocation, with or
+  without `-c`.  Ctrl-C required.  Cause unknown; needs a
+  trace-first investigation.  `CONFIG_UNIQ` is off.
+- `od -c hello-world.txt` — `Unknown syscall: 19` (`readv`).
+  `CONFIG_OD` is off.  `readv` is its own kernel commit.
