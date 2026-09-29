@@ -4,7 +4,7 @@ Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
 **Last updated:** 2026-09-29 (session 33 â†’ pre-session 34)
-**Current HEAD:** tag `20260929-execve-script-fallback`, branch `dev`
+**Current HEAD:** tag `20260929-busybox-sed`, branch `dev`
 **Last milestone:** `v0.6.4` (published) â€” **the basics are done**
 **Next milestone:** none yet â€” `v0.6.5` candidate below
 
@@ -57,134 +57,132 @@ builder, not the kernel C sources.
 
 ---
 
-## Where we are â€” session 33, shell scripts run
+## Where we are â€” session 33, scripts run and file utilities work
 
-**Shell scripts execute.**  Session 33 landed two commits on `dev`,
-both scratch-tagged, both unpushed:
+**Ten commits on `dev`, all scratch-tagged, all unpushed.**  The
+last is `8a88792` (`busybox: enable sed applet`).
+
+Session 33 opened with "make shell scripts run" and closed with a
+useful busybox command set.  Two threads:
+
+### Thread 1 -- script execution (the original goal)
+
+Three kernel fixes made `./script.sh` and `sh script.sh` work:
 
 | Tag | What |
 |---|---|
-| `20260929-max-process-files-64` | `MAX_PROCESS_FILES` 8 â†’ 64; `sh script.sh` works |
-| `20260929-execve-script-fallback` | execve strips `./` before open; returns `ENOEXEC` for short non-ELF; `./script.sh` works |
+| `20260929-max-process-files-64` | `MAX_PROCESS_FILES` 8 â†’ 64 |
+| `20260929-execve-script-fallback` | execve strips `./` before open; returns `ENOEXEC` for short non-ELF |
 
-Both scratch tags are local and **must be dropped before the next
-`v*` push**.
+**`MAX_PROCESS_FILES` 8 â†’ 64.**  At 8, busybox ash's script
+fork+exec path fails with `sh: 3: Invalid argument`; at 64 the
+same script prints its output.  Controlled: same build, same
+script, only the constant varied.  Cost +448 B/pcb; assembly-safe
+(`file_table` sits past `block_kind`, which `context_switch.asm`
+pins).
 
-### What landed in session 33
+**`sys_execve` two fixes.**  (1) Normalize the path with
+`strip_dot_prefix` before the first `f_open`, so `./test.sh` no
+longer fails with `FR_INVALID_NAME` at the open.  (2) Return
+`ENOEXEC`, not `EIO`, for a short non-ELF read, so ash falls back
+to running the script through `sh`.
 
-**Commit 1 â€” `MAX_PROCESS_FILES` 8 â†’ 64** (`include/process.h`).
-Sizes `void* file_table[MAX_PROCESS_FILES]` in `pcb_t`.  At 8,
-busybox ash's script fork+exec path fails with
-`sh: 3: Invalid argument`; at 64 the same script prints its
-output.  Controlled: same build, same script, only the constant
-varied.  Cost +448 B/pcb (56 pointers Ã— 8); ~14 KB across the
-32-entry process table if static.  Assembly-safe: `file_table`
-sits *after* `block_kind`, and `context_switch.asm` reads offsets
-only up to `block_kind` (0x158), which `process.c`'s
-`_Static_assert` pins.
+Result: `./test.sh`, `sh test.sh`, and `busybox sh test.sh` from
+`donix>` all print the script output.
 
-**Commit 2 â€” `sys_execve` script fallback** (`user_syscall.c`).
-Two coordinated fixes in one function:
+### Thread 2 -- busybox command set
 
-1. **Normalize the path** with `strip_dot_prefix` before the first
-   `f_open`, into a local `exec_path[USER_PATH_MAX]`.  FatFs
-   rejects a leading `./` with `FR_INVALID_NAME`, so `./test.sh`
-   failed at the open (`sys_execve: f_open(./test.sh) -> 6`)
-   before any retry could run.  The original `path` is kept for
-   `proc_name` and the diagnostic.  Every open attempt uses
-   `exec_path`.
-2. **Return `ENOEXEC`, not `EIO`, for a short non-ELF read.**  A
-   shell script is shorter than the 64-byte ELF header; the old
-   `got != sizeof(ehdr)` check returned `EIO` before the magic
-   test, and ash does not fall back to an interpreter on `EIO`.
-   Now: `fr != FR_OK` â†’ `EIO`; `got < 4` or magic mismatch â†’
-   `ENOEXEC`; short ELF header â†’ `ENOEXEC`; empty file â†’ `ENOEXEC`;
-   file too large â†’ `EIO`.
+Prompted by "carry forward the experimental changes worth
+keeping," we added two kernel syscalls and enabled five applets,
+**each probed first** for `Unknown syscall:` noise:
 
-Both were needed, and each is individually attributable.  The
-`exec_path` change makes the **open** succeed; the `ENOEXEC`
-change makes the **fallback** run; `MAX_PROCESS_FILES` lets ash
-**complete the fork+exec**.
+| Tag | What | Kernel work |
+|---|---|---|
+| `20260929-uname` | `uname(2)` 63 + busybox applet | new syscall |
+| `20260929-lseek` | `lseek(2)` 8 | new syscall |
+| `20260929-busybox-head` | `head` applet | needs `lseek` |
+| `20260929-busybox-tail` | `tail` applet | needs `lseek(SEEK_END)` |
+| `20260929-busybox-cp` | `cp` applet | none |
+| `20260929-busybox-grep` | `grep` applet | none |
+| `20260929-busybox-sed` | `sed` applet | none |
 
-### Verification (session 33)
+**`uname` is not needed for scripting.**  The experimental tree's
+comment attributing `sh: 3: Invalid argument` to a missing `uname`
+was wrong -- that string came from fd exhaustion.  `uname` is a
+correctness port, done for `busybox uname`.
 
-Focused canary green (full table in `docs/session-log.md`,
-"Per-test canary notes (session 33)").  No `Unknown syscall:`
-lines.  The three script invocations, all printing the script
-output:
+**`lseek` was surfaced by `head -n N`,** which seeks to `SEEK_END`
+to size the file.  Without it: `Unknown syscall: 8` after correct
+output.  Backed by `f_lseek`/`f_tell`; result clamped to
+`[0, file_size]`.
 
-```
-$ ./test.sh
-sys_execve: not an ELF file
-sys_execve: pid=5 entry=... argc=2 ... (busybox)
-Hello, world
-EXIT: pid=6 state=2 parent=5 qhead=5
-EXIT: pid=5 state=2 parent=3 qhead=(empty)
+**`cp`, `grep`, `sed` needed no kernel work.**  I had predicted
+`cp` would need `chmod`/`umask`; it did not, because this build
+has `CONFIG_CHMOD` off and `FEATURE_CP_LONG_OPTIONS` off.  See
+the "applet syscall surface depends on compiled features" entry
+in `docs/gotchas.md`.
 
-$ sh test.sh
-sys_execve: pid=7 entry=... argc=2 ... (busybox)
-Hello, world
-EXIT: pid=8 state=2 parent=7 qhead=7
-EXIT: pid=7 state=2 parent=3 qhead=(empty)
+### The docs commit
 
-donix> busybox sh test.sh
-sys_execve: pid=9 entry=... argc=3 ... (busybox)
-Hello, world
-```
+`20260929-docs-session-33` brought `gotchas.md`, `session-log.md`,
+and `handoff.md` up to date for the script-execution work, before
+the applets started.  This session-end doc pass extends that.
 
-The `sys_open: f_open FAIL path=test.sh ... r=4` line on `vi
-test.sh` is the expected vi-opens-nonexistent-file path -- do not
-silence it (see `docs/gotchas.md`).
+### Verification
 
-**Not ported from the experimental tree:** `uname(2)` (syscall
-63) and the extra `busybox.config` applets (cp, mv, grep, sed,
-chmod, ln, head, tail, test, mount, umount, env, ASH_* features).
-Neither is needed for script execution.  Both remain candidates
-for a later milestone.
+Focused canary green (full table in `docs/session-log.md`).
+No `Unknown syscall:` lines.  One-off verifications cover all
+five applets plus `uname` and the three script invocations.
 
-### The `sh: N: ...` messages are not diagnostic
+### Not carried forward from `testme`
 
-Ash's `sh: 3: Invalid argument` and `sh: ./test.sh: not found` are
-generic; they do not name the failing syscall.  Two unrelated bugs
-produced `Invalid argument` this week (fd exhaustion and a
-`uname` `-ENOSYS`).  Read the kernel trace, not the shell message:
+- The extra `busybox.config` applets that need kernel work:
+  `chmod` (90), `ln`, `mv` (needs `rename` 82), `mount`/`umount`.
+- `FEATURE_ALLOW_EXEC` -- proven unnecessary (the kernel-level
+  `ENOEXEC` fix covers the fallback).
+- `env` applet -- `envp` is ignored by `sys_execve`, so it would
+  only work cosmetically.
 
-```
-sys_execve: f_open(<path>) -> <FRESULT>   open stage failed
-sys_execve: not an ELF file               open OK, format rejected
-sys_execve: pid=... entry=... (name)      exec succeeded
-Unknown syscall: N                         missing handler
-```
+`testme` still has these unported changes.  They are deliberately
+left out, not forgotten.
 
-Full writeup in `docs/gotchas.md`.
+### Known limitation surfaced this session
+
+`musl_sh` (`donix>`) does not strip shell quotes.  `busybox sed
+-n '1p' file` fails from there with `sed: unsupported command '`.
+The same command works from `busybox ash`, or without the quotes
+(`sed -n 1p file`).  See `docs/gotchas.md` and
+`docs/open-issues.md`.
 
 ---
 
 ## NEXT SESSION â€” pick a direction
 
-Session 33 closed script execution.  No committed next milestone.
+Session 33 grew large (10 commits).  No committed next milestone.
 The candidate list (`ROADMAP.md`, "After v0.6.4"):
+
+**Wrap and tag `v0.6.5`.**  Session 33 is a coherent milestone:
+"shell scripts run; busybox file utilities work."  If tagged, drop
+all scratch tags first (`20260929-*`, see `git tag`), tag
+`v0.6.5`, rewrite this file, push.
+
+**More applets.**  `wc`, `echo`, `test`, `sort`, `uniq`, `cut`,
+`tr` are pure read/write and would likely need no kernel work.
+Each is its own probe/commit, same as session 33.  `mv` needs
+`rename(2)` (82); `chmod` needs `chmod(2)` (90); both are small
+but not free.
 
 **Small, close gaps:**
 
 1. **`newfstatat` (262)** â€” reserved number, no dispatch case.
-   Small wrapper over `sys_stat` now that cwd resolution exists.
 2. **`sys_open` `O_DIRECTORY` fix** â€” return `-ENOTDIR` when the
-   target is a file.  Latent today, correct to close.
+   target is a file.
 3. **Ctrl-`[` as ESC** â€” `scancode_to_ascii` has no Ctrl parameter
-   yet.  Deferred during the terminal work.
+   yet.
 4. **`sys_utimensat` cwd resolution** â€” found in session 32; it
-   calls `strip_dot_prefix` but not `resolve_against_cwd`, so it
-   resolves against the FAT root in a non-root cwd.
-
-**Broaden busybox coverage** â€” `cp`, `mv`, `grep`, `sed`, `awk`,
-`tar`.  The `busybox.config` additions from the experimental tree
-enable several of these already; each missing syscall is its own
-commit.  Watch for `Unknown syscall: N`.
-
-**Consider tagging `v0.6.5`** â€” session 33 is a coherent
-milestone ("shell scripts run").  If tagged, drop both scratch
-tags first, rewrite this file, and push.
+   calls `strip_dot_prefix` but not `resolve_against_cwd`.
+5. **`musl_sh` quote stripping** â€” the limitation surfaced this
+   session.  A tokenizer fix, userland-only.
 
 **Larger:** pipes and redirection (`pipe(2)`), environment
 variables (`envp`), the VFS layer (`sys_execve`'s three-attempt
@@ -197,12 +195,10 @@ Pick **one**, do it, test it, tag it.  One change at a time.
 
 ## Canary state
 
-**The focused canary is green as of
-`20260929-execve-script-fallback`.**  Full table in
-`docs/session-log.md`.  `./test.sh`, `sh test.sh`, and
-`fault_pf` are one-off verifications, not canary rows -- the
-canary must not mutate the disk, and script execution, vi save,
-and `fault_pf` all do.
+**The focused canary is green as of `20260929-busybox-sed`.**
+Full table in `docs/session-log.md`.  Script execution and the
+applet one-offs are verification, not canary rows -- the canary
+must not mutate the disk.
 
     # on boot, ash is already running
     pwd                         # /
@@ -240,13 +236,14 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 `brkraw`, `brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`,
 `musl_getcwd`, `busybox echo`, `busybox wc hello-world.txt`.
 
-**Canary rows must not mutate the disk.**  A paired
-`mkdir`/`rmdir` row is possible but still mutates, so it stays out
-of the canary.  Use it as a one-off verification instead.
+**Canary rows must not mutate the disk.**  The new applets
+(`head`, `tail`, `grep`, `sed`) are read-only and could be added
+as canary rows.  `cp` mutates, so it stays a one-off.  If a row
+is added, keep it non-mutating: `busybox head -n 1
+hello-world.txt`, etc.
 
 **Expected noise:** none.  The serial log has no `Unknown syscall:`
-lines.  `sys_execve: pid=... (name)` trace lines are informational.
-Two other lines are informational and expected:
+lines.  Two informational lines are expected:
 `EXIT: pid=N state=1 parent=2 qhead=N` (a forked busybox shell's
 own exit) and `EXIT-FALLBACK: switching to idle, ...` (in
 `musl_fork` when the child is the last runnable process).
@@ -263,15 +260,16 @@ own exit) and `EXIT-FALLBACK: switching to idle, ...` (in
 3. `sys_open` accepts non-directories with `O_DIRECTORY`.  Return
    `-ENOTDIR` when the target is a file.
 4. `sys_utimensat` lacks `resolve_against_cwd` (found session 32).
-5. Fork is O(~6 MB) per call â€” real COW is the long-term fix.
+5. `musl_sh` does not strip shell quotes (surfaced session 33).
 
 Also open: `sys_munmap` is a stub returning 0; `sys_brk`'s fixed
 `heap_base` and the 4 MB mmap window are latent collisions; real
 FatFs timestamp storage (the three timestamp syscalls return 0
 without storing); `prctl` is minimal (`PR_SET_NAME` accepted and
 dropped); busybox applet symlinks not installed; syscall-table
-audit script; `musl_sh` echoes garbage on backspace; `musl_wait`'s
-WNOHANG loop spins.
+audit script; `musl_wait`'s WNOHANG loop spins; `sys_mmap`
+rejects all non-anonymous mappings (a file-backed `mmap` caller
+will get `-ENOMEM` and must fall back to `read`).
 
 ---
 
@@ -286,7 +284,9 @@ Config and source locations (relative to whichever root is being
 edited; both trees have the same top-level layout):
 
 - `configs/busybox.config` â€” tracked canonical busybox config.
-  Enables `CONFIG_VI`, `CONFIG_TOUCH`, `CONFIG_RM`, `CONFIG_RMDIR`.
+  Enables `CONFIG_VI`, `CONFIG_TOUCH`, `CONFIG_RM`, `CONFIG_RMDIR`,
+  `CONFIG_UNAME`, `CONFIG_HEAD`, `CONFIG_TAIL`, `CONFIG_CP`,
+  `CONFIG_GREP`, `CONFIG_SED`.
 - `userland/musl/` â€” tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
@@ -306,10 +306,9 @@ Scratch copies from earlier exploring:
   bisection experiment.  Safe to delete.
 
 **`testme` still has unported changes** from the session-33 work:
-`include/syscall.h` (+`SYS_UNAME` 63), `user_syscall.c` (`sys_uname`
-+ dispatch case), `configs/busybox.config` (extra applets), and
-`include/process.h` (the 8â†’64 already ported).  The `uname` and
-config changes are deliberately left unported; see above.
+`configs/busybox.config` (the extra applets), and the deliberate
+non-port of `FEATURE_ALLOW_EXEC` and `env`.  See "Not carried
+forward" above.
 
 Docs live under `docs/` in each tree; see below.
 
@@ -340,12 +339,11 @@ needs it.  Paths below are relative to a tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Session 33: shell scripts run â€” `sh script`,
-`./script`, and `busybox sh script` all work, via a per-process fd
-table raised to 64 and two coordinated `sys_execve` fixes (strip
-`./` before open; return `ENOEXEC` for short non-ELF).  Session
-34: pick one item from ROADMAP.md's "After v0.6.4" list, or tag
-`v0.6.5`.  One change at a time.**
+`userland/musl/`.  Session 33: shell scripts run, and the busybox
+file-utility set (head, tail, cp, grep, sed) works, on top of two
+new syscalls (uname 63, lseek 8).  Ten commits, all scratch-tagged,
+unpushed.  Session 34: either tag `v0.6.5`, or pick one item from
+ROADMAP.md's "After v0.6.4" list.  One change at a time.**
 
 ---
 

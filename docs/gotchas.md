@@ -335,6 +335,35 @@ fresh and which are long-settled.
   worked before this fix only because ash happened to pass a bare
   name with no `./`.  (Learned 2026-09-29, session 33.)
 
+- **An applet's syscall surface depends on which busybox features
+  are compiled in, not on the applet name.**  Session 33 enabled
+  `cp` expecting it to call `chmod(2)` (90) and `umask(2)` (95),
+  based on what Linux `cp` does.  It called neither.  Why: this
+  build has `CONFIG_CHMOD` off and `FEATURE_CP_LONG_OPTIONS` off,
+  so `cp` never tries to replicate the source mode and never
+  consults the umask; basic `cp src dst` is a straight read/write
+  loop.  `rename(2)` (82) was not called either, because basic
+  `cp` onto a non-existent destination is not a temp+rename.
+
+  The lesson: do NOT predict an applet's syscalls from the applet
+  name alone.  Enable the applet, rebuild, run it, and read the
+  serial log for `Unknown syscall:`.  If any appear, add the
+  syscall as its own kernel commit *first*, disable the applet,
+  commit the syscall, then re-enable the applet in a second commit.
+  That is how `head` -> `lseek` was done (session 33): enable
+  `head`, see `Unknown syscall: 8`, disable `head`, add
+  `sys_lseek`, commit it, re-enable `head`, commit that.  (Learned
+  2026-09-29, session 33.)
+
+- **busybox `grep` does not `mmap` the file, so donix's
+  reject-non-anonymous `sys_mmap` is not in the way.**  donix's
+  `sys_mmap` returns `-ENOMEM` for any mapping where `fd != -1` or
+  `MAP_ANONYMOUS` is not set (see the mmap section).  A future
+  applet that does `mmap(fd, ...)` for a file will get `-ENOMEM`
+  and must fall back to `read`.  `grep` and `sed`, at least in this
+  build, read sequentially and never hit it.  (Learned 2026-09-29,
+  session 33.)
+
 ### Exceptions / faults
 
 - **A user-mode `#PF` error code carries the ring in bit 2; a `#GP`
@@ -423,13 +452,44 @@ blocking poll blocks on fd 0 with timeout < 0; ftruncate seeks
 then truncates; utimes/futimesat/utimensat are no-op stubs that
 verify the path exists; sys_chdir resolves against cwd; rmdir
 mirrors unlink with f_unlink; execve strips ./ before open;
-execve returns ENOEXEC for short non-ELF)
+execve returns ENOEXEC for short non-ELF; lseek is 8, absent
+until session 33, seeks via f_lseek and returns f_tell)
 
 ## Build system
 (existing entries)
 
 ## Musl userland tree
 (existing entries)
+
+## musl_sh does not strip shell quotes
+
+`userland/musl/apps/musl_sh.c` (`donix>`'s shell) does not
+implement quote removal.  A command typed at `donix>` with single
+or double quotes reaches the child program with the quote
+characters still in the argv string.  busybox `sed` then reports
+
+    sed: unsupported command '
+
+because its first argument is literally `'1p'` (with the leading
+quote), not `1p`.
+
+**Symptom:** `donix> busybox sed -n '1p' file` fails; the same
+command from `busybox ash` (where quote removal works) succeeds.
+
+**Workarounds:**
+  - Run the command through `busybox ash`: `donix> busybox sh`,
+    then `sed -n '1p' file` at the ash prompt.
+  - Or omit the quotes where the shell would accept it and the
+    program does not need them: `donix> busybox sed -n 1p file`.
+    (Note that omitting quotes can change semantics: `sed 1p file`
+    without `-n` prints every line *plus* line 1 again, because
+    sed's default-print behavior still applies.  Quote-free is
+    not always equivalent.)
+
+**This is a musl_sh limitation, not a kernel or busybox issue.**
+A real fix is quote removal in `musl_sh`'s tokenizer; until then,
+quote-dependent commands go through ash.  Tracked in
+`docs/open-issues.md`.  (Learned 2026-09-29, session 33.)
 
 ## Git hygiene
 (cross-reference: full text in docs/strategy.md)

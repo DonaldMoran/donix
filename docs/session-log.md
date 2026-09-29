@@ -7,30 +7,71 @@ already records.  Working tags are local and permanent.
 |-----|------|
 | `20260929-max-process-files-64` | process: raise MAX_PROCESS_FILES 8 -> 64; `sh script.sh` works |
 | `20260929-execve-script-fallback` | execve: strip `./` before open; return ENOEXEC for short non-ELF; `./script.sh` works |
+| `20260929-docs-session-33` | docs: session 33 -- script execution, MAX_PROCESS_FILES, execve fixes |
+| `20260929-uname` | uname: implement uname(2) -- syscall 63; enable busybox applet |
+| `20260929-lseek` | kernel: implement lseek(2) -- syscall 8 |
+| `20260929-busybox-head` | busybox: enable head applet |
+| `20260929-busybox-tail` | busybox: enable tail applet |
+| `20260929-busybox-cp` | busybox: enable cp applet |
+| `20260929-busybox-grep` | busybox: enable grep applet |
+| `20260929-busybox-sed` | busybox: enable sed applet |
 
-**Shell scripts run.**  Two commits, both on `dev`, both scratch-
-tagged (local, dropped before the next `v*` push):
+**Shell scripts run; busybox file utilities enabled.**  Ten
+commits on `dev`, all scratch-tagged (local, dropped before the
+next `v*` push).
+
+Three kernel fixes made script execution work:
 
 - `MAX_PROCESS_FILES` 8 -> 64.  At 8, busybox ash's script
   fork+exec path fails with `sh: 3: Invalid argument`; at 64 the
   same script prints its output.  Controlled: same build, same
-  script, only the constant varied.  Cost +448 B/pcb; assembly-safe
-  (offset past `block_kind`).
-
-- `sys_execve`: two coordinated fixes.  (1) Normalize the path
-  with `strip_dot_prefix` before the first `f_open`, so `./test.sh`
-  no longer fails with `FR_INVALID_NAME` at the open.  (2) Return
-  `ENOEXEC`, not `EIO`, for a short non-ELF read, so ash falls back
-  to running the script through `sh`.
+  script, only the constant varied.  Cost +448 B/pcb;
+  assembly-safe (offset past `block_kind`).
+- `sys_execve`: normalize the path with `strip_dot_prefix` before
+  the first `f_open`, so `./test.sh` no longer fails with
+  `FR_INVALID_NAME` at the open.
+- `sys_execve`: return `ENOEXEC`, not `EIO`, for a short non-ELF
+  read, so ash falls back to running the script through `sh`.
 
 Result: `./test.sh`, `sh test.sh`, and `busybox sh test.sh` from
-`donix>` all print the script output.  Verified by the focused
-canary (below) plus the three one-off script invocations.  No
-`Unknown syscall:` lines.
+`donix>` all print the script output.
 
-Not ported from the experimental tree: `uname(2)` and the extra
-`busybox.config` applets.  Neither is needed for script execution;
-both remain candidates for a later milestone.
+Then two kernel syscalls added, each surfaced by an applet:
+
+- `uname(2)` -- 63.  Not needed for scripting; the experimental
+  tree's comment attributing the script failure to a missing
+  uname was wrong.  Added for correctness; `busybox uname` /
+  `uname -a` work.
+- `lseek(2)` -- 8.  Surfaced by `head -n N`, which seeks to
+  `SEEK_END` to size the file.  Without it: `Unknown syscall: 8`
+  after correct output.  Backed by `f_lseek` / `f_tell`;
+  `SEEK_SET`/`CUR`/`END` mapped to absolute offsets; result
+  clamped to `[0, file_size]` (FatFs cannot seek past EOF, Linux
+  can; nothing needs it yet).
+
+Then six applets enabled, each probed first for `Unknown
+syscall:` noise:
+
+| Applet | Kernel support needed |
+|---|---|
+| `head` | `lseek` (added above) |
+| `tail` | `lseek` `SEEK_END` with negative offset |
+| `cp` | none -- plain read/write |
+| `grep` | none -- sequential read, no mmap |
+| `sed` | none -- sequential read/write |
+
+Not ported from the experimental tree: the extra
+`busybox.config` applets that need kernel work (`chmod`, `ln`,
+`mv`, `mount`) and `FEATURE_ALLOW_EXEC` (proven unnecessary).
+The `uname` and `busybox.config` changes from testme are now
+either ported (`uname`) or deliberately left out (the applets
+needing syscalls donix lacks).
+
+**Note on `musl_sh` quoting:** `donix>` (musl_sh) does not strip
+shell quotes, so `busybox sed -n '1p' file` fails from there
+with `sed: unsupported command '`.  The same command works from
+`busybox ash` or without the quotes.  See `docs/gotchas.md`,
+"musl_sh does not strip shell quotes."
 
 ## Session 32 (2026-09-29)
 | Tag | What |
@@ -199,8 +240,8 @@ tags no longer resolve -- the commit messages are the record)
 
 ## Per-test canary notes (session 33)
 
-Focused canary, boot-into-ash, cwd-aware — green as of the
-`20260929-execve-script-fallback` commit:
+Focused canary, boot-into-ash, cwd-aware — green as of
+`20260929-busybox-sed`:
 
 | Row | Result |
 |-----|--------|
@@ -241,11 +282,26 @@ lines appear and are expected:
 One-off verifications (not canary rows — they mutate the disk or
 crash the process):
 
-- **Script execution, three ways** (new this session):
+- **Script execution, three ways** (new in session 33):
   - `./test.sh` → `Hello, world` (kernel: `sys_execve: not an ELF
     file` → ash fallback → fork+sh → child runs script).
   - `sh test.sh` → `Hello, world`.
   - `busybox sh test.sh` from `donix>` → `Hello, world`.
+- **`uname`**: `busybox uname` → `Linux`; `busybox uname -a` →
+  `Linux donix 6.0.0 #1 donix x86_64`.
+- **`head`**: `busybox head -n 3` / `-n 1` / default against
+  `hello-world.txt` → expected lines.  Exercises `lseek`.
+- **`tail`**: `busybox tail -n 1` / `-n 2` / default → expected
+  lines.  Exercises `lseek(SEEK_END, negative)`.
+- **`cp`**: `busybox cp hello-world.txt copy.txt`; `cat copy.txt`
+  matches; `ls copy.txt` finds it.
+- **`grep`**: `busybox grep Hello hello-world.txt` prints the
+  matching line; `grep hello` (lowercase) prints nothing
+  (case-sensitive); `grep nosuchstring` prints nothing.
+- **`sed`**: `busybox sed -n '1p'` / `sed 's/Hello/Goodbye/'` /
+  `sed 's/fatcat/FATCAT/'` from ash → expected output.  From
+  `donix>` the quotes must be omitted (musl_sh does not strip
+  quotes); `sed -n 1p` works.
 - vi round-trip: `vi test.sh`, edit, `:wq`, `cat test.sh` reads
   the text back.
 - `fault_pf` — user-mode `#PF`, process killed, shell returns.
