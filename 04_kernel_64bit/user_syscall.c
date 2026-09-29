@@ -1804,7 +1804,27 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         __asm__ volatile("sti");
         return -(long)EFAULT_;
     }
-
+    /*
+     * Normalize the path for FatFs: strip any leading "./" or "/"
+     * so a path like "./test.sh" becomes "test.sh".  FatFs rejects
+     * a leading "." or "/" with FR_INVALID_NAME, so without this
+     * the first f_open below fails before any retry can run, and
+     * `./script.sh` never reaches the interpreter fallback.
+     *
+     * The caller's original `path` is kept for the proc_name
+     * extraction in section 4.
+     */
+    char exec_path[USER_PATH_MAX];
+    {
+        size_t i = 0;
+        while (path[i] && i < sizeof(exec_path) - 1) {
+            exec_path[i] = path[i];
+            i++;
+        }
+        exec_path[i] = '\0';
+        strip_dot_prefix(exec_path);
+    }
+    
     /* ---- 2. Open and read the whole ELF file. ----
      *
      * Three attempts, in order:
@@ -1844,10 +1864,10 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * exec_resolve_bin_name.
      */
     FIL file;
-    FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
+    FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
     if (fr != FR_OK) {
         int has_drive = 0;
-        for (const char* p = path; *p; p++) {
+        for (const char* p = exec_path; *p; p++) {
             if (*p == ':') { has_drive = 1; break; }
         }
 
@@ -1859,15 +1879,15 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
          * drive prefix FatFs requires.  No uppercasing, no
          * ".ELF" appended.
          */
-        if (!has_drive && path[0] == '/') {
+        if (!has_drive && exec_path[0] == '/') {
             char resolved[USER_PATH_MAX];
             size_t plen = 0;
-            while (path[plen]) plen++;
+            while (exec_path[plen]) plen++;
             if (plen + 3 <= sizeof(resolved)) {   /* "0:" + path + NUL */
                 resolved[0] = '0';
                 resolved[1] = ':';
                 for (size_t i = 0; i <= plen; i++) {
-                    resolved[2 + i] = path[i];
+                    resolved[2 + i] = exec_path[i];
                 }
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1892,7 +1912,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             char resolved[USER_PATH_MAX];
 
             /* (c1) root, uppercased, .ELF appended. */
-            if (exec_resolve_bare_name(path, resolved,
+            if (exec_resolve_bare_name(exec_path, resolved,
                                        sizeof(resolved)) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1903,7 +1923,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             /* (c2) /bin, uppercased, as-is (no .ELF). */
             if (fr != FR_OK &&
-                exec_resolve_bin_name(path, resolved,
+                exec_resolve_bin_name(exec_path, resolved,
                                       sizeof(resolved), 0) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1914,7 +1934,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             /* (c3) /bin, uppercased, .ELF appended. */
             if (fr != FR_OK &&
-                exec_resolve_bin_name(path, resolved,
+                exec_resolve_bin_name(exec_path, resolved,
                                       sizeof(resolved), 1) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1938,16 +1958,41 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     Elf64_Ehdr ehdr;
     UINT got = 0;
     fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
-    if (fr != FR_OK || got != sizeof(ehdr)) {
-        serial_print("sys_execve: short read of ELF header\n");
+    if (fr != FR_OK) {
+        serial_print("sys_execve: f_read header failed\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
     }
 
-    if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
+    /*
+     * A short read here is NOT an I/O error.  The file may simply
+     * be shorter than an ELF header -- a shell script, for example.
+     * What matters is whether the bytes we did read start with the
+     * ELF magic.  If they do, the file claims to be an ELF and we
+     * then require the full 64-byte header.  If they do not, this
+     * is not an ELF and the correct errno is ENOEXEC, which tells
+     * the caller's shell to fall back to running the file through
+     * an interpreter.
+     *
+     * Returning EIO for a short non-ELF file is what broke
+     * `./script.sh`: busybox ash only falls back to `sh script.sh`
+     * when execve returns ENOEXEC; on EIO it prints "I/O error"
+     * and gives up.
+     */
+    if (got < 4 ||
+        ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
         serial_print("sys_execve: not an ELF file\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -(long)ENOEXEC;
+    }
+
+    /* The magic matched: it claims to be an ELF, so require the
+     * full header. */
+    if (got != sizeof(ehdr)) {
+        serial_print("sys_execve: short ELF header\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOEXEC;
@@ -1965,8 +2010,14 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     FSIZE_t file_size = f_size(&file);
-    if (file_size == 0 || file_size > 4ULL * 1024 * 1024) {
-        serial_print("sys_execve: file size out of range\n");
+    if (file_size == 0) {
+        serial_print("sys_execve: empty file\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -(long)ENOEXEC;
+    }
+    if (file_size > 4ULL * 1024 * 1024) {
+        serial_print("sys_execve: file too large\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
