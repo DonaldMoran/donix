@@ -918,9 +918,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.3\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.4\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.3 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.4 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1154,13 +1154,35 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.3\n> ");
+    vga_print("donix v0.6.4\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
         if (kbd_buffer_get(&c)) {
-            if (c == '\b') { if (cmd_pos > 0) { cmd_pos--; vga_putc('\b'); } continue; }
-            if (c == '\n') {
+            /*
+             * Input bytes are the Unix terminal convention, matching
+             * what keyboard.c delivers since session 31 and what every
+             * other reader in the system (musl_sh, busybox ash) already
+             * expects:
+             *
+             *   Backspace -> 0x7F (DEL), not 0x08 (BS)
+             *   Enter     -> 0x0D (CR),  not 0x0A (LF)
+             *
+             * The previous comparisons ('\b' and '\n') predate that
+             * change.  With DEL and CR arriving, neither byte matched:
+             * Enter was dropped (CR < ' '), so the line never
+             * terminated, and Backspace was dropped (DEL > '~'), so
+             * nothing was erased.
+             *
+             * The echo calls below still use '\b' and '\n' -- those
+             * are VGA OUTPUT control codes, not input bytes, and are
+             * unaffected by what the keyboard delivers.
+             */
+            if (c == 0x7F) {
+                if (cmd_pos > 0) { cmd_pos--; vga_putc('\b'); }
+                continue;
+            }
+            if (c == '\r') {
                 vga_putc('\n'); cmd_buffer[cmd_pos] = '\0';
                 handle_command(cmd_buffer); cmd_pos = 0; continue;
             }
