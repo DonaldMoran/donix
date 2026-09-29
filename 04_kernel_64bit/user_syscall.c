@@ -2600,6 +2600,45 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
 }
 
 /*
+ * Linux x86_64 readv(2) — syscall 19.
+ *
+ * Mirror of sys_writev (20).  Reads into each iovec in turn,
+ * accumulating the total; stops early on a short read, exactly as
+ * writev stops on a short write.  The same iov-copy discipline
+ * applies: the iov array is a user pointer and must be copied
+ * through safe_copy_from_user, not dereferenced directly.  The
+ * same WRITEV_MAX_IOVS cap bounds the kernel-stack copy.
+ *
+ * WHY THIS EXISTS: busybox `od -c` calls readv to read the file it
+ * is formatting.  Without syscall 19, `od` got -ENOSYS and logged
+ * "Unknown syscall: 19" and failed.  `od` is off until this lands;
+ * it is re-enabled in the next commit.
+ *
+ * `struct iovec` and WRITEV_MAX_IOVS are defined above, at the
+ * writev section -- both syscalls share them.
+ */
+long sys_readv(int fd, const struct iovec* user_iov, int iovcnt) {
+    if (!user_iov || iovcnt <= 0) return -(long)EINVAL_;
+    if (iovcnt > WRITEV_MAX_IOVS) return -(long)EINVAL_;
+
+    struct iovec local[WRITEV_MAX_IOVS];
+    size_t bytes = (size_t)iovcnt * sizeof(struct iovec);
+    if (safe_copy_from_user(local, user_iov, bytes) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (local[i].iov_len == 0) continue;
+        long n = sys_read(fd, local[i].iov_base, local[i].iov_len);
+        if (n < 0) return (total > 0) ? total : n;
+        total += n;
+        if ((size_t)n < local[i].iov_len) break;  /* short read — stop */
+    }
+    return total;
+}
+
+/*
  * Linux x86_64 ftruncate(2) — syscall 77.
  *
  * Confirmed against arch/x86/entry/syscalls/syscall_64.tbl:
@@ -4200,6 +4239,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
+        case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);

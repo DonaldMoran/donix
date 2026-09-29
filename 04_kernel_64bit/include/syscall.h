@@ -62,6 +62,7 @@
  *  13  rt_sigaction      sys_rt_sigaction  (stub)
  *  14  rt_sigprocmask    sys_rt_sigprocmask(stub)
  *  16  ioctl             sys_ioctl
+ *  19  readv             sys_readv
  *  20  writev            sys_writev
  *  21  access            sys_access
  *  33  dup2              sys_dup2
@@ -137,6 +138,7 @@
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
 #define SYS_IOCTL           16
+#define SYS_READV           19
 #define SYS_WRITEV          20
 #define SYS_ACCESS          21
 #define SYS_DUP2            33
