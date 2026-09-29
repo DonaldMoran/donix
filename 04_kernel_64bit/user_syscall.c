@@ -1018,8 +1018,21 @@ long sys_unlink(const char* path) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
@@ -1077,8 +1090,21 @@ long sys_mkdir(const char* path, int mode) {
     if (!self || !path) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(self, local_path, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    {
+        size_t i = 0;
+        while (resolved[i] && i < sizeof(local_path) - 1) {
+            local_path[i] = resolved[i];
+            i++;
+        }
+        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
