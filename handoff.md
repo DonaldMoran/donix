@@ -3,14 +3,15 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-30 (post-`v0.6.6`, `musl_sh` work)
-**Current HEAD:** tag `20260930-nodebug`, branch `dev`
+**Last updated:** 2026-09-30 (post-`v0.6.6`, `musl_sh` work + `cat`)
+**Current HEAD:** tag `20260930-cat`, branch `dev`
 **Last milestone:** `v0.6.6` (published) — `pipe(2)` done, pipelines
 work
-**Milestone status:** **no bump this session.**  Six commits on
-`dev`, scratch-tagged, unpushed.  A `v0.6.7` bump is deferred until
-the accumulated changes feel substantial enough; until then the
-scratch tags carry the narrative.
+**Milestone status:** **no bump this session.**  Eight commits on
+`dev`, scratch-tagged, unpushed (six `musl_sh` + one docs + one
+`cat`).  A `v0.6.7` bump is deferred until the accumulated changes
+feel substantial enough; until then the scratch tags carry the
+narrative.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026093x-*`) are local scratch restore points** — they exist while
@@ -82,10 +83,15 @@ Six commits on `dev`, scratch-tagged, unpushed:
 | `20260930-seq` | `;` and `&&`; builtins report their own status |
 | (untagged) | `configs/busybox.config`: enable `false`, `true`, `yes`, `seq`, `clear` |
 | `20260930-pipe` | `\|`; `fork_child` refactor; N-stage pipelines |
-| `20260930-nodebug` | remove the tokenizer debug print (HEAD) |
+| `20260930-nodebug` | remove the tokenizer debug print |
+
+Followed by:
+- `20260930-docs` — the session-37 documentation pass.
+- `20260930-cat` — donix-native `cat` gained stdin mode, multiple
+  files, and `-` (so `cat < file` works without busybox).  HEAD.
 
 Full per-commit narrative: `docs/session-log.md`, Session 37.
-`git log --oneline v0.6.6..HEAD` shows exactly these six.
+`git log --oneline v0.6.6..HEAD` shows all eight.
 
 **What the shell does now:** `donix>` tokenizes a line into argv
 (quote-aware, operators split out), parses redirection and pipelines,
@@ -130,39 +136,22 @@ the stdio-guard inversion that made pipelines actually run.
 
 ---
 
-## NEXT SESSION — donix-native applet: `cat` stdin mode
+## NEXT SESSION — `sys_open` `O_DIRECTORY`, then the framebuffer
 
-**Recommended first item: give `cat.elf` a stdin mode.**  This is
-the most visible wart the `musl_sh` work surfaced.  `donix`'s own
-`cat` requires a filename argument:
+**Recommended first item: `sys_open` `O_DIRECTORY` fix.**  Return
+`-ENOTDIR` when the target is a file.  Small kernel change,
+well-scoped, a correctness fix rather than a feature.  This was the
+second item last session; `cat` stdin mode (the first) is done.
 
-    donix> cat < out.txt
-    usage: cat FILE
-
-while busybox's `cat` reads stdin happily:
-
-    donix> busybox cat < out.txt
-    hi
-
-Redirection now works from `donix>`; the project's own `cat` should
-demonstrate it rather than delegating to busybox.  This is
-userland-only (`userland/musl/apps/cat.c`), small, needs no kernel
-change, and it is the same "make our own tool do what busybox does"
-motive that drove the `musl_sh` work.
-
-**Second item: `sys_open` `O_DIRECTORY` fix.**  Return `-ENOTDIR`
-when the target is a file.  Small kernel change, well-scoped, a
-correctness fix rather than a feature.
-
-**Third item (higher value than the two above, listed third by
-choice): a framebuffer console, then Terminus.**
+**Second item (higher value, listed second by choice): a
+framebuffer console, then Terminus.**
 
 The VGA text-mode console is hard to read in a half-screen QEMU
 window on a widescreen monitor.  That makes development itself
 painful, which is why this item is worth more than its position
 suggests — it pays back every future session.  It is listed after
-`cat` and `O_DIRECTORY` only because those are smaller and were
-already queued; swapping this to first is justified.
+`O_DIRECTORY` only because that is smaller and was already queued;
+swapping this to first is justified.
 
 **This is a build, not a revive.**  A framebuffer was built in an
 earlier session but it lived in a scratch tree that no longer
@@ -265,14 +254,15 @@ These are the milestone's headline verification.  `cat | head`
 exercises blocking on both ends; `echo hi | wc` exercises EOF; `echo
 hello | cat` is the smallest end-to-end case.
 
-**Redirection rows (verified this session, runnable from `donix>`):**
+**Redirection rows (verified session 37, runnable from `donix>`):**
 
     echo hi > out.txt ; cat out.txt
     echo hi2 >> out.txt ; cat out.txt
+    cat < out.txt
     busybox cat < out.txt
 
-(`cat < out.txt` with donix-native `cat` fails — that is the item
-`NEXT SESSION` targets.)
+(`cat < out.txt` with donix-native `cat` works as of session 37 —
+`cat.elf` gained stdin mode, multiple files, and `-`.)
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
@@ -336,7 +326,7 @@ expected diagnostics on failure paths.
    means implementing signal delivery.
 
 Also open: `newfstatat` (262) reserved, no dispatch case; `sys_open`
-accepts non-directories with `O_DIRECTORY`; Ctrl- `[` not mapped to
+accepts non-directories with `O_DIRECTORY`; Ctrl-`[` not mapped to
 ESC; `sys_utimensat` lacks `resolve_against_cwd`; `sys_munmap` is a
 stub returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap
 window are latent collisions; real FatFs timestamp storage;
@@ -416,10 +406,10 @@ Newlib is gone.  The userland is a tracked source tree at
 pipelines).  Session 37 made `donix>`'s own shell real: quote
 stripping, `<`/`>`/`>>`/`|`/`&&`/`;` parsing, sequences, and
 pipelines — all userland, no kernel change — committed on `dev`,
-scratch-tagged, milestone deferred.  Next: donix-native `cat` stdin
-mode, then a framebuffer console with Terminus (which is the
-higher-value item even though it is listed third).  One change at a
-time.**
+scratch-tagged, milestone deferred.  Session 37 also gave
+donix-native `cat` a stdin mode (`cat < f` works without busybox).
+Next: `sys_open` `O_DIRECTORY`, then a framebuffer console with
+Terminus (the higher-value item).  One change at a time.**
 
 ---
 
