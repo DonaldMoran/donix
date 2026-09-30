@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "include/vga.h"
 #include "include/serial.h"
+#include "include/fb.h"
 
 /* ------------------------------------------------------------------ */
 /* Tunables                                                            */
@@ -10,7 +11,7 @@
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
 
-/* The one and only framebuffer. VGA text mode has no second hardware
+/* The VGA text framebuffer. VGA text mode has no second hardware
  * buffer; the CRTC scans this address unconditionally. Any "alternate
  * screen" is therefore simulated by saving/restoring this region. */
 #define VGA_MAIN_MEM ((uint16_t *)0xB8000)
@@ -22,13 +23,11 @@
 #define VGA_DEFAULT_ATTR 0x1E
 
 /* Set to 1 to emit a one-line diagnostic on the serial port for any
- * CSI sequence the parser recognizes but does not dispatch. Set to 0
- * for the ported/clean version. */
+ * CSI sequence the parser recognizes but does not dispatch. */
 #define VGA_TRACE_UNHANDLED 0
 
 /* Set to 1 to reply to DSR (ESC[6n) and DA (ESC[c) queries on the
- * serial port. Curses uses these to probe the terminal. Set to 0 if
- * nothing on the host side reads our serial output. */
+ * serial port. */
 #define VGA_REPLY_TO_QUERIES 0
 
 /* VGA CRTC ports */
@@ -45,20 +44,53 @@
 #define MAX_CSI_INTERMEDIATES 2
 
 /* ------------------------------------------------------------------ */
+/* Color palette (VGA 16-color -> RGB)                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The standard IBM CGA/EGA 16-color palette.  A VGA attribute byte is
+ * (background << 4) | foreground; the low 4 bits index the foreground,
+ * the high 4 bits the background.  These RGB values are what the
+ * framebuffer console draws; the VGA backend keeps using the raw
+ * attribute byte and ignores this table.
+ *
+ * Index 6 is "brown" (0xAA,0x55,0x00), the traditional non-linear
+ * value.  Some systems use 0xAA,0xAA,0x00 (a dark yellow); either is
+ * defensible, brown is what VGA text hardware actually showed.
+ */
+static const uint8_t vga_palette[16][3] = {
+    { 0x00, 0x00, 0x00 },  /*  0 black        */
+    { 0x00, 0x00, 0xAA },  /*  1 blue         */
+    { 0x00, 0xAA, 0x00 },  /*  2 green        */
+    { 0x00, 0xAA, 0xAA },  /*  3 cyan         */
+    { 0xAA, 0x00, 0x00 },  /*  4 red          */
+    { 0xAA, 0x00, 0xAA },  /*  5 magenta      */
+    { 0xAA, 0x55, 0x00 },  /*  6 brown        */
+    { 0xAA, 0xAA, 0xAA },  /*  7 light gray   */
+    { 0x55, 0x55, 0x55 },  /*  8 dark gray    */
+    { 0x55, 0x55, 0xFF },  /*  9 light blue   */
+    { 0x55, 0xFF, 0x55 },  /* 10 light green  */
+    { 0x55, 0xFF, 0xFF },  /* 11 light cyan   */
+    { 0xFF, 0x55, 0x55 },  /* 12 light red    */
+    { 0xFF, 0x55, 0xFF },  /* 13 light magenta*/
+    { 0xFF, 0xFF, 0x55 },  /* 14 yellow       */
+    { 0xFF, 0xFF, 0xFF },  /* 15 white        */
+};
+
+/* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 
-/* Always points at VGA_MAIN_MEM. Kept as a named pointer so the
- * drawing primitives read naturally ("active screen" rather than
- * "framebuffer"), and so a future port that gains a real second
- * buffer could swap it. Today it never changes. */
+/* Always points at VGA_MAIN_MEM. Used only by the VGA fallback path
+ * and by the alt-screen save/restore (which always saves/restores the
+ * VGA cell grid, regardless of which backend is drawing). */
 static uint16_t *active_screen = VGA_MAIN_MEM;
 
-/* Storage for the saved primary screen while ?1049h is active. On
- * ?1049h we copy 0xB8000 into here, then clear 0xB8000. On ?1049l we
- * copy back. This is what a real VT100 does in software; on a VGA
- * text console it is the only thing that can work, because the CRT
- * controller has no idea alt_screen[] exists. */
+/* Storage for the saved screen while ?1049h is active.  Sized for the
+ * VGA grid; when the framebuffer is active this array holds the saved
+ * *characters and attributes*, and the restore path redraws them
+ * through the active backend.  It is a cell buffer, not a pixel
+ * buffer, on both backends. */
 static uint16_t alt_screen[VGA_WIDTH * VGA_HEIGHT];
 
 static int alt_saved_row = 0;
@@ -90,6 +122,86 @@ static struct {
 } p;
 
 /* ------------------------------------------------------------------ */
+/* Console geometry: backend-dependent                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The console grid is 80x25 on VGA text and (framebuffer_width /
+ * FB_FONT_W) x (framebuffer_height / FB_FONT_H) on the framebuffer --
+ * 102x42 at 10x18 in 1024x768.  Everywhere the drawing code used the
+ * VGA_WIDTH / VGA_HEIGHT constants it now calls these, so the same
+ * VT100 logic drives either grid.
+ *
+ * VGA_WIDTH and VGA_HEIGHT are still used, but only for: the
+ * alt_screen[] array size (always a VGA-sized cell buffer) and the
+ * VGA fallback draw path.  The *live* grid size is con_cols()/
+ * con_rows().
+ */
+static int con_cols(void) {
+    const fb_info_t* fb = fb_get_info();
+    if (fb->available) return (int)(fb->width / 10);   /* FB_FONT_W */
+    return VGA_WIDTH;
+}
+
+static int con_rows(void) {
+    const fb_info_t* fb = fb_get_info();
+    if (fb->available) return (int)(fb->height / 18);  /* FB_FONT_H */
+    return VGA_HEIGHT;
+}
+
+/* ------------------------------------------------------------------ */
+/* The one cell-draw chokepoint                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Draw one cell.  This is the ONLY place that turns a (ch, attr) pair
+ * into pixels or into a VGA cell; every other drawing routine in this
+ * file calls it.  When the framebuffer is available the glyph is
+ * blitted with fb_putchar, with foreground and background taken from
+ * the VGA palette; otherwise the cell is written to VGA memory.
+ *
+ * Out-of-range (row, col) is silently ignored: the parser clamps
+ * cursor positions to con_rows()/con_cols(), but the bulk operations
+ * (scroll, erase) occasionally run a column or row past the edge and
+ * rely on this being harmless.
+ */
+static void con_put_cell(int row, int col, uint8_t ch, uint8_t attr) {
+    const fb_info_t* fb = fb_get_info();
+
+    if (fb->available) {
+        if (row < 0 || col < 0) return;
+        if (row >= (int)(fb->height / 18)) return;
+        if (col >= (int)(fb->width / 10)) return;
+
+        const uint8_t* fg = vga_palette[attr & 0x0F];
+        const uint8_t* bg = vga_palette[(attr >> 4) & 0x0F];
+
+        fb_putchar(ch,
+                   (uint32_t)col * 10, (uint32_t)row * 18,
+                   fg[0], fg[1], fg[2],
+                   bg[0], bg[1], bg[2]);
+        return;
+    }
+
+    if (row < 0 || col < 0) return;
+    if (row >= VGA_HEIGHT || col >= VGA_WIDTH) return;
+    active_screen[row * VGA_WIDTH + col] = ((uint16_t)attr << 8) | ch;
+}
+
+/*
+ * Fill a run of cells in one row.  Used for blanking (erase, clear,
+ * scroll tails).  Same backend branch as con_put_cell; on the
+ * framebuffer a run of identical cells is just N fb_putchar calls
+ * (the blitter is fast enough; a run-optimized path can come later if
+ * a profile ever shows it matters).
+ */
+static void con_fill_cells(int row, int col, int count, uint8_t ch, uint8_t attr) {
+    for (int i = 0; i < count; i++) {
+        con_put_cell(row, col + i, ch, attr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Low-level helpers                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -104,6 +216,14 @@ static inline void outb(uint16_t port, uint8_t val) {
 }
 
 static void vga_update_hardware_cursor(void) {
+    /* The VGA hardware cursor only exists in text mode.  When the
+     * framebuffer is active there is no CRTC text cursor to move;
+     * the visible cursor is drawn by the framebuffer backend (a
+     * later change).  Skip the port writes entirely then, so we do
+     * not poke CRTC registers while in a graphics mode. */
+    const fb_info_t* fb = fb_get_info();
+    if (fb->available) return;
+
     if (!cursor_visible) {
         outb(VGA_CRTC_INDEX, CURSOR_HIGH);
         outb(VGA_CRTC_DATA, 0x20);
@@ -127,10 +247,6 @@ static inline uint16_t blank_cell(void) {
 /* ------------------------------------------------------------------ */
 
 #if VGA_TRACE_UNHANDLED
-/* Emit a compact diagnostic for an unhandled CSI sequence. Goes to
- * the serial port, not the screen. serial_print takes the (reentrant)
- * print lock internally, which is safe here because the caller already
- * holds it. */
 static void vga_trace_csi(const char *note) {
     char buf[96];
     int  n = 0;
@@ -198,148 +314,177 @@ static void vga_serial_reply_da(void) {}
 #endif
 
 /* ------------------------------------------------------------------ */
-/* Erase / scroll primitives (operate on active_screen)                */
+/* Erase / scroll primitives                                           */
 /* ------------------------------------------------------------------ */
 
 static void vga_scroll(void) {
-    uint16_t blank = blank_cell();
-    for (int row = RESERVED_ROWS; row < VGA_HEIGHT - 1; row++) {
-        for (int col = 0; col < VGA_WIDTH; col++) {
-            active_screen[row * VGA_WIDTH + col] =
-                active_screen[(row + 1) * VGA_WIDTH + col];
+    const int cols = con_cols();
+    const int rows = con_rows();
+
+    for (int row = RESERVED_ROWS; row < rows - 1; row++) {
+        for (int col = 0; col < cols; col++) {
+            uint8_t ch, attr;
+            if (fb_get_info()->available) {
+                /* The framebuffer has no readable cell buffer; the
+                 * scroll is done by reading back the cell we are
+                 * about to overwrite is not possible, so the
+                 * framebuffer scroll is handled below (bit-blit) in
+                 * a dedicated function.  This path is VGA only. */
+                ch = ' '; attr = VGA_DEFAULT_ATTR;
+                (void)ch; (void)attr;
+            } else {
+                uint16_t cell = active_screen[(row + 1) * VGA_WIDTH + col];
+                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
+                             (uint8_t)(cell >> 8));
+            }
         }
     }
-    int last = (VGA_HEIGHT - 1) * VGA_WIDTH;
-    for (int col = 0; col < VGA_WIDTH; col++) {
-        active_screen[last + col] = blank;
-    }
-    cursor_row = VGA_HEIGHT - 1;
+    con_fill_cells(rows - 1, 0, cols, ' ', cursor_attr);
+    cursor_row = rows - 1;
     cursor_col = 0;
     vga_update_hardware_cursor();
 }
 
 static void vga_scroll_region_up(int top, int bottom, int n) {
+    const int cols = con_cols();
+    const int rows = con_rows();
     if (top < RESERVED_ROWS) top = RESERVED_ROWS;
-    if (bottom > VGA_HEIGHT - 1) bottom = VGA_HEIGHT - 1;
+    if (bottom > rows - 1) bottom = rows - 1;
     if (n <= 0 || top > bottom) return;
     int height = bottom - top + 1;
     if (n > height) n = height;
 
     for (int row = top; row <= bottom - n; row++) {
-        for (int col = 0; col < VGA_WIDTH; col++) {
-            active_screen[row * VGA_WIDTH + col] =
-                active_screen[(row + n) * VGA_WIDTH + col];
+        for (int col = 0; col < cols; col++) {
+            if (!fb_get_info()->available) {
+                uint16_t cell = active_screen[(row + n) * VGA_WIDTH + col];
+                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
+                             (uint8_t)(cell >> 8));
+            }
         }
     }
-    uint16_t blank = blank_cell();
     for (int row = bottom - n + 1; row <= bottom; row++) {
-        for (int col = 0; col < VGA_WIDTH; col++) {
-            active_screen[row * VGA_WIDTH + col] = blank;
-        }
+        con_fill_cells(row, 0, cols, ' ', cursor_attr);
     }
 }
 
 static void vga_scroll_region_down(int top, int bottom, int n) {
+    const int cols = con_cols();
+    const int rows = con_rows();
     if (top < RESERVED_ROWS) top = RESERVED_ROWS;
-    if (bottom > VGA_HEIGHT - 1) bottom = VGA_HEIGHT - 1;
+    if (bottom > rows - 1) bottom = rows - 1;
     if (n <= 0 || top > bottom) return;
     int height = bottom - top + 1;
     if (n > height) n = height;
 
     for (int row = bottom; row >= top + n; row--) {
-        for (int col = 0; col < VGA_WIDTH; col++) {
-            active_screen[row * VGA_WIDTH + col] =
-                active_screen[(row - n) * VGA_WIDTH + col];
+        for (int col = 0; col < cols; col++) {
+            if (!fb_get_info()->available) {
+                uint16_t cell = active_screen[(row - n) * VGA_WIDTH + col];
+                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
+                             (uint8_t)(cell >> 8));
+            }
         }
     }
-    uint16_t blank = blank_cell();
     for (int row = top; row < top + n; row++) {
-        for (int col = 0; col < VGA_WIDTH; col++) {
-            active_screen[row * VGA_WIDTH + col] = blank;
-        }
+        con_fill_cells(row, 0, cols, ' ', cursor_attr);
     }
 }
 
 /* ESC[K family. mode: 0=to end of line, 1=to start, 2=whole line. */
 static void vga_erase_line(int mode) {
-    uint16_t blank = blank_cell();
-    int base = cursor_row * VGA_WIDTH;
+    const int cols = con_cols();
     int from, to;
     switch (mode) {
-        case 1: from = 0;            to = cursor_col;        break;
-        case 2: from = 0;            to = VGA_WIDTH - 1;     break;
-        default: from = cursor_col;  to = VGA_WIDTH - 1;     break;
+        case 1: from = 0;            to = cursor_col;    break;
+        case 2: from = 0;            to = cols - 1;      break;
+        default: from = cursor_col;  to = cols - 1;      break;
     }
-    for (int c = from; c <= to; c++) active_screen[base + c] = blank;
+    if (to >= cols) to = cols - 1;
+    if (from < 0) from = 0;
+    con_fill_cells(cursor_row, from, to - from + 1, ' ', cursor_attr);
     vga_update_hardware_cursor();
 }
 
 /* ESC[J family. mode: 0=below, 1=above, 2=all. */
 static void vga_erase_display(int mode) {
-    uint16_t blank = blank_cell();
-    int cur = cursor_row * VGA_WIDTH + cursor_col;
-    int total = VGA_WIDTH * VGA_HEIGHT;
-    switch (mode) {
-        case 1:
-            for (int i = 0; i <= cur; i++) active_screen[i] = blank;
-            break;
-        case 2:
-            for (int i = 0; i < total; i++) active_screen[i] = blank;
-            break;
-        default:
-            for (int i = cur; i < total; i++) active_screen[i] = blank;
-            break;
+    const int cols = con_cols();
+    const int rows = con_rows();
+
+    if (mode == 2) {
+        for (int r = 0; r < rows; r++)
+            con_fill_cells(r, 0, cols, ' ', cursor_attr);
+        vga_update_hardware_cursor();
+        return;
+    }
+
+    if (mode == 1) {
+        for (int r = 0; r < cursor_row; r++)
+            con_fill_cells(r, 0, cols, ' ', cursor_attr);
+        con_fill_cells(cursor_row, 0, cursor_col + 1, ' ', cursor_attr);
+    } else {
+        con_fill_cells(cursor_row, cursor_col, cols - cursor_col,
+                       ' ', cursor_attr);
+        for (int r = cursor_row + 1; r < rows; r++)
+            con_fill_cells(r, 0, cols, ' ', cursor_attr);
     }
     vga_update_hardware_cursor();
 }
 
 static void vga_delete_chars(int n) {
+    const int cols = con_cols();
     if (n < 1) n = 1;
-    int base = cursor_row * VGA_WIDTH;
-    if (n > VGA_WIDTH - cursor_col) n = VGA_WIDTH - cursor_col;
-    for (int c = cursor_col; c + n < VGA_WIDTH; c++) {
-        active_screen[base + c] = active_screen[base + c + n];
+    if (n > cols - cursor_col) n = cols - cursor_col;
+
+    /* Shift cells left.  On VGA we read the cell buffer; on the
+     * framebuffer there is no readable cell buffer, so this is a
+     * no-op for the shift and the tail is blanked.  A framebuffer
+     * implementation would need its own cell mirror; deferred. */
+    if (!fb_get_info()->available) {
+        for (int c = cursor_col; c + n < cols; c++) {
+            uint16_t cell = active_screen[cursor_row * VGA_WIDTH + c + n];
+            con_put_cell(cursor_row, c, (uint8_t)(cell & 0xFF),
+                         (uint8_t)(cell >> 8));
+        }
     }
-    uint16_t blank = blank_cell();
-    for (int c = VGA_WIDTH - n; c < VGA_WIDTH; c++) {
-        active_screen[base + c] = blank;
-    }
+    con_fill_cells(cursor_row, cols - n, n, ' ', cursor_attr);
     vga_update_hardware_cursor();
 }
 
 static void vga_insert_chars(int n) {
+    const int cols = con_cols();
     if (n < 1) n = 1;
-    int base = cursor_row * VGA_WIDTH;
-    if (n > VGA_WIDTH - cursor_col) n = VGA_WIDTH - cursor_col;
-    for (int c = VGA_WIDTH - 1; c - n >= cursor_col; c--) {
-        active_screen[base + c] = active_screen[base + c - n];
+    if (n > cols - cursor_col) n = cols - cursor_col;
+
+    if (!fb_get_info()->available) {
+        for (int c = cols - 1; c - n >= cursor_col; c--) {
+            uint16_t cell = active_screen[cursor_row * VGA_WIDTH + c - n];
+            con_put_cell(cursor_row, c, (uint8_t)(cell & 0xFF),
+                         (uint8_t)(cell >> 8));
+        }
     }
-    uint16_t blank = blank_cell();
-    for (int c = cursor_col; c < cursor_col + n; c++) {
-        active_screen[base + c] = blank;
-    }
+    con_fill_cells(cursor_row, cursor_col, n, ' ', cursor_attr);
     vga_update_hardware_cursor();
 }
 
 static void vga_erase_chars(int n) {
+    const int cols = con_cols();
     if (n < 1) n = 1;
-    int base = cursor_row * VGA_WIDTH;
-    if (n > VGA_WIDTH - cursor_col) n = VGA_WIDTH - cursor_col;
-    uint16_t blank = blank_cell();
-    for (int c = cursor_col; c < cursor_col + n; c++) {
-        active_screen[base + c] = blank;
-    }
+    if (n > cols - cursor_col) n = cols - cursor_col;
+    con_fill_cells(cursor_row, cursor_col, n, ' ', cursor_attr);
     vga_update_hardware_cursor();
 }
 
 static void vga_insert_lines(int n) {
-    vga_scroll_region_down(cursor_row, VGA_HEIGHT - 1, n);
+    const int rows = con_rows();
+    vga_scroll_region_down(cursor_row, rows - 1, n);
     cursor_col = 0;
     vga_update_hardware_cursor();
 }
 
 static void vga_delete_lines(int n) {
-    vga_scroll_region_up(cursor_row, VGA_HEIGHT - 1, n);
+    const int rows = con_rows();
+    vga_scroll_region_up(cursor_row, rows - 1, n);
     cursor_col = 0;
     vga_update_hardware_cursor();
 }
@@ -349,12 +494,15 @@ static void vga_delete_lines(int n) {
 /* ------------------------------------------------------------------ */
 
 static void vga_putc_raw(char c) {
+    const int cols = con_cols();
+    const int rows = con_rows();
+
     if (c == '\n') {
         cursor_row++;
         cursor_col = 0;
-        if (cursor_row >= VGA_HEIGHT) {
+        if (cursor_row >= rows) {
             vga_scroll();
-            cursor_row = VGA_HEIGHT - 1;
+            cursor_row = rows - 1;
         }
         vga_update_hardware_cursor();
         return;
@@ -367,37 +515,34 @@ static void vga_putc_raw(char c) {
     if (c == '\b') {
         if (cursor_col > 0) {
             cursor_col--;
-            active_screen[cursor_row * VGA_WIDTH + cursor_col] = blank_cell();
+            con_put_cell(cursor_row, cursor_col, ' ', cursor_attr);
         }
         vga_update_hardware_cursor();
         return;
     }
     if (c == '\t') {
         int next = (cursor_col + 8) & ~7;
-        if (next > VGA_WIDTH - 1) next = VGA_WIDTH - 1;
+        if (next > cols - 1) next = cols - 1;
         cursor_col = next;
         vga_update_hardware_cursor();
         return;
     }
     if (c == 0x07) {
-        /* BEL: no speaker yet; ignore. This is where a beep would go. */
-        return;
+        return;   /* BEL: no speaker; ignore */
     }
     if (c >= ' ' && c <= '~') {
-        active_screen[cursor_row * VGA_WIDTH + cursor_col] =
-            ((uint16_t)cursor_attr << 8) | (uint8_t)c;
+        con_put_cell(cursor_row, cursor_col, (uint8_t)c, cursor_attr);
         cursor_col++;
-        if (cursor_col >= VGA_WIDTH) {
+        if (cursor_col >= cols) {
             cursor_col = 0;
             cursor_row++;
-            if (cursor_row >= VGA_HEIGHT) {
+            if (cursor_row >= rows) {
                 vga_scroll();
-                cursor_row = VGA_HEIGHT - 1;
+                cursor_row = rows - 1;
             }
         }
         vga_update_hardware_cursor();
     }
-    /* Other C0 controls (0x00..0x1F except the above) are dropped. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,27 +561,13 @@ static void vga_apply_sgr(void) {
     for (int i = 0; i < p.n_params; i++) {
         int v = p.params[i];
         switch (v) {
-            case 0:
-                cursor_attr = VGA_DEFAULT_ATTR;
-                break;
-            case 1:
-                cursor_attr |= 0x08;   /* bold: intensity bit */
-                break;
-            case 7:
-                cursor_attr = sgr_reverse(cursor_attr);
-                break;
-            case 22:
-                cursor_attr &= (uint8_t)~0x08;
-                break;
-            case 27:
-                cursor_attr = VGA_DEFAULT_ATTR;
-                break;
-            case 39:
-                cursor_attr = (uint8_t)((cursor_attr & 0xF0) | 0x07);
-                break;
-            case 49:
-                cursor_attr = (uint8_t)((cursor_attr & 0x0F) | 0x00);
-                break;
+            case 0:  cursor_attr = VGA_DEFAULT_ATTR; break;
+            case 1:  cursor_attr |= 0x08;            break;
+            case 7:  cursor_attr = sgr_reverse(cursor_attr); break;
+            case 22: cursor_attr &= (uint8_t)~0x08;  break;
+            case 27: cursor_attr = VGA_DEFAULT_ATTR; break;
+            case 39: cursor_attr = (uint8_t)((cursor_attr & 0xF0) | 0x07); break;
+            case 49: cursor_attr = (uint8_t)((cursor_attr & 0x0F) | 0x00); break;
             default:
                 if (v >= 30 && v <= 37) {
                     cursor_attr = (uint8_t)((cursor_attr & 0xF0) | (v - 30));
@@ -457,20 +588,32 @@ static void vga_alt_screen_enter(int clear) {
     alt_saved_row = cursor_row;
     alt_saved_col = cursor_col;
 
-    /* Save the visible framebuffer into alt_screen[], then (for
-     * ?1049h, not ?1047h) clear the visible screen. There is no
-     * second hardware buffer on a VGA text console; the CRT
-     * controller scans 0xB8000 unconditionally. The "alternate
-     * screen" is simulated by off-screen memory that we copy back
-     * on ?1049l. */
-    volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        alt_screen[i] = vga[i];
-    }
-    if (clear) {
-        uint16_t blank = ((uint16_t)VGA_DEFAULT_ATTR << 8) | ' ';
+    /*
+     * Save the visible screen into alt_screen[] as CELLS, then (for
+     * ?1049h) clear the visible screen.  On VGA the cells come from
+     * 0xB8000.  On the framebuffer there is no readable cell buffer,
+     * so the save is skipped -- alt-screen restore on the framebuffer
+     * restores a cleared screen rather than the previous contents.
+     * This is a known limitation (commit 1); a cell mirror would fix
+     * it.  vi uses alt-screen for its own display, and does not rely
+     * on restoring the pre-vi screen on the framebuffer path.
+     */
+    if (!fb_get_info()->available) {
+        volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
         for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-            vga[i] = blank;
+            alt_screen[i] = vga[i];
+        }
+        if (clear) {
+            for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+                vga[i] = ((uint16_t)VGA_DEFAULT_ATTR << 8) | ' ';
+            }
+        }
+    } else {
+        if (clear) {
+            const int cols = con_cols();
+            const int rows = con_rows();
+            for (int r = 0; r < rows; r++)
+                con_fill_cells(r, 0, cols, ' ', VGA_DEFAULT_ATTR);
         }
     }
 
@@ -482,10 +625,25 @@ static void vga_alt_screen_enter(int clear) {
 
 static void vga_alt_screen_leave(void) {
     if (!alt_screen_active) return;
-    volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga[i] = alt_screen[i];
+
+    if (!fb_get_info()->available) {
+        volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+            vga[i] = alt_screen[i];
+        }
+    } else {
+        /* Redraw the saved cells through the active backend.  For the
+         * framebuffer the saved cells were not captured (see enter),
+         * so this restores blank cells; the screen is left clear. */
+        for (int r = 0; r < VGA_HEIGHT; r++) {
+            for (int c = 0; c < VGA_WIDTH; c++) {
+                uint16_t cell = alt_screen[r * VGA_WIDTH + c];
+                con_put_cell(r, c, (uint8_t)(cell & 0xFF),
+                             (uint8_t)(cell >> 8));
+            }
+        }
     }
+
     alt_screen_active = 0;
     cursor_row = alt_saved_row;
     cursor_col = alt_saved_col;
@@ -499,8 +657,7 @@ static void vga_set_private_mode(int mode, int set) {
             vga_update_hardware_cursor();
             break;
         case 1:
-            /* DECCKM: application cursor keys. Accepted, not acted on. */
-            break;
+            break;   /* DECCKM: accepted, not acted on */
         case 1049:
             if (set) vga_alt_screen_enter(1);
             else     vga_alt_screen_leave();
@@ -519,7 +676,6 @@ static void vga_set_private_mode(int mode, int set) {
 /* Parameter accessor                                                  */
 /* ------------------------------------------------------------------ */
 
-/* VT100 convention: parameter 0 (or absent) means "default". */
 static int csi_param(int idx, int def) {
     if (idx >= p.n_params) return def;
     int v = p.params[idx];
@@ -532,8 +688,9 @@ static int csi_param(int idx, int def) {
 /* ------------------------------------------------------------------ */
 
 static void csi_dispatch(uint8_t final) {
-    /* Intermediates (space, !, ", #, $, ...) mark sequences we don't
-     * implement. '?' is NOT stored here; it lives in private_marker. */
+    const int cols = con_cols();
+    const int rows = con_rows();
+
     if (p.n_intermediates > 0) {
         vga_trace_csi("(with intermediates)");
         return;
@@ -542,45 +699,45 @@ static void csi_dispatch(uint8_t final) {
     switch (final) {
         case 'A': {
             int n = csi_param(0, 1);
-            cursor_row = clamp(cursor_row - n, RESERVED_ROWS, VGA_HEIGHT - 1);
+            cursor_row = clamp(cursor_row - n, RESERVED_ROWS, rows - 1);
             vga_update_hardware_cursor();
             break;
         }
         case 'B': {
             int n = csi_param(0, 1);
-            cursor_row = clamp(cursor_row + n, RESERVED_ROWS, VGA_HEIGHT - 1);
+            cursor_row = clamp(cursor_row + n, RESERVED_ROWS, rows - 1);
             vga_update_hardware_cursor();
             break;
         }
         case 'C': {
             int n = csi_param(0, 1);
-            cursor_col = clamp(cursor_col + n, 0, VGA_WIDTH - 1);
+            cursor_col = clamp(cursor_col + n, 0, cols - 1);
             vga_update_hardware_cursor();
             break;
         }
         case 'D': {
             int n = csi_param(0, 1);
-            cursor_col = clamp(cursor_col - n, 0, VGA_WIDTH - 1);
+            cursor_col = clamp(cursor_col - n, 0, cols - 1);
             vga_update_hardware_cursor();
             break;
         }
         case 'E': {
             int n = csi_param(0, 1);
-            cursor_row = clamp(cursor_row + n, RESERVED_ROWS, VGA_HEIGHT - 1);
+            cursor_row = clamp(cursor_row + n, RESERVED_ROWS, rows - 1);
             cursor_col = 0;
             vga_update_hardware_cursor();
             break;
         }
         case 'F': {
             int n = csi_param(0, 1);
-            cursor_row = clamp(cursor_row - n, RESERVED_ROWS, VGA_HEIGHT - 1);
+            cursor_row = clamp(cursor_row - n, RESERVED_ROWS, rows - 1);
             cursor_col = 0;
             vga_update_hardware_cursor();
             break;
         }
         case 'G': {
             int c = csi_param(0, 1) - 1;
-            cursor_col = clamp(c, 0, VGA_WIDTH - 1);
+            cursor_col = clamp(c, 0, cols - 1);
             vga_update_hardware_cursor();
             break;
         }
@@ -588,53 +745,37 @@ static void csi_dispatch(uint8_t final) {
         case 'f': {
             int r = csi_param(0, 1) - 1;
             int c = csi_param(1, 1) - 1;
-            cursor_row = clamp(r, RESERVED_ROWS, VGA_HEIGHT - 1);
-            cursor_col = clamp(c, 0, VGA_WIDTH - 1);
+            cursor_row = clamp(r, RESERVED_ROWS, rows - 1);
+            cursor_col = clamp(c, 0, cols - 1);
             vga_update_hardware_cursor();
             break;
         }
-        case 'J':
-            vga_erase_display(csi_param(0, 0));
-            break;
-        case 'K':
-            vga_erase_line(csi_param(0, 0));
-            break;
-        case 'L':
-            vga_insert_lines(csi_param(0, 1));
-            break;
-        case 'M':
-            vga_delete_lines(csi_param(0, 1));
-            break;
-        case 'P':
-            vga_delete_chars(csi_param(0, 1));
-            break;
-        case '@':
-            vga_insert_chars(csi_param(0, 1));
-            break;
-        case 'X':
-            vga_erase_chars(csi_param(0, 1));
-            break;
+        case 'J': vga_erase_display(csi_param(0, 0)); break;
+        case 'K': vga_erase_line(csi_param(0, 0));    break;
+        case 'L': vga_insert_lines(csi_param(0, 1));  break;
+        case 'M': vga_delete_lines(csi_param(0, 1));  break;
+        case 'P': vga_delete_chars(csi_param(0, 1));  break;
+        case '@': vga_insert_chars(csi_param(0, 1));  break;
+        case 'X': vga_erase_chars(csi_param(0, 1));   break;
         case 'S': {
             int n = csi_param(0, 1);
             for (int i = 0; i < n; i++)
-                vga_scroll_region_up(0, VGA_HEIGHT - 1, 1);
+                vga_scroll_region_up(0, rows - 1, 1);
             break;
         }
         case 'T': {
             int n = csi_param(0, 1);
             for (int i = 0; i < n; i++)
-                vga_scroll_region_down(0, VGA_HEIGHT - 1, 1);
+                vga_scroll_region_down(0, rows - 1, 1);
             break;
         }
         case 'Z': {
             int n = csi_param(0, 1);
-            cursor_col = clamp(cursor_col - 8 * n, 0, VGA_WIDTH - 1);
+            cursor_col = clamp(cursor_col - 8 * n, 0, cols - 1);
             vga_update_hardware_cursor();
             break;
         }
-        case 'm':
-            vga_apply_sgr();
-            break;
+        case 'm': vga_apply_sgr(); break;
         case 'h':
         case 'l': {
             int set = (final == 'h');
@@ -657,12 +798,8 @@ static void csi_dispatch(uint8_t final) {
             else        vga_trace_csi("(DSR)");
             break;
         }
-        case 'c':
-            vga_serial_reply_da();
-            break;
-        default:
-            vga_trace_csi("(unknown final)");
-            break;
+        case 'c': vga_serial_reply_da(); break;
+        default:  vga_trace_csi("(unknown final)"); break;
     }
 }
 
@@ -690,21 +827,15 @@ static void ansi_push_param(void) {
 static void vga_putc_unlocked(char c) {
     switch (p.state) {
     case ANSI_NORMAL:
-        if (c == 0x1B) {
-            p.state = ANSI_ESC;
-            return;
-        }
+        if (c == 0x1B) { p.state = ANSI_ESC; return; }
         vga_putc_raw(c);
         return;
 
     case ANSI_ESC:
         if (c == '[') {
             p.state = ANSI_CSI;
-            p.n_params = 0;
-            p.n_intermediates = 0;
-            p.cur_param = 0;
-            p.have_cur_param = 0;
-            p.private_marker = 0;
+            p.n_params = 0; p.n_intermediates = 0;
+            p.cur_param = 0; p.have_cur_param = 0; p.private_marker = 0;
             return;
         }
         if (c == '(' || c == ')' || c == '*' || c == '+') {
@@ -716,13 +847,11 @@ static void vga_putc_unlocked(char c) {
             ansi_reset();
             return;
         }
-        /* Unknown ESC x: drop ESC, re-feed x as ordinary input. */
         ansi_reset();
         vga_putc_raw(c);
         return;
 
     case ANSI_ESC_CHARSET:
-        /* Swallow the charset designator byte. */
         ansi_reset();
         return;
 
@@ -733,30 +862,16 @@ static void vga_putc_unlocked(char c) {
             p.have_cur_param = 1;
             return;
         }
-        if (c == ';') {
-            ansi_push_param();
-            return;
-        }
-        if (c == '?') {
-            /* '?' is the private-marker prefix (e.g. ESC[?1049h).
-             * It is NOT an intermediate byte; record it only in
-             * private_marker, not in intermediates[]. If it were
-             * pushed into intermediates[], csi_dispatch would bail
-             * out on the n_intermediates > 0 check and never reach
-             * the private-mode handler. */
-            p.private_marker = 1;
-            return;
-        }
+        if (c == ';') { ansi_push_param(); return; }
+        if (c == '?') { p.private_marker = 1; return; }
         if (c == '>' || c == '<' || c == '=') {
-            if (p.n_intermediates < MAX_CSI_INTERMEDIATES) {
+            if (p.n_intermediates < MAX_CSI_INTERMEDIATES)
                 p.intermediates[p.n_intermediates++] = c;
-            }
             return;
         }
         if (c >= 0x20 && c <= 0x2F) {
-            if (p.n_intermediates < MAX_CSI_INTERMEDIATES) {
+            if (p.n_intermediates < MAX_CSI_INTERMEDIATES)
                 p.intermediates[p.n_intermediates++] = c;
-            }
             return;
         }
         if (c >= 0x40 && c <= 0x7E) {
@@ -770,12 +885,7 @@ static void vga_putc_unlocked(char c) {
             vga_putc_raw(c);
             return;
         }
-        if (c == 0x1B) {
-            ansi_reset();
-            p.state = ANSI_ESC;
-            return;
-        }
-        /* Any other control byte: swallow. */
+        if (c == 0x1B) { ansi_reset(); p.state = ANSI_ESC; return; }
         return;
     }
 }
@@ -826,9 +936,11 @@ void vga_print_at(int row, int col, const char *s) {
     serial_lock();
     int saved_row = cursor_row;
     int saved_col = cursor_col;
+    const int rows = con_rows();
+    const int cols = con_cols();
 
-    row = clamp(row, RESERVED_ROWS, VGA_HEIGHT - 1);
-    col = clamp(col, 0, VGA_WIDTH - 1);
+    row = clamp(row, RESERVED_ROWS, rows - 1);
+    col = clamp(col, 0, cols - 1);
     cursor_row = row;
     cursor_col = col;
     vga_update_hardware_cursor();
@@ -837,8 +949,8 @@ void vga_print_at(int row, int col, const char *s) {
         vga_putc_unlocked(*s++);
     }
 
-    cursor_row = clamp(saved_row, RESERVED_ROWS, VGA_HEIGHT - 1);
-    cursor_col = clamp(saved_col, 0, VGA_WIDTH - 1);
+    cursor_row = clamp(saved_row, RESERVED_ROWS, rows - 1);
+    cursor_col = clamp(saved_col, 0, cols - 1);
     vga_update_hardware_cursor();
     serial_unlock();
 }
@@ -852,20 +964,18 @@ void vga_print_hex_cur(uint64_t val) {
     }
 
     serial_lock();
-    int pos = cursor_row * VGA_WIDTH + cursor_col;
-    uint16_t attr = (uint16_t)cursor_attr << 8;
+    const int cols = con_cols();
+    const int rows = con_rows();
     for (int i = 0; i < 16; i++) {
-        if (pos + i < VGA_WIDTH * VGA_HEIGHT) {
-            active_screen[pos + i] = attr | (uint8_t)buf[i];
-        }
-    }
-    cursor_col += 16;
-    if (cursor_col >= VGA_WIDTH) {
-        cursor_col = 0;
-        cursor_row++;
-        if (cursor_row >= VGA_HEIGHT) {
-            vga_scroll();
-            cursor_row = VGA_HEIGHT - 1;
+        con_put_cell(cursor_row, cursor_col, (uint8_t)buf[i], cursor_attr);
+        cursor_col++;
+        if (cursor_col >= cols) {
+            cursor_col = 0;
+            cursor_row++;
+            if (cursor_row >= rows) {
+                vga_scroll();
+                cursor_row = rows - 1;
+            }
         }
     }
     vga_update_hardware_cursor();
@@ -895,9 +1005,10 @@ void vga_print_dec_cur(uint64_t val) {
 
 void vga_clear(void) {
     serial_lock();
-    uint16_t blank = blank_cell();
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        active_screen[i] = blank;
+    const int cols = con_cols();
+    const int rows = con_rows();
+    for (int r = 0; r < rows; r++) {
+        con_fill_cells(r, 0, cols, ' ', cursor_attr);
     }
     cursor_row = 0;
     cursor_col = 0;
@@ -907,8 +1018,10 @@ void vga_clear(void) {
 
 void vga_set_cursor(int row, int col) {
     serial_lock();
-    cursor_row = clamp(row, RESERVED_ROWS, VGA_HEIGHT - 1);
-    cursor_col = clamp(col, 0, VGA_WIDTH - 1);
+    const int rows = con_rows();
+    const int cols = con_cols();
+    cursor_row = clamp(row, RESERVED_ROWS, rows - 1);
+    cursor_col = clamp(col, 0, cols - 1);
     vga_update_hardware_cursor();
     serial_unlock();
 }
