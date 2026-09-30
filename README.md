@@ -75,13 +75,17 @@ That's the point. That's the whole point.
   `sys_unlink`, `sys_mkdir`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
-  backspace, line editing, history), its applets (`ls`, `cat`, `echo`,
-  `pwd`, `wc`) run in-process via standalone mode, and `/bin/busybox`
-  is a real path on the image. It forks and execs external binaries,
-  and it shares the working directory with the rest of the system.
-  This is the strongest evidence that the syscall ABI is right —
-  busybox expects a real Unix kernel underneath it, and on donix it
-  gets one.
+  backspace, line editing, history), and it supports real shell
+  redirection — `cat < file`, `echo hi > out.txt`, and repeated
+  redirects in one shell all work. Its file and text applets — `ls`,
+  `cat`, `echo`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`, `grep`,
+  `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`,
+  `uniq`, `mkdir`, `rm`, `rmdir`, `touch` — run in-process via
+  standalone mode, and `/bin/busybox` is a real path on the image. It
+  forks and execs external binaries, and it shares the working
+  directory with the rest of the system. This is the strongest
+  evidence that the syscall ABI is right — busybox expects a real
+  Unix kernel underneath it, and on donix it gets one.
 - **Has a real terminal.** The console is a VT100 emulator: full CSI
   parsing, cursor addressing, SGR colors, the erase, insert, and
   delete families, and a software alternate screen. Full-screen

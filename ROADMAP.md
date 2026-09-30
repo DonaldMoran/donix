@@ -17,7 +17,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, and v0.6.4
+## Done — Phases A through B, and v0.6.5
 
 For the record, so this file does not re-plan finished work:
 
@@ -37,9 +37,22 @@ For the record, so this file does not re-plan finished work:
   translation plus `ftruncate`, `utimes`, `futimesat`, and
   `utimensat`; `rm` and `rmdir`; `cd ..` at `donix>`; a user-mode
   `#PF` (and ring-3 `#GP`) kills the process rather than the kernel.
+- **v0.6.5 — scripts, redirection, and a real fd layer.** Shell
+  scripts run (`MAX_PROCESS_FILES` 8 → 64, `execve` returns
+  `ENOEXEC` for a non-ELF so ash falls back to the interpreter, and
+  `./script.sh` normalizes). Shell redirection works end to end:
+  `cmd < file`, `cmd > file`, `2>`, and repeated redirects in one
+  shell all behave. Four new syscalls — `uname` (63), `lseek` (8),
+  `rename` (82), `readv` (19) — and the busybox file/text utilities
+  are enabled: `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`,
+  `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`. Finally,
+  fds 0/1/2 are first-class: console sentinels so a fresh process's
+  `open` returns fd 3, lowest-free-fd allocation so `close(0);
+  open(file)` returns fd 0, and `dup2`/`fcntl(F_DUPFD)` accept low
+  fds so a redirect whose scratch fd is 0/1/2 works.
 
-The narratives are in the `v0.6.4` annotated tag, `docs/session-log.md`,
-and `handoff.md`.
+The narratives are in the `v0.6.4` and `v0.6.5` annotated tags,
+`docs/session-log.md`, and `handoff.md`.
 
 ---
 
@@ -72,10 +85,12 @@ one-change-at-a-time discipline applies.
 
 ### Broaden busybox coverage
 
-Busybox is the boot shell now, but only some applets have been
-exercised: `ls`, `echo`, `cat`, `pwd`, `wc`, `mkdir`, `touch`, `vi`,
-`rm`, `rmdir`.  The untried ones — `cp`, `mv`, `grep`, `sed`, `awk`,
-`tar` — are where the syscall surface gets tested hardest.
+Busybox is the boot shell now, and the file/text utility set is
+broad: `ls`, `echo`, `cat`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`,
+`grep`, `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`,
+`od`, `uniq`, `mkdir`, `touch`, `vi`, `rm`, `rmdir`.  Still untried:
+`awk`, `tar`, and `find` (which needs `newfstatat`).  These are where
+the syscall surface gets tested hardest.
 
 Work through them one at a time, watching for `Unknown syscall: N` in
 the serial log.  Each missing syscall is its own commit.
@@ -86,9 +101,10 @@ and should wait for those.
 
 ### Shell features
 
-- **Pipes and redirection** — `cat file > out.txt`,
-  `cat file | grep foo`.  Needs `pipe(2)` and `dup2(2)` (the latter
-  already works).
+- **Pipes** — `cat file | grep foo`.  Redirection (`<`, `>`, `2>`)
+  works as of `v0.6.5`; the pipe is the remaining piece and needs
+  `pipe(2)` (`dup2(2)` already works).  This is the biggest gap in
+  the shell.
 - **Environment variables** — extend the argv mechanism with an
   `envp` array; `getenv`/`setenv` on the userland side.
 - **Job control** — busybox ash has `ASH_JOB_CONTROL` off in the

@@ -3,11 +3,12 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-29 (session 34 → pre-session 35)
-**Current HEAD:** tag `20260930-busybox-uniq`, branch `dev`
-**Last milestone:** `v0.6.4` (published) — **the basics are done**
-**Next milestone:** `v0.6.5` candidate — sessions 33 and 34
-together are large enough to tag (see below)
+**Last updated:** 2026-09-29 (post-`v0.6.5`)
+**Current HEAD:** tag `v0.6.5`, branch `dev`
+**Last milestone:** `v0.6.5` (published) — **scripts, redirection,
+and a real fd layer are done**
+**Next milestone:** `v0.6.6` candidate — `pipe(2)` is the headline
+item
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026092x-*`) are local scratch restore points** — they exist while
@@ -58,20 +59,17 @@ builder, not the kernel C sources.
 
 ---
 
-## Where we are — session 34, low fds first-class, `uniq` works
+## Where we are — `v0.6.5` tagged, working tree clean
 
-**Twenty-one commits on `dev`, all scratch-tagged, all unpushed.**
-The last is `9307141` (`busybox: enable uniq applet`).
+`v0.6.5` is published.  Sessions 33 and 34 together are the
+milestone: **scripts run; redirection works; four new syscalls; a
+broad busybox command set; and fds 0/1/2 are first-class.**  All
+scratch tags have been dropped; `dev` is pushed.
+
+### Session 34 — low fds (0/1/2) are first-class, `uniq` works
 
 Session 34 opened with "investigate `uniq`" and closed with `uniq`
-working and a kernel fix that turned out to be the actual bug.  Two
-threads:
-
-### Thread 1 — low fds (0/1/2) are first-class
-
-| Tag | What |
-|---|---|
-| `20260930-low-fd-io` | console sentinels; lowest-free-fd `open`; `dup2`/`fcntl` accept 0/1/2 |
+working and a kernel fix that turned out to be the actual bug.
 
 `uniq FILE` hangs because `alloc_file_slot` started at fd 3.  busybox
 `uniq` does `close(0); open(file)` and expects `open` to return fd 0;
@@ -99,30 +97,23 @@ fd 0 and `read(0, ...)` fell through to the keyboard path in
 Full writeup with the trace: `docs/gotchas.md`, "Low fds (0/1/2) are
 first-class."
 
-### Thread 2 — busybox
+### What session 33 contributed
 
-| Tag | What |
-|---|---|
-| `20260930-busybox-uniq` | `CONFIG_UNIQ=y` |
-
-The applet's hang was the kernel fd bug, not an applet bug.  With low
-fds first-class it works in both the FILE-argument and
-redirected-stdin forms.
-
-### Docs commit
-
-| Tag | What |
-|---|---|
-| `20260930-docs-session-34` | this pass: gotchas, open-issues, session-log, handoff |
+Script execution (`MAX_PROCESS_FILES` 8 → 64, `execve` returns
+`ENOEXEC` for a short non-ELF so ash runs the file through `sh`,
+`./script.sh` normalizes).  Shell redirection end to end (three
+interlocking bugs: `sys_read`/`sys_write` hard-coded fds 0/1/2,
+`sys_fork` never copied `file_table[]`, `close_all_files` started at
+fd 3).  Four syscalls: `uname` (63), `lseek` (8), `rename` (82),
+`readv` (19).  Busybox applets enabled: `head`, `tail`, `cp`, `mv`,
+`grep`, `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`,
+`od`.
 
 ### Known failures, deliberately off
 
 - **`diff`** — deliberately off; larger surface area.
 - **`chmod`, `ln`, `mount`/`umount`** — need `chmod(2)` (90),
   `link(2)`/`symlink(2)` (86/88), and `mount(2)` respectively.
-- **`uniq`** — **no longer on this list.**  It was never an applet
-  bug; it was the kernel fd bug fixed in `20260930-low-fd-io`.  The
-  applet is enabled and tested.
 
 ### Known limitation: `musl_sh`
 
@@ -140,8 +131,8 @@ an `uniq` bug.
 
 `|` does not work in any shell — not ash, not `donix>`.  The shell
 never creates the pipe; `|` reaches the applet as a literal argv
-argument.  Not an applet bug; `pipe(2)` is simply absent.  See
-`docs/open-issues.md`.
+argument.  Not an applet bug; `pipe(2)` is simply absent.  This is
+the headline item for `v0.6.6`.  See `docs/open-issues.md`.
 
 ### Not carried forward from `testme`
 
@@ -152,20 +143,33 @@ are deliberately left out.
 
 ---
 
-## NEXT SESSION — pick a direction
+## NEXT SESSION — `pipe(2)`
 
-Session 34 was two commits.  No committed next milestone.
+`v0.6.6` candidate.  The headline item is `pipe(2)`.
 
-**Recommended first: `pipe(2)`.**  The biggest remaining gap in the
-shell.  Without it, `|` reaches applets as a literal argument.
-`pipe(2)` is syscall 22; the implementation needs a pipe object,
-per-fd read/write ends, and scheduler integration for blocking on an
-empty/full pipe.  Bigger than anything since the redirection fix.
-Worth its own session.
+**`pipe(2)` — the biggest remaining shell gap.**  Without it, `|`
+reaches applets as a literal argument.  `pipe(2)` is syscall 22.  The
+implementation needs:
 
-**Small, close gaps:**
+- a pipe object (a ring buffer, probably kernel-heap-allocated);
+- per-fd read/write ends, so `file_slot_t` gains a `FILE_KIND_PIPE`
+  case with an end flag;
+- scheduler integration for blocking: a reader on an empty pipe and
+  a writer on a full pipe must both block and be woken when the
+  other end acts;
+- `sys_pipe` returning two fds into the caller's array;
+- `sys_read`/`sys_write` handling the pipe kind;
+- `sys_close` waking a blocked peer when an end closes.
+
+Bigger than anything since the redirection fix.  Worth its own
+session.  Test: `busybox cat hello-world.txt | busybox head -n 2`,
+`echo hi | wc`, and the interaction with the `dup2` work already
+done.
+
+**Small, close gaps (all independent, all one-change-at-a-time):**
 
 1. **`newfstatat` (262)** — reserved number, no dispatch case.
+   Delegates to `sys_stat` for `AT_FDCWD` or an absolute path.
 2. **`sys_open` `O_DIRECTORY` fix** — return `-ENOTDIR` when the
    target is a file.
 3. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
@@ -183,22 +187,16 @@ Worth its own session.
 `newfstatat`), `tar`, `diff`.  `chmod` (90), `ln` (86/88), and
 `mount` still need their own syscalls.
 
-**Or tag `v0.6.5`.**  Sessions 33 and 34 together are a coherent
-milestone: "scripts run; redirection works; low fds are first-class;
-broad busybox command set including `uniq`."  If tagged, drop all
-`20260929-*` and `20260930-*` scratch tags first, tag `v0.6.5`,
-rewrite this file, push.
-
 Pick **one**, do it, test it, tag it.  One change at a time.
 
 ---
 
 ## Canary state
 
-**The focused canary is green as of `20260930-busybox-uniq`.**  Full
-table in `docs/session-log.md`.  Script execution, redirection, and
-the applet one-offs are verification, not canary rows — the canary
-must not mutate the disk.
+**The focused canary is green as of `v0.6.5`.**  Full table in
+`docs/session-log.md`.  Script execution, redirection, and the applet
+one-offs are verification, not canary rows — the canary must not
+mutate the disk.
 
     # on boot, ash is already running
     pwd                         # /
@@ -227,7 +225,7 @@ must not mutate the disk.
     # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
 
-**New read-only rows (added session 34), run from ash:**
+**Read-only `uniq` rows (added session 34), run from ash:**
 
     uniq hello-world.txt
     uniq -c < hello-world.txt
@@ -257,7 +255,7 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 the redirection tests mutate, so they stay one-offs.
 
 **Expected noise:** none.  The serial log has no `Unknown syscall:`
-lines and (with the trace off) no `[fd]` lines.  Two informational
+lines and no `[fd]` lines (the fd trace is off).  Two informational
 lines are expected: `EXIT: pid=N state=1 parent=2 qhead=N` (a forked
 busybox shell's own exit) and `EXIT-FALLBACK: switching to idle, ...`
 (in `musl_fork` when the child is the last runnable process).  The
@@ -275,7 +273,7 @@ failed rename is expected — same style of diagnostic `sys_unlink` and
    resolution and `resolve_against_cwd` are both shims.  When a VFS
    lands, delete them; do not extend.
 2. **`pipe(2)` is absent** — `|` does not work in any shell.
-   The biggest remaining gap.
+   The headline item for `v0.6.6`.
 3. **`sys_fcntl` refuses fd < 3** for subcommands other than
    `F_DUPFD`/`F_DUPFD_CLOEXEC`.  Deliberate; a small extension of
    the session-34 work rather than a new problem.
@@ -366,11 +364,11 @@ needs it.  Paths below are relative to a tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  Session 34: low fds (0/1/2) are first-class --
-console sentinels, lowest-free-fd `open`, `dup2`/`fcntl` accept
-0/1/2 -- and busybox `uniq` works.  Twenty-one commits, all
-scratch-tagged, unpushed.  Session 35: implement `pipe(2)` -- the
-biggest remaining gap -- or tag `v0.6.5`.  One change at a time.**
+`userland/musl/`.  `v0.6.5` is published: shell scripts run,
+redirection works, fds 0/1/2 are first-class, and busybox runs a
+broad set of file and text utilities including `uniq`.  Next:
+`pipe(2)` — the biggest remaining shell gap.  One change at a
+time.**
 
 ---
 
