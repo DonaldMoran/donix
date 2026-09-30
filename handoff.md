@@ -3,14 +3,13 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-30 (post-`v0.6.6`, framebuffer console)
-**Current HEAD:** tag `20260930-viwinsize`, branch `dev`
-**Last milestone:** `v0.6.6` (published) — `pipe(2)` done, pipelines
-work
-**Milestone status:** **no bump yet.**  21 commits on `dev`,
-scratch-tagged, unpushed.  A `v0.6.7` bump is deferred until the
-accumulated changes feel substantial enough; the scratch tags carry
-the narrative.
+**Last updated:** 2026-09-30 (post-`v0.6.7`, shell + framebuffer)
+**Current HEAD:** tag `v0.6.7`, branch `dev`
+**Last milestone:** `v0.6.7` (published) — `musl_sh` is a real shell;
+the console is a 1024×768 linear framebuffer
+**Milestone status:** **bumped.**  `v0.6.7` is pushed; `dev` merged
+to `main`.  Scratch tags dropped at the milestone — their narrative
+lives in the `v0.6.7` commit message and `docs/session-log.md`.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026093x-*`) are local scratch restore points** — they exist while
@@ -23,7 +22,8 @@ reference.
 
 **Scratch tags are annotated** (session 37 onward).  The annotation
 is the fuller per-commit summary; at a milestone bump the
-annotations seed the final milestone narrative.
+annotations seed the final milestone narrative.  This is the reason
+to keep tagging each step even when no `v*` tag is imminent.
 
 ---
 
@@ -59,19 +59,16 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Where we are — framebuffer console done, `vi` fills the screen
+## Where we are — `v0.6.7` published
 
-Session 38 put the console on a **1024×768 linear framebuffer** and
-made `vi` use the whole screen.  Session 37 made `donix>`'s shell
-real (`musl_sh` parses quotes, redirection, pipelines) and gave
-donix-native `cat` a stdin mode.  All committed on `dev`,
-scratch-tagged, unpushed; no milestone bump yet.
+`v0.6.7` shipped two sessions of work: **`donix>`'s own shell became
+a real shell**, and **the console became a linear framebuffer**.
+Both were committed on `dev` with scratch tags, then merged to
+`main` and tagged.
 
 ### Session 38 — framebuffer console
 
-Eight commits, all tagged:
-
-| Tag | What |
+| Tag (dropped) | What |
 |---|---|
 | `20260930-vbe` | VBE mode 0x118 (1024×768×24), framebuffer descriptor captured |
 | `20260930-fb` | framebuffer mapped; `fb_putpixel`/`fb_fill`/`fb_fillrect` |
@@ -81,31 +78,49 @@ Eight commits, all tagged:
 | `20260930-fbclean` | test pattern removed |
 | `20260930-winsz` | `TIOCGWINSZ` reports the real console grid |
 | `20260930-viwinsize` | busybox `FEATURE_VI_WIN_RESIZE=y` — `vi` fills the screen |
+| `20260930-psffix` | PSF row bit order (M and W rendered as blobs until fixed) |
 
 **What it means:** the console — boot messages, shell prompt, typed
 input, program output, `vi` — renders on the framebuffer at Terminus
 10×18 (102×42 cells).  `vi` fills the screen, edits, saves, and the
-alt-screen restores cleanly on exit.
+alt-screen restores cleanly on exit.  The VGA text console remains
+as a fallback if VBE fails.
 
 **Key facts for future work:**
 - Mode 0x118 on QEMU is **24bpp, pitch 3072**, framebuffer at
   physical **0xFD000000** — not 32bpp/4096.  The kernel uses the
   values captured in `BootInfo`, so this is data, not assumption.
 - Pixels are **BGR** in memory (`fb.c`'s `FB_BYTE_R/G/B`).
-- PSF glyph rows are **MSB-first** (`fb.c`'s `fb_putchar`).
+- PSF glyph rows are **big-endian, MSB-first** — the top
+  `FB_FONT_W` bits of a 16-bit row value are the pixels
+  (`fb.c`'s `fb_putchar`; see `gotchas.md`).
 - `vga.c` has a **shadow cell grid** (the source of truth on both
   backends); `con_put_cell` is the one draw chokepoint; the grid is
   `con_cols()`×`con_rows()` (102×42 fb, 80×25 VGA).
 - **All of `vga.c`'s VT100 logic is unchanged** and drives either
   backend; callers outside `vga.c` are untouched.
+- **Changing the VBE mode is not a one-line change**: a different
+  mode number also needs `VGA_MAX_COLS`/`VGA_MAX_ROWS` in `vga.c`
+  bumped to the new grid, and (if the bpp differs) a `fb.c` change.
+  Tried 1280×1024 and 1600×1200 — all fell back to text or rendered
+  unreadable.  **1024×768 (`0x118`) is the working mode.**
 
 ### Session 37 — `musl_sh` is a real shell; `cat` has stdin
+
+| Tag (dropped) | What |
+|---|---|
+| `20260930-tokenizer` | two-phase tokenizer: quote stripping + operator splitting |
+| `20260930-redir` | `<`, `>`, `>>` via `open` + `dup2` + `execve` |
+| `20260930-seq` | `;` and `&&`; builtins report their own status |
+| `20260930-pipe` | `\|`; `fork_child` refactor; N-stage pipelines |
+| `20260930-cat` | donix-native `cat`: stdin mode, multiple files, `-` |
+| `20260930-nodebug` | remove the tokenizer debug print |
 
 `donix>` strips quotes and parses `<`, `>`, `>>`, `|`, `&&`, `;`,
 and pipelines.  `cat < file` works without busybox.  Userland only.
 The `musl_sh` limitation every prior handoff carried is closed.
 
-### What `v0.6.6` contributed
+### What `v0.6.6` contributed (prior milestone)
 
 `pipe(2)` end to end (4 KB ring, directed wake, EOF, `-EPIPE`, the
 exit-path wake, the stdio-guard inversion).  `dup(2)` (32).  Keyboard
@@ -124,9 +139,9 @@ fix (Shift+backslash).  See `docs/session-log.md`, Session 36.
 
 ## NEXT SESSION — pick one
 
-The framebuffer was the big item and it is done.  What's left is a
-set of small, independent items and the large subsystems.  Pick
-**one**, do it, test it, tag it.
+`v0.6.7` shipped the framebuffer.  What's left is a set of small,
+independent items and the large subsystems.  Pick **one**, do it,
+test it, tag it.
 
 ### Small, close gaps (recommended next)
 
@@ -152,17 +167,20 @@ set of small, independent items and the large subsystems.  Pick
   milestone-scale effort when ready.
 - **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
   shims when it lands, do not extend them.
+- **PS/2 mouse driver + framebuffer cursor.**  Not on the roadmap
+  yet, but the natural first step toward any interactive GUI.  The
+  framebuffer console is the foundation; a mouse is what would make
+  it interactive.
 - **Font size / resolution.**  The console is 10×18 at 1024×768.
   A bigger glyph (`ter-u24n.psf`, 12×24) or a bigger mode is a
-  data change (`FB_FONT_*` + the `.psf` the Makefile embeds; the
-  VBE mode number in `stage2.asm`) — do it when the current size
-  strains, not before.
+  data change, but **see the "changing the VBE mode" note above** —
+  it also needs the grid constants and possibly `fb.c`.
 
 ---
 
 ## Canary state
 
-**The focused canary is green as of `v0.6.6`.**  Full table in
+**The focused canary is green as of `v0.6.7`.**  Full table in
 `docs/session-log.md`.
 
     # on boot, ash is already running
@@ -203,7 +221,7 @@ set of small, independent items and the large subsystems.  Pick
     echo hi | wc
     echo hello | cat
 
-**Redirection rows (session 37):**
+**Redirection rows (added v0.6.7):**
 
     echo hi > out.txt ; cat out.txt
     echo hi2 >> out.txt ; cat out.txt
@@ -222,7 +240,7 @@ Run these when changing `sys_read`/`sys_write`/`sys_close`/
 Not canary rows (they fork), but they are the only pipe regression
 suite.
 
-**Framebuffer / `vi` verification (session 38, not canary rows):**
+**Framebuffer / `vi` verification (added v0.6.7, not canary rows):**
 
     vi test            # fills the screen; status line on the last row
     # edit, :wq
@@ -256,12 +274,11 @@ nonexistent paths, are expected diagnostics.
    old docs claimed: `busybox yes | busybox head -n 1` does *not*
    hang.  Fixing it means signal delivery.
 
-Also open: `newfstatat` (262) reserved, no dispatch case; `sys_open`
-accepts non-directories with `O_DIRECTORY`; Ctrl- `[` not mapped to
-ESC; `sys_utimensat` lacks `resolve_against_cwd`; `sys_munmap` is a
-stub returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap
-window are latent collisions; real FatFs timestamp storage;
-`prctl` is minimal; busybox applet symlinks not installed;
+Also open: `newfstatat` (262) reserved, no dispatch case; Ctrl- `[` not
+mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
+`sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base` and
+the 4 MB mmap window are latent collisions; real FatFs timestamp
+storage; `prctl` is minimal; busybox applet symlinks not installed;
 syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
@@ -278,9 +295,8 @@ wake is coupled to `sys_close`'s wake.
   `ls`, `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `seq`, `sort`,
   `stat`, `tail`, `tee`, `test`, `touch`, `tr`, `true`, `uname`,
   `uniq`, `wc`, `yes`, `cmp`, `grep`, `sed`, `vi`, `clear`, plus
-  `ash`.  `CONFIG_FEATURE_VI_WIN_RESIZE=y` (session 38).  Off (with
-  reasons): `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel
-  work).
+  `ash`.  `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  Off (with reasons):
+  `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel work).
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
@@ -317,6 +333,8 @@ needs it.  Paths relative to the tree root
   scope" (`FEATURE_VI_WIN_RESIZE`).  Read them together; expect
   more.
 - `docs/session-log.md` — commit tables and per-test canary notes.
+  Rows named by scratch tag; those tags are dropped at `v0.6.7`, so
+  the `v0.6.7` commit message is the record.
 - `docs/open-issues.md` — full open-issues list.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
@@ -329,14 +347,14 @@ needs it.  Paths relative to the tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  `v0.6.6` is the last milestone (`pipe(2)`,
-pipelines).  Session 37 made `donix>`'s own shell real and gave
-`cat` a stdin mode.  Session 38 put the console on a 1024×768 linear
-framebuffer with Terminus 10×18 text — `vi` fills the screen, edits,
-saves, and the alt-screen restores.  All committed on `dev`,
-scratch-tagged, milestone deferred.  Next: pick one small item
-(`newfstatat`, Ctrl-`[`, or similar), or the signal-delivery
-subsystem.  One change at a time.**
+`userland/musl/`.  `v0.6.7` is published: `donix>`'s own shell is
+real (quote stripping, redirection, sequences, pipelines) and the
+console is a 1024×768 linear framebuffer with Terminus 10×18 text —
+`vi` fills the screen, edits, saves, and the alt-screen restores.
+The VGA text console is the fallback.  Next: pick one small item
+(`newfstatat`, Ctrl- `[`) or take on a larger subsystem (signal
+delivery, or a PS/2 mouse driver as the first step toward a GUI).
+One change at a time.**
 
 ---
 
