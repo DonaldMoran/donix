@@ -4,6 +4,7 @@
 #include "include/pmm.h"
 #include "include/idt.h"
 #include "include/vga.h"
+#include "include/fb.h"
 #include "include/keyboard.h"
 #include "include/interrupts.h"
 #include "include/vmm.h"
@@ -1292,6 +1293,16 @@ void kmain(BootInfo *info) {
     serial_init();
     
     validate_bootinfo(info);
+    
+    /* TEMPORARY: confirm the VBE mode-set captured real values.
+     * Remove once the framebuffer is in use (step 2+). */
+    serial_print("FB: addr=0x");    serial_print_hex(info->framebuffer_addr);
+    serial_print(" w=");            serial_print_dec(info->framebuffer_width);
+    serial_print(" h=");            serial_print_dec(info->framebuffer_height);
+    serial_print(" pitch=");        serial_print_dec(info->framebuffer_pitch);
+    serial_print(" bpp=");          serial_print_dec(info->framebuffer_bpp);
+    serial_print("\n");    
+    
     vga_set_cursor_shape(0x00, 0x0F);
     gdt_init();
     idt_init();
@@ -1308,6 +1319,31 @@ void kmain(BootInfo *info) {
     pmm_init(g_bootinfo);
     vmm_init(info);
     heap_init(HEAP_START, HEAP_INITIAL_SIZE);
+    
+    /*
+     * Initialize the linear framebuffer from BootInfo.  stage2 set
+     * VBE mode 0x118 and captured the framebuffer descriptor; if
+     * that failed, framebuffer_addr is 0 and fb_init leaves the
+     * framebuffer disabled, so the VGA text console stays in use.
+     */
+    fb_init(info->framebuffer_addr, info->framebuffer_width,
+            info->framebuffer_height, info->framebuffer_pitch,
+            info->framebuffer_bpp);
+
+    /*
+     * TEST PATTERN (temporary): paint a known pattern so step 2 is
+     * visibly verifiable in the QEMU window.  Removed when the
+     * console is routed through the framebuffer.
+     *
+     * Dark-blue background, red square top-left, green square
+     * bottom-right.  If pitch were wrong the squares would shear.
+     */
+    if (fb_available()) {
+        fb_fill(0x00, 0x00, 0x40);                          /* dark blue */
+        fb_fillrect(0,   0,   200, 200, 0xC0, 0x00, 0x00);  /* red  */
+        fb_fillrect(824, 568, 200, 200, 0x00, 0xC0, 0x00);  /* green */
+    }    
+    
     ata_init();    
     scheduler_init();
     tss_init();

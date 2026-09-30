@@ -89,7 +89,7 @@ all: kernel.bin
 # KERNEL OBJECTS
 # ============================================================
 OBJS = entry.o ring3_entry.o kmain.o pmm.o vmm.o heap.o idt.o interrupts.o \
-	idt_load.o isr.o vga.o keyboard.o serial.o tss.o gdt.o \
+	idt_load.o isr.o vga.o fb.o keyboard.o serial.o tss.o gdt.o \
 	elf.o test_program_data.o \
 	user_syscall.o user_syscall_entry.o process.o string.o scheduler.o \
 	context_switch.o ata.o \
