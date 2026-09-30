@@ -41,6 +41,7 @@ capture.txt
 # OS-specific build outputs (added)
 04_kernel_64bit/test_program
 04_kernel_64bit/test_program_data.c
+04_kernel_64bit/ter_u18n_data.c
 04_kernel_64bit/user_shell_data.c
 
 # FatFs workaround backup (from the f_unlink debugging)
