@@ -4,12 +4,12 @@ donix speaks the Linux x86_64 syscall ABI, runs static musl-linked
 binaries, and boots straight into **busybox `ash`** on top of a
 from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
 per-process working directory, in both shells, across `fork` and
-`execve`. The console is a VT100 emulator, so full-screen software
-runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
-Pipelines work: `cat file | head`, `echo hi | wc` — from `ash` and,
-as of session 37, from donix's own `donix>` shell too. Files and
-directories can be created and removed; a faulting process is killed
-cleanly.
+`execve`. The console is a VT100 emulator on a **1024×768 linear
+framebuffer** with Terminus 10×18 text, so full-screen software
+runs: `vi` fills the screen, edits, and saves. Pipelines work:
+`cat file | head`, `echo hi | wc` — from `ash` and from donix's own
+`donix>` shell. Files and directories can be created and removed; a
+faulting process is killed cleanly.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -19,7 +19,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, v0.6.6, and session 37
+## Done — Phases A through B, v0.6.6, sessions 37 and 38
 
 For the record, so this file does not re-plan finished work:
 
@@ -28,202 +28,125 @@ For the record, so this file does not re-plan finished work:
 - **Phase B** — Linux x86_64 syscall ABI; static musl binaries;
   busybox 1.36.1 running as the boot shell (`ash` interactive, applets
   in-process via standalone mode, `/bin/busybox` on the image).
-- **v0.6.3** — a real working directory. `chdir`/`getcwd`, relative
-  path resolution in `sys_open`/`sys_stat`/`sys_access`, cwd across
-  `fork` and `execve`, `ls`/`cat` path pass-through, and `cd`/`pwd`
-  builtins in `musl_sh`.
-- **v0.6.4 — the basics.** Full VT100/ANSI emulation in `vga.c`
-  (CSI parsing, cursor addressing, SGR, erase/insert/delete, a
-  software alternate screen); `keyboard.c` delivers ESC, DEL, and
-  CR the way Unix software expects; correct Linux `open(2)` flag
-  translation plus `ftruncate`, `utimes`, `futimesat`, and
-  `utimensat`; `rm` and `rmdir`; `cd ..` at `donix>`; a user-mode
-  `#PF` (and ring-3 `#GP`) kills the process rather than the kernel.
-- **v0.6.5 — scripts, redirection, and a real fd layer.** Shell
-  scripts run (`MAX_PROCESS_FILES` 8 → 64, `execve` returns
-  `ENOEXEC` for a non-ELF so ash falls back to the interpreter, and
-  `./script.sh` normalizes). Shell redirection works end to end:
-  `cmd < file`, `cmd > file`, `2>`, and repeated redirects in one
-  shell all behave. Four new syscalls — `uname` (63), `lseek` (8),
-  `rename` (82), `readv` (19) — and the busybox file/text utilities
-  are enabled: `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`,
-  `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`. Finally,
-  fds 0/1/2 are first-class: console sentinels so a fresh process's
-  `open` returns fd 3, lowest-free-fd allocation so `close(0);
-  open(file)` returns fd 0, and `dup2`/`fcntl(F_DUPFD)` accept low
-  fds so a redirect whose scratch fd is 0/1/2 works.
-- **v0.6.6 — pipes.** `pipe(2)` (22) implemented: a 4 KB ring buffer
-  shared by a read end and a write end, blocking `read`/`write` with
-  a directed wake (`reader_waiting`/`writer_waiting` on the pipe,
-  not a broadcast), EOF when the last writer closes, `-EPIPE` when
-  the last reader closes, and a wake on the process-exit path so a
-  writer that `_exit`s without closing does not strand its reader.
-  The `sys_read`/`sys_write` stdio guards were inverted — the old
-  `kind != FILE_KIND_FILE` test mis-routed a pipe `dup2`'d onto
-  fd 0/1 to the console and hung the pipeline. Also `dup(2)` (32),
-  found by the pipe tests. `keyboard.c` fix: Shift+backslash now
-  produces `|` and `\`. Pipelines work from ash:
-  `cat hello-world.txt | head -n 2`, `echo hi | wc`,
-  `echo hello | cat`.
-- **Session 37 — `musl_sh` is a real shell (not yet a milestone).**
-  Committed on `dev`, scratch-tagged, unpushed; no `v0.6.7` bump yet
-  by choice. donix's own shell, `donix>`, now strips quotes and
-  parses `<`, `>`, `>>`, `|`, `&&`, `;`, and pipelines — all
-  userland, no kernel change. The `musl_sh` limitation that every
-  prior handoff carried ("does not strip quotes or parse redirection;
-  run those tests from ash") is closed. Redirection and pipelines
-  now run from `donix>` directly. See `handoff.md` and
-  `docs/session-log.md`, Session 37.
+- **v0.6.3** — a real working directory.
+- **v0.6.4 — the basics.** Full VT100/ANSI emulation in `vga.c`;
+  `keyboard.c` delivers ESC/DEL/CR; correct Linux `open(2)` flags
+  plus `ftruncate`, `utimes`, `futimesat`, `utimensat`; `rm`/`rmdir`;
+  user-mode `#PF`/`#GP` kills the process.
+- **v0.6.5 — scripts, redirection, a real fd layer.** Scripts run;
+  redirection works end to end; four syscalls (`uname`, `lseek`,
+  `rename`, `readv`); more busybox applets; fds 0/1/2 first-class.
+- **v0.6.6 — pipes.** `pipe(2)` (22), 4 KB ring, directed wake, EOF,
+  `-EPIPE`, exit-path wake, stdio-guard inversion. `dup(2)` (32).
+  Keyboard fix (Shift+backslash).
+- **Session 37 — `musl_sh` is a real shell; `cat` has stdin.**
+  `donix>` strips quotes and parses `<`, `>`, `>>`, `|`, `&&`, `;`,
+  and pipelines. `cat < file` works without busybox. Userland only.
+- **Session 38 — framebuffer console.** VBE mode 0x118
+  (1024×768×24), framebuffer mapped into the kernel, Terminus 10×18
+  glyph blitter, the console routed through a framebuffer-aware cell
+  primitive with a shadow grid (scroll / insert-delete / alt-screen
+  all work on the framebuffer), and `vi` filling the screen. The
+  VGA text console is the fallback; the VT100 parser is unchanged
+  and drives either backend.
 
-The narratives are in the `v0.6.4`, `v0.6.5`, and `v0.6.6` annotated
-tags, `docs/session-log.md`, and `handoff.md`.
+The narratives are in the annotated scratch tags,
+`docs/session-log.md`, and `handoff.md`.
 
 ---
 
 ## v0.6.7 — pick a direction
 
-Pipelines work, and donix's own shell parses them. What comes next is
-a set of small, independent items and several larger subsystem
-questions. Pick one, do it, test it, tag it — the project's
-one-change-at-a-time discipline applies.
-
-### Where to start: donix-native applets
-
-The most visible wart the shell work surfaced: donix's own `cat`
-requires a filename and has no stdin mode, so `cat < file` fails
-while `busybox cat < file` works.  Redirection now works from
-`donix>`; the project's own `cat` should demonstrate it rather than
-delegating to busybox.  This is userland-only
-(`userland/musl/apps/cat.c`), small, and needs no kernel change.
+The framebuffer was the big item and it is done.  What's left is a
+set of small, independent items and several larger subsystem
+questions.  Pick one, do it, test it, tag it.
 
 ### Small, close gaps
 
-- **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
-  `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
-  Latent today (nothing triggers it), but correct to close.
-- **`newfstatat` (262).**  Number reserved, no dispatch case.  musl
-  routes `fstatat` through `stat`/`lstat` on x86_64 for the common
-  case, so it is not hit yet; a caller passing `AT_FDCWD` plus flags
-  would reach it.  Delegates to `sys_stat` when `dirfd == AT_FDCWD`
-  or the path is absolute; with cwd resolution now in `sys_stat`,
-  this is a small wrapper rather than a stub.  Unblocks `find`.
-- **Ctrl-`[` as ESC.**  Deferred during the terminal work;
-  `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
-  The literal ESC key is enough for vi, but terminal users expect the
-  alias.
-- **`sys_utimensat` cwd resolution.**  Found in session 32: it calls
-  `strip_dot_prefix` but not `resolve_against_cwd`, like `sys_unlink`
-  and `sys_mkdir` did before session 32 fixed them.  Same one-line
-  fix.
+- **`newfstatat` (262).**  Number reserved, no dispatch case.
+  Delegates to `sys_stat` when `dirfd == AT_FDCWD` or the path is
+  absolute.  Unblocks `find`.
+- **Ctrl-`[` as ESC.**  `scancode_to_ascii` has no Ctrl parameter
+  yet.  Low urgency (the literal ESC key works).
+- **`sys_utimensat` cwd resolution.**  Calls `strip_dot_prefix` but
+  not `resolve_against_cwd`; one-line fix.
 - **`sys_fcntl` fd < 3 for the other subcommands.**  `F_GETFL`,
-  `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`; Linux
-  allows them on a redirected fd.  Small extension of the
-  session-34 work; not on any current path.
-- **Redirection of a builtin is silently ignored.**  `cd /bin > log`
-  runs `cd`, creates no file, prints no error.  Verified in session
-  37.  Either make it loud or make it work (needs an fd-save/restore
-  dance in the parent).  `docs/open-issues.md` item 2.
-- **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
-  `sh: builtin in pipeline not supported` and runs nothing.  Real
-  shells run the builtin in a subshell; adding that is its own
-  change.  `docs/open-issues.md` item 3.
+  `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`.  Not on any
+  current path.
+- **`sys_open` `O_DIRECTORY`** — done in session 38 (returns
+  `-ENOTDIR` on a file).
+- **Redirection of a builtin is silently ignored.**  `docs/open-issues.md`
+  item 2.
+- **A builtin in a pipeline is refused.**  `docs/open-issues.md`
+  item 3.
 
 ### Broaden busybox coverage
 
-Busybox is the boot shell now, and the file/text utility set is
-broad: `ls`, `echo`, `cat`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`,
-`grep`, `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`,
-`od`, `uniq`, `mkdir`, `touch`, `vi`, `rm`, `rmdir`, plus the
-newly enabled `false`, `true`, `yes`, `seq`, and `clear`.  Still
-untried: `awk`, `tar`, and `find` (which needs `newfstatat`).  These
-are where the syscall surface gets tested hardest.
+The file/text utility set is broad.  Still untried: `awk`, `tar`,
+and `find` (needs `newfstatat`).  Work through them one at a time,
+watching for `Unknown syscall: N`.  `ps`, `top`, `kill`, and job
+control need subsystems the kernel does not have yet.
 
-Work through them one at a time, watching for `Unknown syscall: N` in
-the serial log.  Each missing syscall is its own commit.
+### Framebuffer follow-ups (optional, not urgent)
 
-`ps`, `top`, `kill`, and job control need subsystems the kernel does
-not have yet (process introspection, signal delivery, process groups)
-and should wait for those.
-
-### Shell features
-
-- **Environment variables** — extend the argv mechanism with an
-  `envp` array; `getenv`/`setenv` on the userland side.
-- **Job control** — busybox ash has `ASH_JOB_CONTROL` off in the
-  current config.  Enabling it needs signal delivery, process groups,
-  and a foreground/background distinction -- none of which the kernel
-  has today.  `-EPIPE` without `SIGPIPE` (see `docs/open-issues.md`)
-  is part of this, but the gap is narrow: session 37 verified that
-  `busybox yes | busybox head -n 1` does **not** hang, because
-  busybox apps check `write`'s return value.  The exposure is a
-  program that expects to be *killed* by `SIGPIPE` and does not
-  check `write`; none has been found.  Real `SIGPIPE` still belongs
-  with signal delivery.
+The console is 10×18 at 1024×768.  If it strains:
+- **Bigger font** — swap `ter-u18n.psf` for `ter-u24n.psf` (12×24)
+  or `ter-u32n.psf` (16×32) and update `FB_FONT_*` in `fb.c`.  Data
+  change.
+- **Bigger mode** — a different VBE mode number in `stage2.asm`; the
+  kernel adapts (it reads the captured descriptor).  The grid becomes
+  `fb_width/10 × fb_height/18`.
+- **A scalable / anti-aliased GUI font later** — **Hack** (MIT) is
+  the code-oriented choice.  Out of scope for a console.
 
 ### Larger subsystem questions
 
-- **VFS layer.**  `sys_execve` resolves paths through a three-attempt
-  block in the kernel (leading `/` -> `0:` + path; then `0:/NAME.ELF`,
-  `0:/BIN/NAME`, `0:/BIN/NAME.ELF`), and `resolve_against_cwd` is a
-  per-syscall helper.  Both are stand-ins for a virtual filesystem.
-  When a VFS lands, delete the shim and resolve once.  Do not add a
-  fourth exec attempt; build the VFS.  See `docs/open-issues.md`.
-- **Signal delivery.**  `sys_rt_sigaction` and `sys_rt_sigprocmask`
-  are stubs.  Real delivery is a prerequisite for `SIGPIPE`, for job
-  control, and for `kill(2)`.  Larger than it sounds: needs a
-  per-process pending/blocked mask, a delivery point on syscall
-  return or interrupt, and a user-mode handler trampoline.
+- **Signal delivery.**  `sys_rt_sigaction`/`sys_rt_sigprocmask` are
+  stubs.  Prerequisite for `SIGPIPE`, job control, and `kill(2)`.
+  Larger than it sounds: per-process pending/blocked mask, a
+  delivery point on syscall return or interrupt, a user-mode handler
+  trampoline.  Its own milestone-scale effort.
+- **VFS layer.**  `sys_execve`'s three-attempt path resolution and
+  `resolve_against_cwd` are shims.  Delete them when a VFS lands; do
+  not extend them.
 
 ---
 
 ## Kernel hardening and infrastructure
 
-Independent of the shell work.  Roughly in order of value.
+Independent of the shell/framebuffer work.  Roughly in order of
+value.
 
 - **Real copy-on-write for `fork`.**  The eager copy is O(~6 MB) per
   fork.  Mark shared PTEs read-only and copy on write in a `#PF`
-  handler.  Every busybox applet that forks makes the current cost
-  more visible.
-- **Page-table teardown on process exit.**  Walk and free the
-  user-space portion in `process_reclaim`.
-- **ELF loader `PT_NX` follow-up.**  With `EFER.NXE` enabled, mark
-  data/BSS/stack segments non-executable.
-- **`sys_munmap`.**  Currently a stub returning 0.  Needed before any
-  real memory-releasing workload.
-- **`sys_brk` heap base and the mmap window.**  Both are fixed
-  addresses (`0x8000200000` and a 4 MB window); latent collisions.
-- **Kernel log routing.**  Route `sys_execve`/`sys_open` diagnostics
-  to serial only, or add a `SYS_KLOG(level)` syscall.  The trace
-  lines are informational today but will get noisy as more runs.
-- **Real FatFs timestamp storage.**  The three timestamp syscalls
-  (`utimes`, `futimesat`, `utimensat`) return 0 without storing
-  anything.  Enough for `touch` and vi; not enough for a tool that
-  reads timestamps back.
-- **Pipe buffer growth.**  `pipe_t.capacity` is a field (not an
-  inlined macro) precisely so a later session can grow the buffer
-  Linux-style from 4 KB toward 64 KB without touching
-  `sys_read`/`sys_write`.  Not needed for any current caller.
+  handler.
+- **Page-table teardown on process exit.**
+- **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
+  non-executable.
+- **`sys_munmap`.**  Currently a stub returning 0.
+- **`sys_brk` heap base and the mmap window.**  Fixed addresses;
+  latent collisions.
+- **Kernel log routing.**  Route diagnostics to serial only, or add
+  a `SYS_KLOG(level)` syscall.
+- **Real FatFs timestamp storage.**  The timestamp syscalls return 0
+  without storing.
+- **Pipe buffer growth.**  `pipe_t.capacity` is a field precisely so
+  the buffer can grow from 4 KB toward 64 KB later.
 
 ### Testing infrastructure
 
-- **Boot-time self-test mode** (`-DSELFTEST`) — run the existing test
-  binaries at boot and halt.
-- **`make test` target** — boot QEMU headless, run the self-test,
-  grep the serial log.
-- **Spawn regression test** — a kernel-mode child that spawns
-  `HELLO.ELF`, waits, and asserts exit status 0.
-- **Scripted canary** — a `capture.txt` diff against a known-good
-  boot log, so a regression is caught mechanically rather than by eye.
+- **Boot-time self-test mode** (`-DSELFTEST`).
+- **`make test` target** — headless boot + serial grep.
+- **Scripted canary** — diff `capture.txt` against a known-good log.
 
 ### Longer term
 
 - **Per-process tty / console focus** — prerequisite for multiple
-  concurrent shells.  Also the natural point to build the ring-buffer
-  console (see `docs/MAINTENANCE.md` §4e).
-- **Serial console debug access** — kernel shell over COM1,
-  physically separate from the user keyboard.
-- **Framebuffer graphics** — move off VGA text mode.
+  concurrent shells.
+- **Serial console debug access** — kernel shell over COM1.
 - **Device drivers** — PCI enumeration, AHCI, PS/2 mouse.
+- **Scalable GUI font / richer graphics** — beyond the current
+  fixed-size text console.
 
 ---
 

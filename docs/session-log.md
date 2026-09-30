@@ -1,3 +1,131 @@
+## Session 38 — framebuffer console, Terminus, `vi` fills the screen
+
+Eight commits on `dev`, scratch-tagged, unpushed.  **No milestone
+bump yet** — deferred by choice.  Opened with "the VGA text console
+is hard to read in a half-screen QEMU window" and closed with the
+console fully on a 1024×768 linear framebuffer, Terminus 10×18 text,
+and `vi` filling the screen.
+
+The work was kernel + boot chain (not userland): VBE mode setting,
+framebuffer mapping, a glyph blitter, and a dual-backend console.
+
+### Boot chain and framebuffer
+
+| Tag | What |
+|---|---|
+| `20260930-vbe` | VBE mode 0x118 (1024×768×24), framebuffer descriptor captured |
+| `20260930-fb` | framebuffer mapped into the kernel; `fb_putpixel`/`fb_fill`/`fb_fillrect` |
+
+**VBE mode set.**  `stage2.asm` replaced the VGA text mode-03h set
+with a VBE call for mode 0x118 (linear framebuffer bit) plus a
+mode-info query.  The framebuffer physical address, pitch, width,
+height, and bpp are written into the `bootinfo` block at 0x40–0x54,
+which `bootinfo.h` already defined.  Falls back to text mode 03h if
+VBE fails, leaving the fields zero.  `boot.asm` unchanged; no
+Makefile change.
+
+**Observed:** mode 0x118 on QEMU is **24bpp, pitch 3072**, at
+physical **0xFD000000** — not 32bpp/4096 as assumed.  VBE mode
+numbers do not encode bit depth.  The kernel uses the captured
+values, so the assumption was harmless, but the comment was
+corrected.
+
+**Mapping.**  `fb.c` maps the framebuffer's physical range (2.25 MB)
+into the kernel's higher half at `0xFFFFFFFFA0000000`, present +
+writable + NX, page by page via `vmm_map_page_in_cr3`.  The
+boot page tables do not cover 0xFD000000, so this mapping is
+required before any pixel write.
+
+**Byte order — BGR, not RGB.**  The first test pattern came out with
+red and blue swapped.  QEMU's Bochs VBE stores 24bpp pixels as
+B, G, R.  Fixed with `FB_BYTE_R/G/B` macros in `fb.c`; callers still
+pass `(r, g, b)`.  Full writeup: `gotchas.md`, "Assumed byte-order
+conventions."
+
+### Font and console
+
+| Tag | What |
+|---|---|
+| `20260930-font` | Terminus 10×18 glyph blitter (`fb_putchar`/`fb_puts`) |
+| `20260930-fbcon` | console drawing routed through a framebuffer-aware cell primitive |
+| `20260930-shadow` | shadow cell grid: scroll, insert/delete, alt-screen |
+
+**Font.**  `fonts/ter-u18n.psf` (PSF v2, 256 glyphs, 10×18, 36
+bytes/glyph, 32-byte header) is embedded via `xxd -i`, same path as
+`test_program_data`.  The `.psf` was built from Terminus 4.49 source
+(`make psf`).  The Unicode table is the identity mapping for this
+font, so glyph index == character code; the table is not read (the
+code comments this).  **The glyph rows are MSB-first**, so the
+blitter reads bit `(width-1-col)`; getting this wrong mirrors every
+glyph (caught by looking at the output).
+
+**Console routing.**  `vga.c` gained a 16-color VGA→RGB palette and
+a single `con_put_cell` chokepoint that draws either via `fb_putchar`
+(framebuffer) or to VGA text memory.  Every draw site in `vga.c`
+goes through it.  The console grid becomes `con_cols()`/`con_rows()`
+— 102×42 on the framebuffer, 80×25 on VGA — so the same VT100 logic
+drives either backend.  **The VT100 parser, SGR, cursor addressing,
+alt-screen, and the public `vga_*` API are unchanged; callers
+outside `vga.c` are untouched** (every one already went through the
+public API — verified by grep before the change).
+
+**Shadow cell grid.**  The framebuffer is write-only pixels, so
+operations that read cells back (scroll, insert/delete chars,
+alt-screen save/restore) could not move or restore existing
+content — scrolling blanked instead of sliding, and exiting `vi`
+left the screen black.  Fixed with a shadow `uint16_t` cell grid
+(the single source of truth on both backends); `con_put_cell`
+splits into `shadow_set` + `paint_cell`, and every read-back
+operation shifts shadow cells and repaints.
+
+### Cleanup and `vi`
+
+| Tag | What |
+|---|---|
+| `20260930-fbclean` | test pattern removed; framebuffer cleared to console background |
+| `20260930-winsz` | `TIOCGWINSZ` reports the real console grid |
+| `20260930-viwinsize` | busybox `FEATURE_VI_WIN_RESIZE=y` — `vi` fills the screen |
+
+**`fbclean`.**  The step-2 pixel test pattern is replaced with a
+full-framebuffer fill of the console background (VGA blue,
+`0x00,0x00,0xAA`), which also covers the margin strip the 102×42
+grid does not reach (the leftover green-square outline at the
+bottom right).
+
+**`winsz`.**  `sys_ioctl`'s `TIOCGWINSZ` answered a hardcoded
+24×80.  Added `vga_rows()`/`vga_cols()` and reported the live grid
+(42×102).  This is the *kernel* half.
+
+**`viwinsize`.**  The *busybox* half: `CONFIG_FEATURE_VI_WIN_RESIZE=y`.
+`vi` was sizing to 24×80 despite `TIOCGWINSZ` correctly answering
+42×102 — it ignored the result.  Enabling this option made `vi`
+consult the winsize at startup, and it fills the screen.  See
+`gotchas.md`, "The option name describes its most visible effect,
+not its scope": this option was initially dismissed as SIGWINCH-only
+(needs signals, which donix lacks), but it *also* gates the startup
+winsize query.
+
+### Verification (`donix>` / ash)
+
+Framebuffer console:
+
+    # boot messages render on the framebuffer, not just serial
+    # the shell prompt, typed input, and command output render there
+    vi test            # ~ markers rows 2..41, status line row 42
+    :wq                # saves; screen returns to the shell (alt-screen restore)
+    ./test             # the saved script runs
+
+The `vi` round trip — enter alt-screen, edit, save, exit, restore the
+prior screen — exercises the shadow grid's alt-screen save/restore
+and the VT100 parser's cursor addressing and SGR on the framebuffer.
+
+### Expected noise
+
+No `Unknown syscall:` lines.  No `[fd]` lines.  The `FB: mapped N
+pages ...` line is expected (informational).  The usual `EXIT:` lines
+for forked children.  The `sys_open: f_open FAIL ...` from `vi` on a
+new file is expected (the file does not exist yet).
+
 ## Session 37 — `musl_sh`: tokenizer, redirection, sequences, pipelines
 
 Six commits on `dev`, scratch-tagged (one config commit untagged),
@@ -31,9 +159,7 @@ into a *separate* output buffer, so it has none of phase 1's
 in-place hazard.  Together they give `echo hi>out` →
 `echo hi > out` and `echo "a b" c` → `echo`, `a b`, `c`.
 
-### Redirection, sequences, pipelines
-
-| Tag | What |
+### Redirection, sequences, pipelines| Tag | What |
 |---|---|
 | `20260930-redir` | `<`, `>`, `>>` via `open` + `dup2` + `execve` |
 | `20260930-seq` | `;` and `&&`; builtins report their own status |
@@ -75,59 +201,15 @@ only because the shell holds no fd above 2 at exec time; see
 |---|---|
 | (untagged) | `configs/busybox.config`: enable `false`, `true`, `yes`, `seq`, `clear` |
 | `20260930-nodebug` | remove the tokenizer debug print (`[a\|b\|c]`) |
+| `20260930-cat` | donix-native `cat`: stdin mode, multiple files, `-` |
+| `20260930-docs` | the session-37 documentation pass |
 
 The busybox config commit enabled `false`/`true` (needed to test
 `&&` short-circuiting on a real child's exit code) and
-`yes`/`seq`/`clear` (bundled in the same edit; `yes` and `seq` are
-for pipeline stress tests and were not required for this session).
-The commit has no message body, so this is the only record of why.
+`yes`/`seq`/`clear` (bundled in the same edit).
 
-The debug print was scaffolding for the tokenizer steps and was
-removed once the parser consumed argv.  No functional change.
-
-### Verification (`donix>`, not canary rows)
-
-Quoting and operator splitting:
-
-    echo "a b" c        -> a b c
-    echo 'x y'          -> x y
-    echo hi>out         -> tokenized echo hi > out; echo prints "hi > out"
-    echo a && echo b    -> a then b
-
-Redirection round trip:
-
-    echo hi > out.txt ; cat out.txt
-    echo hi2 >> out.txt ; cat out.txt      # hi then hi2
-    busybox cat < out.txt                  # hi
-    echo one > out.txt ; cat out.txt        # one (truncates)
-    echo two > out.txt ; cat out.txt        # two, not one+two
-
-Note: `cat < out.txt` (donix-native `cat`) fails with `usage: cat
-FILE` — donix's `cat` has no stdin mode.  `busybox cat < out.txt`
-works.  That is a `cat.elf` limitation, not a redirection bug.
-
-Sequences:
-
-    echo a ; echo b
-    busybox false && echo skipped           # nothing
-    busybox false && echo x ; echo y        # y only
-    cd /nope && echo not-reached            # cd error, no not-reached
-    exit ; echo no                          # bye, no no
-
-Pipelines (the milestone headline, now runnable from `donix>`, not
-only ash):
-
-    cat hello-world.txt | busybox head -n 2
-    echo hi | busybox wc                    # 1 1 3
-    echo hello | busybox cat                # hello
-    cat hello-world.txt | busybox head -n 2 | busybox wc   # 2 16 97
-    cat hello-world.txt | busybox head -n 2 > f ; cat f
-    cd /bin | busybox cat                   # refused: builtin in pipeline
-    busybox yes | busybox head -n 1         # see below
-
-`cat | head | wc` is the three-stage case that proves the middle
-child's fd close: it would deadlock if the middle command held the
-upstream write end.
+`cat` gained a stdin mode (`cat < file` works without busybox),
+multiple-file concatenation, and `-` for stdin.
 
 ### `-EPIPE` observation — the docs prediction was wrong
 
@@ -139,29 +221,7 @@ Observed this session: it does **not** hang.  `head` prints `y` and
 exits; `yes` receives `-EPIPE`, **handles it**, prints
 `yes: Broken pipe`, and exits; the shell reaps both and returns to
 the prompt.  The prediction was too pessimistic and named the wrong
-example.  The general gap (a program that expects to be *killed* by
-`SIGPIPE` and does not check `write`'s return) remains open, but no
-program has been found that exhibits it.  `open-issues.md` corrected
-accordingly.
-
-### Expected noise
-
-No `Unknown syscall:` lines.  No `[fd]` lines (the fd trace is off).
-No `[a|b|c]` debug line — removed this session.  Expected
-informational lines: `EXIT: pid=N state=2 parent=P qhead=Q` for each
-forked child; `EXIT: pid=N state=1 parent=P qhead=Q` for a forked
-shell's own exit; `EXIT-FALLBACK: switching to idle, ...` when a
-child is the last runnable process.  `yes: Broken pipe` from the
-`busybox yes | busybox head -n 1` line is expected.
-
-### Docs note — `capture.txt` and backspaces
-
-A backspaced line appears in `capture.txt` as its full typed history
-(the `\b \b` erase bytes are captured literally), not its corrected
-form.  Read the `sys_execve: ... argc=N` line or the VGA, not the
-echoed line.  See `gotchas.md`, "`capture.txt` shows backspace
-history…".  This cost real time this session chasing a phantom
-tokenizer bug.
+example.  `open-issues.md` corrected accordingly.
 
 ## Session 36 — `pipe(2)`, pipelines work (v0.6.6)
 
@@ -207,9 +267,7 @@ the existing `block_kind`, no PCB offset movement).
 `pipe_wake_waiter()` checks the waiter is non-NULL, still `BLOCKED`,
 and blocked on *this* kind before waking — the block_kind check is
 what makes a recycled PCB slot safe.  Directed wake, not a
-broadcast.  Blocking loops follow the cli-test-record-block-hlt
-discipline from `sys_read` fd-0 and `sys_poll`.  Test
-`pipe_step2.c`: 7 checks, pass.
+broadcast.  Test `pipe_step2.c`: 7 checks, pass.
 
 **Step 3.**  `file_slot_t.end` flag (read/write);
 `pipe_t.readers_open`/`writers_open` *counts*.  Counts, not flags,
@@ -217,21 +275,16 @@ because `pipe(fds); dup2(fds[1], 1)` leaves two fds holding the
 write end, and closing one must not look like "the writer closed."
 `read` on empty + `writers_open == 0` → 0 (EOF); `write` with
 `readers_open == 0` → `-EPIPE`, checked *before* the full-buffer
-check.  Test `pipe_step3.c`: 6 checks, pass; log ordering confirms
-the reader stayed blocked through the first close.
+check.  Test `pipe_step3.c`: 6 checks, pass.
 
 **Step 3.5.**  `put_file_slot`'s pipe case now wakes the peer when
 a count reaches zero.  Without it, a writer that `_exit`s without
 closing leaves a reader stuck in `hlt` until a keystroke.  Test
-`pipe_step3b.c`: child holds write end, never closes, `_exit`s;
-parent's `read` must return 0 on the exit alone.  STEP3B OK first
-run.
+`pipe_step3b.c`: STEP3B OK first run.
 
 **Step 4.**  The stdio guard inversion.  `sys_read` fd-0 and
 `sys_write` fd-1/2 guards changed from `kind != FILE_KIND_FILE` to
-`kind == FILE_KIND_CONSOLE`.  The old form mis-routed a pipe (kind
-`FILE_KIND_PIPE` is `!= FILE_KIND_FILE`, so a piped stdin took the
-keyboard path and blocked).  Full writeup: `gotchas.md`, "Negative
+`kind == FILE_KIND_CONSOLE`.  Full writeup: `gotchas.md`, "Negative
 fd-kind tests don't extend to new kinds."
 
 ### Also in the milestone
@@ -242,25 +295,13 @@ fd-kind tests don't extend to new kinds."
 | (dropped) | bump version banner to `v0.6.6` |
 | (dropped) | `pipe_step3` back to `dup()` now that `dup(2)` exists |
 
-`dup(2)` was found by `pipe_step3`'s first run, not by reading
-code: musl's `dup()` reaches `SYS_dup` directly and donix had no
-handler, so any caller got `-ENOSYS`.  Implemented as a one-line
-delegation to `sys_fcntl`.  The test had been using
-`fcntl(F_DUPFD)` as a workaround; with `dup(2)` in, the test goes
-back to `dup()` so it exercises the real path.
-
 ### Canary
 
-Focused canary green.  Pipeline rows (new this milestone, run from
-ash):
+Focused canary green.  Pipeline rows (run from ash):
 
     cat hello-world.txt | head -n 2
     echo hi | wc                      # 1 1 3
     echo hello | cat                  # hello
-
-`cat | head` exercises blocking on both ends; `echo hi | wc`
-exercises EOF (the reader must see the writer close and stop);
-`echo hello | cat` is the smallest end-to-end case.
 
 Pipe regression suite (`userland/musl/tests/`), run from ash:
 
@@ -268,19 +309,6 @@ Pipe regression suite (`userland/musl/tests/`), run from ash:
     pipe_step2    # blocking + directed wake
     pipe_step3    # EOF, EPIPE, dup-aware counts
     pipe_step3b   # exit-path wake
-
-Four binaries, `STEPn OK` on success.  Not canary rows — they fork
-and take seconds — but they are the only regression suite the pipe
-code has, and they do not mutate the disk.
-
-### Expected noise
-
-No `Unknown syscall:` lines.  No `[fd]` lines (trace is off).  The
-usual `EXIT: pid=N state=...` lines for forked children;
-`EXIT-FALLBACK: switching to idle, ...` when a child is the last
-runnable process; the `WAIT-WNOHANG-OK` spin from `musl_wait`; the
-`uniq: can't open '<'` line from `donix>` (the `musl_sh`
-redirection gap, still open — headline for `v0.6.7`).
 
 ## Session 34 — low fds first-class, `uniq` works
 
@@ -297,13 +325,9 @@ that turned out to be the actual bug.  Two threads.
 `uniq FILE` hangs because `alloc_file_slot` started at fd 3, so
 `close(0); open(file)` landed the file on fd 3 and `read(0, ...)`
 blocked on the keyboard.  Three interlocking changes: console
-sentinels in fds 0/1/2 (so a fresh process's `open` returns 3),
-`alloc_file_slot` scanning from 0 (so `open` returns 0 after
-`close(0)`), and `sys_dup2` / `sys_fcntl(F_DUPFD)` using
-`get_file_slot_any` (so a redirect whose scratch fd is 0/1/2 works
-and the save/restore dance does not break the *second* redirect in a
-shell).  Full writeup in `gotchas.md`, "Low fds (0/1/2) are
-first-class."
+sentinels in fds 0/1/2, `alloc_file_slot` scanning from 0, and
+`sys_dup2` / `sys_fcntl(F_DUPFD)` using `get_file_slot_any`.  Full
+writeup in `gotchas.md`, "Low fds (0/1/2) are first-class."
 
 ### Thread 2 — busybox
 
@@ -311,36 +335,9 @@ first-class."
 |---|---|
 | `20260930-busybox-uniq` | `CONFIG_UNIQ=y` |
 
-The applet's hang was the kernel fd bug above, not an applet bug.
-With low fds first-class it works in both the FILE-argument and
-redirected-stdin forms.
-
 ### Canary
 
-Focused canary green on both commits.  The new read-only `uniq` rows
-are now valid additions:
+Focused canary green.  New read-only `uniq` rows:
 
     uniq hello-world.txt
     uniq -c < hello-world.txt
-
-Both read-only, both safe as canary rows.  The redirected one is
-ash-only (see `open-issues.md`, test-design notes).
-
-Verification one-offs (mutate, not canary):
-
-    cat < hello-world.txt
-    echo hi > out.txt       ; cat out.txt
-    echo hi2 > out2.txt     ; cat out2.txt
-    head -n 2 hello-world.txt
-    wc hello-world.txt
-    grep Hello hello-world.txt
-
-The two separate `echo >` lines matter: the *second* redirect in one
-shell is what failed before the `dup2`/`fcntl` fix.
-
-### Expected noise
-
-No `Unknown syscall:` lines.  No `[fd]` lines (trace is off).  The
-usual `EXIT: pid=N state=...` lines, the `WAIT-WNOHANG-OK` spin from
-`musl_wait`, and the `uniq: can't open '<'` line from `donix>` (the
-`musl_sh` redirection gap) are all expected.

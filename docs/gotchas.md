@@ -204,11 +204,11 @@ are "a decision encoded as a test on the current set of kinds /
 fd numbers, invalidated by a new one."
 
 A third instance of the same *shape* -- a decision correct only for
-the set of cases known at the time -- appeared the very next
-session, in userland rather than the kernel: see "Multi-write
-output races the child's kernel prints" below. It is not a
-`FILE_KIND_*` case, but it is the same lesson: an assumption baked
-in when the set was smaller, invalidated when the set grew.
+the set of cases known at the time -- appeared the next session, in
+userland rather than the kernel: see "Multi-write output races the
+child's kernel prints" below. And a fourth, in the framebuffer work
+(session 38): two assumed byte conventions, both wrong until tested.
+See "Assumed byte-order conventions" below.
 
 ## Multi-write output races the child's kernel prints
 
@@ -275,6 +275,83 @@ while the set of things that could print between them was small,
 and stopped being harmless when that set grew (a forking pipeline,
 a child that prints on exit). It is the third instance of that
 shape. Expect more; the shape recurs across subsystems.
+
+## Assumed byte-order conventions are the same shape
+
+*Session 38 (framebuffer console), kernel and boot chain. Two
+instances, both "we assumed a convention and it was the other
+one."*
+
+This is the fourth instance of the shape named in "Negative
+fd-kind tests don't extend to new kinds": a decision that was
+wrong, or would have been wrong, because a convention was assumed
+rather than verified. The two framebuffer cases are both about
+**byte order within a pixel or a glyph row.**
+
+**Instance 1 — framebuffer pixels are BGR, not RGB.**
+`fb.c`'s `fb_putpixel` initially packed pixels as
+`p[0]=r; p[1]=g; p[2]=b`.  The test pattern came out with red and
+blue swapped: a "dark blue" fill rendered red, a "red" rectangle
+rendered blue, green (the middle byte) rendered correctly.  QEMU's
+Bochs VBE stores 24bpp and 32bpp pixels in **BGR** order -- byte 0
+is blue.  Fixed with `FB_BYTE_R/G/B` macros in `fb.c`, so callers
+still pass `(r, g, b)` and the quirk lives in one documented place.
+
+**The tell:** when R and B swap, only red and blue change; green
+stays.  If a color test shows "red and blue swapped but green
+fine," it is a byte order, not a palette.
+
+**Instance 2 — PSF glyph rows are MSB-first, not LSB-first.**
+`fb_putchar` initially read a glyph row's bits with
+`if (bits & (1u << col))`, treating bit 0 as the leftmost pixel.
+Terminus PSF rows are packed **most-significant-bit first**: the
+leftmost pixel is the highest bit of the row.  Every glyph rendered
+mirrored -- `donix` read as a horizontal flip of itself.  Fixed by
+reading bit `(FB_FONT_W - 1 - col)` instead.
+
+**The tell:** mirrored glyphs, same size, same spacing, correct
+shapes but flipped, means the bit order within the row is reversed.
+
+**The rule.** A byte-order or bit-order convention is a
+*guess* until a test confirms it.  Both of these were caught only
+because a test pattern was drawn and *looked at* -- the code was
+self-consistent and would have passed any test that did not check
+actual colors or actual glyph orientation.  When you write code
+that packs or unpacks bytes against a hardware or file-format
+convention, verify with a known input whose correct output you can
+recognize (a color you can name, a letter you can read), not just
+with round-trip tests.
+
+## The option name describes its most visible effect, not its scope
+
+*Session 38. A reasoning error, caught by trying it.*
+
+`busybox vi` sized itself to 24×80 on the framebuffer console even
+though it calls `TIOCGWINSZ` and the kernel correctly answers
+42×102 (confirmed with a temporary print in
+`fill_kernel_winsize`).  The fix turned out to be:
+
+    CONFIG_FEATURE_VI_WIN_RESIZE=y
+
+in `configs/busybox.config`.
+
+**The wrong reasoning.** This option was initially dismissed:
+"`FEATURE_VI_WIN_RESIZE` handles SIGWINCH -- the terminal-resized
+signal -- and donix has no signal delivery, so the handler would
+never fire and the option does nothing."  The first two facts are
+true.  The conclusion was wrong.  The option **also gates the code
+that consults `TIOCGWINSZ` at startup** -- which is the part that
+was needed.  Enabling it made `vi` read the winsize, and it filled
+the screen.
+
+**The rule.** A config option's *name* describes its most visible
+or most distinctive effect, not its full scope.  `FEATURE_VI_WIN_RESIZE`
+sounds like "handle resize events," but in busybox `vi.c` it also
+gates the startup size query.  Do not conclude "this option is
+irrelevant" from its name alone -- read the source, or try it.
+The cost of trying was one config line and a rebuild; the cost of
+the wrong conclusion was a documented limitation that was not
+actually a limitation.
 
 ## `argv[cmd_argc] = 0` mutates argv in the child
 

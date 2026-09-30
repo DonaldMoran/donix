@@ -35,7 +35,7 @@
    Linux does allow e.g. `fcntl(0, F_GETFL, ...)` on a redirected fd;
    donix returns `EBADF` there.  Not currently on any path, and
    relaxing it is a small extension of the session-34 work rather
-   than a new problem.  Track here so it is not rediscovered.
+   than a new problem.
 
 5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
    own syscalls.**  Deliberate FatFs-limitation first cuts.
@@ -62,10 +62,9 @@
    Fixing this means implementing signal delivery: a real
    `sys_rt_sigaction`, per-process signal handlers, and a `SIGPIPE`
    raise on the `-EPIPE` write path.  That is a subsystem, not a
-   small change, and out of scope for the pipe work.
+   small change.
 
-Also open: `newfstatat` (262) reserved, no dispatch case;
-`sys_open` accepts non-directories with `O_DIRECTORY`; Ctrl- `[` not
+Also open: `newfstatat` (262) reserved, no dispatch case; Ctrl- `[` not
 mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
 `sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base` and
 the 4 MB mmap window are latent collisions; real FatFs timestamp
@@ -84,15 +83,23 @@ covers everything, non-final closes in a `dup`'d chain stop waking
 the peer and the peer hangs until a keystroke — read the
 `put_file_slot` comment and this entry before touching either).
 
+**Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
+keystroke (visible as a syscall per key in a trace).  This is
+`FEATURE_VI_WIN_RESIZE` re-checking the size; it is `vi`'s behavior,
+harmless, and the reason `vi` fills the screen.  No action.
+
 ### Test-design notes
 
 - **The old `musl_sh` ash-only caveats are gone.**  Through
   `v0.6.6`, `donix>` did not parse `<`, `>`, `|`, `&&`, `;`, or
-  quoting, so redirection and pipeline tests had to run from ash.
-  Session 37 closed that gap.  Any test that was "ash-only for
-  `musl_sh` reasons" is now valid from `donix>` as well.  (`busybox
-  sh` and the boot ash still exist and still work; they are just no
-  longer *required* for redirection or pipeline tests.)
+  quoting.  Session 37 closed that gap; redirection and pipeline
+  tests are valid from `donix>` as well as ash.
+
+- **Framebuffer / `vi` tests are one-offs, not canary rows.**  `vi`
+  mutates the disk (it writes the file) and takes over the screen.
+  `vi test`, `:wq`, `./test` is the round-trip check; run it by hand
+  after framebuffer or console changes, not as part of the boot
+  canary.
 
 - **Pipe regression suite is not a canary.**  `pipe_step1` …
   `pipe_step3b` fork and take seconds; run them when changing
