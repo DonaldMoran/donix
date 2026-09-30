@@ -4617,10 +4617,23 @@ typedef struct {
 } kernel_winsize_t;
 
 static void fill_kernel_winsize(kernel_winsize_t* ws) {
-    ws->ws_row    = 24;
-    ws->ws_col    = 80;
+    /*
+     * Report the real console grid, not a fixed 24x80.  Full-screen
+     * programs (busybox vi, and anything else that queries
+     * TIOCGWINSZ) size their display to this, so a hardcoded 24x80
+     * made vi use only the top-left corner of the 102x42 framebuffer
+     * console.  vga_rows()/vga_cols() report the live grid on
+     * whichever backend is active (framebuffer or VGA text).
+     */
+    ws->ws_row    = (uint16_t)vga_rows();
+    ws->ws_col    = (uint16_t)vga_cols();
     ws->ws_xpixel = 0;
     ws->ws_ypixel = 0;
+    serial_print("TIOCGWINSZ -> ");
+    serial_print_dec(ws->ws_row);
+    serial_print("x");
+    serial_print_dec(ws->ws_col);
+    serial_print("\n");
 }
 
 long sys_ioctl(int fd, unsigned long request, void* argp) {

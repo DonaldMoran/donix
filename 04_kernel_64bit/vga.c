@@ -943,6 +943,8 @@ void vga_set_cursor_shape(uint8_t start_scanline, uint8_t end_scanline) {
     outb(VGA_CRTC_DATA, end_scanline);
     serial_unlock();
 }
+int vga_rows(void) { return con_rows(); }
+int vga_cols(void) { return con_cols(); }
 
 void vga_hide_cursor(void) {
     serial_lock();
