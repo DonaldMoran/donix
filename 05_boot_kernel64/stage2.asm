@@ -92,10 +92,16 @@ start:
     ; Set a VBE linear-framebuffer mode.
     ;
     ; Was: VGA text mode 03h (int 0x10, ax=0x0003).
-    ; Now: VBE mode 0x118 = 1024x768x32bpp, with the
+    ; Now: VBE mode 0x118 = 1024x768x24bpp, with the
     ;      0x4000 "use linear framebuffer" bit set, so the
     ;      mode info block reports a linear framebuffer
     ;      address we can write pixels to directly.
+    ;
+    ; NOTE: VBE mode numbers do not encode bit depth.  On
+    ; QEMU's VBE, 0x118 is 24bpp (3 bytes/pixel, pitch
+    ; 3072), not 32bpp.  Observed after the first boot.
+    ; The kernel uses the values the mode-info block
+    ; reports at runtime, so this comment is just a record.
     ;
     ; This must happen HERE, in real mode, before the switch
     ; to protected/long mode: VBE is a real-mode BIOS service.
@@ -146,6 +152,9 @@ start:
     ;       +0x4C  framebuffer_height  (dword, pixels)
     ;       +0x50  framebuffer_pitch   (dword, bytes/scanline)
     ;       +0x54  framebuffer_bpp     (dword, bits/pixel)
+    ;
+    ; Observed on QEMU (mode 0x118): addr=0xFD000000,
+    ; w=1024, h=768, pitch=3072, bpp=24.
     ;     These slots are already present in the bootinfo
     ;     block (see the layout below); they start zeroed. ---
     mov ax, 0x1000
