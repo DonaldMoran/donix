@@ -88,10 +88,107 @@ start:
     mov ss, ax
     mov sp, 0x7C00
 
-    ; VGA text mode 03h
-    mov ah, 0x00
-    mov al, 0x03
+    ; ----------------------------------------------------
+    ; Set a VBE linear-framebuffer mode.
+    ;
+    ; Was: VGA text mode 03h (int 0x10, ax=0x0003).
+    ; Now: VBE mode 0x118 = 1024x768x32bpp, with the
+    ;      0x4000 "use linear framebuffer" bit set, so the
+    ;      mode info block reports a linear framebuffer
+    ;      address we can write pixels to directly.
+    ;
+    ; This must happen HERE, in real mode, before the switch
+    ; to protected/long mode: VBE is a real-mode BIOS service.
+    ; Once stage2 has gone to long mode there is no way to call
+    ; it without a real-mode trampoline.
+    ;
+    ; On failure (AX != 0x4F after the set), fall back to text
+    ; mode 03h and leave the framebuffer fields in `bootinfo`
+    ; zero.  The kernel checks framebuffer_addr == 0 and stays
+    ; on VGA text.  A VBE failure therefore degrades to the
+    ; previous behaviour rather than a black screen.
+    ;
+    ; The BIOS can clobber ds/es/si/di across an int 0x10, so
+    ; ds and es are saved and restored around the whole block.
+    ; ----------------------------------------------------
+    push ds
+    push es
+
+    ; --- Set VBE mode 0x118 with linear framebuffer.
+    ;     AX = 0x4F02, BX = mode | 0x4000.  Success: AX = 0x004F. ---
+    mov ax, 0x4F02
+    mov bx, 0x4118          ; mode 0x118 | 0x4000 (linear fb)
     int 0x10
+    cmp ax, 0x004F          ; VBE success returns AX = 0x004F
+    jne .vbe_failed
+
+    ; --- Get mode info for 0x118 into the buffer.  ES:DI must
+    ;     point at a 256-byte region; CX = mode number. ---
+    mov ax, 0x1000
+    mov es, ax
+    mov di, vbe_mode_info - $$
+    mov ax, 0x4F01
+    mov cx, 0x0118
+    int 0x10
+    cmp ax, 0x004F
+    jne .vbe_failed
+
+    ; --- Mode attributes: bit 7 must be set (linear framebuffer
+    ;     supported).  If not, this mode is not usable as a
+    ;     linear framebuffer. ---
+    mov al, byte [vbe_mode_info + 0x00]
+    test al, 0x80
+    jz .vbe_failed
+
+    ; --- Copy the fields we need into the `bootinfo` block:
+    ;       +0x40  framebuffer_addr    (qword, physical)
+    ;       +0x48  framebuffer_width   (dword, pixels)
+    ;       +0x4C  framebuffer_height  (dword, pixels)
+    ;       +0x50  framebuffer_pitch   (dword, bytes/scanline)
+    ;       +0x54  framebuffer_bpp     (dword, bits/pixel)
+    ;     These slots are already present in the bootinfo
+    ;     block (see the layout below); they start zeroed. ---
+    mov ax, 0x1000
+    mov ds, ax
+
+    ; framebuffer_addr = dword [mode_info + 0x28], extended to
+    ; a qword.  VBE 3.0 also carries a high dword at +0x2A, but
+    ; for a mode whose framebuffer is below 4 GB (QEMU's is),
+    ; the low dword is enough and the high dword is zero.
+    mov eax, dword [vbe_mode_info + 0x28]
+    mov dword [bootinfo + 0x40], eax
+    mov dword [bootinfo + 0x44], 0
+
+    ; framebuffer_pitch = word [mode_info + 0x10]
+    movzx eax, word [vbe_mode_info + 0x10]
+    mov dword [bootinfo + 0x50], eax
+
+    ; framebuffer_width = word [mode_info + 0x12]
+    movzx eax, word [vbe_mode_info + 0x12]
+    mov dword [bootinfo + 0x48], eax
+
+    ; framebuffer_height = word [mode_info + 0x14]
+    movzx eax, word [vbe_mode_info + 0x14]
+    mov dword [bootinfo + 0x4C], eax
+
+    ; framebuffer_bpp = byte [mode_info + 0x19]
+    movzx eax, byte [vbe_mode_info + 0x19]
+    mov dword [bootinfo + 0x54], eax
+
+    pop es
+    pop ds
+    jmp .vbe_done
+
+.vbe_failed:
+    ; Fall back to VGA text mode 03h.  The bootinfo framebuffer
+    ; fields stay zero, and the kernel will keep using the VGA
+    ; text console.
+    mov ax, 0x0003
+    int 0x10
+    pop es
+    pop ds
+
+.vbe_done:
 
     in  al, 0x92
     or  al, 00000010b
@@ -388,3 +485,19 @@ e820_buffer:
 e820_count:
     dw 0
     dd 0
+
+; VBE mode-info block.  Filled by the int 0x10 / AX=0x4F01 call in
+; `start`.  Must be 256 bytes (VBE spec) and should be aligned, though
+; alignment is not strictly required — VBE writes dwords/words/bytes
+; into it and 16-byte alignment is conventional.  Only the fields the
+; boot code reads are documented here:
+;
+;   0x00  mode attributes    (bit 7 = linear framebuffer supported)
+;   0x10  bytes per scanline (word)
+;   0x12  X resolution       (word)
+;   0x14  Y resolution       (word)
+;   0x19  bits per pixel     (byte)
+;   0x28  physical address of linear framebuffer (dword)
+align 16
+vbe_mode_info:
+    times 256 db 0
