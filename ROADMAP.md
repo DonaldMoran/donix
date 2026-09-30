@@ -6,7 +6,8 @@ from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
 per-process working directory, in both shells, across `fork` and
 `execve`. The console is a VT100 emulator, so full-screen software
 runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
-Pipelines work: `cat file | head`, `echo hi | wc`. Files and
+Pipelines work: `cat file | head`, `echo hi | wc` — from `ash` and,
+as of session 37, from donix's own `donix>` shell too. Files and
 directories can be created and removed; a faulting process is killed
 cleanly.
 
@@ -18,7 +19,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, and v0.6.6
+## Done — Phases A through B, v0.6.6, and session 37
 
 For the record, so this file does not re-plan finished work:
 
@@ -64,6 +65,15 @@ For the record, so this file does not re-plan finished work:
   produces `|` and `\`. Pipelines work from ash:
   `cat hello-world.txt | head -n 2`, `echo hi | wc`,
   `echo hello | cat`.
+- **Session 37 — `musl_sh` is a real shell (not yet a milestone).**
+  Committed on `dev`, scratch-tagged, unpushed; no `v0.6.7` bump yet
+  by choice. donix's own shell, `donix>`, now strips quotes and
+  parses `<`, `>`, `>>`, `|`, `&&`, `;`, and pipelines — all
+  userland, no kernel change. The `musl_sh` limitation that every
+  prior handoff carried ("does not strip quotes or parse redirection;
+  run those tests from ash") is closed. Redirection and pipelines
+  now run from `donix>` directly. See `handoff.md` and
+  `docs/session-log.md`, Session 37.
 
 The narratives are in the `v0.6.4`, `v0.6.5`, and `v0.6.6` annotated
 tags, `docs/session-log.md`, and `handoff.md`.
@@ -72,51 +82,61 @@ tags, `docs/session-log.md`, and `handoff.md`.
 
 ## v0.6.7 — pick a direction
 
-Pipelines work. What comes next is a set of small, independent items
-and several larger subsystem questions. Pick one, do it, test it, tag
-it — the project's one-change-at-a-time discipline applies.
+Pipelines work, and donix's own shell parses them. What comes next is
+a set of small, independent items and several larger subsystem
+questions. Pick one, do it, test it, tag it — the project's
+one-change-at-a-time discipline applies.
 
-### Headline: `musl_sh` quote stripping and redirection parsing
+### Where to start: donix-native applets
 
-The project's own shell, `donix>`, still does not strip quotes or parse
-`<`, `>`, `|`, `&&`, or `;`. Every test involving those must be run
-from ash (`busybox sh`). This is userland-only — a tokenizer fix in
-`userland/musl/apps/musl_sh.c`, no kernel change — and it is the last
-thing between the current shell and a usable one. It is the headline
-item for `v0.6.7`.
+The most visible wart the shell work surfaced: donix's own `cat`
+requires a filename and has no stdin mode, so `cat < file` fails
+while `busybox cat < file` works.  Redirection now works from
+`donix>`; the project's own `cat` should demonstrate it rather than
+delegating to busybox.  This is userland-only
+(`userland/musl/apps/cat.c`), small, and needs no kernel change.
 
 ### Small, close gaps
 
+- **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
+  `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
+  Latent today (nothing triggers it), but correct to close.
 - **`newfstatat` (262).**  Number reserved, no dispatch case.  musl
   routes `fstatat` through `stat`/`lstat` on x86_64 for the common
   case, so it is not hit yet; a caller passing `AT_FDCWD` plus flags
   would reach it.  Delegates to `sys_stat` when `dirfd == AT_FDCWD`
   or the path is absolute; with cwd resolution now in `sys_stat`,
-  this is a small wrapper rather than a stub.
-- **`sys_open` `O_DIRECTORY` fix.**  In the `wants_dir` branch, check
-  `fattrib & AM_DIR` and return `-ENOTDIR` when the target is a file.
-  Latent today (nothing triggers it), but correct to close.
-- **`sys_utimensat` cwd resolution.**  Found in session 32: it calls
-  `strip_dot_prefix` but not `resolve_against_cwd`, like `sys_unlink`
-  and `sys_mkdir` did before session 32 fixed them.  Same one-line
-  fix.
+  this is a small wrapper rather than a stub.  Unblocks `find`.
 - **Ctrl-`[` as ESC.**  Deferred during the terminal work;
   `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
   The literal ESC key is enough for vi, but terminal users expect the
   alias.
+- **`sys_utimensat` cwd resolution.**  Found in session 32: it calls
+  `strip_dot_prefix` but not `resolve_against_cwd`, like `sys_unlink`
+  and `sys_mkdir` did before session 32 fixed them.  Same one-line
+  fix.
 - **`sys_fcntl` fd < 3 for the other subcommands.**  `F_GETFL`,
   `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`; Linux
   allows them on a redirected fd.  Small extension of the
   session-34 work; not on any current path.
+- **Redirection of a builtin is silently ignored.**  `cd /bin > log`
+  runs `cd`, creates no file, prints no error.  Verified in session
+  37.  Either make it loud or make it work (needs an fd-save/restore
+  dance in the parent).  `docs/open-issues.md` item 2.
+- **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
+  `sh: builtin in pipeline not supported` and runs nothing.  Real
+  shells run the builtin in a subshell; adding that is its own
+  change.  `docs/open-issues.md` item 3.
 
 ### Broaden busybox coverage
 
 Busybox is the boot shell now, and the file/text utility set is
 broad: `ls`, `echo`, `cat`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`,
 `grep`, `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`,
-`od`, `uniq`, `mkdir`, `touch`, `vi`, `rm`, `rmdir`.  Still untried:
-`awk`, `tar`, and `find` (which needs `newfstatat`).  These are where
-the syscall surface gets tested hardest.
+`od`, `uniq`, `mkdir`, `touch`, `vi`, `rm`, `rmdir`, plus the
+newly enabled `false`, `true`, `yes`, `seq`, and `clear`.  Still
+untried: `awk`, `tar`, and `find` (which needs `newfstatat`).  These
+are where the syscall surface gets tested hardest.
 
 Work through them one at a time, watching for `Unknown syscall: N` in
 the serial log.  Each missing syscall is its own commit.
@@ -133,8 +153,12 @@ and should wait for those.
   current config.  Enabling it needs signal delivery, process groups,
   and a foreground/background distinction -- none of which the kernel
   has today.  `-EPIPE` without `SIGPIPE` (see `docs/open-issues.md`)
-  is part of this: a real `SIGPIPE` would let `yes | head -n 1`
-  terminate `yes` the way it does on Unix.
+  is part of this, but the gap is narrow: session 37 verified that
+  `busybox yes | busybox head -n 1` does **not** hang, because
+  busybox apps check `write`'s return value.  The exposure is a
+  program that expects to be *killed* by `SIGPIPE` and does not
+  check `write`; none has been found.  Real `SIGPIPE` still belongs
+  with signal delivery.
 
 ### Larger subsystem questions
 

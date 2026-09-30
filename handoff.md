@@ -3,21 +3,28 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-30 (post-`v0.6.6`)
-**Current HEAD:** tag `v0.6.6`, branch `dev`
-**Last milestone:** `v0.6.6` (published) — **`pipe(2)` is done and
-pipelines work**
-**Next milestone:** `v0.6.7` candidate — `musl_sh` quote stripping
-and redirection parsing are the headline items
+**Last updated:** 2026-09-30 (post-`v0.6.6`, `musl_sh` work)
+**Current HEAD:** tag `20260930-nodebug`, branch `dev`
+**Last milestone:** `v0.6.6` (published) — `pipe(2)` done, pipelines
+work
+**Milestone status:** **no bump this session.**  Six commits on
+`dev`, scratch-tagged, unpushed.  A `v0.6.7` bump is deferred until
+the accumulated changes feel substantial enough; until then the
+scratch tags carry the narrative.
 
 Commits are named by tag only, never by SHA.  **Working tags
-(`2026092x-*`) are local scratch restore points** — they exist while
+(`2026093x-*`) are local scratch restore points** — they exist while
 a milestone is being developed and are **dropped before the
 milestone is pushed**.  Only `v*` tags go to the remote and are
 permanent.  The commit record is `docs/session-log.md`; the commit
 message carries the narrative.  Once a scratch tag is dropped it
 resolves to nothing; do not cite one as if it were a stable
 reference.
+
+**Scratch tags are now annotated** (session 37 onward).  The
+annotation is the fuller per-commit summary; at a milestone bump the
+annotations seed the final milestone narrative.  This is the reason
+to keep tagging each step even when no `v*` tag is imminent.
 
 ---
 
@@ -55,77 +62,65 @@ the real tree.
 
 ---
 
-## Where we are — `v0.6.6` tagged, working tree clean
+## Where we are — `musl_sh` work committed, milestone deferred
 
-`v0.6.6` is published.  Session 36 is the milestone: **`pipe(2)` is
-implemented and pipelines work.**  All scratch tags have been
-dropped; `dev` is pushed.
+Session 37 closed the gap that `v0.6.6`'s handoff named as the
+`v0.6.7` headline: **`donix>` (musl_sh) now strips quotes and parses
+`<`, `>`, `>>`, `|`, `&&`, `;`, and pipelines.**  It was userland
+only — a real tokenizer and command runner in
+`userland/musl/apps/musl_sh.c` — with no kernel change, because
+everything it needed (`pipe`, `dup`, `dup2`, `fork`, `execve`,
+`wait4`, redirect via `dup2`, a working cwd) was already in place
+from `v0.6.6`.
 
-### Session 36 — pipes, end to end
+Six commits on `dev`, scratch-tagged, unpushed:
 
-Five kernel steps plus a keyboard fix, a missing syscall, and a
-test revert.  Each step was independently tagged and tested; each
-found exactly one class of bug.  In order:
+| Tag | What |
+|---|---|
+| `20260930-tokenizer` | two-phase tokenizer: quote stripping + operator splitting |
+| `20260930-redir` | `<`, `>`, `>>` via `open` + `dup2` + `execve` |
+| `20260930-seq` | `;` and `&&`; builtins report their own status |
+| (untagged) | `configs/busybox.config`: enable `false`, `true`, `yes`, `seq`, `clear` |
+| `20260930-pipe` | `\|`; `fork_child` refactor; N-stage pipelines |
+| `20260930-nodebug` | remove the tokenizer debug print (HEAD) |
 
-1. **`pipe(2)` object and non-blocking I/O.**  `FILE_KIND_PIPE`, a
-   shared `pipe_t` (4 KB ring, `capacity` a *field* not an inlined
-   macro so growth is additive later), two refcounts kept
-   distinct — slot refcount counts fd references to one *end*, pipe
-   refcount counts live *ends*.  `sys_pipe` allocates the object and
-   both ends atomically and rolls back on failure.
+Full per-commit narrative: `docs/session-log.md`, Session 37.
+`git log --oneline v0.6.6..HEAD` shows exactly these six.
 
-2. **Blocking and directed wake.**  `BLOCK_KIND_PIPE_READ`/`WRITE`
-   = 2/3 (new values for the existing `block_kind`, no PCB offset
-   movement).  `reader_waiting`/`writer_waiting` pointers on the
-   pipe; `pipe_wake_waiter()` checks the waiter is non-NULL, still
-   `BLOCKED`, and blocked on *this* kind before waking — the
-   block_kind check is what makes a recycled PCB slot safe.  This
-   is a directed wake, not a broadcast: a write wakes the one
-   reader that can make progress, not every blocked process.
+**What the shell does now:** `donix>` tokenizes a line into argv
+(quote-aware, operators split out), parses redirection and pipelines,
+runs sequences, and execs.  The `[a|b|c]` debug print that showed
+the tokenization during development has been removed.
 
-3. **EOF, `-EPIPE`, dup-aware counts.**  `file_slot_t.end` flag
-   (read/write); `pipe_t.readers_open`/`writers_open` *counts*.
-   Counts, not flags, because `pipe(fds); dup2(fds[1], 1)` leaves
-   two fds holding the write end, and closing one must not look
-   like "the writer closed."  `read` on empty + `writers_open == 0`
-   → 0 (EOF); `write` with `readers_open == 0` → `-EPIPE`, checked
-   *before* the full-buffer check.
+### What this closes
 
-4. **The exit-path wake.**  `put_file_slot`'s pipe case now wakes
-   the peer when a count reaches zero.  Without it, a writer that
-   `_exit`s without closing leaves a reader stuck in `hlt` until a
-   keystroke — a hang on a headless system.
+The `musl_sh` limitation that every prior handoff carried — *"does
+not strip shell quotes and does not parse redirection or pipes; all
+tests involving `<`, `>`, `|`, `&&`, `;`, or quoting must be run
+from ash"* — is **gone.**  Redirection and pipeline tests now run
+from `donix>` directly.  `busybox sh` and the boot ash still exist
+and still work; they are just no longer *required* for those tests.
 
-5. **The stdio routing fix — this is what made pipelines work.**
-   `sys_read` fd-0 and `sys_write` fd-1/2 guards changed from
-   `kind != FILE_KIND_FILE` to `kind == FILE_KIND_CONSOLE`.  The
-   old form was correct when a file was the only thing `dup2`
-   could put on a low fd; a pipe end (`FILE_KIND_PIPE`) is
-   `!= FILE_KIND_FILE`, so a piped stdin took the keyboard path and
-   blocked forever.  Full writeup: `docs/gotchas.md`, "Negative
-   fd-kind tests don't extend to new kinds."
+### Known limitations introduced by this work
 
-**Also in the milestone:** `dup(2)` (syscall 32) — musl's `dup()`
-reaches `SYS_dup` directly and donix had no handler, so any caller
-got `-ENOSYS`.  Found by `pipe_step3`'s first run, not by reading
-code.  Implemented as a one-line delegation to
-`sys_fcntl(fd, F_DUPFD, 0)`.  And a keyboard fix: `keyboard.c`
-assigned neither `scancode_ascii[0x2B]` nor `scancode_shift[0x2B]`,
-so Shift+backslash produced nothing in either shell — the `|`
-character was untypeable.  Both tables now assign 0x2B.
+- **Redirection of a builtin is silently ignored.**  `cd /bin > log`
+  runs `cd`, creates no `log`, prints no error.  Verified this
+  session (`pwd > log` prints to the screen, not the file).
+- **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
+  `sh: builtin in pipeline not supported` and runs nothing.  A
+  builtin cannot be forked without changing its meaning and donix's
+  builtins have no subshell form.
 
-### What `v0.6.5` contributed (prior milestone)
+Both are in `docs/open-issues.md`, items 2 and 3.
 
-Scripts run (`MAX_PROCESS_FILES` 8 → 64, `execve` returns `ENOEXEC`
-for a short non-ELF so ash runs the file through `sh`,
-`./script.sh` normalizes).  Shell redirection end to end (three
-interlocking bugs: `sys_read`/`sys_write` hard-coded fds 0/1/2,
-`sys_fork` never copied `file_table[]`, `close_all_files` started at
-fd 3).  Four syscalls: `uname` (63), `lseek` (8), `rename` (82),
-`readv` (19).  busybox applets enabled: `head`, `tail`, `cp`, `mv`,
-`grep`, `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`,
-`od`, `uniq`.  And fds 0/1/2 first-class: console sentinels,
-lowest-free-fd `open`, `dup2`/`fcntl` accepting low fds.
+### What `v0.6.6` contributed (prior milestone)
+
+`pipe(2)` end to end: `FILE_KIND_PIPE`, a shared `pipe_t` (4 KB ring),
+blocking read/write with a directed wake, EOF when the last writer
+closes, `-EPIPE` when the last reader closes, an exit-path wake, and
+the stdio-guard inversion that made pipelines actually run.
+`dup(2)` (syscall 32).  Keyboard fix (Shift+backslash).  See
+`docs/session-log.md`, Session 36.
 
 ### Known failures, deliberately off
 
@@ -133,95 +128,99 @@ lowest-free-fd `open`, `dup2`/`fcntl` accepting low fds.
 - **`chmod`, `ln`, `mount`/`umount`** — need `chmod(2)` (90),
   `link(2)`/`symlink(2)` (86/88), and `mount(2)` respectively.
 
-### Known limitation: `musl_sh`
-
-`donix>` (musl_sh) does not strip shell quotes and does not parse
-redirection or pipes.  All tests involving `<`, `>`, `|`, `&&`,
-`;`, or quoting must be run from ash (`busybox sh` from `donix>`,
-or the auto-launched ash at boot).  See `docs/gotchas.md`.
-
-This includes `uniq -c < file`: from `donix>` the `<` reaches
-`uniq` as a literal argument, which is why the `donix>` run shows
-`uniq: can't open '<'`.  That is the `musl_sh` gap, not a `uniq`
-bug.  A pipeline typed at `donix>` behaves the same way — `|`
-reaches the first applet as a literal argument.  This is the
-headline item for `v0.6.7`.
-
 ---
 
-## NEXT SESSION — `musl_sh` quote stripping and redirection
+## NEXT SESSION — donix-native applet: `cat` stdin mode
 
-`v0.6.7` candidate.  The headline items are the two `musl_sh`
-gaps: quote stripping and parsing of redirection (`<`, `>`, `|`),
-plus `&&`/`;`.  Both are userland-only — a tokenizer fix in
-`userland/musl/apps/musl_sh.c`, no kernel change.
+**Recommended first item: give `cat.elf` a stdin mode.**  This is
+the most visible wart the `musl_sh` work surfaced.  `donix`'s own
+`cat` requires a filename argument:
 
-**Why this is the right next item.**  Everything the *kernel*
-needs to run a real shell is now in place: `pipe`, `dup`, `dup2`,
-`fork`, `execve`, `wait4`, redirection via `dup2`, and a working
-cwd.  The only thing standing between `donix>` and a usable
-interactive shell is that its tokenizer doesn't understand the
-syntax.  ash does understand it, which is why all the shell-level
-verification runs there.  Making `musl_sh` understand it means the
-project's own shell can demonstrate the features the kernel
-supports, rather than delegating to busybox.
+    donix> cat < out.txt
+    usage: cat FILE
 
-**Scope, roughly:** split the input line on unquoted whitespace;
-recognize `<`, `>`, `>>`, `|`, `&&`, `;` as operators; honor single
-and double quotes; build an argv for `execve` and a pipeline of
-`fork`/`dup2`/`execve`.  It is a real piece of shell code, but it
-is *only* code — no new syscalls, no kernel risk, and every
-primitive it needs is already tested.
+while busybox's `cat` reads stdin happily:
 
-**Test:** the same commands the canary already runs from ash,
-typed at `donix>` instead.  `cat hello-world.txt | head -n 2`,
-`echo hi > out.txt`, `cat out.txt`, `echo hi2 > out2.txt`, and
-`uniq -c < hello-world.txt`.  When those work from `donix>`, the
-gap is closed.
+    donix> busybox cat < out.txt
+    hi
 
-### If you touch pipelines: read this first
+Redirection now works from `donix>`; the project's own `cat` should
+demonstrate it rather than delegating to busybox.  This is
+userland-only (`userland/musl/apps/cat.c`), small, needs no kernel
+change, and it is the same "make our own tool do what busybox does"
+motive that drove the `musl_sh` work.
 
-`-EPIPE` is delivered without `SIGPIPE` (see
-`docs/open-issues.md`).  On real Linux, when a reader exits, the
-writer is killed by `SIGPIPE`; here it gets `-EPIPE` from `write`
-and must handle it itself.  For `cat file | head`, `head` exits,
-`cat` gets `-EPIPE`, and busybox's `cat` handles it — so the
-common pipelines work.  But a program that *doesn't* handle
-`-EPIPE` (busybox `yes` is the example) will keep writing, or
-block on a full pipe whose reader is gone, and hang rather than
-die.  If you enable `ASH_JOB_CONTROL`, add a `yes`-style test, or
-try `yes | head -n 1`, expect this.  Fixing it means implementing
-signal delivery — a larger change, tracked in `open-issues.md`.
+**Second item: `sys_open` `O_DIRECTORY` fix.**  Return `-ENOTDIR`
+when the target is a file.  Small kernel change, well-scoped, a
+correctness fix rather than a feature.
 
-### Small, close gaps (all independent, all one-change-at-a-time)
+**Third item (higher value than the two above, listed third by
+choice): a framebuffer console, then Terminus.**
+
+The VGA text-mode console is hard to read in a half-screen QEMU
+window on a widescreen monitor.  That makes development itself
+painful, which is why this item is worth more than its position
+suggests — it pays back every future session.  It is listed after
+`cat` and `O_DIRECTORY` only because those are smaller and were
+already queued; swapping this to first is justified.
+
+**This is a build, not a revive.**  A framebuffer was built in an
+earlier session but it lived in a scratch tree that no longer
+exists; it was never committed and the code is gone (confirmed,
+session 37).  `git log --all -- 04_kernel_64bit/` shows no
+framebuffer / VBE / mode-setting work — the closest is the VGA
+text-mode VT100 parser, `22c8329 vga: ANSI/VT100 subset parser`.
+So the work is:
+
+  - boot-time mode setting (VBE/VESA linear framebuffer, or a
+    bootloader handoff), a linear-framebuffer write path, and a
+    glyph blitter;
+  - then **Terminus** at a native size — 10×18, 12×24, or 16×32 —
+    blitted **unscaled**.
+
+Terminus is what Alpine and the Linux kernel use for the console.
+It ships in native sizes from 6×12 to 16×32; the 16×32 size exists
+precisely because VGA 8×16 is unreadable on modern displays.  It is
+OFL-1.1, so bundling it is fine.  The likely reason the earlier
+font "looked terrible" is that a small bitmap was scaled up; a
+native-size blit avoids that.  For a future scalable/anti-aliased
+GUI font, **Hack** (MIT) is the code-oriented choice.
+
+Do the size experiment in a scratch copy first (the standing rule:
+scratch is transient, do not port without re-doing and testing in
+the real tree), then implement cleanly here.
+
+### Smaller, when ready
 
 1. **`newfstatat` (262)** — reserved number, no dispatch case.
    Delegates to `sys_stat` for `AT_FDCWD` or an absolute path.
    Unblocks `find`.
-2. **`sys_open` `O_DIRECTORY` fix** — return `-ENOTDIR` when the
-   target is a file.
-3. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
-   yet.
-4. **`sys_utimensat` cwd resolution** — it calls `strip_dot_prefix`
-   but not `resolve_against_cwd`.
-5. **`sys_fcntl` fd < 3 for the other subcommands** — `F_GETFL`,
+2. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
+   yet; this touches the keyboard layer.  Low urgency.
+3. **`sys_fcntl` fd < 3 for the other subcommands** — `F_GETFL`,
    `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`; Linux
    allows them on a redirected fd.  Not on any current path.
+4. **More applets** — `awk`, `find` (needs `newfstatat`), `tar`.
+   `chmod` (90), `ln` (86/88), and `mount` need their own syscalls.
 
-**More applets, any time:** `awk`, `find` (needs `newfstatat`),
-`tar`.  `chmod` (90), `ln` (86/88), and `mount` need their own
-syscalls.
+### Deliberately later — larger
 
-Pick **one**, do it, test it, tag it.  One change at a time.
+- **Signal delivery (`SIGPIPE`).**  See `open-issues.md` item 6.
+  This is a subsystem (real `sys_rt_sigaction`, per-process handlers,
+  a `SIGPIPE` raise on the `-EPIPE` write path), not a small change,
+  and nothing currently exercises it — `busybox yes | busybox head
+  -n 1` does *not* hang.  Its own milestone-scale effort when ready.
+- **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
+  shims when it lands, do not extend them.
+
+**Pick one, do it, test it, tag it.**  One change at a time.
 
 ---
 
 ## Canary state
 
-**The focused canary is green as of `v0.6.6`.**  Full table in
-`docs/session-log.md`.  Script execution, redirection, the
-pipelines, and the applet one-offs are verification, not canary
-rows — the canary must not mutate the disk.
+**The focused canary is green as of `v0.6.6` and unchanged this
+session.**  Full table in `docs/session-log.md`.
 
     # on boot, ash is already running
     pwd                         # /
@@ -250,23 +249,32 @@ rows — the canary must not mutate the disk.
     # at the ash prompt: pwd, cd /bin, pwd, ls, exit
     # back at donix>: hello
 
-**Read-only `uniq` rows (added v0.6.5), run from ash:**
+**Read-only `uniq` rows (added v0.6.5):**
 
     uniq hello-world.txt
     uniq -c < hello-world.txt
 
-**Pipeline rows (added v0.6.6), run from ash:**
+**Pipeline rows (added v0.6.6) — now runnable from `donix>` as well
+as ash:**
 
     cat hello-world.txt | head -n 2
     echo hi | wc
     echo hello | cat
 
-These are the milestone's headline verification.  `cat | head` is
-the one that exercises blocking on both ends; `echo hi | wc` is the
-one that exercises EOF (the reader must see the writer close and
-stop); `echo hello | cat` is the smallest end-to-end case.
+These are the milestone's headline verification.  `cat | head`
+exercises blocking on both ends; `echo hi | wc` exercises EOF; `echo
+hello | cat` is the smallest end-to-end case.
 
-**Pipe regression suite (`userland/musl/tests/`), run from ash:**
+**Redirection rows (verified this session, runnable from `donix>`):**
+
+    echo hi > out.txt ; cat out.txt
+    echo hi2 >> out.txt ; cat out.txt
+    busybox cat < out.txt
+
+(`cat < out.txt` with donix-native `cat` fails — that is the item
+`NEXT SESSION` targets.)
+
+**Pipe regression suite (`userland/musl/tests/`):**
 
     pipe_step1    # object + non-blocking I/O
     pipe_step2    # blocking + directed wake
@@ -277,19 +285,18 @@ These four are the only regression suite the pipe code has.  Each
 prints a `STEPn OK` (or `STEP3B OK`) line on success.  If you change
 anything in `sys_read`/`sys_write`/`sys_close`/`put_file_slot`/
 `sys_fork`/`sys_pipe`, or add a new `FILE_KIND_*`, run them.  They
-are not canary rows: they fork and they take seconds, but they do
+are **not** canary rows: they fork and they take seconds, but they do
 not mutate the disk.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
 
-**Do NOT add a `donix>` redirection or pipe row.**  `musl_sh` does
-not parse `<`, `>`, or `|`.  Those are ash-only tests until
-`v0.6.7` closes the gap.
-
-**Do NOT run `uniq -c < file` from `donix>`.**  From `donix>` the
-`<` reaches `uniq` as a literal argument and `uniq` reports
-`can't open '<'`.
+**Canary rows must not mutate the disk.**  The read-only applets
+(`head`, `tail`, `grep`, `sed`, `cut`, `sort`, `stat`, `cmp`, `wc`,
+`od`, `uniq`) can be canary rows.  `tee`, `cp`, `mv`, the
+redirection tests, and the pipelines mutate or fork, so they stay
+one-offs.  (The old note forbidding `donix>` redirection/pipeline
+rows is **void** — `musl_sh` parses them now.)
 
 The **full canary** (milestone-only) adds: `echo`, `cat`,
 `musl_stat`, `musl_min`, `musl_malloc`, `musl_printf`, `musl_exec`,
@@ -297,24 +304,17 @@ The **full canary** (milestone-only) adds: `echo`, `cat`,
 `brkgrow`, `musl_dup2`, `musl_dupfd`, `musl_ids`, `musl_getcwd`,
 `busybox echo`, `busybox wc hello-world.txt`.
 
-**Canary rows must not mutate the disk.**  The read-only applets
-(`head`, `tail`, `grep`, `sed`, `cut`, `sort`, `stat`, `cmp`, `wc`,
-`od`, `uniq`) could be added as canary rows.  `tee`, `cp`, `mv`,
-the redirection tests, and the pipelines mutate or fork, so they
-stay one-offs.
-
 **Expected noise:** none beyond the known lines.  The serial log
-has no `Unknown syscall:` lines and no `[fd]` lines (the fd trace
-is off).  Informational lines that are expected: `EXIT: pid=N
-state=2 parent=P qhead=Q` for every forked child (a zombie exit);
-`EXIT: pid=N state=1 parent=P qhead=Q` for a forked shell's own
-exit; `EXIT-FALLBACK: switching to idle, ...` when a child is the
-last runnable process.  The `sys_open: f_open FAIL path=etc/...`
-lines from `busybox stat` are expected — those files do not exist
-and `stat` falls back cleanly.  The `sys_rename: f_rename FAIL ...`
-line from `busybox mv` on a failed rename is expected — same style
-of diagnostic `sys_unlink` and `sys_rmdir` carry, and only prints
-on failure.
+has no `Unknown syscall:` lines, no `[fd]` lines (the fd trace is
+off), and no `[a|b|c]` debug line (removed this session).  Expected
+informational lines: `EXIT: pid=N state=2 parent=P qhead=Q` for
+every forked child; `EXIT: pid=N state=1 parent=P qhead=Q` for a
+forked shell's own exit; `EXIT-FALLBACK: switching to idle, ...`
+when a child is the last runnable process.  `yes: Broken pipe`
+from `busybox yes | busybox head -n 1` is expected.  The
+`sys_open: f_open FAIL path=etc/...` lines from `busybox stat` and
+the `sys_rename: f_rename FAIL ...` line from `busybox mv` are
+expected diagnostics on failure paths.
 
 ---
 
@@ -323,29 +323,26 @@ on failure.
 1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
    resolution and `resolve_against_cwd` are both shims.  When a VFS
    lands, delete them; do not extend.
-2. **`musl_sh` does not strip quotes or parse redirection.**
-   Userland-only fix.  The headline item for `v0.6.7`.
-3. **`sys_fcntl` refuses fd < 3** for subcommands other than
-   `F_DUPFD`/`F_DUPFD_CLOEXEC`.  Deliberate; a small extension of
-   the session-34 work rather than a new problem.
-4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need
-   their own syscalls.**  Deliberate FatFs-limitation first cuts.
-5. **`-EPIPE` is delivered without `SIGPIPE`.**  A program that
-   relies on dying from `SIGPIPE` gets the errno instead.  Read
-   the "If you touch pipelines" note above before changing anything
-   in the pipe or signal path.
+2. **Redirection of a builtin is silently ignored.**  `cd /bin >
+   log` runs `cd`, creates no file, prints nothing.  Verified.
+3. **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
+   `sh: builtin in pipeline not supported` and runs nothing.
+4. **`sys_fcntl` refuses fd < 3** for subcommands other than
+   `F_DUPFD`/`F_DUPFD_CLOEXEC`.  Deliberate; not on any path.
+5. **`-EPIPE` is delivered without `SIGPIPE`.**  Narrower than the
+   old docs claimed: `busybox yes | busybox head -n 1` does *not*
+   hang.  The gap is a program that expects to be *killed* by
+   `SIGPIPE` and does not check `write` — none found.  Fixing it
+   means implementing signal delivery.
 
-Also open: `newfstatat` (262) reserved, no dispatch case;
-`sys_open` accepts non-directories with `O_DIRECTORY`; Ctrl- `[`
-not mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
-`sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base`
-and the 4 MB mmap window are latent collisions; real FatFs
-timestamp storage (the three timestamp syscalls return 0 without
-storing); `prctl` is minimal (`PR_SET_NAME` accepted and dropped);
-busybox applet symlinks not installed; syscall-table audit script;
-`musl_wait`'s WNOHANG loop spins; `sys_mmap` rejects all
-non-anonymous mappings (a file-backed `mmap` caller will get
-`-ENOMEM` and must fall back to `read`); pipes support one
+Also open: `newfstatat` (262) reserved, no dispatch case; `sys_open`
+accepts non-directories with `O_DIRECTORY`; Ctrl- `[` not mapped to
+ESC; `sys_utimensat` lacks `resolve_against_cwd`; `sys_munmap` is a
+stub returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap
+window are latent collisions; real FatFs timestamp storage;
+`prctl` is minimal; busybox applet symlinks not installed;
+syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
+`sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
 wake is coupled to `sys_close`'s wake.
 
@@ -358,11 +355,12 @@ wake is coupled to `sys_close`'s wake.
 Config and source locations (relative to the root):
 
 - `configs/busybox.config` — tracked canonical busybox config.
-  Enabled applets: `cat`, `cp`, `cut`, `echo`, `head`, `ls`,
-  `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `sort`, `stat`,
-  `tail`, `tee`, `test`, `touch`, `tr`, `uname`, `uniq`, `wc`,
-  `cmp`, `grep`, `sed`, `vi`, plus `ash`.  Off (with reasons):
-  `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel work).
+  Enabled applets: `cat`, `cp`, `cut`, `echo`, `false`, `head`,
+  `ls`, `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `seq`, `sort`,
+  `stat`, `tail`, `tee`, `test`, `touch`, `tr`, `true`, `uname`,
+  `uniq`, `wc`, `yes`, `cmp`, `grep`, `sed`, `vi`, `clear`, plus
+  `ash`.  Off (with reasons): `diff` (deliberate),
+  `chmod`/`ln`/`mount` (need kernel work).
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  The pipe regression binaries
   (`pipe_step1`…`pipe_step3b`) live in `tests/` and are staged to
@@ -388,12 +386,16 @@ needs it.  Paths below are relative to the tree root
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  Two entries
-  are a matched pair worth reading together: "Low fds (0/1/2) are
-  first-class" (session 34) and "Negative fd-kind tests don't
-  extend to new kinds" (session 36).  Both are the same class — a
-  decision encoded as a test on the current set of kinds or fd
-  numbers, invalidated when a new one appears.  Expect a third.
+- `docs/gotchas.md` — every bug writeup, by subsystem.  Three
+  entries now form a family, all "a decision correct only for the
+  set of cases known at the time, invalidated when the set grew":
+  "Low fds (0/1/2) are first-class" (session 34), "Negative
+  fd-kind tests don't extend to new kinds" (session 36), and
+  "Multi-write output races the child's kernel prints" (session
+  37).  Read them together; expect a fourth.  Also new in session
+  37: "`argv[cmd_argc] = 0` mutates argv in the child", "Blunt fd
+  close in `fork_child`…", and the diagnostic note "`capture.txt`
+  shows backspace history, not the corrected line."
 - `docs/session-log.md` — commit tables and per-test canary notes.
   Rows are named by tag; scratch tags are dropped before a
   milestone push, so a row's tag may no longer resolve — the
@@ -410,11 +412,13 @@ needs it.  Paths below are relative to the tree root
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  `v0.6.6` is published: `pipe(2)` is implemented
-and pipelines work — `cat file | head`, `echo hi | wc` — with
-blocking read/write, directed wake, EOF, and `-EPIPE`.  `dup(2)`
-(32) added.  Next: `musl_sh` quote stripping and redirection, so
-`donix>` itself can do what ash already can.  One change at a
+`userland/musl/`.  `v0.6.6` is the last milestone (`pipe(2)`,
+pipelines).  Session 37 made `donix>`'s own shell real: quote
+stripping, `<`/`>`/`>>`/`|`/`&&`/`;` parsing, sequences, and
+pipelines — all userland, no kernel change — committed on `dev`,
+scratch-tagged, milestone deferred.  Next: donix-native `cat` stdin
+mode, then a framebuffer console with Terminus (which is the
+higher-value item even though it is listed third).  One change at a
 time.**
 
 ---

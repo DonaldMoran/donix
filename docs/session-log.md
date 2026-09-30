@@ -1,3 +1,167 @@
+## Session 37 — `musl_sh`: tokenizer, redirection, sequences, pipelines
+
+Six commits on `dev`, scratch-tagged (one config commit untagged),
+unpushed.  **No milestone bump yet** — deferred by choice; the
+scratch-tag annotations carry the fuller per-commit narrative and
+will seed the milestone summary when it is written.
+
+This session closed the `musl_sh` gap that `v0.6.6`'s handoff named
+as the headline `v0.6.7` item: `donix>` now strips quotes and parses
+`<`, `>`, `>>`, `|`, `&&`, `;`, and pipelines.  Everything the
+kernel needed was already in place from `v0.6.6` (`pipe`, `dup`,
+`dup2`, `fork`, `execve`, `wait4`, redirect via `dup2`, a working
+cwd); this was userland only, no kernel change.
+
+### Tokenizer
+
+| Tag | What |
+|---|---|
+| `20260930-tokenizer` | two-phase tokenizer: quote stripping + operator splitting |
+
+Phase 1 splits on unquoted space/tab and strips `'...'` / `"..."`,
+in place with a read cursor and a write cursor over the same buffer.
+The in-place hazard — the token terminator landing on the blank the
+read cursor is about to inspect, which silently collapsed every line
+to one token — is written up in the commit and worth remembering:
+the blank is consumed *before* the NUL is written.
+
+Phase 2 splits operator characters (`>>`, `&&` first, then
+`>`, `<`, `|`, `&`, `;`) out of the words phase 1 produced.  It runs
+into a *separate* output buffer, so it has none of phase 1's
+in-place hazard.  Together they give `echo hi>out` →
+`echo hi > out` and `echo "a b" c` → `echo`, `a b`, `c`.
+
+### Redirection, sequences, pipelines
+
+| Tag | What |
+|---|---|
+| `20260930-redir` | `<`, `>`, `>>` via `open` + `dup2` + `execve` |
+| `20260930-seq` | `;` and `&&`; builtins report their own status |
+| `20260930-pipe` | `\|`; `fork_child` refactor; N-stage pipelines |
+
+**Redirection.**  Split argv at the first `<`/`>`/`>>`, fork, and in
+the child `open` the target and `dup2` it onto fd 0 or 1 before
+`execve`.  `>` truncates, `>>` appends; a missing target makes the
+child print and exit *without* exec'ing.  Builtin redirection is
+silently ignored (the builtin runs in the parent, which has no place
+to put a redirected fd) — a known limitation.
+
+**Sequences.**  Split each `;`/`&&` segment and run it; `&&`
+short-circuits on a non-zero status, `;` does not.  `builtin_cd`
+and `builtin_pwd` now return their own status, so `cd /nope && foo`
+correctly skips `foo`.  `exit` is honored at the start of any
+segment and terminates the shell, skipping the rest of the line.
+
+**Pipelines.**  Split each segment on `|`; a one-command segment goes
+through `run_one` unchanged (so a bare `cd` still changes the shell's
+cwd); a multi-command segment with a builtin is refused
+(`sh: builtin in pipeline not supported`) because a builtin cannot be
+forked without changing its meaning.  The fork/redirect/exec half of
+`run_one` was factored into `fork_child`, which takes the pipe fds to
+`dup2` and applies file redirection on top (so `a | b > f` sends
+`b`'s stdout to `f`).  `run_pipeline` forks all commands, closes
+every pipe end in the parent, then waits for all — the close is what
+makes EOF propagate.  The pipeline's status is the last command's.
+
+`fork_child` also closes every inherited fd 3..63 in the child.
+This is what stops a middle command in `a | b | c` from holding the
+upstream write end open and deadlocking the reader.  It is correct
+only because the shell holds no fd above 2 at exec time; see
+`gotchas.md`, "Blunt fd close in `fork_child`…".
+
+### Also
+
+| Tag | What |
+|---|---|
+| (untagged) | `configs/busybox.config`: enable `false`, `true`, `yes`, `seq`, `clear` |
+| `20260930-nodebug` | remove the tokenizer debug print (`[a\|b\|c]`) |
+
+The busybox config commit enabled `false`/`true` (needed to test
+`&&` short-circuiting on a real child's exit code) and
+`yes`/`seq`/`clear` (bundled in the same edit; `yes` and `seq` are
+for pipeline stress tests and were not required for this session).
+The commit has no message body, so this is the only record of why.
+
+The debug print was scaffolding for the tokenizer steps and was
+removed once the parser consumed argv.  No functional change.
+
+### Verification (`donix>`, not canary rows)
+
+Quoting and operator splitting:
+
+    echo "a b" c        -> a b c
+    echo 'x y'          -> x y
+    echo hi>out         -> tokenized echo hi > out; echo prints "hi > out"
+    echo a && echo b    -> a then b
+
+Redirection round trip:
+
+    echo hi > out.txt ; cat out.txt
+    echo hi2 >> out.txt ; cat out.txt      # hi then hi2
+    busybox cat < out.txt                  # hi
+    echo one > out.txt ; cat out.txt        # one (truncates)
+    echo two > out.txt ; cat out.txt        # two, not one+two
+
+Note: `cat < out.txt` (donix-native `cat`) fails with `usage: cat
+FILE` — donix's `cat` has no stdin mode.  `busybox cat < out.txt`
+works.  That is a `cat.elf` limitation, not a redirection bug.
+
+Sequences:
+
+    echo a ; echo b
+    busybox false && echo skipped           # nothing
+    busybox false && echo x ; echo y        # y only
+    cd /nope && echo not-reached            # cd error, no not-reached
+    exit ; echo no                          # bye, no no
+
+Pipelines (the milestone headline, now runnable from `donix>`, not
+only ash):
+
+    cat hello-world.txt | busybox head -n 2
+    echo hi | busybox wc                    # 1 1 3
+    echo hello | busybox cat                # hello
+    cat hello-world.txt | busybox head -n 2 | busybox wc   # 2 16 97
+    cat hello-world.txt | busybox head -n 2 > f ; cat f
+    cd /bin | busybox cat                   # refused: builtin in pipeline
+    busybox yes | busybox head -n 1         # see below
+
+`cat | head | wc` is the three-stage case that proves the middle
+child's fd close: it would deadlock if the middle command held the
+upstream write end.
+
+### `-EPIPE` observation — the docs prediction was wrong
+
+`v0.6.6`'s `open-issues.md` and handoff predicted that
+`busybox yes | busybox head -n 1` would hang, because `-EPIPE` is
+delivered without `SIGPIPE` and busybox `yes` "does not handle it."
+
+Observed this session: it does **not** hang.  `head` prints `y` and
+exits; `yes` receives `-EPIPE`, **handles it**, prints
+`yes: Broken pipe`, and exits; the shell reaps both and returns to
+the prompt.  The prediction was too pessimistic and named the wrong
+example.  The general gap (a program that expects to be *killed* by
+`SIGPIPE` and does not check `write`'s return) remains open, but no
+program has been found that exhibits it.  `open-issues.md` corrected
+accordingly.
+
+### Expected noise
+
+No `Unknown syscall:` lines.  No `[fd]` lines (the fd trace is off).
+No `[a|b|c]` debug line — removed this session.  Expected
+informational lines: `EXIT: pid=N state=2 parent=P qhead=Q` for each
+forked child; `EXIT: pid=N state=1 parent=P qhead=Q` for a forked
+shell's own exit; `EXIT-FALLBACK: switching to idle, ...` when a
+child is the last runnable process.  `yes: Broken pipe` from the
+`busybox yes | busybox head -n 1` line is expected.
+
+### Docs note — `capture.txt` and backspaces
+
+A backspaced line appears in `capture.txt` as its full typed history
+(the `\b \b` erase bytes are captured literally), not its corrected
+form.  Read the `sys_execve: ... argc=N` line or the VGA, not the
+echoed line.  See `gotchas.md`, "`capture.txt` shows backspace
+history…".  This cost real time this session chasing a phantom
+tokenizer bug.
 
 ## Session 36 — `pipe(2)`, pipelines work (v0.6.6)
 

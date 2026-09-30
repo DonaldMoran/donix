@@ -82,23 +82,26 @@ That's the point. That's the whole point.
   cat`. Its file and text applets — `ls`, `cat`, `echo`, `pwd`,
   `wc`, `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`, `sort`,
   `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`, `mkdir`, `rm`,
-  `rmdir`, `touch` — run in-process via standalone mode, and
-  `/bin/busybox` is a real path on the image. It forks and execs
-  external binaries, and it shares the working directory with the
-  rest of the system. This is the strongest evidence that the syscall
-  ABI is right — busybox expects a real Unix kernel underneath it,
-  and on donix it gets one.
+  `rmdir`, `touch`, `false`, `true`, `yes`, `seq`, `clear` — run
+  in-process via standalone mode, and `/bin/busybox` is a real path
+  on the image. It forks and execs external binaries, and it shares
+  the working directory with the rest of the system. This is the
+  strongest evidence that the syscall ABI is right — busybox expects
+  a real Unix kernel underneath it, and on donix it gets one.
 - **Has a real terminal.** The console is a VT100 emulator: full CSI
   parsing, cursor addressing, SGR colors, the erase, insert, and
   delete families, and a software alternate screen. Full-screen
   software gets what it expects. `vi don.txt`, edit, `:wq`, then
   `cat don.txt` reads it back.
-- **Has a second, minimal shell.** Typing `exit` at the busybox `$`
+- **Has a second, real shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
-  forks, execs, and waits like the busybox shell does. `cat
-  hello-world.txt` prints the file; `echo hi` prints `hi`; `ls` lists
-  the FAT volume.
+  forks, execs, and waits like the busybox shell does, and it now
+  strips quotes and parses `<`, `>`, `>>`, `|`, `&&`, and `;` — so
+  redirection and pipelines work at `donix>` directly, not only in
+  `ash`. `cat hello-world.txt | head -n 2`, `echo hi > out.txt`, and
+  `echo a && echo b` all behave. `cat hello-world.txt` prints the
+  file; `echo hi` prints `hi`; `ls` lists the FAT volume.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is 20 short C files. There is no build system you can't read in
