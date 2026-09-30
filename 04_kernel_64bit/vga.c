@@ -81,17 +81,37 @@ static const uint8_t vga_palette[16][3] = {
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 
-/* Always points at VGA_MAIN_MEM. Used only by the VGA fallback path
- * and by the alt-screen save/restore (which always saves/restores the
- * VGA cell grid, regardless of which backend is drawing). */
+/* Always points at VGA_MAIN_MEM. Used only by the VGA fallback draw
+ * path. */
 static uint16_t *active_screen = VGA_MAIN_MEM;
 
-/* Storage for the saved screen while ?1049h is active.  Sized for the
- * VGA grid; when the framebuffer is active this array holds the saved
- * *characters and attributes*, and the restore path redraws them
- * through the active backend.  It is a cell buffer, not a pixel
- * buffer, on both backends. */
-static uint16_t alt_screen[VGA_WIDTH * VGA_HEIGHT];
+/*
+ * Compile-time maxima for the shadow grid.  The live grid is
+ * con_cols() x con_rows(); these are the largest values those return,
+ * so the shadow is big enough for either backend.
+ *   102 = 1024 / 10   (framebuffer width / FB_FONT_W)
+ *    42 =  768 / 18   (framebuffer height / FB_FONT_H)
+ */
+#define VGA_MAX_COLS 102
+#define VGA_MAX_ROWS 42
+
+/*
+ * Shadow cell grid -- the single source of truth for what is on the
+ * screen, on BOTH backends.
+ *
+ * On VGA text, 0xB8000 is a readable cell buffer, but the framebuffer
+ * is write-only pixels.  Rather than special-case every read-back
+ * operation (scroll, insert/delete chars, alt-screen save/restore),
+ * we keep this array as the authoritative screen model and paint the
+ * visible output from it.  Cell layout is (attr << 8) | ch, the same
+ * as a VGA cell.
+ */
+static uint16_t shadow[VGA_MAX_ROWS * VGA_MAX_COLS];
+
+/* Storage for the saved screen while ?1049h is active.  On commit 2
+ * this holds a real saved screen on both backends, because it is
+ * copied from the shadow (see the alt-screen functions). */
+static uint16_t alt_screen[VGA_MAX_ROWS * VGA_MAX_COLS];
 
 static int alt_saved_row = 0;
 static int alt_saved_col = 0;
@@ -165,7 +185,28 @@ static int con_rows(void) {
  * (scroll, erase) occasionally run a column or row past the edge and
  * rely on this being harmless.
  */
-static void con_put_cell(int row, int col, uint8_t ch, uint8_t attr) {
+/* Read a cell from the shadow.  Out-of-range reads return 0. */
+static uint16_t shadow_get(int row, int col) {
+    if (row < 0 || col < 0) return 0;
+    if (row >= VGA_MAX_ROWS || col >= VGA_MAX_COLS) return 0;
+    return shadow[row * VGA_MAX_COLS + col];
+}
+
+/* Write a cell to the shadow only (no visible output).  Used by the
+ * scroll/insert/delete routines, which move shadow cells and then
+ * repaint the affected region. */
+static void shadow_set(int row, int col, uint16_t cell) {
+    if (row < 0 || col < 0) return;
+    if (row >= VGA_MAX_ROWS || col >= VGA_MAX_COLS) return;
+    shadow[row * VGA_MAX_COLS + col] = cell;
+}
+
+/* Paint one already-known cell to the visible backend.  This is the
+ * output half of con_put_cell, split out so scroll/insert/delete can
+ * move shadow cells and then repaint without rewriting the shadow. */
+static void paint_cell(int row, int col, uint16_t cell) {
+    uint8_t ch   = (uint8_t)(cell & 0xFF);
+    uint8_t attr = (uint8_t)(cell >> 8);
     const fb_info_t* fb = fb_get_info();
 
     if (fb->available) {
@@ -185,16 +226,20 @@ static void con_put_cell(int row, int col, uint8_t ch, uint8_t attr) {
 
     if (row < 0 || col < 0) return;
     if (row >= VGA_HEIGHT || col >= VGA_WIDTH) return;
-    active_screen[row * VGA_WIDTH + col] = ((uint16_t)attr << 8) | ch;
+    active_screen[row * VGA_WIDTH + col] = cell;
 }
 
 /*
- * Fill a run of cells in one row.  Used for blanking (erase, clear,
- * scroll tails).  Same backend branch as con_put_cell; on the
- * framebuffer a run of identical cells is just N fb_putchar calls
- * (the blitter is fast enough; a run-optimized path can come later if
- * a profile ever shows it matters).
+ * Draw one cell: update the shadow AND the visible output.  Every
+ * drawing routine calls this (or shadow_set + paint_cell, when it is
+ * moving many cells and wants to repaint once).
  */
+static void con_put_cell(int row, int col, uint8_t ch, uint8_t attr) {
+    uint16_t cell = ((uint16_t)attr << 8) | ch;
+    shadow_set(row, col, cell);
+    paint_cell(row, col, cell);
+}
+
 static void con_fill_cells(int row, int col, int count, uint8_t ch, uint8_t attr) {
     for (int i = 0; i < count; i++) {
         con_put_cell(row, col + i, ch, attr);
@@ -321,25 +366,21 @@ static void vga_scroll(void) {
     const int cols = con_cols();
     const int rows = con_rows();
 
-    for (int row = RESERVED_ROWS; row < rows - 1; row++) {
+    /* Shift the shadow up one row, then repaint the whole grid. */
+    for (int row = 0; row < rows - 1; row++) {
         for (int col = 0; col < cols; col++) {
-            uint8_t ch, attr;
-            if (fb_get_info()->available) {
-                /* The framebuffer has no readable cell buffer; the
-                 * scroll is done by reading back the cell we are
-                 * about to overwrite is not possible, so the
-                 * framebuffer scroll is handled below (bit-blit) in
-                 * a dedicated function.  This path is VGA only. */
-                ch = ' '; attr = VGA_DEFAULT_ATTR;
-                (void)ch; (void)attr;
-            } else {
-                uint16_t cell = active_screen[(row + 1) * VGA_WIDTH + col];
-                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
-                             (uint8_t)(cell >> 8));
-            }
+            shadow_set(row, col, shadow_get(row + 1, col));
         }
     }
-    con_fill_cells(rows - 1, 0, cols, ' ', cursor_attr);
+    for (int col = 0; col < cols; col++) {
+        shadow_set(rows - 1, col, blank_cell());
+    }
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
+            paint_cell(row, col, shadow_get(row, col));
+        }
+    }
+
     cursor_row = rows - 1;
     cursor_col = 0;
     vga_update_hardware_cursor();
@@ -356,15 +397,18 @@ static void vga_scroll_region_up(int top, int bottom, int n) {
 
     for (int row = top; row <= bottom - n; row++) {
         for (int col = 0; col < cols; col++) {
-            if (!fb_get_info()->available) {
-                uint16_t cell = active_screen[(row + n) * VGA_WIDTH + col];
-                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
-                             (uint8_t)(cell >> 8));
-            }
+            shadow_set(row, col, shadow_get(row + n, col));
         }
     }
     for (int row = bottom - n + 1; row <= bottom; row++) {
-        con_fill_cells(row, 0, cols, ' ', cursor_attr);
+        for (int col = 0; col < cols; col++) {
+            shadow_set(row, col, blank_cell());
+        }
+    }
+    for (int row = top; row <= bottom; row++) {
+        for (int col = 0; col < cols; col++) {
+            paint_cell(row, col, shadow_get(row, col));
+        }
     }
 }
 
@@ -379,15 +423,18 @@ static void vga_scroll_region_down(int top, int bottom, int n) {
 
     for (int row = bottom; row >= top + n; row--) {
         for (int col = 0; col < cols; col++) {
-            if (!fb_get_info()->available) {
-                uint16_t cell = active_screen[(row - n) * VGA_WIDTH + col];
-                con_put_cell(row, col, (uint8_t)(cell & 0xFF),
-                             (uint8_t)(cell >> 8));
-            }
+            shadow_set(row, col, shadow_get(row - n, col));
         }
     }
     for (int row = top; row < top + n; row++) {
-        con_fill_cells(row, 0, cols, ' ', cursor_attr);
+        for (int col = 0; col < cols; col++) {
+            shadow_set(row, col, blank_cell());
+        }
+    }
+    for (int row = top; row <= bottom; row++) {
+        for (int col = 0; col < cols; col++) {
+            paint_cell(row, col, shadow_get(row, col));
+        }
     }
 }
 
@@ -436,18 +483,15 @@ static void vga_delete_chars(int n) {
     if (n < 1) n = 1;
     if (n > cols - cursor_col) n = cols - cursor_col;
 
-    /* Shift cells left.  On VGA we read the cell buffer; on the
-     * framebuffer there is no readable cell buffer, so this is a
-     * no-op for the shift and the tail is blanked.  A framebuffer
-     * implementation would need its own cell mirror; deferred. */
-    if (!fb_get_info()->available) {
-        for (int c = cursor_col; c + n < cols; c++) {
-            uint16_t cell = active_screen[cursor_row * VGA_WIDTH + c + n];
-            con_put_cell(cursor_row, c, (uint8_t)(cell & 0xFF),
-                         (uint8_t)(cell >> 8));
-        }
+    for (int c = cursor_col; c + n < cols; c++) {
+        shadow_set(cursor_row, c, shadow_get(cursor_row, c + n));
     }
-    con_fill_cells(cursor_row, cols - n, n, ' ', cursor_attr);
+    for (int c = cols - n; c < cols; c++) {
+        shadow_set(cursor_row, c, blank_cell());
+    }
+    for (int c = cursor_col; c < cols; c++) {
+        paint_cell(cursor_row, c, shadow_get(cursor_row, c));
+    }
     vga_update_hardware_cursor();
 }
 
@@ -456,14 +500,15 @@ static void vga_insert_chars(int n) {
     if (n < 1) n = 1;
     if (n > cols - cursor_col) n = cols - cursor_col;
 
-    if (!fb_get_info()->available) {
-        for (int c = cols - 1; c - n >= cursor_col; c--) {
-            uint16_t cell = active_screen[cursor_row * VGA_WIDTH + c - n];
-            con_put_cell(cursor_row, c, (uint8_t)(cell & 0xFF),
-                         (uint8_t)(cell >> 8));
-        }
+    for (int c = cols - 1; c - n >= cursor_col; c--) {
+        shadow_set(cursor_row, c, shadow_get(cursor_row, c - n));
     }
-    con_fill_cells(cursor_row, cursor_col, n, ' ', cursor_attr);
+    for (int c = cursor_col; c < cursor_col + n; c++) {
+        shadow_set(cursor_row, c, blank_cell());
+    }
+    for (int c = cursor_col; c < cols; c++) {
+        paint_cell(cursor_row, c, shadow_get(cursor_row, c));
+    }
     vga_update_hardware_cursor();
 }
 
@@ -589,31 +634,26 @@ static void vga_alt_screen_enter(int clear) {
     alt_saved_col = cursor_col;
 
     /*
-     * Save the visible screen into alt_screen[] as CELLS, then (for
-     * ?1049h) clear the visible screen.  On VGA the cells come from
-     * 0xB8000.  On the framebuffer there is no readable cell buffer,
-     * so the save is skipped -- alt-screen restore on the framebuffer
-     * restores a cleared screen rather than the previous contents.
-     * This is a known limitation (commit 1); a cell mirror would fix
-     * it.  vi uses alt-screen for its own display, and does not rely
-     * on restoring the pre-vi screen on the framebuffer path.
+     * Save the whole shadow (the screen) into alt_screen[], then
+     * optionally clear.  This works identically on both backends now,
+     * because the shadow is the screen model -- there is no separate
+     * "read 0xB8000" step, which is what made the framebuffer path
+     * restore blank before.
      */
-    if (!fb_get_info()->available) {
-        volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
-        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-            alt_screen[i] = vga[i];
+    const int cols = con_cols();
+    const int rows = con_rows();
+
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < VGA_MAX_COLS; c++) {
+            alt_screen[r * VGA_MAX_COLS + c] = shadow_get(r, c);
         }
-        if (clear) {
-            for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-                vga[i] = ((uint16_t)VGA_DEFAULT_ATTR << 8) | ' ';
+    }
+
+    if (clear) {
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                con_put_cell(r, c, ' ', VGA_DEFAULT_ATTR);
             }
-        }
-    } else {
-        if (clear) {
-            const int cols = con_cols();
-            const int rows = con_rows();
-            for (int r = 0; r < rows; r++)
-                con_fill_cells(r, 0, cols, ' ', VGA_DEFAULT_ATTR);
         }
     }
 
@@ -626,21 +666,22 @@ static void vga_alt_screen_enter(int clear) {
 static void vga_alt_screen_leave(void) {
     if (!alt_screen_active) return;
 
-    if (!fb_get_info()->available) {
-        volatile uint16_t *vga = (volatile uint16_t *)0xB8000;
-        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-            vga[i] = alt_screen[i];
+    /*
+     * Restore: write the saved cells back into the shadow and
+     * repaint.  This gives back the pre-alt-screen contents on both
+     * backends -- the fix for vi exit leaving the screen black.
+     */
+    const int cols = con_cols();
+    const int rows = con_rows();
+
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < VGA_MAX_COLS; c++) {
+            shadow_set(r, c, alt_screen[r * VGA_MAX_COLS + c]);
         }
-    } else {
-        /* Redraw the saved cells through the active backend.  For the
-         * framebuffer the saved cells were not captured (see enter),
-         * so this restores blank cells; the screen is left clear. */
-        for (int r = 0; r < VGA_HEIGHT; r++) {
-            for (int c = 0; c < VGA_WIDTH; c++) {
-                uint16_t cell = alt_screen[r * VGA_WIDTH + c];
-                con_put_cell(r, c, (uint8_t)(cell & 0xFF),
-                             (uint8_t)(cell >> 8));
-            }
+    }
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            paint_cell(r, c, shadow_get(r, c));
         }
     }
 
