@@ -83,6 +83,40 @@ static char g_write_bounce[WRITE_CHUNK];
 
 #define FILE_KIND_FILE 1
 #define FILE_KIND_DIR  2
+/*
+ * A console slot.  fds 0, 1, and 2 start life holding one of these
+ * (see process.c's process_create) so that open(2) returns fd 3 for
+ * a process that has not closed anything, matching Linux, where
+ * stdio fds are always occupied at startup.
+ *
+ * A console slot carries no obj -- slot->obj is NULL and stays NULL.
+ * sys_read/sys_write recognize it by kind and take their existing
+ * keyboard/screen path; put_file_slot frees it without calling
+ * f_close.  Nothing else in this file treats FILE_KIND_CONSOLE as a
+ * real open file.
+ */
+#define FILE_KIND_CONSOLE 3
+
+/* Set to 1 for one build to trace the fd lifecycle of ash's
+ * redirection.  Turn back to 0 before committing. */
+#define DEBUG_FD_TRACE 0
+
+#if DEBUG_FD_TRACE
+static const char* kind_name(uint32_t k) {
+    switch (k) {
+        case FILE_KIND_FILE:    return "FILE";
+        case FILE_KIND_DIR:     return "DIR";
+        case FILE_KIND_CONSOLE: return "CONSOLE";
+        default:                return "?";
+    }
+}
+#define FDTRACE(...) do { \
+    serial_print("[fd] pid="); serial_print_dec((uint64_t)process_get_current()->pid); \
+    serial_print(" "); __VA_ARGS__; serial_print("\n"); \
+} while (0)
+#else
+#define FDTRACE(...) do {} while (0)
+#endif
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -598,16 +632,57 @@ static void put_file_slot(file_slot_t* slot) {
     }
     if (slot->kind == FILE_KIND_FILE) {
         f_close((FIL*)slot->obj);
+        kfree(slot->obj);
     } else if (slot->kind == FILE_KIND_DIR) {
         f_closedir((DIR*)slot->obj);
+        kfree(slot->obj);
+    } else if (slot->kind == FILE_KIND_CONSOLE) {
+        /* obj is NULL; nothing to close or free. */
     }
-    kfree(slot->obj);
     kfree(slot);
+}
+
+/*
+ * Allocate a console sentinel slot for fd 0, 1, or 2.
+ *
+ * The slot has no obj; sys_read/sys_write dispatch on kind, not on
+ * obj, for console fds.  Returns NULL on kmalloc failure, in which
+ * case the caller leaves the fd NULL and it behaves the way it did
+ * before sentinels existed.
+ */
+static file_slot_t* alloc_console_slot(void) {
+    file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
+    if (!slot) return NULL;
+    slot->kind     = FILE_KIND_CONSOLE;
+    slot->refcount = 1;
+    slot->obj      = NULL;
+    return slot;
+}
+
+/*
+ * Install console sentinels in fds 0, 1, and 2 of a new process.
+ *
+ * See include/user_syscall.h for the contract.  Called from
+ * process_create after the file_table[] zeroing loop.  Idempotent
+ * in the sense that it overwrites whatever is in 0/1/2, but it is
+ * only ever called on a freshly zeroed table.
+ */
+void user_syscall_init_console_fds(struct pcb* pcb) {
+    if (!pcb) return;
+    for (int fd = 0; fd <= 2; fd++) {
+        /*
+         * On failure, alloc_console_slot returns NULL and the fd
+         * stays NULL.  NULL fd 0/1/2 already takes the keyboard/
+         * screen path in sys_read/sys_write, so this degrades to
+         * the pre-sentinel behavior rather than breaking.
+         */
+        ((pcb_t*)pcb)->file_table[fd] = alloc_console_slot();
+    }
 }
 
 static void close_all_files(pcb_t* proc) {
     if (!proc) return;
-    for (int i = 3; i < MAX_PROCESS_FILES; i++) {
+    for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         file_slot_t* slot = (file_slot_t*)proc->file_table[i];
         if (!slot) continue;
         put_file_slot(slot);
@@ -615,16 +690,51 @@ static void close_all_files(pcb_t* proc) {
     }
 }
 
+/*
+* open(2) must return the LOWEST free fd, including 0, 1, and
+* 2 when they are free.  This is Linux/POSIX semantics and
+* real programs depend on it.  busybox `uniq FILE` does:
+*
+*     close(STDIN_FILENO);              // frees fd 0
+*     xopen(input_filename, O_RDONLY);  // expects fd 0 back
+*
+* and then reads from stdin (fd 0).  Before this change the
+* search started at fd 3, so the open landed on fd 3, stdin
+* stayed pointed at the now-closed fd 0, read(0, ...) fell
+* through to the keyboard path in sys_read, and the applet
+* blocked forever waiting for a keystroke that never came.
+* That was the `uniq` "hang".
+*
+* fds 0/1/2 are not permanently reserved, but a fresh process
+* starts with all three HELD by console sentinels (see
+* user_syscall_init_console_fds, called from process_create).
+* So the first open() of a fresh process returns fd 3 -- the
+* sentinels are occupied -- and fd 0/1/2 only become available
+* again after the program explicitly closes them, exactly as
+* on Linux.  Without the sentinels a fresh process would get
+* fd 0 back from its first open(), which breaks shell
+* redirection bookkeeping (ash saves and restores stdio fds).
+*
+* This does NOT relax the fd<3 guard in get_file_slot().
+* That guard remains the default for the file syscalls.  Two
+* callers opt out explicitly, because a redirected stdio fd
+* is a real open file there:
+*
+*   - sys_dup2 uses get_file_slot_any so `dup2(file_fd, 0/1/2)`
+*     and its restore twin `dup2(saved, 0/1/2)` work.
+*   - sys_fcntl uses get_file_slot_any for F_DUPFD and
+*     F_DUPFD_CLOEXEC only, so a shell can save stdio.  Its
+*     other subcommands still call get_file_slot and refuse
+*     fd < 3.  The new fd from F_DUPFD still lands on fd >= 3.
+*/
 static int alloc_file_slot(file_slot_t** out_slot) {
     pcb_t* self = process_get_current();
     if (!self) return -1;
-
     int fd = -1;
-    for (int i = 3; i < MAX_PROCESS_FILES; i++) {
+    for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         if (self->file_table[i] == NULL) { fd = i; break; }
     }
     if (fd == -1) return -1;
-
     file_slot_t* slot = (file_slot_t*)kmalloc(sizeof(file_slot_t));
     if (!slot) return -1;
     slot->kind     = 0;
@@ -642,6 +752,41 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
     if (!slot) return NULL;
     if (kind != 0 && slot->kind != kind) return NULL;
     return slot;
+}
+
+/*
+ * Like get_file_slot, but accepts fds 0, 1, and 2.
+ *
+ * The general get_file_slot() refuses fds < 3.  That guard is the
+ * default because most file syscalls must not treat stdin/stdout/
+ * stderr as ordinary open files.  But redirection -- busybox ash's
+ * `<`, `>`, `2>` -- works by opening a file and calling dup2() to
+ * install it as fd 0, 1, or 2.  After that, those low fds hold
+ * real files, and the syscalls involved in the redirect dance must
+ * see them:
+ *
+ *   - sys_read and sys_write, so read(0, ...) and write(1, ...)
+ *     consult file_table[0] / file_table[1] instead of falling
+ *     through to the keyboard/screen.
+ *   - sys_close, so a redirect-created file's refcount reaches
+ *     zero and FatFs commits the directory entry.
+ *   - sys_dup2, so dup2(file_fd, 1) and the restore dup2(saved, 1)
+ *     work -- without this a second redirect in the same shell
+ *     failed with EBADF once an earlier redirect had freed a low fd.
+ *   - sys_fcntl, for F_DUPFD and F_DUPFD_CLOEXEC only, so a shell
+ *     can save stdio before redirecting it.
+ *
+ * Everything else -- fstat, getdents64, lseek, ftruncate, and the
+ * other fcntl subcommands -- keeps using get_file_slot and refuses
+ * fd < 3.
+ *
+ * Returns NULL if the fd is out of range, or holds no slot.
+ * Does not check slot->kind -- the caller does.
+ */
+static file_slot_t* get_file_slot_any(int fd) {
+    pcb_t* self = process_get_current();
+    if (!self || fd < 0 || fd >= MAX_PROCESS_FILES) return NULL;
+    return (file_slot_t*)self->file_table[fd];
 }
 
 
@@ -670,8 +815,18 @@ static file_slot_t* get_file_slot(int fd, uint32_t kind) {
 #define F_DUPFD_CLOEXEC 1030
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
-    file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -(long)EBADF_;
+    file_slot_t* slot;
+    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+        slot = get_file_slot_any(fd);
+    } else {
+        slot = get_file_slot(fd, 0);
+    }
+    if (!slot) {
+        FDTRACE({ serial_print("fcntl fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" cmd="); serial_print_dec((uint64_t)cmd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     switch (cmd) {
         case F_DUPFD:
@@ -715,6 +870,9 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
 
             slot->refcount++;
             self->file_table[newfd] = slot;
+            FDTRACE({ serial_print("fcntl DUPFD fd="); serial_print_dec((uint64_t)fd);
+                      serial_print(" min="); serial_print_dec((uint64_t)min);
+                      serial_print(" -> "); serial_print_dec((uint64_t)newfd); });
             return (long)newfd;
         }
         case F_GETFD:  return 0;              /* no FD_CLOEXEC set */
@@ -890,6 +1048,9 @@ long sys_open(const char* path, int flags) {
         if (dr == FR_OK) {
             slot->kind = FILE_KIND_DIR;
             slot->obj  = dir_obj;
+            FDTRACE({ serial_print("open  "); serial_print(dir_path);
+                      serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                      serial_print(" kind=DIR"); });
             return fd;
         }
         kfree(dir_obj);
@@ -913,7 +1074,10 @@ long sys_open(const char* path, int flags) {
     FRESULT r = f_open(file_obj, local_path, mode);
     if (r == FR_OK) {
         slot->kind = FILE_KIND_FILE;
-        slot->obj  = file_obj;
+        slot->obj  = file_obj;    
+        FDTRACE({ serial_print("open  "); serial_print(local_path);
+                  serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" kind=FILE"); });
         return fd;
     }
 
@@ -933,6 +1097,9 @@ long sys_open(const char* path, int flags) {
                 kfree(file_obj);
                 slot->kind = FILE_KIND_DIR;
                 slot->obj  = dir_obj;
+                FDTRACE({ serial_print("open  "); serial_print(local_path);
+                          serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                          serial_print(" kind=DIR (fallback)"); });
                 return fd;
             }
             kfree(dir_obj);
@@ -952,14 +1119,24 @@ long sys_open(const char* path, int flags) {
     kfree(file_obj);
     kfree(slot);
     self->file_table[fd] = NULL;
+    FDTRACE({ serial_print("open  FAIL "); serial_print(local_path);
+              serial_print(" r="); serial_print_dec(r); });
     return fatfs_errno(r);
 }
 
 long sys_close(int fd) {
-    file_slot_t* slot = get_file_slot(fd, 0);
-    if (!slot) return -(long)EBADF_;
+    file_slot_t* slot = get_file_slot_any(fd);
+
+    if (!slot) {
+        FDTRACE({ serial_print("close fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     pcb_t* self = process_get_current();
+    FDTRACE({ serial_print("close fd="); serial_print_dec((uint64_t)fd);
+              serial_print(" kind="); serial_print(kind_name(slot->kind));
+              serial_print(" -> 0"); });
     self->file_table[fd] = NULL;
     put_file_slot(slot);
     return 0;
@@ -990,8 +1167,13 @@ long sys_dup2(int oldfd, int newfd) {
     if (oldfd < 0 || oldfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
     if (newfd < 0 || newfd >= MAX_PROCESS_FILES) return -(long)EBADF_;
 
-    file_slot_t* old_slot = get_file_slot(oldfd, 0);
-    if (!old_slot) return -(long)EBADF_;
+    file_slot_t* old_slot = get_file_slot_any(oldfd);
+    if (!old_slot) {
+        FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
+                  serial_print(" new="); serial_print_dec((uint64_t)newfd);
+                  serial_print(" -> EBADF"); });
+        return -(long)EBADF_;
+    }
 
     /* dup2(fd, fd) is a no-op returning fd, not an error. */
     if (oldfd == newfd) return (long)newfd;
@@ -1010,6 +1192,11 @@ long sys_dup2(int oldfd, int newfd) {
     /* Share the slot and take a new reference. */
     old_slot->refcount++;
     self->file_table[newfd] = old_slot;
+
+    FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
+              serial_print(" new="); serial_print_dec((uint64_t)newfd);
+              serial_print(" kind="); serial_print(kind_name(old_slot->kind));
+              serial_print(" -> "); serial_print_dec((uint64_t)newfd); });
     return (long)newfd;
 }
 
@@ -1089,6 +1276,104 @@ long sys_rmdir(const char* path) {
     if (r != FR_OK) {
         serial_print("sys_rmdir: f_unlink FAIL path=");
         serial_print(local_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 rename(2) — syscall 82.
+ *
+ * Rename (move) a file or directory.  This is the first
+ * two-path syscall in donix: both oldpath and newpath must be
+ * resolved against the process cwd, then stripped of any leading
+ * "./" or "/", exactly as the one-path syscalls do.  The same
+ * pattern will be needed for link(2) and symlink(2) when they
+ * land.
+ *
+ * ABI:
+ *   arg0  const char*  oldpath
+ *   arg1  const char*  newpath
+ *   returns  0 on success, -errno on failure.
+ *
+ * FatFs semantics (see ff.h f_rename):
+ *   - f_rename does NOT replace an existing destination.  Linux
+ *     rename(2) DOES replace.  If newpath exists, f_rename
+ *     returns FR_EXIST, which fatfs_errno maps to -EPERM.  So
+ *     `mv a b` where b already exists fails rather than
+ *     overwriting.  This is a deliberate first cut: safer, and
+ *     nothing in the current applet set relies on the replace
+ *     behavior.  A future caller that needs Linux semantics can
+ *     unlink the destination first, then rename -- but that loses
+ *     the atomicity of rename, so it is a decision, not a fix.
+ *
+ *   - On FAT16, f_rename only works within a directory.  Renaming
+ *     `dir/a` to `dir/b` works; `dir/a` to `other/b` fails.
+ *     Linux rename(2) allows cross-directory moves.  For donix's
+ *     flat FAT root this covers `mv a b`; a cross-directory move
+ *     is a known limitation, tracked in docs/open-issues.md.
+ *
+ * Errors: -EFAULT for a bad user pointer, -ENAMETOOLONG if a
+ * resolved path overflows, otherwise the FatFs errno mapping
+ * (FR_NO_FILE -> -ENOENT, FR_EXIST -> -EPERM, etc.).
+ */
+long sys_rename(const char* user_oldpath, const char* user_newpath) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_oldpath || !user_newpath) return -(long)EFAULT_;
+
+    char old_path[USER_PATH_MAX];
+    char new_path[USER_PATH_MAX];
+    char old_resolved[USER_PATH_MAX];
+    char new_resolved[USER_PATH_MAX];
+
+    /* Copy both paths out of user space. */
+    if (copy_user_string(old_path, sizeof(old_path), user_oldpath) != 0) {
+        return -(long)EFAULT_;
+    }
+    if (copy_user_string(new_path, sizeof(new_path), user_newpath) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    /* Resolve both against the process cwd. */
+    if (resolve_against_cwd(self, old_path, old_resolved,
+                            sizeof(old_resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    if (resolve_against_cwd(self, new_path, new_resolved,
+                            sizeof(new_resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+
+    /* Copy the resolved forms back into the working buffers. */
+    {
+        size_t i = 0;
+        while (old_resolved[i] && i < sizeof(old_path) - 1) {
+            old_path[i] = old_resolved[i];
+            i++;
+        }
+        old_path[i] = '\0';
+    }
+    {
+        size_t i = 0;
+        while (new_resolved[i] && i < sizeof(new_path) - 1) {
+            new_path[i] = new_resolved[i];
+            i++;
+        }
+        new_path[i] = '\0';
+    }
+
+    /* Strip leading "./" and "/" that FatFs rejects. */
+    strip_dot_prefix(old_path);
+    strip_dot_prefix(new_path);
+
+    FRESULT r = f_rename(old_path, new_path);
+    if (r != FR_OK) {
+        serial_print("sys_rename: f_rename FAIL old=");
+        serial_print(old_path);
+        serial_print(" new=");
+        serial_print(new_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
         return fatfs_errno(r);
@@ -1804,7 +2089,27 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         __asm__ volatile("sti");
         return -(long)EFAULT_;
     }
-
+    /*
+     * Normalize the path for FatFs: strip any leading "./" or "/"
+     * so a path like "./test.sh" becomes "test.sh".  FatFs rejects
+     * a leading "." or "/" with FR_INVALID_NAME, so without this
+     * the first f_open below fails before any retry can run, and
+     * `./script.sh` never reaches the interpreter fallback.
+     *
+     * The caller's original `path` is kept for the proc_name
+     * extraction in section 4.
+     */
+    char exec_path[USER_PATH_MAX];
+    {
+        size_t i = 0;
+        while (path[i] && i < sizeof(exec_path) - 1) {
+            exec_path[i] = path[i];
+            i++;
+        }
+        exec_path[i] = '\0';
+        strip_dot_prefix(exec_path);
+    }
+    
     /* ---- 2. Open and read the whole ELF file. ----
      *
      * Three attempts, in order:
@@ -1844,10 +2149,10 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * exec_resolve_bin_name.
      */
     FIL file;
-    FRESULT fr = f_open(&file, path, FA_READ | FA_OPEN_EXISTING);
+    FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
     if (fr != FR_OK) {
         int has_drive = 0;
-        for (const char* p = path; *p; p++) {
+        for (const char* p = exec_path; *p; p++) {
             if (*p == ':') { has_drive = 1; break; }
         }
 
@@ -1859,15 +2164,15 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
          * drive prefix FatFs requires.  No uppercasing, no
          * ".ELF" appended.
          */
-        if (!has_drive && path[0] == '/') {
+        if (!has_drive && exec_path[0] == '/') {
             char resolved[USER_PATH_MAX];
             size_t plen = 0;
-            while (path[plen]) plen++;
+            while (exec_path[plen]) plen++;
             if (plen + 3 <= sizeof(resolved)) {   /* "0:" + path + NUL */
                 resolved[0] = '0';
                 resolved[1] = ':';
                 for (size_t i = 0; i <= plen; i++) {
-                    resolved[2 + i] = path[i];
+                    resolved[2 + i] = exec_path[i];
                 }
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1892,7 +2197,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             char resolved[USER_PATH_MAX];
 
             /* (c1) root, uppercased, .ELF appended. */
-            if (exec_resolve_bare_name(path, resolved,
+            if (exec_resolve_bare_name(exec_path, resolved,
                                        sizeof(resolved)) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1903,7 +2208,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             /* (c2) /bin, uppercased, as-is (no .ELF). */
             if (fr != FR_OK &&
-                exec_resolve_bin_name(path, resolved,
+                exec_resolve_bin_name(exec_path, resolved,
                                       sizeof(resolved), 0) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1914,7 +2219,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             /* (c3) /bin, uppercased, .ELF appended. */
             if (fr != FR_OK &&
-                exec_resolve_bin_name(path, resolved,
+                exec_resolve_bin_name(exec_path, resolved,
                                       sizeof(resolved), 1) == 0) {
                 FRESULT fr2 = f_open(&file, resolved,
                                      FA_READ | FA_OPEN_EXISTING);
@@ -1938,16 +2243,41 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     Elf64_Ehdr ehdr;
     UINT got = 0;
     fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
-    if (fr != FR_OK || got != sizeof(ehdr)) {
-        serial_print("sys_execve: short read of ELF header\n");
+    if (fr != FR_OK) {
+        serial_print("sys_execve: f_read header failed\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
     }
 
-    if (ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
+    /*
+     * A short read here is NOT an I/O error.  The file may simply
+     * be shorter than an ELF header -- a shell script, for example.
+     * What matters is whether the bytes we did read start with the
+     * ELF magic.  If they do, the file claims to be an ELF and we
+     * then require the full 64-byte header.  If they do not, this
+     * is not an ELF and the correct errno is ENOEXEC, which tells
+     * the caller's shell to fall back to running the file through
+     * an interpreter.
+     *
+     * Returning EIO for a short non-ELF file is what broke
+     * `./script.sh`: busybox ash only falls back to `sh script.sh`
+     * when execve returns ENOEXEC; on EIO it prints "I/O error"
+     * and gives up.
+     */
+    if (got < 4 ||
+        ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
         serial_print("sys_execve: not an ELF file\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -(long)ENOEXEC;
+    }
+
+    /* The magic matched: it claims to be an ELF, so require the
+     * full header. */
+    if (got != sizeof(ehdr)) {
+        serial_print("sys_execve: short ELF header\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOEXEC;
@@ -1965,8 +2295,14 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     FSIZE_t file_size = f_size(&file);
-    if (file_size == 0 || file_size > 4ULL * 1024 * 1024) {
-        serial_print("sys_execve: file size out of range\n");
+    if (file_size == 0) {
+        serial_print("sys_execve: empty file\n");
+        f_close(&file);
+        __asm__ volatile("sti");
+        return -(long)ENOEXEC;
+    }
+    if (file_size > 4ULL * 1024 * 1024) {
+        serial_print("sys_execve: file too large\n");
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -2305,7 +2641,18 @@ long sys_write(int fd, const void* buf, size_t count) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EBADF_;
 
-    if (fd == 1 || fd == 2) {
+    /*
+     * fd 1 and 2 are the screen ONLY when nothing has been dup2'd
+     * onto them.  `echo hi > file` opens the file and calls
+     * dup2(file_fd, 1); after that, write(1, ...) must write the
+     * file, not the screen.  The old code went straight to the
+     * screen path and ignored file_table[1], so `>` silently
+     * discarded the redirect.
+     */
+    file_slot_t* std_slot = get_file_slot_any(fd); 
+    
+    if ((fd == 1 || fd == 2) &&
+        (!std_slot || std_slot->kind != FILE_KIND_FILE)) {
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
@@ -2322,8 +2669,8 @@ long sys_write(int fd, const void* buf, size_t count) {
         return (long)count;
     }
 
-    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
-    if (slot) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
         if (!bounce) return -(long)ENOMEM_;
@@ -2414,6 +2761,45 @@ long sys_writev(int fd, const struct iovec* user_iov, int iovcnt) {
 }
 
 /*
+ * Linux x86_64 readv(2) — syscall 19.
+ *
+ * Mirror of sys_writev (20).  Reads into each iovec in turn,
+ * accumulating the total; stops early on a short read, exactly as
+ * writev stops on a short write.  The same iov-copy discipline
+ * applies: the iov array is a user pointer and must be copied
+ * through safe_copy_from_user, not dereferenced directly.  The
+ * same WRITEV_MAX_IOVS cap bounds the kernel-stack copy.
+ *
+ * WHY THIS EXISTS: busybox `od -c` calls readv to read the file it
+ * is formatting.  Without syscall 19, `od` got -ENOSYS and logged
+ * "Unknown syscall: 19" and failed.  `od` is off until this lands;
+ * it is re-enabled in the next commit.
+ *
+ * `struct iovec` and WRITEV_MAX_IOVS are defined above, at the
+ * writev section -- both syscalls share them.
+ */
+long sys_readv(int fd, const struct iovec* user_iov, int iovcnt) {
+    if (!user_iov || iovcnt <= 0) return -(long)EINVAL_;
+    if (iovcnt > WRITEV_MAX_IOVS) return -(long)EINVAL_;
+
+    struct iovec local[WRITEV_MAX_IOVS];
+    size_t bytes = (size_t)iovcnt * sizeof(struct iovec);
+    if (safe_copy_from_user(local, user_iov, bytes) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (local[i].iov_len == 0) continue;
+        long n = sys_read(fd, local[i].iov_base, local[i].iov_len);
+        if (n < 0) return (total > 0) ? total : n;
+        total += n;
+        if ((size_t)n < local[i].iov_len) break;  /* short read — stop */
+    }
+    return total;
+}
+
+/*
  * Linux x86_64 ftruncate(2) — syscall 77.
  *
  * Confirmed against arch/x86/entry/syscalls/syscall_64.tbl:
@@ -2450,12 +2836,88 @@ long sys_ftruncate(int fd, long length) {
     return 0;
 }
 
+/*
+ * Linux x86_64 lseek(2) — syscall 8.
+ *
+ * Repositions the read/write cursor on an open file.  Backed by
+ * FatFs's f_lseek() on the FIL's fptr; f_tell() returns the new
+ * position.  sys_ftruncate already uses f_lseek, so the mechanism
+ * is proven.
+ *
+ * ABI:
+ *   arg0  int    fd
+ *   arg1  off_t  offset  (signed 64-bit)
+ *   arg2  int    whence  SEEK_SET(0) / SEEK_CUR(1) / SEEK_END(2)
+ *   returns  the resulting offset from the start of the file,
+ *            or -errno.
+ *
+ * Linux permits seeking past EOF; FatFs does not reliably.  We
+ * clamp the target to [0, file_size] and reject anything outside
+ * with -EINVAL.  Nothing on donix seeks past EOF today; if a
+ * caller appears that needs sparse writes, revisit this.
+ *
+ * WHY THIS EXISTS: busybox `head -n N` calls lseek(fd, 0,
+ * SEEK_END) to size the file before reading.  Without syscall 8
+ * it got -ENOSYS and logged "Unknown syscall: 8" (session 33,
+ * head applet).  The output was still correct because busybox
+ * fell back to sequential reading, but the noise hid real
+ * problems and other applets (tail, cp's size checks) would
+ * exercise lseek harder.
+ *
+ * Linux x86_64 syscall numbers: lseek is 8 (see
+ * arch/x86/entry/syscalls/syscall_64.tbl).  It was previously
+ * unimplemented -- not shadowed at another number, just absent.
+ */
+#define SEEK_SET_ 0
+#define SEEK_CUR_ 1
+#define SEEK_END_ 2
+
+long sys_lseek(int fd, long offset, int whence) {
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+
+    FIL* file_obj = (FIL*)slot->obj;
+
+    FSIZE_t size = f_size(file_obj);
+    FSIZE_t cur  = f_tell(file_obj);
+
+    long target;
+    switch (whence) {
+        case SEEK_SET_:  target = offset;                    break;
+        case SEEK_CUR_:  target = (long)cur + offset;        break;
+        case SEEK_END_:  target = (long)size + offset;       break;
+        default:         return -(long)EINVAL_;
+    }
+
+    /* Clamp to [0, size].  See the header comment: Linux allows
+     * seeking past EOF, FatFs does not; reject rather than
+     * silently truncate. */
+    if (target < 0 || (FSIZE_t)target > size) {
+        return -(long)EINVAL_;
+    }
+
+    FRESULT r = f_lseek(file_obj, (FSIZE_t)target);
+    if (r != FR_OK) return fatfs_errno(r);
+
+    return (long)f_tell(file_obj);
+}
+
 long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
     if (!self) return -(long)EBADF_;
 
-    if (fd == 0) {
+    /*
+     * fd 0 is the keyboard ONLY when nothing has been dup2'd onto
+     * it.  busybox ash's `<` redirection opens a file and calls
+     * dup2(file_fd, 0); after that, read(0, ...) must read the
+     * file, not the keyboard.  The old code went straight to the
+     * keyboard path and ignored file_table[0], so `cat < file`
+     * blocked forever on keyboard input.
+     */
+    file_slot_t* fd0_slot = get_file_slot_any(0);
+    
+    if (fd == 0 && (!fd0_slot || fd0_slot->kind != FILE_KIND_FILE)) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
         while (bytes_read < count) {
             __asm__ volatile("cli");
@@ -2495,8 +2957,8 @@ long sys_read(int fd, void* buf, size_t count) {
         return (long)bytes_read;
     }
 
-    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
-    if (slot) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
         char* bounce = (char*)kmalloc(512);
         if (!bounce) return -(long)ENOMEM_;
@@ -2699,6 +3161,72 @@ long sys_setsid(void) {
  */
 long sys_geteuid(void) {
     return 1000;
+}
+
+/*
+ * Linux x86_64 uname(2) — syscall 63.
+ *
+ * Fills a struct utsname with fixed fields.  Every field is
+ * _UTSNAME_LENGTH (65) bytes, NUL-terminated, in this order:
+ *
+ *   sysname    "Linux"       -- what busybox checks to pick the
+ *                               Linux code path over BSD or other
+ *   nodename   "donix"       -- hostname; anything reasonable
+ *   release    "6.0.0"       -- kernel version; digits and dots
+ *                               only, so version parsers do not
+ *                               choke
+ *   version    "#1 donix"    -- free-form build string
+ *   machine    "x86_64"      -- architecture; checkers branch on
+ *                               this to pick word size
+ *   domainname "(none)"      -- NIS domain; everyone prints this
+ *
+ * The exact values are less important than the shape: sysname
+ * must be "Linux" so glibc/musl/busybox pick their Linux
+ * behavior, and machine must be "x86_64" so anything doing
+ * architecture-specific work gets the right answer.  The
+ * remaining fields are informational.
+ *
+ * Without this syscall, `busybox uname` prints an error.  It is
+ * NOT required for shell script execution -- the session-33
+ * script fixes are independent of this.
+ */
+struct donix_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static void set_utsname_field(char* dst, const char* src) {
+    int i = 0;
+    while (src[i] && i < 64) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+long sys_uname(void* user_buf) {
+    if (!user_buf) return -(long)EFAULT_;
+
+    struct donix_utsname u;
+    /* Zero every byte so the fields beyond the NUL we write are
+     * deterministic.  Some callers memcmp the whole struct. */
+    for (size_t i = 0; i < sizeof(u); i++) ((uint8_t*)&u)[i] = 0;
+
+    set_utsname_field(u.sysname,    "Linux");
+    set_utsname_field(u.nodename,   "donix");
+    set_utsname_field(u.release,    "6.0.0");
+    set_utsname_field(u.version,    "#1 donix");
+    set_utsname_field(u.machine,    "x86_64");
+    set_utsname_field(u.domainname, "(none)");
+
+    if (safe_copy_to_user(user_buf, &u, sizeof(u)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
 }
 
 /*
@@ -3636,7 +4164,8 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 long sys_fork(void) {
     __asm__ volatile("cli");
 
-    pcb_t* parent = process_get_current();
+    pcb_t* parent = process_get_current(); 
+    
     if (!parent) {
         __asm__ volatile("sti");
         return -(long)EAGAIN_;
@@ -3757,6 +4286,34 @@ long sys_fork(void) {
     }
 
     /*
+     * Child inherits the parent's open fds.
+     *
+     * process_create zeroed the child's file_table[], but fork
+     * must give the child the same open fds as the parent.  This
+     * is what makes `cmd < file` work: the shell opens the file,
+     * dup2()s it onto fd 0, then forks and execs the command.  If
+     * the child starts with an empty table, fd 0 is NULL in the
+     * child, its read(0) falls through to the keyboard, and the
+     * command blocks forever.  Same for `>`: fd 1 must carry the
+     * parent's redirected file into the child.
+     *
+     * Each slot is SHARED, not copied: the child's fd and the
+     * parent's fd point at the same file_slot_t, and the refcount
+     * is incremented for the new reference -- exactly as dup2
+     * shares a slot.  Closing either fd drops one reference; the
+     * slot is freed only when the last reference goes away.
+     *
+     * fds 0, 1, 2 are included: the parent may have dup2'd a file
+     * onto them, and the child must see the same redirection.
+     */
+    for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
+        file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
+        if (!_slot) continue;
+        _slot->refcount++;
+        child->file_table[_fd] = _slot;
+    }
+
+    /*
      * Build the child's iretq-resume frame from the parent's current
      * syscall-entry frame.  This sets the child's %rax to 0, which is
      * how fork() signals "you are the child" to user code.
@@ -3835,6 +4392,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
         case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
         case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
+        case SYS_LSEEK:           return (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2);
         case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
         case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
@@ -3842,6 +4400,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
+        case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
@@ -3850,10 +4409,12 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_UNAME:           return (uint64_t)sys_uname((void*)arg0);
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
         case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
         case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
+        case SYS_RENAME:          return (uint64_t)sys_rename((const char*)arg0, (const char*)arg1);
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);

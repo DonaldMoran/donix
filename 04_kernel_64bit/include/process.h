@@ -7,7 +7,7 @@
 #define MAX_PROCESSES 32
 #define PROC_NAME_LEN 32
 #define PROC_STACK_SIZE  16384   // 16KB: syscall entry + nested timer frame + sys_read blocking headroom
-#define MAX_PROCESS_FILES 8
+#define MAX_PROCESS_FILES 64
 #define PROC_CWD_MAX 128
 
 // Process states

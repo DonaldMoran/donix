@@ -54,6 +54,7 @@
  *   5  fstat             sys_fstat         (Linux entry: sys_newfstat)
  *   6  lstat             sys_lstat         (Linux entry: sys_newlstat)
  *   7  poll              sys_poll
+ *   8  lseek             sys_lseek
  *   9  mmap              sys_mmap
  *  10  mprotect          sys_mprotect      (stub)
  *  11  munmap            sys_munmap        (stub)
@@ -61,6 +62,7 @@
  *  13  rt_sigaction      sys_rt_sigaction  (stub)
  *  14  rt_sigprocmask    sys_rt_sigprocmask(stub)
  *  16  ioctl             sys_ioctl
+ *  19  readv             sys_readv
  *  20  writev            sys_writev
  *  21  access            sys_access
  *  33  dup2              sys_dup2
@@ -69,10 +71,12 @@
  *  59  execve            sys_execve
  *  60  exit              sys_exit
  *  61  wait4             sys_wait4
+ *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
+ *  82  rename            sys_rename
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
@@ -126,6 +130,7 @@
 #define SYS_FSTAT           5
 #define SYS_LSTAT           6
 #define SYS_POLL            7
+#define SYS_LSEEK           8
 #define SYS_MMAP            9
 #define SYS_MPROTECT        10
 #define SYS_MUNMAP          11
@@ -133,6 +138,7 @@
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
 #define SYS_IOCTL           16
+#define SYS_READV           19
 #define SYS_WRITEV          20
 #define SYS_ACCESS          21
 #define SYS_DUP2            33
@@ -141,10 +147,12 @@
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
+#define SYS_UNAME           63
 #define SYS_FCNTL           72
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80
+#define SYS_RENAME          82
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
@@ -207,14 +215,17 @@ long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
 long sys_rmdir(const char* path);
 long sys_ftruncate(int fd, long length);
+long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
 long sys_setsid(void);
 long sys_geteuid(void);
 long sys_getppid(void);
+long sys_uname(void* user_buf);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
+long sys_rename(const char* oldpath, const char* newpath);
 long sys_utimes(const char* path, const void* times);
 long sys_futimesat(int dirfd, const char* path, const void* times);
 long sys_utimensat(int dirfd, const char* path, const void* times,

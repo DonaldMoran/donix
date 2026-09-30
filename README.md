@@ -62,8 +62,9 @@ That's the point. That's the whole point.
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
-  `fstat`, `chdir`, `getcwd`, `geteuid`, `prctl`, `ftruncate`,
-  `utimensat`, `unlink`, `rmdir` — the numbers and semantics match
+  `fstat`, `lstat`, `access`, `chdir`, `getcwd`, `geteuid`, `prctl`,
+  `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`, `rmdir`,
+  `uname`, `readv`, `writev` — the numbers and semantics match
   Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
   unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
@@ -74,13 +75,17 @@ That's the point. That's the whole point.
   `sys_unlink`, `sys_mkdir`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
-  backspace, line editing, history), its applets (`ls`, `cat`, `echo`,
-  `pwd`, `wc`) run in-process via standalone mode, and `/bin/busybox`
-  is a real path on the image. It forks and execs external binaries,
-  and it shares the working directory with the rest of the system.
-  This is the strongest evidence that the syscall ABI is right —
-  busybox expects a real Unix kernel underneath it, and on donix it
-  gets one.
+  backspace, line editing, history), and it supports real shell
+  redirection — `cat < file`, `echo hi > out.txt`, and repeated
+  redirects in one shell all work. Its file and text applets — `ls`,
+  `cat`, `echo`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`, `grep`,
+  `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`,
+  `uniq`, `mkdir`, `rm`, `rmdir`, `touch` — run in-process via
+  standalone mode, and `/bin/busybox` is a real path on the image. It
+  forks and execs external binaries, and it shares the working
+  directory with the rest of the system. This is the strongest
+  evidence that the syscall ABI is right — busybox expects a real
+  Unix kernel underneath it, and on donix it gets one.
 - **Has a real terminal.** The console is a VT100 emulator: full CSI
   parsing, cursor addressing, SGR colors, the erase, insert, and
   delete families, and a software alternate screen. Full-screen

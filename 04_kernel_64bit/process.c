@@ -7,6 +7,7 @@
 #include "include/heap.h"
 #include "include/user_space.h"
 #include "include/elf.h"
+#include "include/user_syscall.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -256,10 +257,24 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
     pcb->next = NULL; pcb->prev = NULL;
     pcb->timeslice_ticks = 0; pcb->total_ticks = 0;
 
-    /* Initialize process file descriptor slots to NULL */
+    /*
+     * Initialize process file descriptor slots.
+     *
+     * Zero the whole table, then install console sentinels in fds
+     * 0, 1, and 2.  A fresh process's stdio fds are "occupied" by
+     * the console, so open(2) returns fd 3 -- matching Linux, where
+     * stdio fds are never free at startup.  A program that closes
+     * one (e.g. busybox `uniq FILE` does close(0)) frees the
+     * sentinel and the next open(2) may reuse it.
+     *
+     * user_syscall_init_console_fds is in user_syscall.c; it owns
+     * the file_slot_t layout.  On allocation failure it leaves the
+     * fd NULL, which degrades to the pre-sentinel behavior.
+     */
     for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         pcb->file_table[i] = NULL;
     }
+    user_syscall_init_console_fds(pcb);
 
     scheduler_ready_queue_add(pcb);
     return pcb;
