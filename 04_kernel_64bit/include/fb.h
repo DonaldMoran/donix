@@ -45,6 +45,18 @@ void fb_putpixel(uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b);
 void fb_fillrect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                  uint8_t r, uint8_t g, uint8_t b);
 
+/* Draw one character at pixel (x, y) with foreground and background
+ * colors.  Glyph cell is 10x18 (Terminus ter-u18n). */
+void fb_putchar(int c, uint32_t x, uint32_t y,
+                uint8_t fr, uint8_t fg, uint8_t fb,
+                uint8_t br, uint8_t bg, uint8_t bb);
+
+/* Draw a NUL-terminated string at (x, y); returns the x past the
+ * last character.  No wrapping. */
+uint32_t fb_puts(const char* s, uint32_t x, uint32_t y,
+                 uint8_t fr, uint8_t fg, uint8_t fb,
+                 uint8_t br, uint8_t bg, uint8_t bb);
+
 /* Accessor for other modules (glyph blitter in step 3). */
 const fb_info_t* fb_get_info(void);
 

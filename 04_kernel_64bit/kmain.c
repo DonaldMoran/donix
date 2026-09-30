@@ -1342,7 +1342,18 @@ void kmain(BootInfo *info) {
         fb_fill(0x00, 0x00, 0x40);                          /* dark blue */
         fb_fillrect(0,   0,   200, 200, 0xC0, 0x00, 0x00);  /* red  */
         fb_fillrect(824, 568, 200, 200, 0x00, 0xC0, 0x00);  /* green */
-    }    
+
+        /* Glyph blitter test: white text on the dark blue, a few
+         * lines so we can judge readability and spacing. */
+        fb_puts("donix framebuffer test",
+                20, 20,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
+        fb_puts("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                20, 60,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
+        fb_puts("abcdefghijklmnopqrstuvwxyz",
+                20, 90,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
+        fb_puts("0123456789 !@#$%^&*()",
+                20, 120,  0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
+    }
     
     ata_init();    
     scheduler_init();

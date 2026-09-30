@@ -134,3 +134,100 @@ void fb_fillrect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
         }
     }
 }
+
+/* ============================================================
+ * GLYPH BLITTER -- Terminus 10x18
+ *
+ * The embedded font is ter_u18n_data[], produced by `xxd -i` from
+ * fonts/ter-u18n.psf and linked in via ter_u18n_data.o.  Layout
+ * (decoded from the file header):
+ *
+ *   offset 0    magic 72 b5 4a 86   (PSF v2)
+ *   offset 4    version
+ *   offset 8    header size = 32
+ *   offset 12   flags       = 1  (Unicode table present)
+ *   offset 16   char count  = 256
+ *   offset 20   charsize    = 36  (bytes per glyph)
+ *   offset 24   height      = 18  (pixels)
+ *   offset 28   width       = 10  (pixels)
+ *   offset 32   glyph data, 256 glyphs of 36 bytes
+ *
+ * Each glyph is 18 rows of 2 bytes (little-endian).  The low 10
+ * bits of a row are the 10 pixels, bit 0 = leftmost.  A set bit
+ * is a foreground pixel.
+ *
+ * The Unicode table (signalled by flags bit 0) is present but is
+ * the identity mapping 0..255 for this font, so glyph index ==
+ * character code and the table can be ignored.  If a future font
+ * has a non-identity table, this assumption breaks and the table
+ * must be read.
+ *
+ * These dimensions are #defines, not reads from the header, so
+ * the blitter is fast and the sizes are visible at the call site.
+ * They MUST match the embedded .psf; swapping to a different
+ * Terminus size means changing FB_FONT_* and the .psf the
+ * Makefile embeds.
+ * ============================================================ */
+
+#define FB_FONT_HEADER  32
+#define FB_FONT_W       10
+#define FB_FONT_H       18
+#define FB_FONT_CHARSIZE 36     /* bytes per glyph */
+#define FB_FONT_ROWBYTES 2      /* bytes per glyph row */
+
+extern const unsigned char fonts_ter_u18n_psf[];
+extern const unsigned int  fonts_ter_u18n_psf_len;
+
+/* Return a pointer to glyph `c`'s bitmap inside the embedded font,
+ * or NULL if c is out of range. */
+static const uint8_t* font_glyph(int c) {
+    if (c < 0 || c > 255) return NULL;
+    unsigned int need = FB_FONT_HEADER + (unsigned int)c * FB_FONT_CHARSIZE;
+    if (need + FB_FONT_CHARSIZE > fonts_ter_u18n_psf_len) return NULL;
+    return fonts_ter_u18n_psf + need;
+}
+
+/* Blit one character at pixel position (x, y) with the given
+ * foreground and background colors.  (x, y) is the top-left of the
+ * glyph cell.  Cells are FB_FONT_W x FB_FONT_H pixels. */
+void fb_putchar(int c, uint32_t x, uint32_t y,
+                uint8_t fr, uint8_t fg, uint8_t fb_,
+                uint8_t br, uint8_t bg, uint8_t bb) {
+    if (!g_fb.available) return;
+
+    const uint8_t* g = font_glyph(c);
+    if (!g) return;
+
+    for (uint32_t row = 0; row < FB_FONT_H; row++) {
+        /* Row is 2 little-endian bytes; assemble the 16-bit value
+         * and use its low FB_FONT_W bits. */
+        uint16_t bits = (uint16_t)g[row * FB_FONT_ROWBYTES]
+                      | ((uint16_t)g[row * FB_FONT_ROWBYTES + 1] << 8);
+
+        for (uint32_t col = 0; col < FB_FONT_W; col++) {
+            uint8_t r, gg, b;
+            if (bits & (1u << (FB_FONT_W - 1 - col))) {
+                r = fr; gg = fg; b = fb_;
+            } else {
+                r = br; gg = bg; b = bb;
+            }
+            fb_putpixel(x + col, y + row, r, gg, b);
+        }
+    }
+}
+
+/* Draw a NUL-terminated string starting at pixel (x, y).  Advances
+ * x by FB_FONT_W per character; does NOT wrap at the right edge
+ * (a console layer above this handles wrapping).  Returns the x
+ * position just past the last character drawn. */
+uint32_t fb_puts(const char* s, uint32_t x, uint32_t y,
+                 uint8_t fr, uint8_t fg, uint8_t fb_,
+                 uint8_t br, uint8_t bg, uint8_t bb) {
+    if (!g_fb.available) return x;
+    while (*s) {
+        fb_putchar((unsigned char)*s, x, y, fr, fg, fb_, br, bg, bb);
+        x += FB_FONT_W;
+        s++;
+    }
+    return x;
+}
