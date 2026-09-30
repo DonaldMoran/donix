@@ -129,8 +129,165 @@ static int run_builtin(int argc, char** argv) {
     return 0;
 }
 
+/*
+ * ---- Tokenizer, phase 1 ----
+ *
+ * Split `line` (NUL-terminated, modified in place) into argv.
+ *
+ * This pass handles only:
+ *
+ *   - unquoted space/tab separates words
+ *   - '...' and "..." group, contents taken literally; the quote
+ *     characters themselves are dropped
+ *
+ * Operators (< > >> | && ;) are NOT handled here.  They are left
+ * as literal characters inside words, so `echo hi>out` yields the
+ * single word `hi>out`.  split_operators() below is phase 2 and
+ * splits operator-containing words after this pass has run.
+ *
+ * In-place, two pointers over the same buffer:
+ *   r = read  cursor, walks the raw input
+ *   w = write cursor, walks the cooked output
+ * w never gets ahead of r, so writing *w while reading *r is safe.
+ *
+ * The one hazard of an in-place pass is the token terminator.  On
+ * a word with no quotes, every byte is copied 1:1, so at the end
+ * of the word w has caught up to r -- and writing the terminating
+ * NUL at w would land on the blank that r is about to inspect,
+ * making the outer loop see a NUL and stop after one token.  So
+ * the blank is consumed (r++) BEFORE the NUL is written; that is
+ * what keeps the two cursors' work from colliding.  A word WITH
+ * quotes shrinks, so w < r and the terminator is safe anyway --
+ * but the blank must still be stepped over for the next token.
+ *
+ * Returns argc.  argv is NUL-terminated.  SH_MAX_ARGS caps the
+ * token count; extra tokens are silently dropped.
+ */
+#define SH_MAX_ARGS 16
+
+static int tokenize(char* line, char** argv) {
+    char* r = line;
+    char* w = line;
+    int argc = 0;
+
+    while (*r && argc < SH_MAX_ARGS - 1) {
+        /* Skip unquoted blanks between tokens. */
+        while (*r == ' ' || *r == '\t') r++;
+        if (!*r) break;
+
+        argv[argc++] = w;
+
+        while (*r && *r != ' ' && *r != '\t') {
+            if (*r == '\'' || *r == '"') {
+                char q = *r++;
+                while (*r && *r != q) *w++ = *r++;
+                if (*r == q) r++;   /* consume closing quote */
+                /* Unclosed quote: run to end of line. */
+            } else {
+                *w++ = *r++;
+            }
+        }
+
+        /* Consume one trailing blank BEFORE writing the NUL, so
+         * the terminator never lands on the byte r is inspecting.
+         * (See the hazard note above.) */
+        if (*r == ' ' || *r == '\t') r++;
+        *w++ = 0;
+    }
+
+    argv[argc] = (char*)0;
+    return argc;
+}
+
+/*
+ * ---- Tokenizer, phase 2 ----
+ *
+ * Split operator characters out of the words phase 1 produced.
+ *
+ * Phase 1 gives words like `hi>out`, `a&&b`, `x|y`.  Phase 2
+ * rewrites each such word as the sequence of tokens
+ * `hi`, `>`, `out` / `a`, `&&`, `b` / `x`, `|`, `y`, so the
+ * parser step can look at argv and see the operators.
+ *
+ * Operators, longest match first:
+ *   >>  &&  then  >  <  |  &  ;
+ *
+ * `&` and `;` are included because `&&` and `;` are in scope and
+ * a lone `&`/`;` must not glue to a word.  A lone `&` is not
+ * valid shell; it is tokenized and left for the parser to reject.
+ *
+ * This pass does NOT run in place.  Phase 1 wrote its tokens into
+ * `line`; phase 2 copies them into `out`, inserting a NUL at each
+ * operator boundary, and rewrites argv to point into `out`.  Two
+ * separate buffers means no byte that is still to be read is ever
+ * overwritten -- the in-place hazard phase 1 had to dance around
+ * does not exist here.  `out` must be large enough for the worst
+ * case; see the caller.
+ *
+ * Returns the new argc.  argv is NUL-terminated.
+ */
+static int split_operators(char* out, char** argv, int argc) {
+    char* w = out;
+    int nargc = 0;
+
+    for (int i = 0; i < argc; i++) {
+        if (nargc >= SH_MAX_ARGS - 1) break;
+
+        const char* p = argv[i];
+        char* start = w;
+
+        while (*p) {
+            char c = *p;
+            if (c == '>' || c == '<' || c == '|' ||
+                c == '&' || c == ';') {
+
+                /* Close the word before the operator. */
+                if (w > start) {
+                    *w++ = 0;
+                    argv[nargc++] = start;
+                    if (nargc >= SH_MAX_ARGS - 1) break;
+                    start = w;
+                }
+
+                /* The operator itself, longest match first. */
+                char* op = w;
+                *w++ = c;
+                p++;
+                if ((c == '>' || c == '&') && *p == c) {
+                    *w++ = *p++;
+                }
+                *w++ = 0;
+                argv[nargc++] = op;
+                if (nargc >= SH_MAX_ARGS - 1) break;
+                start = w;
+            } else {
+                *w++ = *p++;
+            }
+        }
+
+        /* Close the word after the last operator (or the whole
+         * word if it had none). */
+        if (w > start && nargc < SH_MAX_ARGS - 1) {
+            *w++ = 0;
+            argv[nargc++] = start;
+        }
+    }
+
+    argv[nargc] = (char*)0;
+    return nargc;
+}
+
 int main(void) {
     char line[256];
+
+    /*
+     * Phase 2 output buffer.  Phase 2 only ever adds one NUL per
+     * operator run, and an operator run is at least one character,
+     * so the worst case is 2x the input length.  line is 256, so
+     * 512 is safe.  static so it does not sit on the stack next to
+     * line[].
+     */
+    static char out[512];
 
     /*
      * Drop into busybox ash on boot.  When the user types `exit`
@@ -175,25 +332,27 @@ int main(void) {
 
         if (n == 0) continue;
 
-        /*
-         * Tokenize the line ONCE, in the parent, so builtins can
-         * see argv.  The fork/exec path reuses the same argv.
-         *
-         * MAX_ARGS caps the token count; extra tokens are dropped.
-         */
-        enum { MAX_ARGS = 16 };
-        char* argv[MAX_ARGS];
-        int argc = 0;
+        char* argv[SH_MAX_ARGS];
+        int argc = tokenize(line, argv);
+        argc = split_operators(out, argv, argc);
+
+        /* TEMPORARY debug: the whole line is built into one buffer
+         * and written with a single sys_write, so the tokenization
+         * cannot be interleaved or torn.  Remove once the parser
+         * step consumes argv. */
         {
-            char* p = line;
-            while (*p && argc < MAX_ARGS - 1) {
-                while (*p == ' ' || *p == '\t') p++;
-                if (!*p) break;
-                argv[argc++] = p;
-                while (*p && *p != ' ' && *p != '\t') p++;
-                if (*p) *p++ = 0;
+            char dbg[512];
+            unsigned long d = 0;
+            int i;
+            dbg[d++] = '[';
+            for (i = 0; i < argc; i++) {
+                if (i) dbg[d++] = '|';
+                const char* s = argv[i];
+                while (*s && d < sizeof(dbg) - 3) dbg[d++] = *s++;
             }
-            argv[argc] = (char*)0;
+            dbg[d++] = ']';
+            dbg[d++] = '\n';
+            puts_raw(dbg, d);
         }
 
         if (argc == 0) continue;
