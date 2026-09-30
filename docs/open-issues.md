@@ -1,76 +1,70 @@
 ## Open issues
 
-### Resolved in session 34
-
-- **`uniq` hangs.**  Not an `uniq` bug.  `alloc_file_slot` started at
-  fd 3, so `uniq`'s `close(0); open(file)` idiom landed the file on
-  fd 3 and `read(0, ...)` blocked on the keyboard.  Fixed by console
-  sentinels, lowest-free-fd `open`, and relaxing the `sys_dup2` /
-  `sys_fcntl(F_DUPFD)` fd<3 guards.  See `gotchas.md`, "Low fds
-  (0/1/2) are first-class."  Commit `20260930-low-fd-io`.
-
-### Resolved in session 36 (v0.6.6)
-
-- **`pipe(2)` absent — `|` does not work in any shell.**  Implemented
-  as a 4 KB ring buffer shared by a read end and a write end, with
-  blocking `read`/`write`, a directed wake (`reader_waiting` /
-  `writer_waiting` on the pipe, not a broadcast), EOF when the last
-  writer closes, `-EPIPE` when the last reader closes, and a wake on
-  the process-exit path so a writer that `_exit`s without closing does
-  not strand its reader.  The `sys_read`/`sys_write` stdio guards were
-  inverted so a pipe `dup2`'d onto fd 0/1 is routed as a real fd, not
-  as the console.  Verified: `cat hello-world.txt | head -n 2`,
-  `echo hi | wc`, `echo hello | cat`, all from ash.  See
-  `docs/gotchas.md`, "Negative fd-kind tests don't extend to new
-  kinds."  Five commits, all in `v0.6.6`; see `docs/session-log.md`
-  for the table.
-
-- **`dup(2)` (syscall 32) missing.**  Found by `pipe_step3`'s first
-  run: musl's `dup()` reaches `SYS_dup` directly, and donix had no
-  handler, so `dup` returned `-ENOSYS`.  Fixed as a one-line
-  delegation to `sys_fcntl(fd, F_DUPFD, 0)`.  Commit in `v0.6.6`;
-  see `docs/session-log.md`.
-
 ### Open
 
 1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
    resolution and `resolve_against_cwd` are both shims.  When a VFS
    lands, delete them; do not extend.
 
-2. **`musl_sh` does not strip quotes or parse redirection.**
-   Userland-only fix.  Headline item for `v0.6.7`.  Affects `<`,
-   `>`, `|`, `&&`, `;`, and any quoting — all tests involving those
-   must currently be run from ash.  A tokenizer fix, no kernel
-   change.
+2. **Redirection of a builtin is silently ignored.**  `musl_sh`'s
+   builtins (`cd`, `pwd`) run in the parent, before any fork, so
+   there is no child to install a redirected fd into.  `cd /bin >
+   log` runs `cd`, drops the `>` and `log` as ordinary argv the
+   builtin ignores, creates no `log`, and prints no error.  Same for
+   `<` and `>>`.
 
-3. **`sys_fcntl` refuses fd < 3 for subcommands other than
+   Verified (session 37):
+   - `cd / > log` — no output, no error, no file; `cd` succeeded.
+   - `pwd > log` — prints `/` to the screen, not into `log`.
+   - `ls` shows no `log`; `cat log` fails with `cannot open`.
+
+   A loud failure would be better than silence; so would actually
+   redirecting the builtin (which needs an fd-save / fd-restore dance
+   in the parent, not a child fork).  Not on any current path.
+
+3. **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
+   `sh: builtin in pipeline not supported` and runs nothing.  A
+   builtin cannot be forked without changing its meaning (`cd` in a
+   pipeline would not affect the parent's cwd), and donix's builtins
+   have no subshell form.  Real shells run the builtin in a
+   subshell; adding that is its own change.  Deliberate limitation.
+
+4. **`sys_fcntl` refuses fd < 3 for subcommands other than
    `F_DUPFD`/`F_DUPFD_CLOEXEC`.**  Deliberate: `F_GETFL`, `F_SETFL`,
    `F_GETFD`, `F_SETFD` are not meaningful on a console sentinel.
    Linux does allow e.g. `fcntl(0, F_GETFL, ...)` on a redirected fd;
    donix returns `EBADF` there.  Not currently on any path, and
    relaxing it is a small extension of the session-34 work rather
-   than a new problem.  Track here so it is not rediscovered.
+   than a new problem.
 
-4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
+5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
    own syscalls.**  Deliberate FatFs-limitation first cuts.
 
-5. **`-EPIPE` is delivered without `SIGPIPE`.**  v0.6.6's `sys_write`
-   on a pipe with no reader returns `-EPIPE` (32), matching Linux's
+6. **`-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on a
+   pipe with no reader returns `-EPIPE` (32), matching Linux's
    errno.  Real Linux *also* raises `SIGPIPE` first, which by default
    terminates the process before `write` returns.  donix's signal
    path is a stub (`sys_rt_sigaction` returns 0 and installs
    nothing), so the signal is not delivered and the process sees the
    errno instead of dying.  A program that checks `write`'s return
    value sees the right answer; a program that relies on dying from
-   `SIGPIPE` does not.  Consequence for pipelines: `yes | head -n 1`
-   would, on Linux, have `yes` killed by `SIGPIPE` when `head` exits;
-   on donix, `yes` gets `-EPIPE` from `write` and must handle it
-   itself.  busybox's `yes` does not, because on Linux it never has
-   to.  Fixing this means implementing signal delivery, which is out
-   of scope for the pipe work.
+   `SIGPIPE` does not.
 
-Also open: `newfstatat` (262) reserved, no dispatch case;
-`sys_open` accepts non-directories with `O_DIRECTORY`; Ctrl- `[` not
+   This gap is narrower than `v0.6.6`'s docs suggested.  Session 37
+   ran the case the old docs named as the poster child —
+   `busybox yes | busybox head -n 1` — and it does **not** hang:
+   `head` prints `y` and exits, `yes` gets `-EPIPE`, handles it,
+   prints `yes: Broken pipe`, and exits.  busybox apps generally
+   check `write`'s return value, so the common pipelines are fine.
+   The remaining exposure is a program that expects to be *killed*
+   by `SIGPIPE` and does not check `write` — none has been found.
+
+   Fixing this means implementing signal delivery: a real
+   `sys_rt_sigaction`, per-process signal handlers, and a `SIGPIPE`
+   raise on the `-EPIPE` write path.  That is a subsystem, not a
+   small change.
+
+Also open: `newfstatat` (262) reserved, no dispatch case; Ctrl- `[` not
 mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
 `sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base` and
 the 4 MB mmap window are latent collisions; real FatFs timestamp
@@ -89,17 +83,26 @@ covers everything, non-final closes in a `dup`'d chain stop waking
 the peer and the peer hangs until a keystroke — read the
 `put_file_slot` comment and this entry before touching either).
 
+**Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
+keystroke (visible as a syscall per key in a trace).  This is
+`FEATURE_VI_WIN_RESIZE` re-checking the size; it is `vi`'s behavior,
+harmless, and the reason `vi` fills the screen.  No action.
+
 ### Test-design notes
 
-- **`uniq -c < file` is an ash-only test.**  From `donix>` (`musl_sh`),
-  the `<` is passed to `uniq` as a literal argument — `musl_sh` does
-  not parse redirection — so `uniq` tries to open a file named `<`
-  and fails with `can't open '<'`.  That is the `musl_sh`
-  redirection gap (issue 2 above), not a `uniq` bug.  Same rule as
-  the other redirect checks: run them from ash.
+- **The old `musl_sh` ash-only caveats are gone.**  Through
+  `v0.6.6`, `donix>` did not parse `<`, `>`, `|`, `&&`, `;`, or
+  quoting.  Session 37 closed that gap; redirection and pipeline
+  tests are valid from `donix>` as well as ash.
 
-- **Pipeline tests are ash-only too.**  `musl_sh` does not parse
-  `|` any more than it parses `<`.  A pipeline typed at `donix>`
-  passes `|` to the first applet as a literal argument.  All pipe
-  verification — `cat file | head`, `echo hi | wc`, `echo hello |
-  cat` — must run from ash.
+- **Framebuffer / `vi` tests are one-offs, not canary rows.**  `vi`
+  mutates the disk (it writes the file) and takes over the screen.
+  `vi test`, `:wq`, `./test` is the round-trip check; run it by hand
+  after framebuffer or console changes, not as part of the boot
+  canary.
+
+- **Pipe regression suite is not a canary.**  `pipe_step1` …
+  `pipe_step3b` fork and take seconds; run them when changing
+  `sys_read`/`sys_write`/`sys_close`/`put_file_slot`/`sys_fork`/
+  `sys_pipe` or adding a `FILE_KIND_*`, but not as part of the boot
+  canary.

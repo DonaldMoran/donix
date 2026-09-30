@@ -132,9 +132,9 @@ trace the `fcntl`/`dup2` sequence, not `open`/`read`.
 
 ## Negative fd-kind tests don't extend to new kinds
 
-*Session 36 (v0.6.6), tag `v0.6.6`. Same class as the session-34
-`uniq` hang: a low-fd dispatch that was correct for files and
-silently wrong when a new fd kind appeared.*
+*Session 36 (v0.6.6). Same class as the session-34 `uniq` hang: a
+low-fd dispatch that was correct for files and silently wrong when a
+new fd kind appeared.*
 
 `sys_read` and `sys_write` have a fast path that routes fd 0
 (keyboard) and fds 1/2 (screen) to the console instead of the
@@ -201,5 +201,253 @@ This is the second bug of this exact shape. The first (session 34,
 which was correct when the only low fds were stdio and wrong once
 a program `close(0)`'d and expected `open` to hand fd 0 back. Both
 are "a decision encoded as a test on the current set of kinds /
-fd numbers, invalidated by a new one." Expect a third; look for
-it at the next `FILE_KIND_*` addition.
+fd numbers, invalidated by a new one."
+
+A third instance of the same *shape* -- a decision correct only for
+the set of cases known at the time -- appeared the next session, in
+userland rather than the kernel: see "Multi-write output races the
+child's kernel prints" below. And a fourth, in the framebuffer work
+(session 38): two assumed byte conventions, both wrong until tested.
+See "Assumed byte-order conventions" below.
+
+## Multi-write output races the child's kernel prints
+
+*Session 37 (musl_sh work), userland. Three instances of one
+pattern, all in `userland/musl/apps/musl_sh.c` or its debug
+scaffolding.*
+
+**Symptom.** A line of output is missing its tail -- a closing
+`]`, a trailing `\n` -- or two unrelated lines run together with no
+separator between them. It happens on *some* lines and not others,
+and the discriminator is not obvious from the text alone.
+
+**Root cause.** Output produced as several separate `write` calls
+(`puts_raw` is one `write` per call) can be interleaved with output
+the *kernel* prints during a child's `fork`/`exec`, or with the next
+thing the shell prints. Each `puts_raw` is its own `sys_write`; the
+scheduler can run the child -- which prints `sys_execve: ...`, or
+`EXIT: ...` -- between two of them. The bytes are not lost, they are
+*reordered*, and the ordering matters.
+
+**The three instances.**
+
+1. **The tokenizer debug print (fixed).** The line
+
+       puts_raw("[", 1);
+       for (...) { if (i) puts_raw("|", 1); puts_z(argv[i]); }
+       puts_raw("]\n", 2);
+
+   produced `[echo|x y` with no `]\n` on lines where the next thing
+   was a child's `sys_execve: ...` print. Building the whole line
+   into one buffer and issuing a single `puts_raw` fixed it. This is
+   the instance that named the pattern.
+
+2. **`sh: cannot open <file>` (open).** In the redirection failure
+   path, `fork_child` does three writes:
+
+       puts_z("sh: cannot open ");
+       puts_z(redir_file);
+       puts_raw("\n", 1);
+
+   Same exposure. Cosmetic (it is an error path), but the same bug.
+
+3. **`cd: cannot cd to <path>` (open).** `builtin_cd`'s failure
+   path does three writes:
+
+       puts_z("cd: cannot cd to ");
+       puts_z(target);
+       puts_raw("\n", 1);
+
+   Observed in the step-2 run: `cd: cannot cd to /nopedonix>` --
+   the newline was reordered past the next prompt.
+
+**The rule.** When the *ordering* of your output relative to
+anything else matters -- and it does whenever a child may print
+between your writes, or the shell may print next -- build the whole
+line in one buffer and issue **one** `write`. Several
+`puts_raw`/`puts_z` calls in a row are several writes and are not
+atomic with respect to each other.
+
+**Note the connection.** This is the same lesson as "Negative
+fd-kind tests don't extend to new kinds," in a different medium:
+a choice (split the output into several writes) that was harmless
+while the set of things that could print between them was small,
+and stopped being harmless when that set grew (a forking pipeline,
+a child that prints on exit). It is the third instance of that
+shape. Expect more; the shape recurs across subsystems.
+
+## Assumed byte-order conventions are the same shape
+
+*Session 38 (framebuffer console), kernel and boot chain. Two
+instances, both "we assumed a convention and it was the other
+one."*
+
+This is the fourth instance of the shape named in "Negative
+fd-kind tests don't extend to new kinds": a decision that was
+wrong, or would have been wrong, because a convention was assumed
+rather than verified. The two framebuffer cases are both about
+**byte order within a pixel or a glyph row.**
+
+**Instance 1 — framebuffer pixels are BGR, not RGB.**
+`fb.c`'s `fb_putpixel` initially packed pixels as
+`p[0]=r; p[1]=g; p[2]=b`.  The test pattern came out with red and
+blue swapped: a "dark blue" fill rendered red, a "red" rectangle
+rendered blue, green (the middle byte) rendered correctly.  QEMU's
+Bochs VBE stores 24bpp and 32bpp pixels in **BGR** order -- byte 0
+is blue.  Fixed with `FB_BYTE_R/G/B` macros in `fb.c`, so callers
+still pass `(r, g, b)` and the quirk lives in one documented place.
+
+**The tell:** when R and B swap, only red and blue change; green
+stays.  If a color test shows "red and blue swapped but green
+fine," it is a byte order, not a palette.
+
+**Instance 2 — PSF glyph rows are MSB-first, not LSB-first.**
+`fb_putchar` initially read a glyph row's bits with
+`if (bits & (1u << col))`, treating bit 0 as the leftmost pixel.
+Terminus PSF rows are packed **most-significant-bit first**: the
+leftmost pixel is the highest bit of the row.  Every glyph rendered
+mirrored -- `donix` read as a horizontal flip of itself.  Fixed by
+reading bit `(FB_FONT_W - 1 - col)` instead.
+
+**The tell:** mirrored glyphs, same size, same spacing, correct
+shapes but flipped, means the bit order within the row is reversed.
+
+**The rule.** A byte-order or bit-order convention is a
+*guess* until a test confirms it.  Both of these were caught only
+because a test pattern was drawn and *looked at* -- the code was
+self-consistent and would have passed any test that did not check
+actual colors or actual glyph orientation.  When you write code
+that packs or unpacks bytes against a hardware or file-format
+convention, verify with a known input whose correct output you can
+recognize (a color you can name, a letter you can read), not just
+with round-trip tests.
+
+## The option name describes its most visible effect, not its scope
+
+*Session 38. A reasoning error, caught by trying it.*
+
+`busybox vi` sized itself to 24×80 on the framebuffer console even
+though it calls `TIOCGWINSZ` and the kernel correctly answers
+42×102 (confirmed with a temporary print in
+`fill_kernel_winsize`).  The fix turned out to be:
+
+    CONFIG_FEATURE_VI_WIN_RESIZE=y
+
+in `configs/busybox.config`.
+
+**The wrong reasoning.** This option was initially dismissed:
+"`FEATURE_VI_WIN_RESIZE` handles SIGWINCH -- the terminal-resized
+signal -- and donix has no signal delivery, so the handler would
+never fire and the option does nothing."  The first two facts are
+true.  The conclusion was wrong.  The option **also gates the code
+that consults `TIOCGWINSZ` at startup** -- which is the part that
+was needed.  Enabling it made `vi` read the winsize, and it filled
+the screen.
+
+**The rule.** A config option's *name* describes its most visible
+or most distinctive effect, not its full scope.  `FEATURE_VI_WIN_RESIZE`
+sounds like "handle resize events," but in busybox `vi.c` it also
+gates the startup size query.  Do not conclude "this option is
+irrelevant" from its name alone -- read the source, or try it.
+The cost of trying was one config line and a rebuild; the cost of
+the wrong conclusion was a documented limitation that was not
+actually a limitation.
+
+## `argv[cmd_argc] = 0` mutates argv in the child
+
+*Session 37 (musl_sh work), userland.*
+
+`fork_child` terminates the command's argv by writing a NUL at
+`argv[cmd_argc]`, because `execve` reads argv to its NUL and the
+command may be a prefix of a longer token list (`echo hi > f` --
+the command is `echo hi`, the `>` and `f` are the redirection):
+
+    argv[cmd_argc] = (char*)0;
+    execve(argv[0], argv, (char**)0);
+
+`argv[cmd_argc]` is either the operator token or the line's existing
+NUL, so the write is in bounds. It is safe **because the child execs
+or `_exit`s immediately afterward** -- no code re-reads argv after
+this point.
+
+**The hazard.** This is a decision that is correct only because of
+what happens next. If `execve` fails and the child were to *continue*
+rather than `_exit`, it would see a truncated argv: everything from
+`cmd_argc` on is now unreachable (`argv[cmd_argc]` reads as the
+terminator). Nothing does that today -- the child's next statement
+is `_exit(127)` -- but it is the kind of coupling worth naming, in
+the same family as the blunt-fd-close entry below.
+
+**If you change the child's post-`execve` path**, check this
+mutation first. If the child ever needs the full argv after a failed
+`execve`, terminate the command some other way (a separate
+`char* cmd_argv[SH_MAX_ARGS]` copy, or save/restore the byte).
+
+## Blunt fd close in `fork_child` is correct only for the current shell
+
+*Session 37 (musl_sh work), userland.*
+
+`fork_child` closes **every** fd from 3 to 63 in the child, just
+before `execve`:
+
+    for (int fd = 3; fd < 64; fd++) close(fd);
+
+**Why it is there.** In a pipeline `a | b | c`, the middle command
+`b` inherits the parent's copies of *both* pipe ends as well as its
+own. `in_fd`/`out_fd` become its fd 0 and fd 1, but the *other* ends
+are still open on raw fds above 2. If `b` keeps the upstream write
+end open, then when `a` exits the reader (`b` itself) never sees
+EOF -- there is still a writer holding the pipe -- and the pipeline
+deadlocks. Closing all inherited fds above 2 is the standard fix.
+
+**Why it is a gotcha.** Closing 3..63 unconditionally is a
+sledgehammer. It is correct **only because the shell holds no fd
+above 2 at exec time** -- it opens nothing persistent. If the shell
+ever does (a history file, a script fd, a directory fd held across a
+command), this close would silently kill it in every child.
+
+**If you give the shell any fd above 2**, replace the blanket close
+with an explicit "close these fds" list threaded through
+`fork_child`. Do not just widen or narrow the range; the range is
+the wrong shape. This is the same family as the `argv[cmd_argc] = 0`
+entry above: correct because of what the shell happens to hold
+today, not because of anything structural.
+
+## `capture.txt` shows backspace history, not the corrected line
+
+*Session 37 (musl_sh work), diagnostic note -- not a bug.*
+
+**Symptom.** A line in `capture.txt` reads as garbage -- the typed
+text, an erase, more text -- and does not match what the shell
+actually ran. Example:
+
+    donix> echo "a b c"    " c
+    sys_execve: pid=4 ... argc=3 (echo)
+    a b c
+
+which looks like it tokenized `echo "a b c" " c` into three tokens
+and printed something that does not match. It did not.
+
+**Root cause.** The shell's line editor erases a character by
+emitting `\b \b` to the console:
+
+    if (c == '\b' || c == 0x7f) {
+        if (n > 0) { n--; puts_raw("\b \b", 3); }
+        continue;
+    }
+
+On a real terminal (the VGA/SDL display), `\b \b` visually erases
+the character, so the screen shows the corrected line. On **serial**
+-- which is what `capture.txt` records -- the `\b \b` bytes are
+captured *literally*, and a transcript does not retroactively edit
+itself. So `capture.txt` shows the full typed history, backspaces
+and all, while `line[]` (what the tokenizer saw) and the VGA both
+show the corrected line.
+
+**How to read a backspaced capture line.** Do not read the echoed
+line as the shell's input. Read the `sys_execve: ... argc=N`
+line -- that is the real argument count -- or read the VGA. A
+transcript of an edit is not the edited text.
+
+**Not a bug.** The shell is correct; the capture is a faithful
+record of the byte stream including the erase sequences.

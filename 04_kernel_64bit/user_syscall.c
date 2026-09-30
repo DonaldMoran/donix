@@ -16,6 +16,17 @@
 
 /* Defined below, in the execve helpers section. */
 static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
+/* Defined below, in the stat section.  sys_open needs it for the
+ * O_DIRECTORY-on-a-file check, which runs before the definition. */
+static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno);
+
+/* ENOTDIR (20) on Linux x86_64.  Guarded, so the block in the
+ * sys_chdir section further down is a no-op once this one is seen
+ * -- the #ifndef there skips its own define.  Needed here because
+ * sys_open (above the sys_chdir section) returns it. */
+#ifndef ENOTDIR_
+#define ENOTDIR_ 20
+#endif
 
 /* Defined in kmain.c — reboots the machine via keyboard controller + ACPI reset port. */
 extern void handle_reboot_sequence(void);
@@ -1430,6 +1441,47 @@ long sys_open(const char* path, int flags) {
     int is_root   = path_is_root(local_path);
 
     if (wants_dir || is_root) {
+        /*
+         * O_DIRECTORY on a file: Linux returns -ENOTDIR.
+         *
+         * FatFs's f_opendir rejects a non-directory with
+         * FR_NO_PATH (or FR_INVALID_NAME), which fatfs_errno maps
+         * to -ENOENT -- "no such file", the wrong answer.  musl's
+         * opendir() and any caller that opens a path expecting a
+         * directory rely on -ENOTDIR to distinguish "this is a
+         * file" from "this does not exist"; -ENOENT makes them
+         * report the path as missing.
+         *
+         * Check with a stat before f_opendir so we can tell the
+         * two cases apart.  f_stat_with_retry is the same helper
+         * sys_stat uses, so bare names and /bin fallbacks resolve
+         * identically here.
+         *
+         * Only when wants_dir && !is_root: a root alias (".", "/",
+         * "0:/") is a directory by definition, and the is_root-only
+         * path (no O_DIRECTORY, but a root alias) has nothing to
+         * check.
+         *
+         * Latent today -- no shell command reaches this path
+         * (busybox `ls FILE` lstats first and never opendirs a
+         * file) -- but correct to close.  See
+         * docs/open-issues.md.
+         */
+        if (wants_dir && !is_root) {
+            FILINFO fno;
+            FRESULT sr = f_stat_with_retry(local_path, &fno);
+            if (sr != FR_OK) {
+                kfree(slot);
+                self->file_table[fd] = NULL;
+                return fatfs_errno(sr);
+            }
+            if (!(fno.fattrib & AM_DIR)) {
+                kfree(slot);
+                self->file_table[fd] = NULL;
+                return -(long)ENOTDIR_;
+            }
+        }
+
         DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
         if (!dir_obj) {
             kfree(slot);
@@ -4565,8 +4617,16 @@ typedef struct {
 } kernel_winsize_t;
 
 static void fill_kernel_winsize(kernel_winsize_t* ws) {
-    ws->ws_row    = 24;
-    ws->ws_col    = 80;
+    /*
+     * Report the real console grid, not a fixed 24x80.  Full-screen
+     * programs (busybox vi, and anything else that queries
+     * TIOCGWINSZ) size their display to this, so a hardcoded 24x80
+     * made vi use only the top-left corner of the 102x42 framebuffer
+     * console.  vga_rows()/vga_cols() report the live grid on
+     * whichever backend is active (framebuffer or VGA text).
+     */
+    ws->ws_row    = (uint16_t)vga_rows();
+    ws->ws_col    = (uint16_t)vga_cols();
     ws->ws_xpixel = 0;
     ws->ws_ypixel = 0;
 }

@@ -4,6 +4,7 @@
 #include "include/pmm.h"
 #include "include/idt.h"
 #include "include/vga.h"
+#include "include/fb.h"
 #include "include/keyboard.h"
 #include "include/interrupts.h"
 #include "include/vmm.h"
@@ -918,9 +919,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.6\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.7\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.6 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.7 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1154,7 +1155,7 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.6\n> ");
+    vga_print("donix v0.6.7\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
@@ -1292,6 +1293,7 @@ void kmain(BootInfo *info) {
     serial_init();
     
     validate_bootinfo(info);
+       
     vga_set_cursor_shape(0x00, 0x0F);
     gdt_init();
     idt_init();
@@ -1308,6 +1310,31 @@ void kmain(BootInfo *info) {
     pmm_init(g_bootinfo);
     vmm_init(info);
     heap_init(HEAP_START, HEAP_INITIAL_SIZE);
+    
+    /*
+     * Initialize the linear framebuffer from BootInfo.  stage2 set
+     * VBE mode 0x118 and captured the framebuffer descriptor; if
+     * that failed, framebuffer_addr is 0 and fb_init leaves the
+     * framebuffer disabled, so the VGA text console stays in use.
+     */
+    fb_init(info->framebuffer_addr, info->framebuffer_width,
+            info->framebuffer_height, info->framebuffer_pitch,
+            info->framebuffer_bpp);
+
+    /*
+     * Clear the whole framebuffer to the console's default
+     * background color (VGA blue, the background nibble of
+     * VGA_DEFAULT_ATTR 0x1E).
+     *
+     * This fills EVERY pixel, including the margin strip the
+     * 102x42 character grid does not reach (the grid covers
+     * 1020x756 of the 1024x768 framebuffer), so nothing from an
+     * earlier frame shows through at the edges.
+     */
+    if (fb_available()) {
+        fb_fill(0x00, 0x00, 0xAA);
+    }
+    
     ata_init();    
     scheduler_init();
     tss_init();

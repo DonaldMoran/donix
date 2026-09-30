@@ -10,10 +10,10 @@ were natively compiled for it.
 It boots on bare metal through 16-bit real mode, 32-bit protected mode,
 and into 64-bit long mode; starts a higher-half C kernel; brings up
 paging, the heap, a preemptive scheduler, an ELF loader, an ATA driver,
-and a FAT16 filesystem; and drops you at a working Unix shell with a
-real per-process working directory. Nothing is emulated, nothing is
-stubbed out at the syscall layer that matters, and nothing is a subset
-of a larger system.
+a FAT16 filesystem, and a linear framebuffer console; and drops you at
+a working Unix shell with a real per-process working directory.
+Nothing is emulated, nothing is stubbed out at the syscall layer that
+matters, and nothing is a subset of a larger system.
 
 It is a kernel. It is not Linux.
 
@@ -82,23 +82,30 @@ That's the point. That's the whole point.
   cat`. Its file and text applets — `ls`, `cat`, `echo`, `pwd`,
   `wc`, `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`, `sort`,
   `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`, `mkdir`, `rm`,
-  `rmdir`, `touch` — run in-process via standalone mode, and
-  `/bin/busybox` is a real path on the image. It forks and execs
-  external binaries, and it shares the working directory with the
-  rest of the system. This is the strongest evidence that the syscall
-  ABI is right — busybox expects a real Unix kernel underneath it,
-  and on donix it gets one.
-- **Has a real terminal.** The console is a VT100 emulator: full CSI
-  parsing, cursor addressing, SGR colors, the erase, insert, and
-  delete families, and a software alternate screen. Full-screen
-  software gets what it expects. `vi don.txt`, edit, `:wq`, then
-  `cat don.txt` reads it back.
-- **Has a second, minimal shell.** Typing `exit` at the busybox `$`
+  `rmdir`, `touch`, `false`, `true`, `yes`, `seq`, `clear` — run
+  in-process via standalone mode, and `/bin/busybox` is a real path
+  on the image. It forks and execs external binaries, and it shares
+  the working directory with the rest of the system. This is the
+  strongest evidence that the syscall ABI is right — busybox expects
+  a real Unix kernel underneath it, and on donix it gets one.
+- **Has a real terminal on a linear framebuffer.** The console is a
+  VT100 emulator drawing on a 1024×768 VBE linear framebuffer, with
+  **Terminus 10×18** text (OFL-1.1) rendered unscaled — 102 columns
+  by 42 rows. Full CSI parsing, cursor addressing, SGR colors, the
+  erase, insert, and delete families, and a software alternate
+  screen. Full-screen software gets what it expects: `vi don.txt`
+  fills the screen, edit, `:wq`, then `cat don.txt` reads it back.
+  The framebuffer was chosen over VGA text mode because VGA text is
+  hard to read in a half-screen window on a modern display; the  console grid is 102×42 instead of 80×25.
+- **Has a second, real shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
-  forks, execs, and waits like the busybox shell does. `cat
-  hello-world.txt` prints the file; `echo hi` prints `hi`; `ls` lists
-  the FAT volume.
+  forks, execs, and waits like the busybox shell does, and it strips
+  quotes and parses `<`, `>`, `>>`, `|`, `&&`, and `;` — so
+  redirection and pipelines work at `donix>` directly, not only in
+  `ash`. `cat hello-world.txt | head -n 2`, `echo hi > out.txt`, and
+  `echo a && echo b` all behave. `cat hello-world.txt` prints the
+  file; `echo hi` prints `hi`; `ls` lists the FAT volume.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is 20 short C files. There is no build system you can't read in
@@ -123,7 +130,7 @@ untested.
 - `clang` and `ld.lld` — kernel C compiler and linker
 - `qemu-system-x86_64` — the emulator donix runs in
 - `mtools` — `mcopy`, `mdir`, `mkfs.vfat`, for building the FAT image
-- `xxd` — for embedding the kernel-side test program
+- `xxd` — for embedding the kernel-side test program and the console font
 - `gcc` — the *host* compiler, used to build musl from source
 - `git` and `make` — obvious
 
@@ -147,8 +154,9 @@ project builds busybox from source the first time you build a disk
 image, driven by `configs/busybox.config`. The source is cloned into
 `third_party/busybox/` (gitignored). **Network access is required on
 first run** — it clones from `https://git.busybox.net/busybox`. The
-tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`, and
-`CONFIG_FEATURE_SH_STANDALONE=y` (so applets run in-process).
+tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
+`CONFIG_FEATURE_SH_STANDALONE=y`, and `CONFIG_FEATURE_VI_WIN_RESIZE=y`
+(so `vi` fills the framebuffer console).
 
 ---
 
@@ -231,8 +239,8 @@ The default uncommented line is the single-drive TCG configuration.
 
 **Interact with the OS in the QEMU window**, not the terminal. The
 terminal shows the kernel's serial log; the shell is on the emulated
-VGA console. On boot you land in busybox `ash` (a `$` prompt). Type
-`exit` to return to donix's own shell (a `donix> ` prompt); type
+framebuffer console. On boot you land in busybox `ash` (a `$` prompt).
+Type `exit` to return to donix's own shell (a `donix> ` prompt); type
 `busybox sh` or `/bin/busybox sh` to get back into `ash`.
 
 To stop QEMU, close the window or press `Ctrl-C` in the terminal.
@@ -269,6 +277,7 @@ top-level `Makefile` for other modes.
 03_boot_64bit/          long-mode entry, PAE paging
 04_kernel_64bit/        64-bit kernel source
   fatfs/                vendored FatFs R0.16 + ATA shim
+  fonts/                tracked console font (ter-u18n.psf)
   include/              kernel headers
 05_boot_kernel64/       boot chain assembly, image builder
 userland/musl/          musl userland source tree
@@ -323,6 +332,8 @@ not reach into `userland/musl/`; the image Makefile invokes
 MIT License. Use freely, modify freely, credit appreciated.
 
 Note on third-party components: donix builds against musl (MIT-style)
-and busybox (GPLv2). Neither is vendored into the donix source tree —
-both are fetched from upstream by the build system and live under
-`third_party/` (gitignored). The donix source itself remains MIT.
+and busybox (GPLv2), and bundles the Terminus console font (OFL-1.1).
+musl and busybox are not vendored into the donix source tree — both are
+fetched from upstream by the build system and live under
+`third_party/` (gitignored). The Terminus `.psf` is tracked under
+`04_kernel_64bit/fonts/`. The donix source itself remains MIT.

@@ -89,7 +89,7 @@ all: kernel.bin
 # KERNEL OBJECTS
 # ============================================================
 OBJS = entry.o ring3_entry.o kmain.o pmm.o vmm.o heap.o idt.o interrupts.o \
-	idt_load.o isr.o vga.o keyboard.o serial.o tss.o gdt.o \
+	idt_load.o isr.o vga.o fb.o ter_u18n_data.o keyboard.o serial.o tss.o gdt.o \
 	elf.o test_program_data.o \
 	user_syscall.o user_syscall_entry.o process.o string.o scheduler.o \
 	context_switch.o ata.o \
@@ -145,6 +145,21 @@ test_program: test_program.o user_linker.ld
 
 test_program.o: test_program.asm
 	$(AS) -f elf64 test_program.asm -o test_program.o
+
+# ============================================================
+# TERMINUS FONT (embedded)
+# ============================================================
+#
+# fonts/ter-u18n.psf is a PSF v2 font: 256 glyphs, 10x18, 36
+# bytes per glyph, 32-byte header.  xxd -i turns it into a C
+# array (ter_u18n_data[]) linked into the kernel image.  The
+# blitter in fb.c reads that array directly; nothing is loaded
+# from disk at runtime.
+ter_u18n_data.o: ter_u18n_data.c
+	$(CC) $(CFLAGS) -c ter_u18n_data.c -o ter_u18n_data.o
+
+ter_u18n_data.c: fonts/ter-u18n.psf
+	$(XXD) -i fonts/ter-u18n.psf > ter_u18n_data.c
 
 # ============================================================
 # ASSEMBLY RULES
@@ -211,6 +226,7 @@ user_syscall.o: user_syscall.c
 # ============================================================
 clean:
 	rm -f *.o *.bin *.elf *.d test_program test_program.bin test_program_data.c
+	rm -f ter_u18n_data.c
 	rm -f fatfs/*.o fatfs/*.d
 
 # ============================================================
