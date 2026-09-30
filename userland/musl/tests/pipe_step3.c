@@ -29,7 +29,6 @@
  */
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -124,21 +123,8 @@ static void test_dup_keeps_writer_open(void) {
          * finally lets EOF fire.  The parent's read() returns 0
          * only after the SECOND close. */
         close(fds[0]);
-        /*
-         * Use fcntl(F_DUPFD) rather than dup().  donix implements
-         * syscall 72 (fcntl) with the F_DUPFD subcommand, but does
-         * NOT implement syscall 32 (dup).  musl's dup() wrapper on
-         * this build reaches syscall 32 directly, so calling dup()
-         * here would fail with ENOSYS and the test would fail for
-         * a reason that has nothing to do with pipes.
-         *
-         * fcntl(fd, F_DUPFD, 0) is exactly what dup(fd) means, and
-         * the fcntl path is already proven by the musl_dupfd test.
-         * When dup(2) is implemented (a separate change, tracked in
-         * open-issues.md), this can go back to dup().
-         */
-        int dupfd = fcntl(fds[1], F_DUPFD, 0);
-        if (dupfd < 0) { write(2, "child: fcntl DUPFD failed\n", 27); _exit(1); }
+        int dupfd = dup(fds[1]);
+        if (dupfd < 0) { write(2, "child: dup failed\n", 18); _exit(1); }
         close(fds[1]);   /* first close; writer still open via dupfd */
         for (volatile int i = 0; i < 5000000; i++) { }
         close(dupfd);    /* second close; now writer is really gone */
