@@ -97,7 +97,7 @@ void keyboard_init(void) {
     scancode_ascii[0x27] = ';';
     scancode_ascii[0x28] = '\'';
     scancode_ascii[0x29] = '`';
-
+    scancode_ascii[0x2B] = '\\';
     scancode_ascii[0x2C] = 'z';
     scancode_ascii[0x2D] = 'x';
     scancode_ascii[0x2E] = 'c';
@@ -150,7 +150,7 @@ void keyboard_init(void) {
     scancode_shift[0x27] = ':';
     scancode_shift[0x28] = '"';
     scancode_shift[0x29] = '~';
-
+    scancode_shift[0x2B] = '|';
     scancode_shift[0x2C] = 'Z';
     scancode_shift[0x2D] = 'X';
     scancode_shift[0x2E] = 'C';
