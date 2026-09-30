@@ -1293,16 +1293,7 @@ void kmain(BootInfo *info) {
     serial_init();
     
     validate_bootinfo(info);
-    
-    /* TEMPORARY: confirm the VBE mode-set captured real values.
-     * Remove once the framebuffer is in use (step 2+). */
-    serial_print("FB: addr=0x");    serial_print_hex(info->framebuffer_addr);
-    serial_print(" w=");            serial_print_dec(info->framebuffer_width);
-    serial_print(" h=");            serial_print_dec(info->framebuffer_height);
-    serial_print(" pitch=");        serial_print_dec(info->framebuffer_pitch);
-    serial_print(" bpp=");          serial_print_dec(info->framebuffer_bpp);
-    serial_print("\n");    
-    
+       
     vga_set_cursor_shape(0x00, 0x0F);
     gdt_init();
     idt_init();
@@ -1331,28 +1322,17 @@ void kmain(BootInfo *info) {
             info->framebuffer_bpp);
 
     /*
-     * TEST PATTERN (temporary): paint a known pattern so step 2 is
-     * visibly verifiable in the QEMU window.  Removed when the
-     * console is routed through the framebuffer.
+     * Clear the whole framebuffer to the console's default
+     * background color (VGA blue, the background nibble of
+     * VGA_DEFAULT_ATTR 0x1E).
      *
-     * Dark-blue background, red square top-left, green square
-     * bottom-right.  If pitch were wrong the squares would shear.
+     * This fills EVERY pixel, including the margin strip the
+     * 102x42 character grid does not reach (the grid covers
+     * 1020x756 of the 1024x768 framebuffer), so nothing from an
+     * earlier frame shows through at the edges.
      */
     if (fb_available()) {
-        fb_fill(0x00, 0x00, 0x40);                          /* dark blue */
-        fb_fillrect(0,   0,   200, 200, 0xC0, 0x00, 0x00);  /* red  */
-        fb_fillrect(824, 568, 200, 200, 0x00, 0xC0, 0x00);  /* green */
-
-        /* Glyph blitter test: white text on the dark blue, a few
-         * lines so we can judge readability and spacing. */
-        fb_puts("donix framebuffer test",
-                20, 20,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
-        fb_puts("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-                20, 60,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
-        fb_puts("abcdefghijklmnopqrstuvwxyz",
-                20, 90,   0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
-        fb_puts("0123456789 !@#$%^&*()",
-                20, 120,  0xFF, 0xFF, 0xFF,   0x00, 0x00, 0x40);
+        fb_fill(0x00, 0x00, 0xAA);
     }
     
     ata_init();    
