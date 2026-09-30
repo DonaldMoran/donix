@@ -190,6 +190,9 @@ static const uint8_t* font_glyph(int c) {
 /* Blit one character at pixel position (x, y) with the given
  * foreground and background colors.  (x, y) is the top-left of the
  * glyph cell.  Cells are FB_FONT_W x FB_FONT_H pixels. */
+/* Blit one character at pixel position (x, y) with the given
+ * foreground and background colors.  (x, y) is the top-left of the
+ * glyph cell.  Cells are FB_FONT_W x FB_FONT_H pixels. */
 void fb_putchar(int c, uint32_t x, uint32_t y,
                 uint8_t fr, uint8_t fg, uint8_t fb_,
                 uint8_t br, uint8_t bg, uint8_t bb) {
@@ -199,14 +202,25 @@ void fb_putchar(int c, uint32_t x, uint32_t y,
     if (!g) return;
 
     for (uint32_t row = 0; row < FB_FONT_H; row++) {
-        /* Row is 2 little-endian bytes; assemble the 16-bit value
-         * and use its low FB_FONT_W bits. */
-        uint16_t bits = (uint16_t)g[row * FB_FONT_ROWBYTES]
-                      | ((uint16_t)g[row * FB_FONT_ROWBYTES + 1] << 8);
+        /*
+         * PSF glyph rows are a 16-bit BIG-ENDIAN value: the first
+         * byte is the high 8 bits, the second the low 8 bits.  The
+         * FB_FONT_W pixels are the TOP FB_FONT_W bits of that value
+         * (leftmost pixel = most significant bit).  So:
+         *   bits = (byte0 << 8) | byte1;
+         *   pixel `col` = bit (15 - col).
+         *
+         * (An earlier version assembled the row little-endian and
+         * read the low FB_FONT_W bits, which decoded most glyphs
+         * into close-but-wrong shapes and cut off the outer strokes
+         * of the widest letters -- M and W rendered as blobs.)
+         */
+        uint16_t bits = ((uint16_t)g[row * FB_FONT_ROWBYTES] << 8)
+                      | (uint16_t)g[row * FB_FONT_ROWBYTES + 1];
 
         for (uint32_t col = 0; col < FB_FONT_W; col++) {
             uint8_t r, gg, b;
-            if (bits & (1u << (FB_FONT_W - 1 - col))) {
+            if (bits & (1u << (15 - col))) {
                 r = fr; gg = fg; b = fb_;
             } else {
                 r = br; gg = bg; b = bb;
