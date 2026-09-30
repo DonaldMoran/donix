@@ -62,8 +62,9 @@ That's the point. That's the whole point.
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
-  `fstat`, `chdir`, `getcwd`, `geteuid`, `prctl`, `ftruncate`,
-  `utimensat`, `unlink`, `rmdir` — the numbers and semantics match
+  `fstat`, `lstat`, `access`, `chdir`, `getcwd`, `geteuid`, `prctl`,
+  `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`, `rmdir`,
+  `uname`, `readv`, `writev` — the numbers and semantics match
   Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
   unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
