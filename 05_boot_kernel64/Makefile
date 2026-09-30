@@ -56,6 +56,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/pipe_step2.elf \
 	$(USERLAND_BIN)/pipe_step3.elf \
 	$(USERLAND_BIN)/pipe_step3b.elf \
+	$(USERLAND_BIN)/at_step1.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -130,6 +131,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/pipe_step2.elf"     PIPE_STEP2.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/pipe_step3.elf"     PIPE_STEP3.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
 
 	@echo "--- staging busybox at /bin/busybox ---"

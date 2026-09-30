@@ -91,7 +91,9 @@
  * 218  set_tid_address   sys_set_tid_address
  * 231  exit_group        sys_exit_group -> sys_exit
  * 235  utimes            sys_utimes        (session 31; no-op stub)
+ * 257  openat            sys_openat        (resolve_at; find needs it)
  * 261  futimesat         sys_futimesat     (session 31; no-op stub)
+ * 262  newfstatat        sys_newfstatat    (general stat; stat/lstat/fstat wrap it)
  * 269  faccessat         sys_faccessat
  * 273  set_robust_list   sys_set_robust_list
  * 280  utimensat         sys_utimensat     (session 31; no-op stub)
@@ -101,12 +103,6 @@
  * ------------------------------------------------------------
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
- *
- *  262 newfstatat        number reserved; no dispatch case.
- *                        musl routes fstatat through stat/lstat
- *                        on x86_64 for the common case, so it is
- *                        not hit yet.  A caller passing
- *                        AT_FDCWD plus flags would reach it.
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -169,6 +165,7 @@
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_EXIT_GROUP      231
 #define SYS_UTIMES          235
+#define SYS_OPENAT          257
 #define SYS_FUTIMESAT       261
 #define SYS_NEWFSTATAT      262   /* number reserved; no dispatch case yet */
 #define SYS_FACCESSAT       269
@@ -214,6 +211,7 @@ long sys_munmap(void* addr, size_t length);
 void* sys_brk(void* addr);
 
 long sys_open(const char* path, int flags);
+long sys_openat(int dirfd, const char* path, int flags);
 long sys_close(int fd);
 /*
  * sys_dup -- Linux x86_64 dup(2), syscall 32.
@@ -234,6 +232,7 @@ long sys_ftruncate(int fd, long length);
 long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
+long sys_newfstatat(int dirfd, const char* pathname, void* user_stat, int flags);
 long sys_wait4(long pid, int* user_status, int options);
 /*
  * sys_pipe -- Linux x86_64 pipe(2), syscall 22.

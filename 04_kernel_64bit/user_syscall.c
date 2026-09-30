@@ -14,11 +14,47 @@
 #include "include/user_space.h"
 #include "ff.h"
 
+
+typedef struct file_slot_s {
+    uint32_t kind;
+    uint32_t refcount;
+    uint32_t end;
+    void    *obj;
+    /*
+     * Directory path, for FILE_KIND_DIR slots only.  NULL for every
+     * other kind.
+     *
+     * A dir slot remembers the absolute Unix-form path it was opened
+     * with, so that an *at() syscall -- openat(2), newfstatat(2) --
+     * can resolve a relative path against it.  FatFs's DIR object
+     * does not carry a path (it holds a cluster/sector cursor), so
+     * the path must be stored alongside it.
+     *
+     * The string is kmalloc'd, not an inline array, so file, pipe,
+     * and console slots stay small; only an open directory pays for
+     * it.  The stored form is Unix ("/bin", "/"), NOT the FatFs
+     * "0:/BIN" form -- resolve_at concatenates it with a relative
+     * path and the result is handed to resolve_against_cwd's
+     * callers, which strip_dot_prefix for FatFs.
+     *
+     * Freed in put_file_slot's FILE_KIND_DIR case.  Shared by
+     * refcount like obj: sys_fork and sys_dup2 copy the slot
+     * pointer and bump the refcount, so the path rides along.
+     */
+    char    *dir_path;
+} file_slot_t;
+
 /* Defined below, in the execve helpers section. */
 static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
 /* Defined below, in the stat section.  sys_open needs it for the
  * O_DIRECTORY-on-a-file check, which runs before the definition. */
 static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno);
+/* Defined below, in the stat section.  sys_newfstatat's
+ * AT_EMPTY_PATH case calls it. */
+static long sys_fstat_body(int fd, void* user_stat);
+/* Defined below, in the file table helpers section.  resolve_at
+ * (in the *at() resolution section) calls it. */
+static file_slot_t* get_file_slot_any(int fd);
 
 /* ENOTDIR (20) on Linux x86_64.  Guarded, so the block in the
  * sys_chdir section further down is a no-op once this one is seen
@@ -241,24 +277,6 @@ static const char* kind_name(uint32_t k) {
 #else
 #define FDTRACE(...) do {} while (0)
 #endif
-
-typedef struct file_slot_s {
-    uint32_t kind;
-    uint32_t refcount;
-    /*
-     * Pipe end flag.  Set only for FILE_KIND_PIPE slots, to
-     * PIPE_END_READ or PIPE_END_WRITE.  0 for every other kind.
-     *
-     * The flag is on the SLOT, not on the shared pipe_t, because
-     * each fd is exactly one end.  Two fds can hold the same end
-     * (a dup2 of the write end), and in that case both slots
-     * carry PIPE_END_WRITE -- which is why "the writer has
-     * closed" is NOT a per-slot flag.  It is a count on the pipe
-     * object (writers_open); see pipe_t.
-     */
-    uint32_t end;
-    void    *obj;
-} file_slot_t;
 
 #if DEBUG_FIL
 static void dump_fil(const char* tag, FIL* f) {
@@ -593,6 +611,151 @@ static int resolve_against_cwd(pcb_t* self, const char* path,
     }
 }
 
+/* ============================================================
+ * *at() PATH RESOLUTION
+ *
+ * Linux's *at(2) family -- openat(2), newfstatat(2), unlinkat(2),
+ * mkdirat(2), and the rest -- takes a directory fd and a path, and
+ * resolves the path the way Unix does:
+ *
+ *   - an absolute path ignores dirfd entirely;
+ *   - AT_FDCWD means "resolve against the process cwd";
+ *   - any other dirfd means "resolve against that directory".
+ *
+ * donix's file_slot_t for a directory remembers the absolute path
+ * it was opened with (slot->dir_path, see the struct comment), so
+ * the third case is implementable without a VFS: the resolver
+ * concatenates that stored path with the relative path.
+ *
+ * This is the ONE place that rule lives.  sys_openat and
+ * sys_newfstatat both call it; future *at syscalls call it too.
+ * Do not grow a second copy of this logic inside a syscall.
+ *
+ * The result is an ABSOLUTE Unix-form path (leading '/').  Callers
+ * pass it through strip_dot_prefix before handing it to FatFs,
+ * exactly as sys_open and sys_stat already do for their own paths.
+ *
+ * Constants are Linux x86_64 / musl, confirmed against
+ * third_party/musl-install/include/fcntl.h.  AT_FDCWD is negative;
+ * do not compare it as unsigned.
+ * ============================================================ */
+#define AT_FDCWD_           (-100)
+#define AT_SYMLINK_NOFOLLOW_ 0x100
+#define AT_REMOVEDIR_        0x200
+#define AT_SYMLINK_FOLLOW_   0x400
+#define AT_NO_AUTOMOUNT_     0x800
+#define AT_EMPTY_PATH_       0x1000
+
+/*
+ * True if `path` is an absolute Unix path (starts with '/').
+ */
+static int path_is_absolute(const char* path) {
+    return path[0] == '/';
+}
+
+/*
+ * Copy `src` to `out`, which holds `cap` bytes.  Returns 0 on
+ * success, -1 if it would not fit (including the NUL).
+ */
+static int path_copy(char* out, size_t cap, const char* src) {
+    size_t i = 0;
+    while (src[i]) {
+        if (i + 1 >= cap) return -1;
+        out[i] = src[i];
+        i++;
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+/*
+ * Resolve `path` against `dirfd` the way Unix does.
+ *
+ *   out, cap        the destination; cap must be >= USER_PATH_MAX
+ *   dirfd           AT_FDCWD, or a directory fd
+ *   path            the caller's path (may be "" only with the
+ *                   caller's own AT_EMPTY_PATH handling; resolve_at
+ *                   itself treats "" as a path that resolves to the
+ *                   directory itself)
+ *
+ * Returns 0 and writes an absolute Unix-form path to `out`, or a
+ * negative errno:
+ *
+ *   -EINVAL   path would overflow out
+ *   -EBADF    dirfd is negative and not AT_FDCWD, or out of range
+ *   -ENOTDIR  dirfd names a slot that is not a directory
+ *   -ENOENT   dirfd is a directory slot with no recorded path
+ *             (should not happen; defensively correct)
+ *
+ * The cases, in the order they are tested:
+ *
+ *   1. path is absolute                -> path, dirfd ignored
+ *   2. dirfd == AT_FDCWD, path == ""   -> cwd
+ *   3. dirfd == AT_FDCWD, path other   -> resolve_against_cwd(path)
+ *   4. dirfd is a dir slot, path == "" -> the dir's path
+ *   5. dirfd is a dir slot, relative   -> dir_path + "/" + path
+ *   6. dirfd is anything else          -> -ENOTDIR / -EBADF
+ *
+ * A dir slot's stored path is already absolute ("/", "/bin"), so
+ * cases 4 and 5 produce an absolute result directly.
+ */
+static int resolve_at(int dirfd, const char* path,
+                      char* out, size_t cap) {
+    /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
+    if (path_is_absolute(path)) {
+        return path_copy(out, cap, path) == 0 ? 0 : -(long)EINVAL_;
+    }
+
+    /* 2 and 3. AT_FDCWD: cwd-relative, which is what every existing
+     * path syscall already does.  Delegate so there is one cwd
+     * resolution rule, not two. */
+    if (dirfd == AT_FDCWD_) {
+        pcb_t* self = process_get_current();
+        if (resolve_against_cwd(self, path, out, cap) != 0) {
+            return -(long)EINVAL_;
+        }
+        return 0;
+    }
+
+    /* 4, 5, 6. A real dirfd.  It must be in range and name a
+     * directory. */
+    if (dirfd < 0 || dirfd >= MAX_PROCESS_FILES) {
+        return -(long)EBADF_;
+    }
+    file_slot_t* slot = get_file_slot_any(dirfd);
+    if (!slot) return -(long)EBADF_;
+    if (slot->kind != FILE_KIND_DIR) return -(long)ENOTDIR_;
+    if (!slot->dir_path) return -(long)ENOENT_;
+
+    /* 4. Empty path: the directory itself.  Callers that do not
+     * want this (newfstatat without AT_EMPTY_PATH) reject before
+     * reaching here. */
+    if (path[0] == '\0') {
+        return path_copy(out, cap, slot->dir_path) == 0 ? 0 : -(long)EINVAL_;
+    }
+
+    /* 5. dir_path + "/" + path, avoiding a doubled slash when
+     * dir_path is "/" or already ends in "/". */
+    size_t o = 0;
+    size_t dlen = 0;
+    while (slot->dir_path[dlen]) dlen++;
+
+    for (size_t i = 0; i < dlen; i++) {
+        if (o + 1 >= cap) return -(long)EINVAL_;
+        out[o++] = slot->dir_path[i];
+    }
+    if (o == 0 || out[o - 1] != '/') {
+        if (o + 1 >= cap) return -(long)EINVAL_;
+        out[o++] = '/';
+    }
+    for (size_t i = 0; path[i]; i++) {
+        if (o + 1 >= cap) return -(long)EINVAL_;
+        out[o++] = path[i];
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 /*
  * Map a FatFs FRESULT to a Linux -errno suitable for return
  * from a syscall.
@@ -840,6 +1003,7 @@ static void put_file_slot(file_slot_t* slot) {
     } else if (slot->kind == FILE_KIND_DIR) {
         f_closedir((DIR*)slot->obj);
         kfree(slot->obj);
+        if (slot->dir_path) kfree(slot->dir_path);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
     } else if (slot->kind == FILE_KIND_PIPE) {
@@ -920,6 +1084,7 @@ static file_slot_t* alloc_console_slot(void) {
     slot->kind     = FILE_KIND_CONSOLE;
     slot->refcount = 1;
     slot->obj      = NULL;
+    slot->dir_path = NULL;
     return slot;
 }
 
@@ -1004,6 +1169,7 @@ static int alloc_file_slot(file_slot_t** out_slot) {
     slot->kind     = 0;
     slot->refcount = 1;
     slot->obj      = NULL;
+    slot->dir_path = NULL;
     self->file_table[fd] = slot;
     *out_slot = slot;
     return fd;
@@ -1290,26 +1456,25 @@ long sys_pipe(int* user_pipefd) {
 // ============================================================
 // FILE SYSCALLS
 // ============================================================
-long sys_open(const char* path, int flags) {
+/*
+ * The shared open(2) body, given a path that is already an
+ * absolute Unix-form path (from resolve_at or a direct caller).
+ *
+ * sys_open and sys_openat both funnel into this; it is where the
+ * FatFs translation, the DIR-vs-FILE decision, and the fd
+ * allocation live.  It does NOT resolve a cwd or a dirfd -- the
+ * caller has done that with resolve_at.
+ *
+ * `in_path` must be absolute (leading '/') or a FatFs-form path
+ * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
+ */
+static long open_resolved(const char* in_path, int flags) {
     pcb_t* self = process_get_current();
-    if (!self || !path) return -(long)EFAULT_;
+    if (!self) return -(long)EFAULT_;
 
     char local_path[USER_PATH_MAX];
-    char resolved[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
-        return -(long)EFAULT_;
-    }
-    if (resolve_against_cwd(self, local_path, resolved,
-                            sizeof(resolved)) != 0) {
+    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
         return -(long)ENAMETOOLONG_;
-    }
-    {
-        size_t i = 0;
-        while (resolved[i] && i < sizeof(local_path) - 1) {
-            local_path[i] = resolved[i];
-            i++;
-        }
-        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
@@ -1351,21 +1516,6 @@ long sys_open(const char* path, int flags) {
      *   0x10  FA_OPEN_ALWAYS
      *   0x30  FA_OPEN_APPEND
      *
-     * The previous translation in this file tested the wrong bits
-     * and as a result never set any creation flag for the common
-     * open(O_RDWR|O_CREAT) that touch(1), vi's :wq path, cp(1),
-     * and every other file-creating program issues.  FatFs then
-     * tried to open an existing file, found none, and returned
-     * FR_NO_FILE.  See the trace:
-     *
-     *   sys_open: f_open FAIL path=don.txt flags=0x8042 mode=0x03 r=4
-     *
-     * flags=0x8042 is O_RDWR|O_CREAT|O_LARGEFILE; mode=0x03 is just
-     * FA_READ|FA_WRITE, with no create bit.  The create request was
-     * being silently dropped because the check was `flags & 0x0200`
-     * (which is O_TRUNC) rather than `flags & 0x0040` (which is
-     * O_CREAT).
-     *
      * FatFs expresses the creation choice as a single mode value,
      * not as independent bits, so the order of precedence matters.
      */
@@ -1375,34 +1525,14 @@ long sys_open(const char* path, int flags) {
     int o_append = (flags & 0x0400) != 0;   /* O_APPEND */
 
     if (o_creat && o_excl) {
-        /* O_CREAT|O_EXCL: fail if the file already exists.
-         * FA_CREATE_NEW does exactly that: create only if
-         * missing, return FR_EXIST otherwise.  This is the
-         * correct mapping for mkstemp(3) and for callers that
-         * need a guarantee the file did not previously exist. */
         mode |= FA_CREATE_NEW;
     } else if (o_creat && o_trunc) {
-        /* O_CREAT|O_TRUNC: create if missing, truncate if
-         * present.  FA_CREATE_ALWAYS does both.  This is what
-         * `vi :wq`, `cp`, and `touch` on a missing file
-         * actually issue. */
         mode |= FA_CREATE_ALWAYS;
     } else if (o_creat) {
-        /* O_CREAT alone: create if missing, leave existing
-         * content untouched.  FA_OPEN_ALWAYS is exactly this. */
         mode |= FA_OPEN_ALWAYS;
     } else if (o_trunc) {
-        /* O_TRUNC without O_CREAT: POSIX calls this undefined;
-         * Linux truncates an existing file and fails if it does
-         * not exist.  FatFs has no exact equivalent.  We use
-         * FA_CREATE_ALWAYS, which truncates existing files and
-         * (unlike Linux) also creates missing ones.  Nothing in
-         * busybox or musl relies on the "fail if missing" part
-         * of the Linux semantics; a caller that does would need
-         * an explicit stat first. */
         mode |= FA_CREATE_ALWAYS;
     } else {
-        /* No creation or truncation flag: open existing only. */
         mode |= FA_OPEN_EXISTING;
     }
 
@@ -1411,28 +1541,9 @@ long sys_open(const char* path, int flags) {
     }
 
     /*
-     * Linux open(2) is also used to open directories — musl's
+     * Linux open(2) is also used to open directories -- musl's
      * opendir() calls open(path, O_RDONLY|O_DIRECTORY) and then
      * readdir(), which uses getdents64(2).
-     *
-     * FatFs's f_open is not usable for this in two cases:
-     *
-     *   1. The path is a root alias (".", "/", "0:", "0:/").
-     *      f_open returns FR_INVALID_NAME for "." and friends,
-     *      and for "0:/" it can return FR_OK with a FIL that is
-     *      not usable because the root is not a file.
-     *
-     *   2. The caller explicitly asked for a directory with
-     *      O_DIRECTORY, and the path is a real directory.  f_open
-     *      returns FR_INVALID_NAME or FR_NO_FILE, which the old
-     *      fallback then recovered from by calling f_opendir — but
-     *      it did so only after trying f_open first, and the "0:/"
-     *      case above bypassed the fallback entirely because
-     *      f_open returned FR_OK.
-     *
-     * The fix is to route every directory request to f_opendir up
-     * front, and to normalize root aliases to "0:/" (the only form
-     * f_opendir reliably accepts for the root).
      *
      * O_DIRECTORY is 0x10000 on Linux x86_64.
      */
@@ -1443,29 +1554,6 @@ long sys_open(const char* path, int flags) {
     if (wants_dir || is_root) {
         /*
          * O_DIRECTORY on a file: Linux returns -ENOTDIR.
-         *
-         * FatFs's f_opendir rejects a non-directory with
-         * FR_NO_PATH (or FR_INVALID_NAME), which fatfs_errno maps
-         * to -ENOENT -- "no such file", the wrong answer.  musl's
-         * opendir() and any caller that opens a path expecting a
-         * directory rely on -ENOTDIR to distinguish "this is a
-         * file" from "this does not exist"; -ENOENT makes them
-         * report the path as missing.
-         *
-         * Check with a stat before f_opendir so we can tell the
-         * two cases apart.  f_stat_with_retry is the same helper
-         * sys_stat uses, so bare names and /bin fallbacks resolve
-         * identically here.
-         *
-         * Only when wants_dir && !is_root: a root alias (".", "/",
-         * "0:/") is a directory by definition, and the is_root-only
-         * path (no O_DIRECTORY, but a root alias) has nothing to
-         * check.
-         *
-         * Latent today -- no shell command reaches this path
-         * (busybox `ls FILE` lstats first and never opendirs a
-         * file) -- but correct to close.  See
-         * docs/open-issues.md.
          */
         if (wants_dir && !is_root) {
             FILINFO fno;
@@ -1493,6 +1581,23 @@ long sys_open(const char* path, int flags) {
         if (dr == FR_OK) {
             slot->kind = FILE_KIND_DIR;
             slot->obj  = dir_obj;
+            /*
+             * Remember the absolute Unix-form path so an *at()
+             * syscall with this fd as dirfd can resolve against
+             * it.  is_root stores "/"; otherwise store the
+             * resolved absolute path the caller passed in
+             * (in_path), NOT the strip_dot_prefix'd FatFs form.
+             */
+            {
+                const char* store = is_root ? "/" : in_path;
+                size_t plen = 0;
+                while (store[plen]) plen++;
+                slot->dir_path = (char*)kmalloc(plen + 1);
+                if (slot->dir_path) {
+                    for (size_t i = 0; i <= plen; i++)
+                        slot->dir_path[i] = store[i];
+                }
+            }
             FDTRACE({ serial_print("open  "); serial_print(dir_path);
                       serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
                       serial_print(" kind=DIR"); });
@@ -1519,7 +1624,7 @@ long sys_open(const char* path, int flags) {
     FRESULT r = f_open(file_obj, local_path, mode);
     if (r == FR_OK) {
         slot->kind = FILE_KIND_FILE;
-        slot->obj  = file_obj;    
+        slot->obj  = file_obj;
         FDTRACE({ serial_print("open  "); serial_print(local_path);
                   serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
                   serial_print(" kind=FILE"); });
@@ -1529,8 +1634,7 @@ long sys_open(const char* path, int flags) {
     /*
      * f_open failed and the caller did not ask for a directory.
      * Last-resort fallback: the path might be a directory the
-     * caller opened without O_DIRECTORY.  Try f_opendir; if it
-     * works, hand back a directory slot.  FR_INVALID_NAME (6) and
+     * caller opened without O_DIRECTORY.  FR_INVALID_NAME (6) and
      * FR_NO_FILE (4) are what FatFs returns when f_open is asked
      * to open a directory with file semantics.
      */
@@ -1542,6 +1646,17 @@ long sys_open(const char* path, int flags) {
                 kfree(file_obj);
                 slot->kind = FILE_KIND_DIR;
                 slot->obj  = dir_obj;
+                /* Same dir_path recording as the O_DIRECTORY
+                 * branch above. */
+                {
+                    size_t plen = 0;
+                    while (in_path[plen]) plen++;
+                    slot->dir_path = (char*)kmalloc(plen + 1);
+                    if (slot->dir_path) {
+                        for (size_t i = 0; i <= plen; i++)
+                            slot->dir_path[i] = in_path[i];
+                    }
+                }
                 FDTRACE({ serial_print("open  "); serial_print(local_path);
                           serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
                           serial_print(" kind=DIR (fallback)"); });
@@ -1567,6 +1682,58 @@ long sys_open(const char* path, int flags) {
     FDTRACE({ serial_print("open  FAIL "); serial_print(local_path);
               serial_print(" r="); serial_print_dec(r); });
     return fatfs_errno(r);
+}
+
+/*
+ * Linux x86_64 open(2) -- syscall 2.
+ *
+ * open(path, flags) is openat(AT_FDCWD, path, flags).  Both funnel
+ * into open_resolved; this wrapper exists so there is exactly one
+ * open implementation.
+ *
+ * The path is copied from user space, resolved against the cwd
+ * (absolute paths pass through), and handed to open_resolved.
+ */
+long sys_open(const char* path, int flags) {
+    if (!path) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return open_resolved(resolved, flags);
+}
+
+/*
+ * Linux x86_64 openat(2) -- syscall 257.
+ *
+ * openat(dirfd, path, flags): resolve `path` against `dirfd` (an
+ * absolute path ignores dirfd; AT_FDCWD means the cwd), then open
+ * exactly as open(2) does.  Needed by busybox `find`, which opens
+ * each directory with openat(dirfd, name, O_RDONLY|O_DIRECTORY) as
+ * it recurses.
+ *
+ * Deliberately a thin wrapper over the same resolve_at and
+ * open_resolved that open(2) uses.  It is not a second open.
+ */
+long sys_openat(int dirfd, const char* path, int flags) {
+    if (!path) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return open_resolved(resolved, flags);
 }
 
 long sys_close(int fd) {
@@ -2028,7 +2195,7 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
     }
 }
 
-long sys_fstat(int fd, void* user_stat) {
+static long sys_fstat_body(int fd, void* user_stat) {
     if (!user_stat) return -(long)EFAULT_;
 
     file_slot_t* slot = get_file_slot(fd, 0);
@@ -2062,6 +2229,20 @@ long sys_fstat(int fd, void* user_stat) {
         return -(long)EFAULT_;
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 fstat(2) -- syscall 5.
+ *
+ * fstat(fd, st) is newfstatat(fd, "", st, AT_EMPTY_PATH).  The
+ * work lives in sys_fstat_body; this is the public name.
+ *
+ * It is NOT routed through sys_newfstatat, because
+ * sys_newfstatat's AT_EMPTY_PATH case calls sys_fstat_body --
+ * routing fstat through newfstatat would be a cycle.
+ */
+long sys_fstat(int fd, void* user_stat) {
+    return sys_fstat_body(fd, user_stat);
 }
 
 /*
@@ -2116,50 +2297,29 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
 }
 
 /*
- * Linux x86_64 stat(2) — syscall 4.
+ * The shared stat body, given an absolute Unix-form path.  This is
+ * what sys_newfstatat (and therefore stat/lstat/fstat) all use.
  *
- * Path-based sibling of sys_fstat.  musl's stat(path, st) routes
- * through fstatat(AT_FDCWD, path, st, 0) → fstatat_kstat →
- * __syscall(SYS_stat, path, &kst).  SYS_stat is 4.
- *
- * The path is resolved against the process cwd first (see
- * resolve_against_cwd), then strip_dot_prefix removes any leading
- * "./" or "/", then it is handed to FatFs's f_stat.
- *
- * Failure return is a proper negative errno (via fatfs_errno) so
- * that callers like busybox ash's PATH search get a sensible
- * message ("No such file or directory") instead of the default
- * "Operation not permitted" that musl assigns to a bare -1.
+ * Handles the root aliases, the bare-name retry, and the
+ * kernel_stat_t fill.  Does NOT resolve against a cwd or a dirfd;
+ * the caller has done that with resolve_at.
  */
-long sys_stat(const char* user_path, void* user_stat) {
-    if (!user_path || !user_stat) return -(long)EFAULT_;
+static long stat_resolved(const char* abs_path, void* user_stat) {
+    if (!user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
-    char resolved[USER_PATH_MAX];
-    if (copy_user_string(path, sizeof(path), user_path) != 0) {
-        return -(long)EFAULT_;
-    }
-    if (resolve_against_cwd(process_get_current(), path, resolved,
-                            sizeof(resolved)) != 0) {
+    if (path_copy(path, sizeof(path), abs_path) != 0) {
         return -(long)ENAMETOOLONG_;
-    }
-    {
-        size_t i = 0;
-        while (resolved[i] && i < sizeof(path) - 1) {
-            path[i] = resolved[i];
-            i++;
-        }
-        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
 #if DEBUG_STAT_TRACE
-    serial_print("sys_stat: '");
+    serial_print("stat_resolved: '");
     serial_print(path);
     serial_print("'\n");
 #endif
 
-    /* ".", "/", "0:", "0:/" — synthesize a root-directory stat.
+    /* ".", "/", "0:", "0:/" -- synthesize a root-directory stat.
      * f_stat would return FR_INVALID_NAME for all of them. */
     if (path_is_root(path)) {
         kernel_stat_t st;
@@ -2186,16 +2346,91 @@ long sys_stat(const char* user_path, void* user_stat) {
 }
 
 /*
- * Linux x86_64 lstat(2) — syscall 6.
+ * Linux x86_64 newfstatat(2) -- syscall 262.
  *
- * FAT has no symlinks, so lstat and stat are identical.  musl's
- * lstat() routes to fstatat(AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW)
- * which, on x86_64, dispatches to __syscall(SYS_lstat, path, &kst).
- * Without this, busybox falls back and prints the "Unknown syscall:
- * 6" line we saw during musl_readdir.
+ * The general stat.  On x86_64 musl, stat/lstat/fstat are
+ * implemented in terms of newfstatat, but musl's fstatat_kstat()
+ * fast-paths the simple cases to syscalls 4, 6, and 5 directly.
+ * Syscall 262 is therefore reached exactly when none of those
+ * fast paths apply:
+ *
+ *   - a real dirfd with a relative path (find's recursion);
+ *   - flags that are neither 0 nor AT_SYMLINK_NOFOLLOW.
+ *
+ * Because it must handle those general cases, it is the honest
+ * home of the stat logic, and sys_stat / sys_lstat / sys_fstat
+ * are the wrappers -- the same inversion Linux has.
+ *
+ * Flags (Linux x86_64, confirmed against musl's fcntl.h):
+ *
+ *   AT_SYMLINK_NOFOLLOW  0x100   no-op (FAT has no symlinks)
+ *   AT_REMOVEDIR         0x200   not meaningful for stat -> EINVAL
+ *   AT_SYMLINK_FOLLOW    0x400   not meaningful for stat -> EINVAL
+ *   AT_NO_AUTOMOUNT      0x800   no-op (no automounting)
+ *   AT_EMPTY_PATH        0x1000  stat the fd itself
+ *
+ * Unknown bits are refused with -EINVAL, as Linux does.
+ *
+ * AT_EMPTY_PATH with an empty pathname is the fstat(2) form: stat
+ * the fd `dirfd` names, whatever kind it is.  An empty pathname
+ * WITHOUT AT_EMPTY_PATH is -ENOENT.
+ */
+long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
+                    int flags) {
+    if (!pathname) return -(long)EFAULT_;
+
+    /* Refuse flags we do not understand, and the two that are
+     * meaningful only to other *at syscalls. */
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ |
+                  AT_EMPTY_PATH_)) {
+        return -(long)EINVAL_;
+    }
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), pathname) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    /*
+     * AT_EMPTY_PATH with an empty path: stat the fd itself (the
+     * fstat form).  newfstatat(fd, "", st, AT_EMPTY_PATH) is
+     * exactly fstat(fd, st) on Linux.
+     */
+    if (local[0] == '\0') {
+        if (flags & AT_EMPTY_PATH_) {
+            return sys_fstat_body(dirfd, user_stat);
+        }
+        return -(long)ENOENT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return stat_resolved(resolved, user_stat);
+}
+
+/*
+ * Linux x86_64 stat(2) -- syscall 4.
+ *
+ * stat(p, st) is newfstatat(AT_FDCWD, p, st, 0).  Thin wrapper;
+ * the work is in stat_resolved, reached via sys_newfstatat.
+ */
+long sys_stat(const char* user_path, void* user_stat) {
+    return sys_newfstatat(AT_FDCWD_, user_path, user_stat, 0);
+}
+
+/*
+ * Linux x86_64 lstat(2) -- syscall 6.
+ *
+ * lstat(p, st) is newfstatat(AT_FDCWD, p, st, AT_SYMLINK_NOFOLLOW).
+ * FAT has no symlinks, so the flag is a no-op and the result is
+ * the same as stat -- but the call still goes through the general
+ * path, so there is one stat implementation.
  */
 long sys_lstat(const char* user_path, void* user_stat) {
-    return sys_stat(user_path, user_stat);
+    return sys_newfstatat(AT_FDCWD_, user_path, user_stat,
+                          AT_SYMLINK_NOFOLLOW_);
 }
 
 /*
@@ -5182,6 +5417,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
         case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
+        case SYS_OPENAT:          return (uint64_t)sys_openat((int)arg0, (const char*)arg1, (int)arg2);
         case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
         case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
         case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
@@ -5225,6 +5461,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
+        case SYS_NEWFSTATAT:      return (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3);
         case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
         case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
