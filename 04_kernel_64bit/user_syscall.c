@@ -156,6 +156,25 @@ typedef struct pipe_s {
     uint32_t write_pos;     /* next byte to write                     */
     uint8_t* buf;           /* kmalloc'd, capacity bytes              */
     uint32_t refcount;      /* live ends: 0, 1, or 2                  */
+
+    /*
+     * Waiters (Step 2).  NULL when nobody is blocked on that end.
+     *
+     * At most one reader and one writer can be blocked at a time:
+     * a second reader that finds reader_waiting already set would
+     * have to block behind the first, and there is no wait queue
+     * to hold it.  In practice this is not a limitation -- a pipe
+     * has one read end and one write end, and the single reader /
+     * single writer case is what shells use.  If a future test
+     * needs multiple concurrent readers on one pipe, replace these
+     * two pointers with a proper wait queue.
+     *
+     * These are DIRECTED-WAKE pointers.  The peer that makes
+     * progress reads the appropriate one and wakes exactly that
+     * process, instead of broadcasting to every blocked process.
+     */
+    struct pcb* reader_waiting;
+    struct pcb* writer_waiting;
 } pipe_t;
 
 /* Set to 1 for one build to trace the fd lifecycle of ash's
@@ -706,6 +725,51 @@ static void put_pipe_ref(pipe_t* pipe) {
     }
     if (pipe->buf) kfree(pipe->buf);
     kfree(pipe);
+}
+
+/*
+ * Wake one pipe waiter, if it is still there and still waiting.
+ *
+ * `waiter` is pipe->reader_waiting or pipe->writer_waiting.  `kind`
+ * is the block_kind that waiter must currently have for the wake
+ * to be valid -- BLOCK_KIND_PIPE_READ for a reader,
+ * BLOCK_KIND_PIPE_WRITE for a writer.
+ *
+ * The checks defend against a STALE pointer:
+ *
+ *   - waiter == NULL: nobody was waiting when the peer recorded
+ *     the pointer, or the peer already woke and cleared it.
+ *
+ *   - waiter->state != BLOCKED: the process was woken by something
+ *     else in the window between the peer reading the pointer and
+ *     this call, or it exited and its PCB slot was reused.  A
+ *     reused slot could in principle be a *different* process now
+ *     blocked on a *different* pipe, so the block_kind check below
+ *     is what actually makes the reuse safe.
+ *
+ *   - waiter->block_kind != kind: the process is blocked, but on
+ *     something else (a different pipe end, waitpid, keyboard).
+ *     Waking it would be wrong -- it is not the process that put
+ *     itself in this pipe's waiter slot.  This is the check that
+ *     makes a recycled PCB slot harmless.
+ *
+ * On a valid wake: mark READY, clear block_kind, and re-add to the
+ * ready queue.  scheduler_ready_queue_add is idempotent, so a
+ * redundant add is harmless; the state flip is the load-bearing
+ * part.
+ *
+ * Does NOT touch the pipe's waiter field.  The caller clears it,
+ * inside its own cli region, so the pointer and the state stay
+ * consistent.
+ */
+static void pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
+    if (!waiter) return;
+    if (waiter->state != PROC_STATE_BLOCKED) return;
+    if (waiter->block_kind != kind) return;
+
+    waiter->state      = PROC_STATE_READY;
+    waiter->block_kind = BLOCK_KIND_NONE;
+    scheduler_ready_queue_add(waiter);
 }
 
 static void put_file_slot(file_slot_t* slot) {
@@ -1355,6 +1419,50 @@ long sys_close(int fd) {
     FDTRACE({ serial_print("close fd="); serial_print_dec((uint64_t)fd);
               serial_print(" kind="); serial_print(kind_name(slot->kind));
               serial_print(" -> 0"); });
+
+    /*
+     * If this is a pipe end, a peer may be blocked on the other
+     * end and needs to wake up so it can see the state change.
+     *
+     * STEP 2 SEMANTICS: we wake the peer, but we do NOT yet
+     * deliver EOF or EPIPE.  A blocked reader whose writer just
+     * closed will loop, find the pipe still empty, and re-block
+     * (because Step 2 has no "no writer left" case).  A blocked
+     * writer whose reader just closed will do the same.  That is
+     * a known Step-2 gap; Step 3 adds the closed-end flags and
+     * turns these wakes into EOF / EPIPE.
+     *
+     * Why wake at all, if the peer just re-blocks?  Because
+     * without the wake the peer is never scheduled to re-check,
+     * and Step 3 will not be able to fix the behavior without
+     * also adding this wake.  We are putting the wake in now so
+     * Step 3 is a smaller change.  The wake is harmless today:
+     * the peer re-checks, re-blocks, and the only cost is one
+     * scheduler pass.
+     *
+     * A pipe_t is freed when the LAST end closes.  If this is the
+     * first end to close, put_file_slot's refcount sees 2 -> 1
+     * and keeps the object alive, so reading pipe->reader_waiting
+     * / writer_waiting below is safe.  If this is the last end,
+     * the peer cannot be blocked on a pipe neither end of which
+     * is open -- but to be safe, the wake happens BEFORE
+     * put_file_slot frees the object.
+     */
+    if (slot->kind == FILE_KIND_PIPE) {
+        pipe_t* pipe = (pipe_t*)slot->obj;
+        /* We do not know which end this fd is (Step 2 has no end
+         * flag), so wake both potential waiters.  At most one is
+         * ever non-NULL. */
+        if (pipe->reader_waiting) {
+            pipe_wake_waiter(pipe->reader_waiting, BLOCK_KIND_PIPE_READ);
+            pipe->reader_waiting = NULL;
+        }
+        if (pipe->writer_waiting) {
+            pipe_wake_waiter(pipe->writer_waiting, BLOCK_KIND_PIPE_WRITE);
+            pipe->writer_waiting = NULL;
+        }
+    }
+
     self->file_table[fd] = NULL;
     put_file_slot(slot);
     return 0;
@@ -2886,32 +2994,84 @@ long sys_write(int fd, const void* buf, size_t count) {
         }
         return (long)count;
     }
+
     /*
-     * Pipe write end.  Step 1: copy as much as fits, return the
-     * count written; if the pipe is full, return -EAGAIN.  Step 2
-     * makes "full" block instead of returning -EAGAIN.
+     * Pipe write end.  Step 2: if the pipe is full, block until a
+     * reader drains space, then retry.  Step 3 will add EPIPE when
+     * the read end has closed; Step 2 does not distinguish "full
+     * and a reader exists" from "full and the reader is gone."
      *
-     * The ring is capacity bytes.  Free space is
-     * capacity - used.  We copy min(count, free), advancing
-     * write_pos with wraparound.  A short write (fewer bytes than
-     * requested) is legal for a pipe and is what a caller looping
-     * on write() expects.
+     * BLOCKING DISCIPLINE.  The loop below mirrors sys_read's fd-0
+     * path and sys_poll's blocking path exactly:
+     *
+     *     cli
+     *     if (space available) { sti; proceed; }
+     *     record self as the pipe's writer_waiter
+     *     mark BLOCKED
+     *     sti; hlt
+     *
+     * The cli is what makes the check and the waiter-store atomic
+     * with respect to a reader that might drain the pipe on another
+     * tick.  Without it there is a missed-wakeup window: we check
+     * "full", a reader drains the pipe and calls pipe_wake_waiter
+     * on writer_waiting (still NULL), we store self and hlt, and
+     * nobody wakes us -- the wake already happened.
+     *
+     * We do NOT assume the wake means space is available.  After
+     * hlt we loop and re-check; the space may have been taken by
+     * another writer (we are the only writer for this pipe in
+     * practice, but the loop is correct either way).
      */
     file_slot_t* pslot = get_file_slot_any(fd);
     if (pslot && pslot->kind == FILE_KIND_PIPE) {
         pipe_t* pipe = (pipe_t*)pslot->obj;
+        pcb_t* self = process_get_current();
 
-        uint32_t free_space = pipe->capacity - pipe->used;
-        if (free_space == 0) {
-            /* Full.  Step 2 blocks here; Step 1 reports EAGAIN. */
-            return -(long)EAGAIN_;
+        for (;;) {
+            __asm__ volatile("cli");
+            uint32_t free_space = pipe->capacity - pipe->used;
+            if (free_space > 0) {
+                __asm__ volatile("sti");
+                break;
+            }
+
+            /*
+             * Full.  If there is no current process we cannot
+             * block; return EAGAIN as Step 1 did.  This is a
+             * defensive path -- sys_write always runs in process
+             * context -- but it keeps a bug in the block path
+             * from becoming a hang.
+             */
+            if (!self) {
+                __asm__ volatile("sti");
+                return -(long)EAGAIN_;
+            }
+
+            /*
+             * Record the waiter and block, with interrupts still
+             * off from the cli above.  Both the store and the
+             * state change are inside the critical section so a
+             * reader on another tick sees a consistent picture:
+             * either we are BLOCKED and recorded, or we are not
+             * yet either and will re-check.
+             */
+            pipe->writer_waiting = self;
+            self->state      = PROC_STATE_BLOCKED;
+            self->block_kind = BLOCK_KIND_PIPE_WRITE;
+
+            __asm__ volatile("sti");
+            __asm__ volatile("hlt");
+            /* Woken by pipe_wake_waiter via a reader's drain.
+             * Loop and re-check the free space. */
         }
 
+        /* We hold the cli?  No -- the break above did sti.  From
+         * here on we run with interrupts enabled, matching the
+         * Step 1 path.  Copy as much as fits. */
+        uint32_t free_space = pipe->capacity - pipe->used;
         size_t to_write = count;
         if (to_write > free_space) to_write = free_space;
 
-        /* Copy in two spans: from write_pos to end of buffer, then
-         * wrap to start.  done tracks bytes copied across both. */
         size_t done = 0;
         while (done < to_write) {
             size_t span = to_write - done;
@@ -2921,9 +3081,13 @@ long sys_write(int fd, const void* buf, size_t count) {
             if (safe_copy_from_user(pipe->buf + pipe->write_pos,
                                     (const uint8_t*)buf + done,
                                     span) != 0) {
-                /* Partial write already committed to the ring is
-                 * fine; return what we managed. */
                 pipe->used += (uint32_t)done;
+                /* A reader may have been waiting while we copied. */
+                if (pipe->reader_waiting) {
+                    pipe_wake_waiter(pipe->reader_waiting,
+                                     BLOCK_KIND_PIPE_READ);
+                    pipe->reader_waiting = NULL;
+                }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
             pipe->write_pos = (pipe->write_pos + (uint32_t)span)
@@ -2931,8 +3095,15 @@ long sys_write(int fd, const void* buf, size_t count) {
             done += span;
         }
         pipe->used += (uint32_t)done;
+
+        /* Bytes are in the ring: wake a waiting reader, if any. */
+        if (pipe->reader_waiting) {
+            pipe_wake_waiter(pipe->reader_waiting, BLOCK_KIND_PIPE_READ);
+            pipe->reader_waiting = NULL;
+        }
         return (long)done;
     }
+
     file_slot_t* slot = get_file_slot_any(fd);
     if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
@@ -3220,25 +3391,47 @@ long sys_read(int fd, void* buf, size_t count) {
         }
         return (long)bytes_read;
     }
+
     /*
-     * Pipe read end.  Step 1: copy as much as is available, return
-     * the count read; if the pipe is empty, return -EAGAIN.  Step 2
-     * makes "empty" block instead of returning -EAGAIN, and Step 3
-     * makes "empty AND no writer left" return 0 (EOF).
+     * Pipe read end.  Step 2: if the pipe is empty, block until a
+     * writer puts bytes in, then retry.  Step 3 will distinguish
+     * "empty and writer still open" (block) from "empty and writer
+     * closed" (return 0, EOF); Step 2 blocks in both cases.
      *
-     * Short reads are legal for a pipe; a reader looping on read()
-     * handles them.
+     * The blocking discipline mirrors sys_write's pipe branch
+     * above, and sys_read's own fd-0 path: cli, check, record
+     * self, mark BLOCKED, sti+hlt, loop.  See the sys_write pipe
+     * branch for the full comment on the missed-wakeup window.
+     *
+     * We do NOT assume the wake means data is available; we loop
+     * and re-check, because the wake can be redundant.
      */
     file_slot_t* pslot = get_file_slot_any(fd);
     if (pslot && pslot->kind == FILE_KIND_PIPE) {
         pipe_t* pipe = (pipe_t*)pslot->obj;
+        pcb_t* self = process_get_current();
 
-        if (pipe->used == 0) {
-            /* Empty.  Step 2 blocks here; Step 3 may return 0 for
-             * EOF.  Step 1 reports EAGAIN. */
-            return -(long)EAGAIN_;
+        for (;;) {
+            __asm__ volatile("cli");
+            if (pipe->used > 0) {
+                __asm__ volatile("sti");
+                break;
+            }
+
+            if (!self) {
+                __asm__ volatile("sti");
+                return -(long)EAGAIN_;
+            }
+
+            pipe->reader_waiting = self;
+            self->state      = PROC_STATE_BLOCKED;
+            self->block_kind = BLOCK_KIND_PIPE_READ;
+
+            __asm__ volatile("sti");
+            __asm__ volatile("hlt");
         }
 
+        /* Copy what is available, then wake a waiting writer. */
         size_t to_read = count;
         if (to_read > pipe->used) to_read = pipe->used;
 
@@ -3252,6 +3445,11 @@ long sys_read(int fd, void* buf, size_t count) {
                                   pipe->buf + pipe->read_pos,
                                   span) != 0) {
                 pipe->used -= (uint32_t)done;
+                if (pipe->writer_waiting) {
+                    pipe_wake_waiter(pipe->writer_waiting,
+                                     BLOCK_KIND_PIPE_WRITE);
+                    pipe->writer_waiting = NULL;
+                }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
             pipe->read_pos = (pipe->read_pos + (uint32_t)span)
@@ -3259,8 +3457,15 @@ long sys_read(int fd, void* buf, size_t count) {
             done += span;
         }
         pipe->used -= (uint32_t)done;
+
+        /* Space freed: wake a waiting writer, if any. */
+        if (pipe->writer_waiting) {
+            pipe_wake_waiter(pipe->writer_waiting, BLOCK_KIND_PIPE_WRITE);
+            pipe->writer_waiting = NULL;
+        }
         return (long)done;
     }
+
     file_slot_t* slot = get_file_slot_any(fd);
     if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
