@@ -3104,17 +3104,26 @@ long sys_write(int fd, const void* buf, size_t count) {
     if (!self) return -(long)EBADF_;
 
     /*
-     * fd 1 and 2 are the screen ONLY when nothing has been dup2'd
-     * onto them.  `echo hi > file` opens the file and calls
-     * dup2(file_fd, 1); after that, write(1, ...) must write the
-     * file, not the screen.  The old code went straight to the
-     * screen path and ignored file_table[1], so `>` silently
-     * discarded the redirect.
+     * fd 1 and 2 are the screen ONLY when they hold a console slot,
+     * or nothing at all.  A redirected file (`echo hi > file` does
+     * dup2(file_fd, 1)) or a pipe end (a shell's `cmd | other`
+     * puts the write end of the pipe on the child's fd 1) is a
+     * real fd and must be written through, not sent to the screen.
+     *
+     * Same reasoning as sys_read's fd-0 guard: the old test was
+     * `kind != FILE_KIND_FILE`, which mis-routes a pipe.  Invert
+     * it to "is this a console slot" -- that is what the keyboard/
+     * screen path is for.
+     *
+     * Note this one reads file_table[fd] (via get_file_slot_any(fd)),
+     * not file_table[1], because the guard applies to both fd 1 and
+     * fd 2 and each needs its own slot.  The sys_read guard reads
+     * file_table[0] specifically because it only ever guards fd 0.
      */
-    file_slot_t* std_slot = get_file_slot_any(fd); 
-    
+    file_slot_t* std_slot = get_file_slot_any(fd);
+
     if ((fd == 1 || fd == 2) &&
-        (!std_slot || std_slot->kind != FILE_KIND_FILE)) {
+        (!std_slot || std_slot->kind == FILE_KIND_CONSOLE)) {
         size_t remaining = count;
         const uint8_t* user_ptr = (const uint8_t*)buf;
         while (remaining > 0) {
@@ -3506,16 +3515,31 @@ long sys_read(int fd, void* buf, size_t count) {
     if (!self) return -(long)EBADF_;
 
     /*
-     * fd 0 is the keyboard ONLY when nothing has been dup2'd onto
-     * it.  busybox ash's `<` redirection opens a file and calls
-     * dup2(file_fd, 0); after that, read(0, ...) must read the
-     * file, not the keyboard.  The old code went straight to the
-     * keyboard path and ignored file_table[0], so `cat < file`
-     * blocked forever on keyboard input.
+     * fd 0 is the keyboard ONLY when it holds a console slot, or
+     * nothing at all.  Anything else on fd 0 -- a redirected file
+     * (busybox ash's `<` does dup2(file_fd, 0)) or a pipe end (a
+     * shell's `cmd | other` puts the read end of the pipe on the
+     * child's fd 0) -- is a real fd and must be read through, not
+     * sent to the keyboard.
+     *
+     * The old guard said `kind != FILE_KIND_FILE`, which was
+     * correct when a file was the only thing dup2 could put on
+     * fd 0.  It is wrong for a pipe: a pipe slot has kind
+     * FILE_KIND_PIPE, which is != FILE_KIND_FILE, so the guard
+     * was true and a piped stdin fell through to the keyboard
+     * path.  Inverting the test to "is this a console slot"
+     * fixes that and is also what the sentinel design means: the
+     * keyboard path exists exactly for the console sentinels
+     * installed by user_syscall_init_console_fds.
+     *
+     * A NULL fd 0 is also treated as the keyboard: that is the
+     * pre-sentinel behavior, and it is what a process that closed
+     * fd 0 without reopening anything sees.
      */
     file_slot_t* fd0_slot = get_file_slot_any(0);
-    
-    if (fd == 0 && (!fd0_slot || fd0_slot->kind != FILE_KIND_FILE)) {
+
+    if (fd == 0 &&
+        (!fd0_slot || fd0_slot->kind == FILE_KIND_CONSOLE)) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
         while (bytes_read < count) {
             __asm__ volatile("cli");
