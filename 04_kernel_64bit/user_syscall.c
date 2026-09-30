@@ -842,20 +842,53 @@ static void put_file_slot(file_slot_t* slot) {
          * object once the last END closes, and after that the
          * counts are gone.
          *
-         * A reader whose writer is the end being closed here will
-         * see writers_open == 0 on its next check and get EOF; a
-         * writer whose reader is being closed sees readers_open
-         * == 0 and gets -EPIPE.  But this function does not wake
-         * anyone: sys_close does that, because sys_close is the
-         * only caller that knows a close just happened and needs
-         * to prod the peer.  put_file_slot is also reached from
-         * process exit, where there is no peer left to wake.
+         * WAKE ON ZERO.  If the decrement took the count to zero,
+         * the end is gone systemwide and any peer blocked on the
+         * other end has a terminal condition to observe: a reader
+         * with no writer left sees EOF, a writer with no reader
+         * left sees EPIPE.  This function wakes that peer directly.
+         *
+         * sys_close also wakes, and it runs BEFORE this function on
+         * the close path, so on that path the peer is already
+         * marked READY and the wake here is a no-op (the waiter
+         * pointer was cleared by sys_close).  The wake here is
+         * what covers the OTHER path: process exit.  When a process
+         * exits, close_all_files calls put_file_slot directly, with
+         * no sys_close involved, and without this wake a reader
+         * blocked on the exiting writer's pipe would sit in hlt
+         * until the next keyboard IRQ woke it via
+         * process_wake_all_blocked.  On a headless system, or in a
+         * pipeline where no key is pressed, that is a hang.
+         *
+         * Context: put_file_slot is reached from sys_close (process
+         * context, interrupts on) and from process_exit (interrupts
+         * off, but process_wake_parent_if_waiting already calls
+         * scheduler_ready_queue_add in that same context, so
+         * touching the ready queue here is consistent with what
+         * process_exit already does).
+         *
+         * The wake is only attempted when the count REACHES zero.
+         * A non-final close leaves the count > 0; the peer (if any)
+         * is woken by sys_close, re-checks, sees the count still
+         * positive, and re-blocks.  Doing it here only on zero
+         * keeps this function from waking spuriously on every
+         * intermediate close in a dup'd chain.
          */
         pipe_t* pipe = (pipe_t*)slot->obj;
         if (slot->end == PIPE_END_READ) {
             if (pipe->readers_open > 0) pipe->readers_open--;
+            if (pipe->readers_open == 0 && pipe->writer_waiting) {
+                pipe_wake_waiter(pipe->writer_waiting,
+                                 BLOCK_KIND_PIPE_WRITE);
+                pipe->writer_waiting = NULL;
+            }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
+            if (pipe->writers_open == 0 && pipe->reader_waiting) {
+                pipe_wake_waiter(pipe->reader_waiting,
+                                 BLOCK_KIND_PIPE_READ);
+                pipe->reader_waiting = NULL;
+            }
         }
         put_pipe_ref(pipe);
     }
