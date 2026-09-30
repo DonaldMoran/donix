@@ -2,6 +2,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <stdio.h>
+#include <fcntl.h>
 
 static void puts_raw(const char* s, unsigned long n) {
     __asm__ volatile("syscall"
@@ -277,6 +278,60 @@ static int split_operators(char* out, char** argv, int argc) {
     return nargc;
 }
 
+/*
+ * ---- Redirection (step 1 of the parser) ----
+ *
+ * Look for the first <, >, or >> in argv.  If found, and there is
+ * a word after it, treat that word as the filename and return the
+ * operator kind via *kind_out and the filename via *file_out.
+ *
+ *   *redir_idx_out  = index of the operator in argv
+ *   *kind_out       = REDIR_IN / REDIR_OUT / REDIR_APPEND
+ *   *file_out       = argv[redir_idx + 1]
+ *
+ * The command to run is argv[0 .. redir_idx).  The caller forks
+ * and, in the child, opens *file_out and dup2()s it onto fd 0 or
+ * 1 before exec.
+ *
+ * Returns 1 if a redirection was found and is well-formed, 0
+ * otherwise.  On 0 the caller runs argv unchanged.
+ *
+ * Step 1 limits, deliberately:
+ *   - only the FIRST redirection is honored; a second < or > is
+ *     left in the command's args and reaches the program literally
+ *   - a pipeline (|) or a sequence (; &&) later in argv is NOT
+ *     handled here; the caller will see it as an ordinary word
+ *     after the operator position
+ *   - redirection of a builtin is not supported (builtins run in
+ *     the parent before any fork)
+ */
+enum { REDIR_NONE = 0, REDIR_IN, REDIR_OUT, REDIR_APPEND };
+
+static int parse_redir(char** argv, int argc,
+                       int* redir_idx_out,
+                       int* kind_out,
+                       const char** file_out) {
+    for (int i = 0; i < argc; i++) {
+        const char* a = argv[i];
+        int kind = REDIR_NONE;
+        if (strcmp(a, "<") == 0) kind = REDIR_IN;
+        else if (strcmp(a, ">") == 0) kind = REDIR_OUT;
+        else if (strcmp(a, ">>") == 0) kind = REDIR_APPEND;
+        if (kind == REDIR_NONE) continue;
+
+        /* A redirection with nothing after it is a syntax error.
+         * A redirection with nothing before it likewise. */
+        if (i == 0) return 0;
+        if (i + 1 >= argc) return 0;
+
+        *redir_idx_out = i;
+        *kind_out = kind;
+        *file_out = argv[i + 1];
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
     char line[256];
 
@@ -368,8 +423,30 @@ int main(void) {
         /*
          * Builtins run in the parent, before any fork.  If one
          * handled the line, loop back for the next prompt.
+         *
+         * NOTE: redirection on a builtin is not supported in this
+         * step.  `cd /bin > log` runs cd and ignores the redirect
+         * (the > and log reach run_builtin as extra argv, which
+         * cd ignores).  Redirection of builtins comes later.
          */
         if (run_builtin(argc, argv)) {
+            continue;
+        }
+
+        /*
+         * Parse a redirection, if any.  The command to execute is
+         * argv[0 .. redir_idx); the file is argv[redir_idx + 1].
+         * cmd_argc bounds the command for execve, so the operator
+         * and filename are not passed to the program.
+         */
+        int redir_idx = 0, redir_kind = REDIR_NONE;
+        const char* redir_file = 0;
+        int has_redir = parse_redir(argv, argc,
+                                    &redir_idx, &redir_kind, &redir_file);
+        int cmd_argc = has_redir ? redir_idx : argc;
+
+        if (cmd_argc == 0) {
+            puts_raw("sh: syntax error\n", 17);
             continue;
         }
 
@@ -380,6 +457,49 @@ int main(void) {
         }
 
         if (pid == 0) {
+            /*
+             * Apply the redirection in the child, before exec.
+             * On any failure, print and exit -- do NOT exec, so
+             * the program does not run without its redirect.
+             */
+            if (has_redir) {
+                int flags;
+                int target_fd;
+                if (redir_kind == REDIR_IN) {
+                    flags = O_RDONLY;
+                    target_fd = 0;
+                } else if (redir_kind == REDIR_OUT) {
+                    flags = O_WRONLY | O_CREAT | O_TRUNC;
+                    target_fd = 1;
+                } else { /* REDIR_APPEND */
+                    flags = O_WRONLY | O_CREAT | O_APPEND;
+                    target_fd = 1;
+                }
+
+                int fd = open(redir_file, flags, 0644);
+                if (fd < 0) {
+                    puts_z("sh: cannot open ");
+                    puts_z(redir_file);
+                    puts_raw("\n", 1);
+                    _exit(1);
+                }
+                if (dup2(fd, target_fd) < 0) {
+                    puts_raw("sh: dup2 failed\n", 16);
+                    _exit(1);
+                }
+                if (fd != target_fd) close(fd);
+            }
+
+            /*
+             * argv is NUL-terminated at cmd_argc.  Passing the
+             * full argv with cmd_argc as the boundary is not
+             * possible through execve (it reads to the NUL), so
+             * write a NUL at argv[cmd_argc] to terminate the
+             * command there.  argv[cmd_argc] is either the
+             * operator or the existing NUL, so this is safe.
+             */
+            argv[cmd_argc] = (char*)0;
+
             /*
              * Pass argv[0] through unchanged.  The kernel's
              * sys_execve handles the forms the user might type:
