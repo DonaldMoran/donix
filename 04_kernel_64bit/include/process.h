@@ -28,6 +28,24 @@ typedef enum {
  */
 #define BLOCK_KIND_NONE    0
 #define BLOCK_KIND_WAITPID 1
+/*
+ * Pipe waiters (Step 2).
+ *
+ * Values 2 and 3, appended.  block_kind is already a uint64_t at
+ * offset 0x158, already read by context_switch.asm, and already
+ * pinned by _Static_assert in process.c.  Adding new VALUES does
+ * not move the field; adding new values is the whole reason the
+ * directed-wake design can work without a scheduler change.
+ *
+ *   BLOCK_KIND_PIPE_READ  -- blocked in sys_read on an empty pipe
+ *   BLOCK_KIND_PIPE_WRITE -- blocked in sys_write on a full pipe
+ *
+ * The distinction matters to the waker: a write that puts bytes
+ * in the ring wakes a PIPE_READ waiter, a read that drains bytes
+ * wakes a PIPE_WRITE waiter, and neither wakes the other.
+ */
+#define BLOCK_KIND_PIPE_READ  2
+#define BLOCK_KIND_PIPE_WRITE 3
 
 // Process Control Block
 typedef struct pcb {

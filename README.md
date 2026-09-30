@@ -38,12 +38,12 @@ no "and then a miracle happens." You can read the whole thing in a
 weekend and understand every line.
 
 It is also a working system, not a toy. It boots you into a real shell.
-It forks, execs, and waits. It changes directories and resolves
-relative paths. It reads directories and stats files. It allocates
-memory with `malloc` and frees it. It does all of that through the same
-syscall interface Linux does, using the same ABI, so that real,
-unmodified musl binaries can run on a kernel that shares no code with
-the one they were built for.
+It forks, execs, and waits. It pipes one process into another. It
+changes directories and resolves relative paths. It reads directories
+and stats files. It allocates memory with `malloc` and frees it. It
+does all of that through the same syscall interface Linux does, using
+the same ABI, so that real, unmodified musl binaries can run on a
+kernel that shares no code with the one they were built for.
 
 That's the point. That's the whole point.
 
@@ -61,12 +61,12 @@ That's the point. That's the whole point.
   Unix program is linked; they just happen to run on a kernel that
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
-  `fork`, `execve`, `wait4`, `brk`, `mmap`, `getdents64`, `stat`,
-  `fstat`, `lstat`, `access`, `chdir`, `getcwd`, `geteuid`, `prctl`,
-  `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`, `rmdir`,
-  `uname`, `readv`, `writev` — the numbers and semantics match
-  Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
-  unmodified.
+  `pipe`, `dup`, `dup2`, `fork`, `execve`, `wait4`, `brk`, `mmap`,
+  `getdents64`, `stat`, `fstat`, `lstat`, `access`, `chdir`, `getcwd`,
+  `geteuid`, `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`,
+  `unlink`, `rmdir`, `uname`, `readv`, `writev` — the numbers and
+  semantics match Linux x86_64. musl's `printf`, `malloc`, and
+  `opendir` work unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
   are real; `cd /bin; ls` lists `/bin`; `cd ..` walks back up; the
   change survives `fork` and `execve`. Relative paths (`.`, `..`,
@@ -77,15 +77,17 @@ That's the point. That's the whole point.
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
   backspace, line editing, history), and it supports real shell
   redirection — `cat < file`, `echo hi > out.txt`, and repeated
-  redirects in one shell all work. Its file and text applets — `ls`,
-  `cat`, `echo`, `pwd`, `wc`, `head`, `tail`, `cp`, `mv`, `grep`,
-  `sed`, `cut`, `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`,
-  `uniq`, `mkdir`, `rm`, `rmdir`, `touch` — run in-process via
-  standalone mode, and `/bin/busybox` is a real path on the image. It
-  forks and execs external binaries, and it shares the working
-  directory with the rest of the system. This is the strongest
-  evidence that the syscall ABI is right — busybox expects a real
-  Unix kernel underneath it, and on donix it gets one.
+  redirects in one shell all work — as well as real pipelines:
+  `cat hello-world.txt | head -n 2`, `echo hi | wc`, `echo hello |
+  cat`. Its file and text applets — `ls`, `cat`, `echo`, `pwd`,
+  `wc`, `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`, `sort`,
+  `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`, `mkdir`, `rm`,
+  `rmdir`, `touch` — run in-process via standalone mode, and
+  `/bin/busybox` is a real path on the image. It forks and execs
+  external binaries, and it shares the working directory with the
+  rest of the system. This is the strongest evidence that the syscall
+  ABI is right — busybox expects a real Unix kernel underneath it,
+  and on donix it gets one.
 - **Has a real terminal.** The console is a VT100 emulator: full CSI
   parsing, cursor addressing, SGR colors, the erase, insert, and
   delete families, and a software alternate screen. Full-screen
