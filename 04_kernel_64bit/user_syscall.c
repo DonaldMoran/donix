@@ -1662,6 +1662,30 @@ long sys_dup2(int oldfd, int newfd) {
     return (long)newfd;
 }
 
+/*
+ * Linux x86_64 dup(2) -- syscall 32.
+ *
+ * dup(fd) is defined as fcntl(fd, F_DUPFD, 0): duplicate fd onto
+ * the lowest free fd >= 0.  We delegate to sys_fcntl rather than
+ * duplicating the aliasing logic, because sys_fcntl's F_DUPFD
+ * case already does the right thing -- shares the slot, bumps
+ * slot->refcount, clamps the result to fd >= 3 (get_file_slot's
+ * guard; see the comment there).  One implementation of the
+ * dup semantics, not two.
+ *
+ * The only difference between dup and fcntl(F_DUPFD, 0) is the
+ * return value convention, and they share it: the new fd on
+ * success, -errno on failure.
+ *
+ * This exists because musl's dup() wrapper reaches syscall 32
+ * directly rather than routing through fcntl.  Without a handler
+ * here, any caller of dup() got -ENOSYS; pipe_step3's test 3
+ * tripped over it, which is how the gap was found.
+ */
+long sys_dup(int fd) {
+    return sys_fcntl(fd, F_DUPFD, 0);
+}
+
 long sys_unlink(const char* path) {
     pcb_t* self = process_get_current();
     if (!self || !path) return -(long)EFAULT_;
@@ -5115,6 +5139,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
         case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
+        case SYS_DUP:             return (uint64_t)sys_dup((int)arg0);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();

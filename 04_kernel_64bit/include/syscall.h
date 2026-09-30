@@ -66,6 +66,7 @@
  *  20  writev            sys_writev
  *  21  access            sys_access
  *  22  pipe              sys_pipe          (Step 1: non-blocking; see note)
+ *  32  dup               sys_dup           (alias of fcntl F_DUPFD)
  *  33  dup2              sys_dup2
  *  39  getpid            sys_getpid
  *  57  fork              sys_fork
@@ -143,6 +144,7 @@
 #define SYS_WRITEV          20
 #define SYS_ACCESS          21
 #define SYS_PIPE            22
+#define SYS_DUP             32
 #define SYS_DUP2            33
 #define SYS_GETPID          39
 #define SYS_FORK            57
@@ -213,6 +215,18 @@ void* sys_brk(void* addr);
 
 long sys_open(const char* path, int flags);
 long sys_close(int fd);
+/*
+ * sys_dup -- Linux x86_64 dup(2), syscall 32.
+ *
+ * dup(fd) is exactly fcntl(fd, F_DUPFD, 0): return the lowest
+ * free fd >= 0 (clamped to >= 3 here, see sys_fcntl) aliased to
+ * the same open file description.  donix had no handler for 32
+ * until this; musl's dup() wrapper reaches it directly, so any
+ * program calling dup() got -ENOSYS.  pipe_step3's first run hit
+ * it.  Implemented as a direct call into sys_fcntl so there is
+ * one implementation of the dup semantics, not two.
+ */
+long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
 long sys_rmdir(const char* path);
