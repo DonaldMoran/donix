@@ -65,6 +65,7 @@
  *  19  readv             sys_readv
  *  20  writev            sys_writev
  *  21  access            sys_access
+ *  22  pipe              sys_pipe          (Step 1: non-blocking; see note)
  *  33  dup2              sys_dup2
  *  39  getpid            sys_getpid
  *  57  fork              sys_fork
@@ -141,6 +142,7 @@
 #define SYS_READV           19
 #define SYS_WRITEV          20
 #define SYS_ACCESS          21
+#define SYS_PIPE            22
 #define SYS_DUP2            33
 #define SYS_GETPID          39
 #define SYS_FORK            57
@@ -219,6 +221,15 @@ long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_wait4(long pid, int* user_status, int options);
+/*
+ * sys_pipe -- Linux x86_64 pipe(2), syscall 22.
+ *
+ * arg0 is a user pointer to int[2]; on success pipefd[0] is the
+ * read end and pipefd[1] is the write end.  Step 1 is
+ * non-blocking: read on empty and write on full return -EAGAIN.
+ * Blocking, EOF, and EPIPE are Step 2/3.
+ */
+long sys_pipe(int* user_pipefd);
 long sys_setsid(void);
 long sys_geteuid(void);
 long sys_getppid(void);

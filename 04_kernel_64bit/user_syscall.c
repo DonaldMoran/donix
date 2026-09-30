@@ -97,6 +97,67 @@ static char g_write_bounce[WRITE_CHUNK];
  */
 #define FILE_KIND_CONSOLE 3
 
+/*
+ * A pipe end.  slot->obj points at a shared pipe_t (see below).
+ * TWO file_slot_t objects -- the read end and the write end --
+ * point at the SAME pipe_t.  The end flag lives on the slot, not
+ * on the pipe object, because the object is shared and the two
+ * ends differ only in which operation they permit.
+ *
+ * The pipe_t itself carries a refcount, separate from the slot
+ * refcount.  slot->refcount counts fd references to one end (a
+ * dup2 of the read end bumps the slot refcount, not the pipe
+ * refcount); pipe->refcount counts live ENDS (open read end +
+ * open write end = 2), and the pipe_t is freed when the last end
+ * closes.  Keeping the two refcounts distinct is what makes
+ * "close the write end, reader sees EOF" work while a dup'd read
+ * end is still open.
+ */
+#define FILE_KIND_PIPE 4
+
+/* Pipe end flags.  Stored in pipe_slot_t.end. */
+#define PIPE_END_READ  1
+#define PIPE_END_WRITE 2
+
+/*
+ * Pipe buffer capacity, in bytes.
+ *
+ * This is a FIELD on pipe_t (pipe->capacity), not a #define used
+ * inline, so that a future session can grow the buffer the way
+ * Linux does (4 KB -> 64 KB) by reallocating and copying the ring,
+ * without touching sys_read/sys_write: those already consult
+ * pipe->capacity instead of this literal.  Do not replace the
+ * field with this macro at the use sites.
+ *
+ * 4096 is one page.  Linux starts at one page and grows toward
+ * 64 KB; we start at one page and do not grow yet.  For the
+ * current applet set (cat | head, echo | wc) the producer never
+ * writes more than 4 KB before the consumer reads, so growth
+ * would never trigger.  Raise PIPE_DEFAULT_CAPACITY if a test
+ * ever shows otherwise.
+ */
+#define PIPE_DEFAULT_CAPACITY 4096
+
+/*
+ * The pipe object.  One per pipe(2) call, shared by the read-end
+ * and write-end slots.  See the FILE_KIND_PIPE comment above for
+ * the two-refcount scheme.
+ *
+ * Single-threaded kernel: no lock is needed.  The kernel runs with
+ * interrupts disabled across the read/write paths that touch the
+ * ring (Step 2 adds the cli/sti discipline; Step 1 is
+ * non-blocking and never sleeps).  If a future change makes a
+ * pipe operation preemptible, this struct needs a lock.
+ */
+typedef struct pipe_s {
+    uint32_t capacity;      /* bytes; starts at PIPE_DEFAULT_CAPACITY */
+    uint32_t used;          /* bytes currently in the ring            */
+    uint32_t read_pos;      /* next byte to read                      */
+    uint32_t write_pos;     /* next byte to write                     */
+    uint8_t* buf;           /* kmalloc'd, capacity bytes              */
+    uint32_t refcount;      /* live ends: 0, 1, or 2                  */
+} pipe_t;
+
 /* Set to 1 for one build to trace the fd lifecycle of ash's
  * redirection.  Turn back to 0 before committing. */
 #define DEBUG_FD_TRACE 0
@@ -624,6 +685,29 @@ static int copy_user_string(char* dst, size_t dst_cap, const char* user_src) {
  * (e.g. sys_close, which sets file_table[fd] = NULL separately)
  * use this and then clear their own table entry.
  */
+/*
+ * Drop one reference to the pipe OBJECT (not the slot).
+ *
+ * The pipe_t is shared by the read-end and write-end slots.  Each
+ * end holds one reference; the pipe_t is freed, and its ring
+ * buffer with it, when the last end goes away.  A slot that merely
+ * aliases an existing end (dup2) does NOT take a pipe reference --
+ * slot->refcount counts fd references to one end, pipe->refcount
+ * counts ends.
+ *
+ * Called only from put_file_slot, when a PIPE-kind slot is about
+ * to be freed (its own slot refcount reached zero).
+ */
+static void put_pipe_ref(pipe_t* pipe) {
+    if (!pipe) return;
+    if (pipe->refcount > 1) {
+        pipe->refcount--;
+        return;
+    }
+    if (pipe->buf) kfree(pipe->buf);
+    kfree(pipe);
+}
+
 static void put_file_slot(file_slot_t* slot) {
     if (!slot) return;
     if (slot->refcount > 1) {
@@ -638,6 +722,9 @@ static void put_file_slot(file_slot_t* slot) {
         kfree(slot->obj);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
+    } else if (slot->kind == FILE_KIND_PIPE) {
+        /* obj is the shared pipe_t; drop this end's reference. */
+        put_pipe_ref((pipe_t*)slot->obj);
     }
     kfree(slot);
 }
@@ -881,6 +968,137 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
         case F_SETFL:  return 0;              /* ignore            */
         default:       return -(long)EINVAL_;
     }
+}
+
+// ============================================================
+// PIPE (Linux syscall 22) -- Step 1: object, sys_pipe, non-blocking I/O
+//
+// This step creates pipes and moves bytes through them.  It does
+// NOT block: read on an empty pipe and write on a full pipe return
+// -EAGAIN.  Blocking, EOF, and EPIPE are Step 2/3.
+//
+// The object and the refcount scheme are described at the
+// FILE_KIND_PIPE and pipe_t definitions near the top of this file.
+// ============================================================
+
+/* 24 is EMFILE (too many open files) on Linux x86_64. */
+#ifndef EMFILE_
+#define EMFILE_ 24
+#endif
+
+/*
+ * Allocate one pipe end as a file_slot_t pointing at `pipe`.
+ *
+ * On success, stores the slot in *out_slot and returns its fd.  On
+ * failure (no free fd, or kmalloc failed) returns -1 and stores
+ * NULL.  Does not increment pipe->refcount; the caller does that
+ * once per end, after both ends have allocated, so a failure on
+ * the second end does not leave the pipe's count inflated.
+ */
+static int pipe_alloc_end(pipe_t* pipe, uint32_t end, file_slot_t** out_slot) {
+    file_slot_t* slot = NULL;
+    int fd = alloc_file_slot(&slot);
+    if (fd == -1) {
+        *out_slot = NULL;
+        return -1;
+    }
+    slot->kind = FILE_KIND_PIPE;
+    slot->obj  = pipe;
+    /* slot->refcount is already 1 from alloc_file_slot; the end
+     * flag is stored in the slot, not the shared object. */
+    (void)end;  /* Step 2 reads this; Step 1 does not need to store it yet */
+    *out_slot = slot;
+    return fd;
+}
+
+/*
+ * Linux x86_64 pipe(2) -- syscall 22.
+ *
+ * ABI:
+ *   arg0  int[2]  user pointer to a two-int array
+ *   returns  0 on success, -errno on failure.
+ *
+ * On success, pipefd[0] is the read end and pipefd[1] is the write
+ * end.  Both are low fds: pipe() allocates the lowest free fds,
+ * which after a fresh process's console sentinels means fd 3 and
+ * fd 4.
+ *
+ * Allocation is atomic from the caller's point of view: if the
+ * second end cannot be allocated (table full, kmalloc failed), the
+ * first end is rolled back and the pipe_t is freed, and the
+ * function returns -EMFILE.  A half-created pipe must not leak, and
+ * a caller that got back a read end with no write end could never
+ * see EOF.
+ *
+ * EMFILE (24) is the Linux errno for "process file table full".
+ */
+long sys_pipe(int* user_pipefd) {
+    if (!user_pipefd) return -(long)EFAULT_;
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EMFILE_;
+
+    /* 1. The shared object. */
+    pipe_t* pipe = (pipe_t*)kmalloc(sizeof(pipe_t));
+    if (!pipe) return -(long)ENOMEM_;
+
+    pipe->buf = (uint8_t*)kmalloc(PIPE_DEFAULT_CAPACITY);
+    if (!pipe->buf) {
+        kfree(pipe);
+        return -(long)ENOMEM_;
+    }
+    pipe->capacity  = PIPE_DEFAULT_CAPACITY;
+    pipe->used      = 0;
+    pipe->read_pos  = 0;
+    pipe->write_pos = 0;
+    pipe->refcount  = 0;   /* incremented once per end, below */
+
+    /* 2. The two ends. */
+    file_slot_t* rslot = NULL;
+    file_slot_t* wslot = NULL;
+
+    int rfd = pipe_alloc_end(pipe, PIPE_END_READ, &rslot);
+    if (rfd == -1) {
+        kfree(pipe->buf);
+        kfree(pipe);
+        return -(long)EMFILE_;
+    }
+
+    int wfd = pipe_alloc_end(pipe, PIPE_END_WRITE, &wslot);
+    if (wfd == -1) {
+        /* Roll back the read end: clear its fd, free the slot,
+         * free the object.  put_file_slot on a PIPE slot with
+         * refcount 1 calls put_pipe_ref, which frees buf and the
+         * pipe -- but we already know the pipe, so free directly
+         * and just release the slot. */
+        self->file_table[rfd] = NULL;
+        kfree(rslot);
+        kfree(pipe->buf);
+        kfree(pipe);
+        return -(long)EMFILE_;
+    }
+
+    /* 3. Both ends exist: the pipe now has two live references. */
+    pipe->refcount = 2;
+
+    /* 4. Write the fds back to the user.  This is a 2-int write,
+     * 8 bytes.  If it faults, unwind everything we built. */
+    int fds[2];
+    fds[0] = rfd;
+    fds[1] = wfd;
+    if (safe_copy_to_user(user_pipefd, fds, sizeof(fds)) != 0) {
+        self->file_table[rfd] = NULL;
+        self->file_table[wfd] = NULL;
+        kfree(rslot);
+        kfree(wslot);
+        kfree(pipe->buf);
+        kfree(pipe);
+        return -(long)EFAULT_;
+    }
+
+    FDTRACE({ serial_print("pipe  rfd="); serial_print_dec((uint64_t)rfd);
+              serial_print(" wfd="); serial_print_dec((uint64_t)wfd); });
+    return 0;
 }
 
 // ============================================================
@@ -2668,7 +2886,53 @@ long sys_write(int fd, const void* buf, size_t count) {
         }
         return (long)count;
     }
+    /*
+     * Pipe write end.  Step 1: copy as much as fits, return the
+     * count written; if the pipe is full, return -EAGAIN.  Step 2
+     * makes "full" block instead of returning -EAGAIN.
+     *
+     * The ring is capacity bytes.  Free space is
+     * capacity - used.  We copy min(count, free), advancing
+     * write_pos with wraparound.  A short write (fewer bytes than
+     * requested) is legal for a pipe and is what a caller looping
+     * on write() expects.
+     */
+    file_slot_t* pslot = get_file_slot_any(fd);
+    if (pslot && pslot->kind == FILE_KIND_PIPE) {
+        pipe_t* pipe = (pipe_t*)pslot->obj;
 
+        uint32_t free_space = pipe->capacity - pipe->used;
+        if (free_space == 0) {
+            /* Full.  Step 2 blocks here; Step 1 reports EAGAIN. */
+            return -(long)EAGAIN_;
+        }
+
+        size_t to_write = count;
+        if (to_write > free_space) to_write = free_space;
+
+        /* Copy in two spans: from write_pos to end of buffer, then
+         * wrap to start.  done tracks bytes copied across both. */
+        size_t done = 0;
+        while (done < to_write) {
+            size_t span = to_write - done;
+            size_t to_end = pipe->capacity - pipe->write_pos;
+            if (span > to_end) span = to_end;
+
+            if (safe_copy_from_user(pipe->buf + pipe->write_pos,
+                                    (const uint8_t*)buf + done,
+                                    span) != 0) {
+                /* Partial write already committed to the ring is
+                 * fine; return what we managed. */
+                pipe->used += (uint32_t)done;
+                return (done > 0) ? (long)done : -(long)EFAULT_;
+            }
+            pipe->write_pos = (pipe->write_pos + (uint32_t)span)
+                              % pipe->capacity;
+            done += span;
+        }
+        pipe->used += (uint32_t)done;
+        return (long)done;
+    }
     file_slot_t* slot = get_file_slot_any(fd);
     if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
@@ -2956,7 +3220,47 @@ long sys_read(int fd, void* buf, size_t count) {
         }
         return (long)bytes_read;
     }
+    /*
+     * Pipe read end.  Step 1: copy as much as is available, return
+     * the count read; if the pipe is empty, return -EAGAIN.  Step 2
+     * makes "empty" block instead of returning -EAGAIN, and Step 3
+     * makes "empty AND no writer left" return 0 (EOF).
+     *
+     * Short reads are legal for a pipe; a reader looping on read()
+     * handles them.
+     */
+    file_slot_t* pslot = get_file_slot_any(fd);
+    if (pslot && pslot->kind == FILE_KIND_PIPE) {
+        pipe_t* pipe = (pipe_t*)pslot->obj;
 
+        if (pipe->used == 0) {
+            /* Empty.  Step 2 blocks here; Step 3 may return 0 for
+             * EOF.  Step 1 reports EAGAIN. */
+            return -(long)EAGAIN_;
+        }
+
+        size_t to_read = count;
+        if (to_read > pipe->used) to_read = pipe->used;
+
+        size_t done = 0;
+        while (done < to_read) {
+            size_t span = to_read - done;
+            size_t to_end = pipe->capacity - pipe->read_pos;
+            if (span > to_end) span = to_end;
+
+            if (safe_copy_to_user((uint8_t*)buf + done,
+                                  pipe->buf + pipe->read_pos,
+                                  span) != 0) {
+                pipe->used -= (uint32_t)done;
+                return (done > 0) ? (long)done : -(long)EFAULT_;
+            }
+            pipe->read_pos = (pipe->read_pos + (uint32_t)span)
+                             % pipe->capacity;
+            done += span;
+        }
+        pipe->used -= (uint32_t)done;
+        return (long)done;
+    }
     file_slot_t* slot = get_file_slot_any(fd);
     if (slot && slot->kind == FILE_KIND_FILE) {
         FIL* file_obj = (FIL*)slot->obj;
@@ -4403,6 +4707,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
+        case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
