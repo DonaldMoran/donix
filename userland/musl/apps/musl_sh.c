@@ -70,9 +70,9 @@ static void run_busybox_sh(void) {
  * program (ls, cat, hello) is left to exec.  Only the commands
  * whose whole purpose is to affect the shell are builtins.
  *
- * Each builtin now returns its own exit status (0 = success), so
- * that `&&` can short-circuit on a failed builtin the same way it
- * does on a failed program.
+ * Each builtin returns its own exit status (0 = success), so that
+ * `&&` can short-circuit on a failed builtin the same way it does
+ * on a failed program.
  */
 
 /* Print the current working directory, like /bin/pwd. */
@@ -776,25 +776,6 @@ int main(void) {
         char* argv[SH_MAX_ARGS];
         int argc = tokenize(line, argv);
         argc = split_operators(out, argv, argc);
-
-        /* TEMPORARY debug: the whole line is built into one buffer
-         * and written with a single sys_write, so the tokenization
-         * cannot be interleaved or torn.  Remove once the parser
-         * step consumes argv. */
-        {
-            char dbg[512];
-            unsigned long d = 0;
-            int i;
-            dbg[d++] = '[';
-            for (i = 0; i < argc; i++) {
-                if (i) dbg[d++] = '|';
-                const char* s = argv[i];
-                while (*s && d < sizeof(dbg) - 3) dbg[d++] = *s++;
-            }
-            dbg[d++] = ']';
-            dbg[d++] = '\n';
-            puts_raw(dbg, d);
-        }
 
         if (argc == 0) continue;
 
