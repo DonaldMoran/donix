@@ -62,28 +62,30 @@ static void run_busybox_sh(void) {
  * exit (termination) -- a forked child is useless, because the
  * child's state change is discarded when it exits.
  *
- * These builtins therefore run in the PARENT, before the fork.
+ * These builtins therefore run in the PARENT, before any fork.
  * They are checked by name, after tokenization, and if matched,
- * handled inline and the line is done -- no fork, no exec.
+ * handled inline and the command is done -- no fork, no exec.
  *
  * The set is deliberately small.  Anything that can be an external
  * program (ls, cat, hello) is left to exec.  Only the commands
  * whose whole purpose is to affect the shell are builtins.
  *
- * `exit` was already a special case in main(); it is now here for
- * consistency, and `cd` / `pwd` join it.
+ * Each builtin now returns its own exit status (0 = success), so
+ * that `&&` can short-circuit on a failed builtin the same way it
+ * does on a failed program.
  */
 
 /* Print the current working directory, like /bin/pwd. */
-static void builtin_pwd(void) {
+static int builtin_pwd(void) {
     char buf[256];
     char* r = getcwd(buf, sizeof(buf));
     if (!r) {
         puts_z("pwd: cannot determine cwd\n");
-        return;
+        return 1;
     }
     puts_z(buf);
     printf("\n");
+    return 0;
 }
 
 /*
@@ -93,9 +95,10 @@ static void builtin_pwd(void) {
  *   cd <path>    -> chdir(path)
  *
  * On failure, print a short message and leave cwd unchanged
- * (chdir does not move it on failure).
+ * (chdir does not move it on failure).  Returns chdir's result
+ * as the command status, so `cd /nope && foo` skips foo.
  */
-static void builtin_cd(int argc, char** argv) {
+static int builtin_cd(int argc, char** argv) {
     const char* target = "/";
     if (argc >= 2) target = argv[1];
 
@@ -103,30 +106,36 @@ static void builtin_cd(int argc, char** argv) {
         puts_z("cd: cannot cd to ");
         puts_z(target);
         puts_raw("\n", 1);
+        return 1;
     }
+    return 0;
 }
 
 /*
- * Return 1 if the builtin ran (and the caller should NOT fork),
- * 0 if this is not a builtin.
+ * Run a builtin in the parent if argv[0] names one.
+ *
+ * On a match, runs it and stores its exit status in *status_out,
+ * returning 1.  On no match, returns 0 and leaves *status_out
+ * untouched.
  *
  * Matching is by exact argv[0]; no path search, no aliases.
  * "cd" is the builtin; "/bin/cd" or "busybox cd" are not (there
  * is no such file, and busybox has no cd applet).
+ *
+ * `exit` is handled by the sequence runner, not here, because it
+ * must terminate the shell rather than just return a status.
  */
-static int run_builtin(int argc, char** argv) {
+static int run_builtin(int argc, char** argv, int* status_out) {
     if (argc == 0 || argv[0] == 0) return 0;
 
     if (strcmp(argv[0], "cd") == 0) {
-        builtin_cd(argc, argv);
+        *status_out = builtin_cd(argc, argv);
         return 1;
     }
     if (strcmp(argv[0], "pwd") == 0) {
-        builtin_pwd();
+        *status_out = builtin_pwd();
         return 1;
     }
-    /* `exit` is handled in main() before this point, because it
-     * must return from main, not just fall through. */
     return 0;
 }
 
@@ -208,7 +217,7 @@ static int tokenize(char* line, char** argv) {
  * Phase 1 gives words like `hi>out`, `a&&b`, `x|y`.  Phase 2
  * rewrites each such word as the sequence of tokens
  * `hi`, `>`, `out` / `a`, `&&`, `b` / `x`, `|`, `y`, so the
- * parser step can look at argv and see the operators.
+ * parser can look at argv and see the operators.
  *
  * Operators, longest match first:
  *   >>  &&  then  >  <  |  &  ;
@@ -279,7 +288,7 @@ static int split_operators(char* out, char** argv, int argc) {
 }
 
 /*
- * ---- Redirection (step 1 of the parser) ----
+ * ---- Redirection ----
  *
  * Look for the first <, >, or >> in argv.  If found, and there is
  * a word after it, treat that word as the filename and return the
@@ -296,14 +305,11 @@ static int split_operators(char* out, char** argv, int argc) {
  * Returns 1 if a redirection was found and is well-formed, 0
  * otherwise.  On 0 the caller runs argv unchanged.
  *
- * Step 1 limits, deliberately:
+ * Limits, deliberately:
  *   - only the FIRST redirection is honored; a second < or > is
  *     left in the command's args and reaches the program literally
- *   - a pipeline (|) or a sequence (; &&) later in argv is NOT
- *     handled here; the caller will see it as an ordinary word
- *     after the operator position
  *   - redirection of a builtin is not supported (builtins run in
- *     the parent before any fork)
+ *     the parent, which has no place to put a redirected fd)
  */
 enum { REDIR_NONE = 0, REDIR_IN, REDIR_OUT, REDIR_APPEND };
 
@@ -330,6 +336,187 @@ static int parse_redir(char** argv, int argc,
         return 1;
     }
     return 0;
+}
+
+/*
+ * ---- Command runner ----
+ *
+ * Run ONE command: argv[0..argc), with any redirection already
+ * present in argv.
+ *
+ * A builtin runs in the parent (run_builtin) and its own status is
+ * returned.  Anything else forks; the child applies the
+ * redirection and execs; the parent waits and returns the child's
+ * exit status.
+ *
+ * Returns the command's exit status (0 = success, 1 = failure).
+ * Callers use this for `&&`.
+ *
+ * `exit` is NOT handled here -- the sequence runner checks for it
+ * before calling this, because it must terminate the shell.
+ */
+static int run_one(char** argv, int argc) {
+    int bstatus = 0;
+    if (run_builtin(argc, argv, &bstatus)) {
+        /*
+         * Builtin.  NOTE: a redirection attached to a builtin is
+         * ignored -- the operator and filename reach the builtin
+         * as ordinary argv and are silently dropped.  This is a
+         * known step-1/step-2 limitation, to be revisited.
+         */
+        return bstatus;
+    }
+
+    int redir_idx = 0, redir_kind = REDIR_NONE;
+    const char* redir_file = 0;
+    int has_redir = parse_redir(argv, argc,
+                                &redir_idx, &redir_kind, &redir_file);
+    int cmd_argc = has_redir ? redir_idx : argc;
+
+    if (cmd_argc == 0) {
+        puts_raw("sh: syntax error\n", 17);
+        return 1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        puts_raw("FORK-FAILED\n", 12);
+        return 1;
+    }
+
+    if (pid == 0) {
+        /*
+         * Apply the redirection in the child, before exec.
+         * On any failure, print and exit -- do NOT exec, so
+         * the program does not run without its redirect.
+         */
+        if (has_redir) {
+            int flags;
+            int target_fd;
+            if (redir_kind == REDIR_IN) {
+                flags = O_RDONLY;
+                target_fd = 0;
+            } else if (redir_kind == REDIR_OUT) {
+                flags = O_WRONLY | O_CREAT | O_TRUNC;
+                target_fd = 1;
+            } else { /* REDIR_APPEND */
+                flags = O_WRONLY | O_CREAT | O_APPEND;
+                target_fd = 1;
+            }
+
+            int fd = open(redir_file, flags, 0644);
+            if (fd < 0) {
+                puts_z("sh: cannot open ");
+                puts_z(redir_file);
+                puts_raw("\n", 1);
+                _exit(1);
+            }
+            if (dup2(fd, target_fd) < 0) {
+                puts_raw("sh: dup2 failed\n", 16);
+                _exit(1);
+            }
+            if (fd != target_fd) close(fd);
+        }
+
+        /*
+         * argv is NUL-terminated at cmd_argc.  execve reads argv
+         * to the NUL, so write one at argv[cmd_argc] to terminate
+         * the command there.  argv[cmd_argc] is either the
+         * operator or the existing NUL, so this is safe; the
+         * child execs (or _exits) immediately after, so the
+         * mutation never escapes.
+         */
+        argv[cmd_argc] = (char*)0;
+
+        execve(argv[0], argv, (char**)0);
+        puts_raw("EXEC-FAILED\n", 12);
+        _exit(127);
+    }
+
+    int status = 0;
+    wait4(pid, &status, 0, (void*)0);
+
+    /*
+     * Extract the child's exit code for `&&`.  WIFEXITED /
+     * WEXITSTATUS from <sys/wait.h>.  A child killed by a signal
+     * (not possible here -- no signal delivery) would fall
+     * through as 1.
+     */
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return 1;
+}
+
+/*
+ * ---- Sequence runner ----
+ *
+ * Walk the tokenized line, splitting it into commands separated by
+ * `;` or `&&`, and run each one with run_one().
+ *
+ *   cmd1 ; cmd2          run cmd1, then cmd2 regardless
+ *   cmd1 && cmd2         run cmd1, then cmd2 only if cmd1 was 0
+ *
+ * `&&` short-circuits on a non-zero status; `;` does not.  A
+ * command with no separator is just a one-element sequence.
+ *
+ * `exit` is honored at the start of any command: it terminates
+ * the shell immediately, skipping the rest of the line.  Sets
+ * *should_exit and returns.
+ *
+ * `|` is NOT a separator here -- a pipeline is still a literal
+ * word, so `a | b` runs `a` with `|` and `b` as args.  Pipelines
+ * are a later step.
+ *
+ * Returns the exit status of the last command run.
+ */
+static int run_line(char** argv, int argc, int* should_exit) {
+    int i = 0;
+    int last_status = 0;
+
+    *should_exit = 0;
+    while (i < argc) {
+        /* Find the end of this command: the next ; or && at or
+         * after i. */
+        int j = i;
+        while (j < argc && strcmp(argv[j], ";") != 0 &&
+               strcmp(argv[j], "&&") != 0) {
+            j++;
+        }
+        int sep = (j < argc) ? (argv[j][0] == ';' ? ';' : '&') : 0;
+        int cmd_argc = j - i;
+
+        if (cmd_argc > 0) {
+            /* `exit` must terminate the shell, not fork. */
+            if (strcmp(argv[i], "exit") == 0) {
+                *should_exit = 1;
+                return 0;
+            }
+
+            last_status = run_one(&argv[i], cmd_argc);
+        }
+
+        if (sep == 0) break;            /* end of line */
+
+        if (sep == '&') {
+            /* &&: skip the next command if this one failed. */
+            if (last_status != 0) {
+                /* Skip past the operator and the next command. */
+                i = j + 1;
+                while (i < argc && strcmp(argv[i], ";") != 0 &&
+                       strcmp(argv[i], "&&") != 0) {
+                    i++;
+                }
+                if (i < argc && strcmp(argv[i], ";") == 0) {
+                    i++;    /* ; after a skipped && operand: continue */
+                    continue;
+                }
+                break;      /* nothing left */
+            }
+        }
+        /* `;` or a satisfied `&&`: advance to the next command. */
+        i = j + 1;
+    }
+
+    return last_status;
 }
 
 int main(void) {
@@ -412,109 +599,12 @@ int main(void) {
 
         if (argc == 0) continue;
 
-        /* `exit` terminates the shell itself, so it is handled
-         * before the builtin dispatch (which returns rather than
-         * returning from main). */
-        if (strcmp(argv[0], "exit") == 0) {
+        int should_exit = 0;
+        run_line(argv, argc, &should_exit);
+
+        if (should_exit) {
             puts_raw("bye\n", 4);
             return 0;
         }
-
-        /*
-         * Builtins run in the parent, before any fork.  If one
-         * handled the line, loop back for the next prompt.
-         *
-         * NOTE: redirection on a builtin is not supported in this
-         * step.  `cd /bin > log` runs cd and ignores the redirect
-         * (the > and log reach run_builtin as extra argv, which
-         * cd ignores).  Redirection of builtins comes later.
-         */
-        if (run_builtin(argc, argv)) {
-            continue;
-        }
-
-        /*
-         * Parse a redirection, if any.  The command to execute is
-         * argv[0 .. redir_idx); the file is argv[redir_idx + 1].
-         * cmd_argc bounds the command for execve, so the operator
-         * and filename are not passed to the program.
-         */
-        int redir_idx = 0, redir_kind = REDIR_NONE;
-        const char* redir_file = 0;
-        int has_redir = parse_redir(argv, argc,
-                                    &redir_idx, &redir_kind, &redir_file);
-        int cmd_argc = has_redir ? redir_idx : argc;
-
-        if (cmd_argc == 0) {
-            puts_raw("sh: syntax error\n", 17);
-            continue;
-        }
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            puts_raw("FORK-FAILED\n", 12);
-            continue;
-        }
-
-        if (pid == 0) {
-            /*
-             * Apply the redirection in the child, before exec.
-             * On any failure, print and exit -- do NOT exec, so
-             * the program does not run without its redirect.
-             */
-            if (has_redir) {
-                int flags;
-                int target_fd;
-                if (redir_kind == REDIR_IN) {
-                    flags = O_RDONLY;
-                    target_fd = 0;
-                } else if (redir_kind == REDIR_OUT) {
-                    flags = O_WRONLY | O_CREAT | O_TRUNC;
-                    target_fd = 1;
-                } else { /* REDIR_APPEND */
-                    flags = O_WRONLY | O_CREAT | O_APPEND;
-                    target_fd = 1;
-                }
-
-                int fd = open(redir_file, flags, 0644);
-                if (fd < 0) {
-                    puts_z("sh: cannot open ");
-                    puts_z(redir_file);
-                    puts_raw("\n", 1);
-                    _exit(1);
-                }
-                if (dup2(fd, target_fd) < 0) {
-                    puts_raw("sh: dup2 failed\n", 16);
-                    _exit(1);
-                }
-                if (fd != target_fd) close(fd);
-            }
-
-            /*
-             * argv is NUL-terminated at cmd_argc.  Passing the
-             * full argv with cmd_argc as the boundary is not
-             * possible through execve (it reads to the NUL), so
-             * write a NUL at argv[cmd_argc] to terminate the
-             * command there.  argv[cmd_argc] is either the
-             * operator or the existing NUL, so this is safe.
-             */
-            argv[cmd_argc] = (char*)0;
-
-            /*
-             * Pass argv[0] through unchanged.  The kernel's
-             * sys_execve handles the forms the user might type:
-             *
-             *   - a bare name like "ls"  -> "0:/LS.ELF" (attempt c1)
-             *   - an absolute path like "/LS.ELF"
-             *                            -> "0:/LS.ELF" (attempt b)
-             *   - bare "busybox"         -> "0:/BIN/BUSYBOX" (c2)
-             */
-            execve(argv[0], argv, (char**)0);
-            puts_raw("EXEC-FAILED\n", 12);
-            _exit(127);
-        }
-
-        int status = 0;
-        wait4(pid, &status, 0, (void*)0);
     }
 }
