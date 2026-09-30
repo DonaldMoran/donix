@@ -1,3 +1,58 @@
+## Session 39 — `20260930-at` (opens `v0.6.8`)
+
+| Tag | What |
+|---|---|
+| `20260930-at` | `resolve_at`, `file_slot_t.dir_path`, `newfstatat` (262), `openat` (257); stat family inverted; `find` enabled with `-type` |
+
+**Commit 1** (`at: resolve_at, newfstatat(262), openat(257)`):
+implemented the `*at()` path-resolution rule in one place
+(`resolve_at`), added `file_slot_t.dir_path` so a directory fd
+remembers its absolute path, inverted the stat family so
+`sys_newfstatat` is the general implementation and
+`sys_stat`/`sys_lstat`/`sys_fstat` are wrappers, split `open(2)`
+into `open_resolved` + `sys_open`/`sys_openat`.  Strict flag
+handling in `newfstatat`: `AT_SYMLINK_NOFOLLOW` and
+`AT_NO_AUTOMOUNT` are no-ops, `AT_EMPTY_PATH` is the fstat form,
+unknown bits are `-EINVAL`.  Added `tests/at_step1.c`.
+
+**Commit 2** (`config: enable busybox find with -type`): enabled
+`CONFIG_FIND=y` and `CONFIG_FEATURE_FIND_TYPE=y`.  Other
+`FEATURE_FIND_*` predicates deliberately off.
+
+**Canary:** green.  `at_step1` 7/7.  `find /bin`,
+`find / -type d`, `find / -type f -name busybox` all behave.  No
+`Unknown syscall:` lines for 257 or 262.
+
+**Notes for the milestone narrative:**
+- musl 1.2.5 on x86_64 does **not** reach syscall 262 for the
+  common stat cases — its `fstatat_kstat()` fast-paths
+  `stat`/`lstat`/`fstat` to 4/6/5.  Syscall 262 is reached only
+  for a real dirfd + relative path, or non-standard flags.
+  `statx` (332) is unreachable: `SYS_fstatat` is defined as
+  `SYS_newfstatat`, so musl compiles the `fstatat_kstat` branch,
+  not the statx branch.  Confirmed by grep: no `statx` in the
+  kernel, and `SYS_statx` never called.
+- `sys_fstat_body` was factored out of `sys_fstat` so that
+  `sys_newfstatat`'s `AT_EMPTY_PATH` case can call it without
+  recursing through `newfstatat`.  `sys_fstat` is now a wrapper.
+- The `sys_execve` three-attempt path block was **not** touched.
+  It does a different job (bare-name search) and remains the VFS
+  shim it was.
+- `resolve_at` needs `get_file_slot_any`, which is defined much
+  lower in the file.  A forward declaration was added just above
+  `resolve_at`, not at the top, because `file_slot_t` is not yet
+  in scope at the top.  See the build error it fixed: implicit
+  declaration, then "static declaration follows non-static
+  declaration."
+
+**Gotchas added:** "The kernel syscall name and the libc name
+differ"; "When the count disagrees with the lines, suspect the
+test."
+
+**Scratch tag kept:** `20260930-at` is local, not pushed, and is
+part of the open `v0.6.8` milestone (not dropped until the
+milestone is pushed).
+
 ## Session 38 — framebuffer console, Terminus, `vi` fills the screen
 
 Eight commits on `dev`, scratch-tagged, unpushed.  **No milestone

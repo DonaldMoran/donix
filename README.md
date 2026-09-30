@@ -80,9 +80,10 @@ That's the point. That's the whole point.
   redirects in one shell all work — as well as real pipelines:
   `cat hello-world.txt | head -n 2`, `echo hi | wc`, `echo hello |
   cat`. Its file and text applets — `ls`, `cat`, `echo`, `pwd`,
-  `wc`, `head`, `tail`, `cp`, `mv`, `grep`, `sed`, `cut`, `sort`,
-  `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`, `mkdir`, `rm`,
-  `rmdir`, `touch`, `false`, `true`, `yes`, `seq`, `clear` — run
+  `wc`, `head`, `tail`, `cp`, `mv`, `find`, `grep`, `sed`, `cut`,
+  `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`,
+  `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
+  `clear` — run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the

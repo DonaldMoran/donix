@@ -3,13 +3,15 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-09-30 (post-`v0.6.7`, shell + framebuffer)
-**Current HEAD:** tag `v0.6.7`, branch `dev`
+**Last updated:** 2026-09-30 (session 39, `*at` family opened)
+**Current HEAD:** branch `dev`, two commits past `origin/dev`;
+scratch tag `20260930-at` (local)
 **Last milestone:** `v0.6.7` (published) — `musl_sh` is a real shell;
 the console is a 1024×768 linear framebuffer
-**Milestone status:** **bumped.**  `v0.6.7` is pushed; `dev` merged
-to `main`.  Scratch tags dropped at the milestone — their narrative
-lives in the `v0.6.7` commit message and `docs/session-log.md`.
+**Milestone status:** **open — `v0.6.8` in progress.**  `20260930-at`
+is the first commit of the `v0.6.8` milestone.  `dev` is two commits
+ahead of `origin/dev`, not pushed.  Scratch tags are local and are
+dropped before the milestone is pushed.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026093x-*`) are local scratch restore points** — they exist while
@@ -59,72 +61,71 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Where we are — `v0.6.7` published
+## Where we are — `v0.6.8` in progress
 
-`v0.6.7` shipped two sessions of work: **`donix>`'s own shell became
-a real shell**, and **the console became a linear framebuffer**.
-Both were committed on `dev` with scratch tags, then merged to
-`main` and tagged.
+`v0.6.7` shipped the shell and the framebuffer.  The current
+milestone, `v0.6.8`, is the **`*at()` family**.  It opened in
+session 39 with the resolver and the two syscalls busybox `find`
+needs; more of the family is expected before the bump.
 
-### Session 38 — framebuffer console
+### Session 39 — the `*at()` family; `find`
 
-| Tag (dropped) | What |
+| Tag (kept, milestone open) | What |
 |---|---|
-| `20260930-vbe` | VBE mode 0x118 (1024×768×24), framebuffer descriptor captured |
-| `20260930-fb` | framebuffer mapped; `fb_putpixel`/`fb_fill`/`fb_fillrect` |
-| `20260930-font` | Terminus 10×18 glyph blitter |
-| `20260930-fbcon` | console drawing routed through a framebuffer-aware primitive |
-| `20260930-shadow` | shadow cell grid: scroll, insert/delete, alt-screen |
-| `20260930-fbclean` | test pattern removed |
-| `20260930-winsz` | `TIOCGWINSZ` reports the real console grid |
-| `20260930-viwinsize` | busybox `FEATURE_VI_WIN_RESIZE=y` — `vi` fills the screen |
-| `20260930-psffix` | PSF row bit order (M and W rendered as blobs until fixed) |
+| `20260930-at` | `resolve_at`, `file_slot_t.dir_path`, `newfstatat` (262), `openat` (257); stat family inverted to wrappers; `find` enabled with `-type` |
 
-**What it means:** the console — boot messages, shell prompt, typed
-input, program output, `vi` — renders on the framebuffer at Terminus
-10×18 (102×42 cells).  `vi` fills the screen, edits, saves, and the
-alt-screen restores cleanly on exit.  The VGA text console remains
-as a fallback if VBE fails.
+**What it means:** the `*at()` path-resolution rule now exists in
+one place.  `newfstatat(2)` and `openat(2)` are implemented; the
+busybox `find` applet is enabled and works — `find /bin`,
+`find / -type d`, and `find / -type f -name busybox` all behave.
+`find` recurses with `openat` and stats entries with
+`newfstatat`, exactly as on Linux.
 
 **Key facts for future work:**
-- Mode 0x118 on QEMU is **24bpp, pitch 3072**, framebuffer at
-  physical **0xFD000000** — not 32bpp/4096.  The kernel uses the
-  values captured in `BootInfo`, so this is data, not assumption.
-- Pixels are **BGR** in memory (`fb.c`'s `FB_BYTE_R/G/B`).
-- PSF glyph rows are **big-endian, MSB-first** — the top
-  `FB_FONT_W` bits of a 16-bit row value are the pixels
-  (`fb.c`'s `fb_putchar`; see `gotchas.md`).
-- `vga.c` has a **shadow cell grid** (the source of truth on both
-  backends); `con_put_cell` is the one draw chokepoint; the grid is
-  `con_cols()`×`con_rows()` (102×42 fb, 80×25 VGA).
-- **All of `vga.c`'s VT100 logic is unchanged** and drives either
-  backend; callers outside `vga.c` are untouched.
-- **Changing the VBE mode is not a one-line change**: a different
-  mode number also needs `VGA_MAX_COLS`/`VGA_MAX_ROWS` in `vga.c`
-  bumped to the new grid, and (if the bpp differs) a `fb.c` change.
-  Tried 1280×1024 and 1600×1200 — all fell back to text or rendered
-  unreadable.  **1024×768 (`0x118`) is the working mode.**
+- **`resolve_at(dirfd, path, out, cap)` is the one resolver.**  An
+  absolute path ignores `dirfd`; `AT_FDCWD` delegates to
+  `resolve_against_cwd`; a real dirfd concatenates the directory
+  slot's stored path with the relative path.  Every future `*at`
+  syscall (`unlinkat`, `mkdirat`, `renameat`, `linkat`,
+  `readlinkat`, `faccessat`, ...) calls it.  Do **not** grow a
+  second copy of this logic.
+- **`file_slot_t.dir_path`** is a `kmalloc`'d absolute Unix-form
+  path, set only for `FILE_KIND_DIR` slots, freed in
+  `put_file_slot`.  It rides `fork`/`dup2` via refcount slot
+  sharing.  It is stored in **Unix form** (`/bin`), not FatFs form
+  (`0:/BIN`).
+- **The stat family is inverted, as on Linux.**  `sys_newfstatat`
+  (262) is the general implementation.  `sys_stat` is
+  `newfstatat(AT_FDCWD, p, st, 0)`; `sys_lstat` is the same with
+  `AT_SYMLINK_NOFOLLOW`; `sys_fstat` is a wrapper over
+  `sys_fstat_body`, which `newfstatat`'s `AT_EMPTY_PATH` case calls.
+  `sys_stat`/`sys_lstat`/`sys_fstat` no longer contain resolution
+  logic.
+- **`open(2)` is split.**  `open_resolved(path, flags)` is the one
+  open body; `sys_open` and `sys_openat` are thin wrappers over it
+  through `resolve_at`.
+- **musl's routing, confirmed.**  On x86_64, `stat`/`lstat`/`fstat`
+  are `fstatat` variants, and musl's `fstatat_kstat()` fast-paths
+  the common cases to syscalls 4/6/5.  **Syscall 262 is reached
+  only when those fast paths do not apply** — a real dirfd with a
+  relative path, or non-standard flags.  `statx` (332) is
+  **unreachable** on x86_64 musl 1.2.5: `SYS_fstatat` is defined
+  (as `SYS_newfstatat`), so the `#else` statx branch never compiles.
+  Do not "implement statx" thinking it will help; the grep for
+  `statx` in the kernel is empty for a reason.
+- **The `sys_execve` three-attempt path shim is unchanged.**
+  `resolve_at` is a *different* seam with a different job (dirfd
+  resolution, not bare-name search).  Do not confuse them; the
+  execve shim still needs the VFS to go away.
 
-### Session 37 — `musl_sh` is a real shell; `cat` has stdin
+### What `v0.6.7` contributed (prior milestone)
 
-| Tag (dropped) | What |
-|---|---|
-| `20260930-tokenizer` | two-phase tokenizer: quote stripping + operator splitting |
-| `20260930-redir` | `<`, `>`, `>>` via `open` + `dup2` + `execve` |
-| `20260930-seq` | `;` and `&&`; builtins report their own status |
-| `20260930-pipe` | `\|`; `fork_child` refactor; N-stage pipelines |
-| `20260930-cat` | donix-native `cat`: stdin mode, multiple files, `-` |
-| `20260930-nodebug` | remove the tokenizer debug print |
-
-`donix>` strips quotes and parses `<`, `>`, `>>`, `|`, `&&`, `;`,
-and pipelines.  `cat < file` works without busybox.  Userland only.
-The `musl_sh` limitation every prior handoff carried is closed.
-
-### What `v0.6.6` contributed (prior milestone)
-
-`pipe(2)` end to end (4 KB ring, directed wake, EOF, `-EPIPE`, the
-exit-path wake, the stdio-guard inversion).  `dup(2)` (32).  Keyboard
-fix (Shift+backslash).  See `docs/session-log.md`, Session 36.
+`musl_sh` became a real shell (quote stripping, `<`, `>`, `>>`,
+`|`, `&&`, `;`, pipelines), and the console became a 1024×768
+linear framebuffer with Terminus 10×18 text.  `vi` fills the
+screen, edits, saves, alt-screen restores.  VGA text is the
+fallback.  See `docs/session-log.md` and the `v0.6.7` commit
+message.
 
 ### Known limitations
 
@@ -139,23 +140,41 @@ fix (Shift+backslash).  See `docs/session-log.md`, Session 36.
 
 ## NEXT SESSION — pick one
 
-`v0.6.7` shipped the framebuffer.  What's left is a set of small,
-independent items and the large subsystems.  Pick **one**, do it,
-test it, tag it.
+`20260930-at` opened `v0.6.8`.  The milestone's theme is the
+`*at()` family; the resolver is built and the two syscalls busybox
+needed are done.  Continuing the theme is the natural next step.
 
-### Small, close gaps (recommended next)
+### On-theme (recommended, continues `v0.6.8`)
 
-1. **`newfstatat` (262)** — reserved number, no dispatch case.
-   Delegates to `sys_stat` for `AT_FDCWD` or an absolute path.
-   Unblocks `find`.
-2. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
-   yet; touches the keyboard layer.  Low urgency.
-3. **`sys_fcntl` fd < 3 for the other subcommands** — `F_GETFL`,
+The remaining `*at` syscalls all share `resolve_at` and are now
+cheap — each is a wrapper plus a dispatch case:
+
+1. **`unlinkat` (263)** — `unlink`/`rmdir` in one syscall,
+   `AT_REMOVEDIR` selects.  Used by busybox `rm -r`.
+2. **`mkdirat` (258)** — `mkdir` with a dirfd.  Rarely needed on
+   its own; useful once a shell or tool uses a dirfd.
+3. **`renameat` (264)** — two-path, needs `resolve_at` twice.
+4. **`linkat` (265) / `readlinkat` (267) / `symlinkat` (266)** —
+   FAT has no links or symlinks; these would be honest `-EPERM` /
+   `-ENOSYS` until the VFS exists.  Probably skip for now.
+5. **`faccessat` / `fchmodat` / `fchownat`** — donix ignores
+   permissions and ownership; `faccessat` already aliases
+   `sys_access`.  Skip.
+
+**Start with `unlinkat` (263).**  It is the one with a real
+consumer (`rm -r`), it shares `resolve_at` directly, and it is the
+smallest honest extension of the work just done.
+
+### Small, close gaps (non-theme)
+
+1. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl
+   parameter yet; touches the keyboard layer.  Low urgency.
+2. **`sys_fcntl` fd < 3 for the other subcommands** — `F_GETFL`,
    `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`.  Not on
    any current path.
-4. **`sys_utimensat` cwd resolution** — it calls `strip_dot_prefix`
-   but not `resolve_against_cwd`; one-line fix.
-5. **More applets** — `awk`, `find` (needs `newfstatat`), `tar`.
+3. **`sys_utimensat` cwd resolution** — it calls
+   `strip_dot_prefix` but not `resolve_against_cwd`; one-line fix.
+4. **More applets** — `awk`, `tar`.
 
 ### Deliberately later — larger
 
@@ -173,14 +192,15 @@ test it, tag it.
   it interactive.
 - **Font size / resolution.**  The console is 10×18 at 1024×768.
   A bigger glyph (`ter-u24n.psf`, 12×24) or a bigger mode is a
-  data change, but **see the "changing the VBE mode" note above** —
-  it also needs the grid constants and possibly `fb.c`.
+  data change, but **see the `v0.6.7` "changing the VBE mode" note
+  in `docs/session-log.md`** — it also needs the grid constants and
+  possibly `fb.c`.
 
 ---
 
 ## Canary state
 
-**The focused canary is green as of `v0.6.7`.**  Full table in
+**The focused canary is green as of `20260930-at`.**  Full table in
 `docs/session-log.md`.
 
     # on boot, ash is already running
@@ -228,6 +248,16 @@ test it, tag it.
     cat < out.txt
     busybox cat < out.txt
 
+**`find` rows (added `20260930-at`):**
+
+    find /bin                  # /bin, /bin/busybox
+    find / -type d             # /, /bin
+    find / -type f -name busybox
+
+**`*at` regression test (`userland/musl/tests/`, not a canary row):**
+
+    at_step1    # resolve_at via dirfd; fstatat flags; AT_EMPTY_PATH
+
 **Pipe regression suite (`userland/musl/tests/`):**
 
     pipe_step1    # object + non-blocking I/O
@@ -238,7 +268,8 @@ test it, tag it.
 Run these when changing `sys_read`/`sys_write`/`sys_close`/
 `put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
 Not canary rows (they fork), but they are the only pipe regression
-suite.
+suite.  `at_step1` is the analogous suite for `resolve_at` and the
+stat family.
 
 **Framebuffer / `vi` verification (added v0.6.7, not canary rows):**
 
@@ -264,8 +295,9 @@ nonexistent paths, are expected diagnostics.
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
 1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are both shims.  When a VFS
-   lands, delete them; do not extend.
+   resolution is a shim; `resolve_at` and `resolve_against_cwd`
+   are two more seams that a VFS would subsume.  When a VFS lands,
+   delete them; do not extend.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
 4. **`sys_fcntl` refuses fd < 3** for subcommands other than
@@ -274,15 +306,17 @@ nonexistent paths, are expected diagnostics.
    old docs claimed: `busybox yes | busybox head -n 1` does *not*
    hang.  Fixing it means signal delivery.
 
-Also open: `newfstatat` (262) reserved, no dispatch case; Ctrl- `[` not
-mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
-`sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base` and
-the 4 MB mmap window are latent collisions; real FatFs timestamp
-storage; `prctl` is minimal; busybox applet symlinks not installed;
-syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
-`sys_mmap` rejects all non-anonymous mappings; pipes support one
-concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake.
+Also open: the rest of the `*at` family (`unlinkat`, `mkdirat`,
+`renameat`, `linkat`, `readlinkat`, `symlinkat`) — the resolver
+exists, the syscalls do not; Ctrl- `[` not mapped to ESC;
+`sys_utimensat` lacks `resolve_against_cwd`; `sys_munmap` is a stub
+returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
+are latent collisions; real FatFs timestamp storage; `prctl` is
+minimal; busybox applet symlinks not installed; syscall-table audit
+script; `musl_wait`'s WNOHANG loop spins; `sys_mmap` rejects all
+non-anonymous mappings; pipes support one concurrent reader and one
+concurrent writer; `put_file_slot`'s pipe wake is coupled to
+`sys_close`'s wake.
 
 ---
 
@@ -291,16 +325,21 @@ wake is coupled to `sys_close`'s wake.
 **Real project root:** `/home/noneya/code/donix/`.
 
 - `configs/busybox.config` — tracked canonical busybox config.
-  Enabled applets: `cat`, `cp`, `cut`, `echo`, `false`, `head`,
-  `ls`, `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `seq`, `sort`,
-  `stat`, `tail`, `tee`, `test`, `touch`, `tr`, `true`, `uname`,
-  `uniq`, `wc`, `yes`, `cmp`, `grep`, `sed`, `vi`, `clear`, plus
-  `ash`.  `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  Off (with reasons):
-  `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel work).
+  Enabled applets: `cat`, `cp`, `cut`, `echo`, `false`, `find`,
+  `head`, `ls`, `mkdir`, `mv`, `od`, `pwd`, `rm`, `rmdir`, `seq`,
+  `sort`, `stat`, `tail`, `tee`, `test`, `touch`, `tr`, `true`,
+  `uname`, `uniq`, `wc`, `yes`, `cmp`, `grep`, `sed`, `vi`,
+  `clear`, plus `ash`.  `CONFIG_FEATURE_VI_WIN_RESIZE=y`.
+  `CONFIG_FIND=y` and `CONFIG_FEATURE_FIND_TYPE=y` (added
+  `20260930-at`).  The other `FEATURE_FIND_*` predicates are off
+  deliberately (no timestamps, no users, no links).  Off (with
+  reasons): `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel
+  work).
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
-  `05_boot_kernel64/Makefile`.
+  `05_boot_kernel64/Makefile`.  `tests/at_step1.c` added
+  `20260930-at`.
 - `04_kernel_64bit/fonts/ter-u18n.psf` — tracked font source
   (generated from Terminus 4.49 via `make psf`).  The `.psf` is
   tracked; the generated `ter_u18n_data.c` is gitignored (like
@@ -326,15 +365,13 @@ needs it.  Paths relative to the tree root
 - `docs/gotchas.md` — every bug writeup, by subsystem.  A growing
   family of "a decision correct only for the cases known at the
   time": the low-fd and fd-kind entries (sessions 34, 36), the
-  multi-write-interleave entry (session 37), and the byte-order
-  entries (session 38).  New in session 38: "Assumed byte-order
-  conventions are the same shape" (BGR pixels, MSB-first glyphs)
-  and "The option name describes its most visible effect, not its
-  scope" (`FEATURE_VI_WIN_RESIZE`).  Read them together; expect
+  multi-write-interleave entry (session 37), the byte-order
+  entries (session 38), and now two from session 39 — the
+  kernel-name/libc-name confusion, and "when the count disagrees
+  with the lines, suspect the test."  Read them together; expect
   more.
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Rows named by scratch tag; those tags are dropped at `v0.6.7`, so
-  the `v0.6.7` commit message is the record.
+  Rows named by scratch tag.
 - `docs/open-issues.md` — full open-issues list.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
@@ -348,13 +385,12 @@ needs it.  Paths relative to the tree root
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` is published: `donix>`'s own shell is
-real (quote stripping, redirection, sequences, pipelines) and the
-console is a 1024×768 linear framebuffer with Terminus 10×18 text —
-`vi` fills the screen, edits, saves, and the alt-screen restores.
-The VGA text console is the fallback.  Next: pick one small item
-(`newfstatat`, Ctrl- `[`) or take on a larger subsystem (signal
-delivery, or a PS/2 mouse driver as the first step toward a GUI).
-One change at a time.**
+real, and the console is a 1024×768 linear framebuffer.  The
+`v0.6.8` milestone is open: `20260930-at` implemented `resolve_at`,
+`newfstatat` (262), and `openat` (257), inverting the stat family
+to wrappers as on Linux, and enabled busybox `find` (with `-type`).
+Next: continue the `*at()` family — `unlinkat` (263) is the
+smallest honest extension.  One change at a time.**
 
 ---
 
