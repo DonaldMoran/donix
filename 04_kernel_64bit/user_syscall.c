@@ -4629,11 +4629,6 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
     ws->ws_col    = (uint16_t)vga_cols();
     ws->ws_xpixel = 0;
     ws->ws_ypixel = 0;
-    serial_print("TIOCGWINSZ -> ");
-    serial_print_dec(ws->ws_row);
-    serial_print("x");
-    serial_print_dec(ws->ws_col);
-    serial_print("\n");
 }
 
 long sys_ioctl(int fd, unsigned long request, void* argp) {
