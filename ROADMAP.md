@@ -6,8 +6,9 @@ from-scratch kernel. `cd`, `pwd`, `ls`, and `cat` respect a real
 per-process working directory, in both shells, across `fork` and
 `execve`. The console is a VT100 emulator, so full-screen software
 runs: `vi` edits a file, `:wq` saves it, `cat` reads it back.
-Files and directories can be created and removed; a faulting
-process is killed cleanly.
+Pipelines work: `cat file | head`, `echo hi | wc`. Files and
+directories can be created and removed; a faulting process is killed
+cleanly.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -17,7 +18,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, and v0.6.5
+## Done — Phases A through B, and v0.6.6
 
 For the record, so this file does not re-plan finished work:
 
@@ -50,18 +51,39 @@ For the record, so this file does not re-plan finished work:
   `open` returns fd 3, lowest-free-fd allocation so `close(0);
   open(file)` returns fd 0, and `dup2`/`fcntl(F_DUPFD)` accept low
   fds so a redirect whose scratch fd is 0/1/2 works.
+- **v0.6.6 — pipes.** `pipe(2)` (22) implemented: a 4 KB ring buffer
+  shared by a read end and a write end, blocking `read`/`write` with
+  a directed wake (`reader_waiting`/`writer_waiting` on the pipe,
+  not a broadcast), EOF when the last writer closes, `-EPIPE` when
+  the last reader closes, and a wake on the process-exit path so a
+  writer that `_exit`s without closing does not strand its reader.
+  The `sys_read`/`sys_write` stdio guards were inverted — the old
+  `kind != FILE_KIND_FILE` test mis-routed a pipe `dup2`'d onto
+  fd 0/1 to the console and hung the pipeline. Also `dup(2)` (32),
+  found by the pipe tests. `keyboard.c` fix: Shift+backslash now
+  produces `|` and `\`. Pipelines work from ash:
+  `cat hello-world.txt | head -n 2`, `echo hi | wc`,
+  `echo hello | cat`.
 
-The narratives are in the `v0.6.4` and `v0.6.5` annotated tags,
-`docs/session-log.md`, and `handoff.md`.
+The narratives are in the `v0.6.4`, `v0.6.5`, and `v0.6.6` annotated
+tags, `docs/session-log.md`, and `handoff.md`.
 
 ---
 
-## After v0.6.4: pick a direction
+## v0.6.7 — pick a direction
 
-The basics work and full-screen software runs. What comes next is a
-set of small, independent items and several larger subsystem
-questions. Pick one, do it, test it, tag it — the project's
-one-change-at-a-time discipline applies.
+Pipelines work. What comes next is a set of small, independent items
+and several larger subsystem questions. Pick one, do it, test it, tag
+it — the project's one-change-at-a-time discipline applies.
+
+### Headline: `musl_sh` quote stripping and redirection parsing
+
+The project's own shell, `donix>`, still does not strip quotes or parse
+`<`, `>`, `|`, `&&`, or `;`. Every test involving those must be run
+from ash (`busybox sh`). This is userland-only — a tokenizer fix in
+`userland/musl/apps/musl_sh.c`, no kernel change — and it is the last
+thing between the current shell and a usable one. It is the headline
+item for `v0.6.7`.
 
 ### Small, close gaps
 
@@ -82,6 +104,10 @@ one-change-at-a-time discipline applies.
   `scancode_to_ascii` has no fourth parameter for Ctrl state yet.
   The literal ESC key is enough for vi, but terminal users expect the
   alias.
+- **`sys_fcntl` fd < 3 for the other subcommands.**  `F_GETFL`,
+  `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`; Linux
+  allows them on a redirected fd.  Small extension of the
+  session-34 work; not on any current path.
 
 ### Broaden busybox coverage
 
@@ -101,16 +127,14 @@ and should wait for those.
 
 ### Shell features
 
-- **Pipes** — `cat file | grep foo`.  Redirection (`<`, `>`, `2>`)
-  works as of `v0.6.5`; the pipe is the remaining piece and needs
-  `pipe(2)` (`dup2(2)` already works).  This is the biggest gap in
-  the shell.
 - **Environment variables** — extend the argv mechanism with an
   `envp` array; `getenv`/`setenv` on the userland side.
 - **Job control** — busybox ash has `ASH_JOB_CONTROL` off in the
   current config.  Enabling it needs signal delivery, process groups,
   and a foreground/background distinction -- none of which the kernel
-  has today.
+  has today.  `-EPIPE` without `SIGPIPE` (see `docs/open-issues.md`)
+  is part of this: a real `SIGPIPE` would let `yes | head -n 1`
+  terminate `yes` the way it does on Unix.
 
 ### Larger subsystem questions
 
@@ -120,6 +144,11 @@ and should wait for those.
   per-syscall helper.  Both are stand-ins for a virtual filesystem.
   When a VFS lands, delete the shim and resolve once.  Do not add a
   fourth exec attempt; build the VFS.  See `docs/open-issues.md`.
+- **Signal delivery.**  `sys_rt_sigaction` and `sys_rt_sigprocmask`
+  are stubs.  Real delivery is a prerequisite for `SIGPIPE`, for job
+  control, and for `kill(2)`.  Larger than it sounds: needs a
+  per-process pending/blocked mask, a delivery point on syscall
+  return or interrupt, and a user-mode handler trampoline.
 
 ---
 
@@ -146,6 +175,10 @@ Independent of the shell work.  Roughly in order of value.
   (`utimes`, `futimesat`, `utimensat`) return 0 without storing
   anything.  Enough for `touch` and vi; not enough for a tool that
   reads timestamps back.
+- **Pipe buffer growth.**  `pipe_t.capacity` is a field (not an
+  inlined macro) precisely so a later session can grow the buffer
+  Linux-style from 4 KB toward 64 KB without touching
+  `sys_read`/`sys_write`.  Not needed for any current caller.
 
 ### Testing infrastructure
 
