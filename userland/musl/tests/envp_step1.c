@@ -31,30 +31,23 @@
  * failure came from the kernel or from musl, and this test is
  * about the kernel.
  *
- * ASM CONSTRAINT NOTE (this is a bug we hit and fixed here).
- * Every asm block below that executes `syscall` declares `%rax`
- * as an OUTPUT ("=a"(ret)), not merely as an input.  The
- * `syscall` instruction always overwrites %rax with the return
- * value, so an asm block that names %rax only as an input and
- * does not list it as clobbered is lying to the compiler: GCC
- * may assume %rax survives the block and reuse it for the next
- * operation without reloading.
+ * ASM CONSTRAINT NOTE.  Every asm block below that executes
+ * `syscall` declares %rax as an OUTPUT ("=a"(ret)), not merely
+ * as an input.  The `syscall` instruction always overwrites %rax
+ * with the return value, so an asm block that names %rax only as
+ * an input and does not list it as clobbered is lying to the
+ * compiler: GCC may assume %rax survives the block and reuse it
+ * for the next operation without reloading.
  *
  * That is exactly what happened in the first cut of this file.
- * puts_raw was written
+ * puts_raw was written with "a"(1L) as an input and no output
+ * and no "rax" clobber.  With two puts_raw calls back to back at
+ * the end of main, GCC kept its belief that %rax still held 1
+ * from the first call's input and issued the second `syscall`
+ * without reloading %rax.  The second syscall therefore ran with
+ * %rax = the FIRST syscall's return value.  The run showed
  *
- *     __asm__ volatile("syscall"
- *                      : : "a"(1L), "D"(1L), "S"(s), "d"(n)
- *                      : "rcx", "r11", "memory");
- *
- * -- no output, no "rax" clobber.  With two puts_raw calls
- * back to back at the end of main, GCC kept its belief that
- * %rax still held 1 from the first call's input and issued the
- * second `syscall` without reloading %rax.  The second syscall
- * therefore ran with %rax = the FIRST syscall's return value.
- * The run showed
- *
- *     Unknown syscall: 41                     (socket, from elsewhere)
+ *     Unknown syscall: 41                     (socket, unrelated)
  *     Unknown syscall: 18446744073709551578   (-38, i.e. -ENOSYS)
  *
  * The second line is the tell: 18446744073709551578 is 2^64-38,
@@ -66,9 +59,16 @@
  * "a"(NNL) as an input, so the missing clobber never showed.
  * See docs/gotchas.md.
  *
- * The fix, applied throughout: give every syscall asm an
- * "=a"(ret) output.  That is the truth, and it makes the
- * compiler reload %rax for each call.
+ * STRING LENGTH NOTE.  puts_raw below takes ONLY the string; it
+ * computes the length itself.  The first cut took (str, len) and
+ * every call site hand-counted the length -- and several were
+ * wrong (off by one or two), silently writing the string's NUL
+ * terminator or one byte past it.  That is invisible on the
+ * console (a NUL writes as nothing) until the day a string ends
+ * exactly at a page boundary and the extra byte faults.  Do not
+ * reintroduce a length parameter: there is no compile-time check
+ * on a hand-counted length, and it WILL be wrong again.  See
+ * docs/gotchas.md.
  *
  * The helper IS a normal musl binary (it uses getenv and printf),
  * which is correct -- the thing being tested is whether the C
@@ -88,12 +88,18 @@
  * write(2) directly, no stdio buffering -- keeps the ordering
  * between parent and child bytes deterministic.
  *
+ * Takes only the string; computes the length.  See the STRING
+ * LENGTH NOTE above -- do not add a length parameter back.
+ *
  * "=a"(ret) is load-bearing.  See the ASM CONSTRAINT NOTE above:
  * without it GCC assumes %rax is unchanged, and a second
  * puts_raw immediately after this one runs `syscall` with a
  * stale %rax.
  */
-static void puts_raw(const char* s, unsigned long n) {
+static void puts_raw(const char* s) {
+    unsigned long n = 0;
+    while (s[n]) n++;
+
     long ret;
     __asm__ volatile("syscall"
                      : "=a"(ret)
@@ -164,7 +170,7 @@ static int run_helper_with_envp(char** envp) {
 
         /* execve only returns on failure.  Exit 99 so the driver
          * can tell "execve failed" from any helper exit code. */
-        puts_raw("ENVP-CHILD-EXEC-FAIL\n", 22);
+        puts_raw("ENVP-CHILD-EXEC-FAIL\n");
         raw_exit(99);
     }
 
@@ -184,15 +190,15 @@ int main(void) {
 
         int code = run_helper_with_envp(envp);
         if (code == 0) {
-            puts_raw("ok 1: single var survives execve\n", 34);
+            puts_raw("ok 1: single var survives execve\n");
         } else if (code == 2) {
-            puts_raw("FAIL 1: getenv returned NULL (envp dropped)\n", 46);
+            puts_raw("FAIL 1: getenv returned NULL (envp dropped)\n");
             return 1;
         } else if (code == 99) {
-            puts_raw("FAIL 1: execve failed\n", 22);
+            puts_raw("FAIL 1: execve failed\n");
             return 1;
         } else {
-            puts_raw("FAIL 1: unexpected child exit\n", 30);
+            puts_raw("FAIL 1: unexpected child exit\n");
             return 1;
         }
     }
@@ -206,15 +212,15 @@ int main(void) {
 
         int code = run_helper_with_envp(envp);
         if (code == 0) {
-            puts_raw("ok 2: two vars survive execve\n", 32);
+            puts_raw("ok 2: two vars survive execve\n");
         } else if (code == 2) {
-            puts_raw("FAIL 2: getenv returned NULL (envp dropped)\n", 46);
+            puts_raw("FAIL 2: getenv returned NULL (envp dropped)\n");
             return 1;
         } else if (code == 99) {
-            puts_raw("FAIL 2: execve failed\n", 22);
+            puts_raw("FAIL 2: execve failed\n");
             return 1;
         } else {
-            puts_raw("FAIL 2: unexpected child exit\n", 30);
+            puts_raw("FAIL 2: unexpected child exit\n");
             return 1;
         }
     }
@@ -233,19 +239,19 @@ int main(void) {
 
         int code = run_helper_with_envp(envp);
         if (code == 2) {
-            puts_raw("ok 3: empty envp passes through as empty\n", 41);
+            puts_raw("ok 3: empty envp passes through as empty\n");
         } else if (code == 0) {
-            puts_raw("FAIL 3: empty envp got a stale environment\n", 43);
+            puts_raw("FAIL 3: empty envp got a stale environment\n");
             return 1;
         } else if (code == 99) {
-            puts_raw("FAIL 3: execve failed\n", 22);
+            puts_raw("FAIL 3: execve failed\n");
             return 1;
         } else {
-            puts_raw("FAIL 3: unexpected child exit\n", 30);
+            puts_raw("FAIL 3: unexpected child exit\n");
             return 1;
         }
     }
 
-    puts_raw("ENVP-ALL-PASS\n", 14);
+    puts_raw("ENVP-ALL-PASS\n");
     raw_exit(0);
 }

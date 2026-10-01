@@ -535,3 +535,164 @@ path.  A deletion is caught only by a test that exercises the
 exercises it, which is exactly when the deletion is safe and
 exactly when there is no test to say so.  That asymmetry is why
 deletion wants a run, not a review.
+
+
+## An input-only `syscall` asm block does not tell GCC that `%rax` is overwritten
+
+*Session 42 (the envp regression test), commit `20261001-envtest`.
+A bug in the test's own inline asm, found by a log line that made
+no sense.*
+
+`envp_step1.c` issues its syscalls as raw inline asm, matching
+`musl_exec.c` and `musl_exec2.c`.  The write helper was copied from
+those files verbatim:
+
+    static void puts_raw(const char* s, unsigned long n) {
+        __asm__ volatile("syscall"
+                         :
+                         : "a"(1L), "D"(1L), "S"(s), "d"(n)
+                         : "rcx", "r11", "memory");
+    }
+
+`"a"(1L)` is an **input**.  The asm has **no outputs** and does not
+list `"rax"` as clobbered.  It declares `rcx`, `r11`, `memory` —
+which is correct, those are what `syscall` destroys — and stops
+there.
+
+But `syscall` **always overwrites `%rax` with the return value.**
+The block never told the compiler so.  GCC was therefore free to
+believe `%rax` still held `1` after the call, and to reuse that
+belief for the next operation without reloading.
+
+With two `puts_raw` calls back to back at the end of `main`:
+
+    puts_raw("ENVP-ALL-PASS\n", 14);
+    puts_raw("ENVP-RAW-EXIT\n", 14);
+    raw_exit(0);
+
+the second `syscall` ran **without reloading `%rax`**.  It executed
+with `%rax` = the first syscall's return value.  The serial log
+showed:
+
+    ok 3: empty envp passes through as empty
+    Unknown syscall: 41
+    Unknown syscall: 18446744073709551578
+
+**The second line is the tell.**  `18446744073709551578` is
+`2^64 - 38`, the unsigned bit pattern of `-38` — which is
+`-ENOSYS`, the value syscall 41 (`socket`, unrelated) had just
+returned.  A syscall *number* that is the previous syscall's
+*return value* is only possible if `%rax` was never reloaded.
+
+**Why it hid in `musl_exec.c` and `musl_exec2.c`.**  They have the
+identical `puts_raw`.  It never bit there because their callers
+always followed a `puts_raw` with a `raw_fork`/`raw_wait4`/
+`raw_exec`/`raw_exit` that sets `"a"(NNL)` as an input — a fresh
+`%rax`, which masked the missing clobber.  The latent bug is still
+in those two files' `puts_raw` (both now fixed in
+`20261001-lenfix`).
+
+**The rule.**  An inline-asm block that executes `syscall` must
+declare `%rax` as an output (`"=a"(ret)`) or list `"rax"` as a
+clobber.  Naming it only as an input is a lie to the compiler.  The
+compiler does not know what the instruction does; it knows only
+what the constraints say.
+
+    static void puts_raw(const char* s) {
+        unsigned long n = 0;
+        while (s[n]) n++;
+
+        long ret;
+        __asm__ volatile("syscall"
+                         : "=a"(ret)
+                         : "a"(1L), "D"(1L), "S"(s), "d"(n)
+                         : "rcx", "r11", "memory");
+        (void)ret;
+    }
+
+**The tell.**  A syscall number in the kernel's "Unknown syscall:"
+diagnostic that is the *previous* syscall's return value, as an
+unsigned 64-bit number.  `18446744073709551578` for `-ENOSYS`,
+`18446744073709551614` for `-2` (`-ENOENT`), and so on.  Real
+syscall numbers are small and positive; a number near `2^64` is a
+return value in disguise.
+
+**Where this shape recurs.**  Same family as "A syscall argument the
+caller did not set holds the previous syscall's return value"
+(session 41).  That entry is about a *register the kernel reads*
+holding a stale value because the caller never set it.  This one is
+about a *register the compiler believes* holds a value because the
+asm block never said otherwise.  Both are stale `%rax`-adjacent
+state at a syscall boundary, both are deterministic rather than
+flaky, and both were found by reading a trace that showed a value
+that should not have been there.  The check is the same: when a
+syscall sees an argument or a number that no caller could have
+meant, suspect the boundary between the caller and the kernel, and
+read the asm constraints or the libc wrapper.
+
+## A hand-counted string length in a syscall wrapper will be wrong
+
+*Session 42 (the envp regression test), commit `20261001-lenfix`.
+A bug in the test's own string literals, invisible on the console.*
+
+`puts_raw` originally took `(const char* s, unsigned long n)` and
+wrote exactly `n` bytes.  Every call site hand-counted the length:
+
+    puts_raw("ok 1: single var survives execve\n", 34);
+    puts_raw("FAIL 1: getenv returned NULL (envp dropped)\n", 46);
+    puts_raw("FAIL 1: unexpected child exit\n", 30);
+    ...
+
+Of the **thirteen** such literals in `envp_step1.c`, **nine were
+wrong** — off by one or two.  The runs *looked* clean, because of
+which direction they were wrong:
+
+- A length one **too long** writes the string's NUL terminator as a
+  byte.  On the serial console a NUL prints as nothing, so the extra
+  byte was invisible.
+- A length two too long writes the NUL and the byte after it — also
+  invisible unless that byte happens to be printable, and in
+  `.rodata` it usually is not.
+- A length **too short** drops the trailing `\n`.  That one *was*
+  visible: the `MUSL_EXEC2-ALL-PASS` line ran together with the
+  kernel's `EXIT:` diagnostic on the same line, because the final
+  `puts_raw` was passed `19` for a `20`-byte string and never wrote
+  the newline.
+
+**Why "one too long" is not harmless.**  It is a one-byte read past
+the end of the literal.  In `.rodata` with other constants nearby it
+reads whatever is next, which is why the output still looked right.
+But a literal that ends exactly at a page boundary makes the extra
+byte a **fault** — and the day it faults is the day the test is
+being used to debug something else.
+
+**The rule.**  Do not pass a hand-counted length to a function that
+writes a string.  There is no compile-time check on a counted
+literal, and it *will* be wrong again.  The fix is to **remove the
+parameter**, not to recount:
+
+    static void puts_raw(const char* s) {
+        unsigned long n = 0;
+        while (s[n]) n++;
+        ... /* write(1, s, n) via the asm block above */
+    }
+
+C gives you `sizeof` for an array and nothing for a bare pointer, so
+the only reliable length for a string literal is one the callee
+computes.  `strlen` is available in a normal musl binary; in a raw-
+asm test, a two-line loop is enough and depends on nothing.
+
+**The tell.**  Two strings on the same output line that should be on
+separate lines.  That is a dropped `\n`, which means the length was
+too short.  The inverse — a `\0` byte appearing in a `write` of a
+literal — does not show on a console but shows in a hexdump of the
+output stream.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"The incremental kernel build can silently skip" (session 41): a
+derived value (`n = 34`) that was never checked against the thing it
+derives from (the literal's actual length), whose wrongness was
+masked because the wrong value was *close enough* to produce
+plausible output.  In every case the fix is to check the source of
+truth — here, to not have a derived value at all.
