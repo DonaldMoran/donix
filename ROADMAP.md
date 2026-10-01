@@ -55,30 +55,42 @@ The narratives are in the annotated scratch tags,
 
 ---
 
-## v0.6.8 — in progress, the `*at()` family
+## v0.6.8 — the `*at()` family (ready to close)
 
 Opened in session 39 (`20260930-at`).  The theme is the `*at()`
 family: one path resolver shared by every syscall that takes a
-dirfd.  `resolve_at`, `newfstatat` (262), and `openat` (257) are
-done; the stat family is inverted to wrappers as on Linux; busybox
-`find` (with `-type`) is enabled and works.  The remaining
-syscalls (`unlinkat`, `mkdirat`, `renameat`, …) are wrappers plus
-dispatch cases.  `unlinkat` (263) is the smallest honest next step.
+dirfd.  `resolve_at` is that resolver; `newfstatat` (262),
+`openat` (257), `unlinkat` (263), `faccessat` (269), and
+`utimensat` (280) all route through it.  The stat family is
+inverted to wrappers as on Linux.  busybox `find` (with `-type`)
+is enabled and works.
+
+**Every `*at` syscall with a consumer is implemented.**  The
+remaining ones have no caller in the current applet set, verified
+by reading busybox's source:
+
+- `mkdirat` (258) — no consumer; `tar`/`cpio`/`unzip` would, but
+  each needs a VFS first.
+- `renameat` (264) — no consumer; `rm`-style code uses `rename`
+  (82).
+- `linkat`/`symlinkat`/`readlinkat` (265/266/267) — FAT has no
+  links; no consumer is possible.
+
+See `open-issues.md` item 7 and `gotchas.md`, "A consumer inferred
+from behavior is not a consumer," for the `unlinkat` finding: it
+was added on the belief that `rm -r` needs it, and `rm -r` does
+not.
+
+The milestone is **closeable**.  The next milestone is `v0.6.9`,
+`envp`: `sys_execve` currently ignores its third argument, so `env`
+and `printenv` run but show an empty environment and `$VAR`
+expansion is always empty.  Env passing has a real, readable
+consumer (every applet that reads the environment), is a
+self-contained change to `sys_execve`'s argv-layout code, and is
+what makes the environment-using half of busybox actually work.
 
 The live state, the canary rows, and the NEXT SESSION list are in
-[`handoff.md`](handoff.md).  This file records *future* work; the
-`v0.6.8` items still outstanding are listed there.
-
-### Still open in this milestone (from `handoff.md`)
-
-- **`unlinkat` (263)** — `unlink`/`rmdir` in one syscall;
-  `AT_REMOVEDIR` selects.  Real consumer: `rm -r`.
-- **`mkdirat` (258)** — `mkdir` with a dirfd.
-- **`renameat` (264)** — two-path; `resolve_at` twice.
-- **`linkat` / `readlinkat` / `symlinkat`** — FAT has no links or
-  symlinks; honest `-EPERM`/`-ENOSYS` until a VFS exists.  Skip.
-- **`faccessat` / `fchmodat` / `fchownat`** — donix ignores
-  permissions and ownership.  Skip.
+[`handoff.md`](handoff.md).
 
 ---
 
@@ -88,8 +100,13 @@ Independent of the shell/framebuffer work.  Roughly in order of
 value.
 
 - **Real copy-on-write for `fork`.**  The eager copy is O(~6 MB) per
-  fork.  Mark shared PTEs read-only and copy on write in a `#PF`
-  handler.
+  fork, and copies read-only pages (`.text`, `.rodata`)
+  unconditionally.  Mark shared PTEs read-only and copy on write in
+  a `#PF` handler; at minimum, skip the read-only regions.  **This
+  is a standing cost, not a regression** — it is present at
+  `v0.6.6` and earlier.  Session 41 bisected a perceived slowdown
+  in `musl_wait` and found the change was in the console (VGA text
+  → framebuffer), not in `fork`; see `session-log.md`, session 41.
 - **Page-table teardown on process exit.**
 - **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
   non-executable.

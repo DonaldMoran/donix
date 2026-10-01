@@ -230,3 +230,144 @@ was never tested against the thing that defines truth.  The
 byte-order case was caught by drawing a test pattern and looking
 at it; this case was caught by a `grep`.  Both are cheap and both
 are the only thing that actually settles the question.
+
+## A syscall argument the caller did not set holds the previous syscall's return value
+
+*Session 41 (`faccessat`), commit `20261001-faccessat`. Not a kernel
+bug in the end -- a validation that should not have been there.*
+
+`sys_faccessat` was rewritten to route through `resolve_at` and, by
+analogy with `sys_newfstatat` and `sys_unlinkat`, to validate its
+`flags` argument: unknown bits → `-EINVAL`.  `at_step1` section 8
+then failed:
+
+    [faccessat] dirfd=3 flags=0x00000000FFFFFFEA
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
+
+`0xFFFFFFEA` is `-22`.  It is not random garbage and it is not
+uninitialized memory.  It is the **return value of the previous
+syscall** -- section 7's bad-flag `fstatat`, which returns `-EINVAL`
+-- still sitting in `%r10`, the register the kernel reads as the
+fourth syscall argument.  Section 9 showed the same thing with a
+different leftover: `flags=0x1`, the return of whatever ran before.
+
+**Why the register was stale.**  musl calls this syscall with
+**three** arguments:
+
+    third_party/musl-src/src/unistd/faccessat.c:
+        return syscall(SYS_faccessat, fd, filename, amode);
+
+The kernel's syscall entry reads `%rdi`, `%rsi`, `%rdx`, `%r10`,
+`%r8`, `%r9` for arguments 1..6.  A three-argument call does not
+write `%r10`, so it holds whatever the last thing to use it left
+behind -- and on this path that is the previous syscall's return
+value, because the syscall-return path puts the result in `%rax`
+but nothing clears `%r10`.
+
+So the failure was **deterministic**, not flaky: `faccessat` after
+a call that returned `-EINVAL` always saw `0xFFFFFFEA`; after a call
+that returned `1` always saw `0x1`.  That is why the trace showed a
+clean `-22` rather than noise.
+
+**The rule.**  Before validating a syscall argument, find out
+whether the caller's wrapper actually sets it.  Read the libc
+source (or the syscall's own kernel entry comment) and count the
+arguments.  **Do not add a validation because a sibling syscall has
+one** -- the sibling may be called differently.
+
+**The specific asymmetry, for the record.**  `faccessat` and
+`utimensat` are both `*at` syscalls, both now route through
+`resolve_at`, and they differ on exactly this point:
+
+- `sys_faccessat` does **not** validate flags.  musl calls it with
+  three arguments.  Linux's `faccessat(2)` does not validate flags
+  either; only `faccessat2(2)` (439) does, and donix does not
+  implement 439.
+- `sys_utimensat` **does** validate flags.  musl calls it with four
+  (the `#else` branch of `third_party/musl-src/src/stat/utimensat.c`,
+  which is what runs on x86_64 -- no 32-bit `time_t`, so the
+  `_time64` path is compiled out).  The fourth register is set, so
+  a mask is safe.
+
+The difference is not a style choice.  It is **which one musl passes
+four arguments to**, read from musl's source.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"A consumer inferred from behavior is not a consumer" (session 40):
+a decision that was plausible, matched something nearby, and was
+never tested against the thing that defines truth.  The PIT case
+was a wrong *number*, the `unlinkat` case a wrong *causal claim*,
+this one a wrong *assumption about the ABI*.  All three were caught
+by going to the source -- `grep` for the number, `grep` for the
+symbol, `cat` for the caller -- and all three had a plausible story
+that made the check feel unnecessary.
+
+**A related tell.**  A validation added "for consistency" is a
+validation whose correctness depends on every caller, not on the
+value being validated.  If the goal is consistency, the honest move
+is to check whether the consistency holds -- here, whether both
+syscalls are called the same way -- before copying the pattern.
+
+## The incremental kernel build can silently skip
+
+*Session 41, build hygiene. Not a kernel bug -- a make dependency
+that does not do what it looks like it does.*
+
+After editing `04_kernel_64bit/user_syscall.c`, `make -C
+04_kernel_64bit` printed:
+
+    make: Entering directory '/home/noneya/code/donix/04_kernel_64bit'
+    make: Nothing to be done for 'all'.
+    make: Leaving directory '/home/noneya/code/donix/04_kernel_64bit'
+
+with the source already saved.  The build that followed staged an
+image whose `kernel.bin` did **not** contain the edit, and the
+result was a test failure that looked like a code bug:
+
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
+
+The reason: `kernel.bin`'s mtime was **newer** than
+`user_syscall.c`'s.  `make` compares timestamps, and a newer output
+than input means "up to date."  The edit and a previous build had
+landed close enough together that the output's timestamp was later,
+so make skipped the rebuild -- and the image was built against a
+stale `kernel.bin`.
+
+**Why it is easy to miss.**  The build *succeeded*.  No error, no
+warning, no "nothing to do" that looks wrong on its own.  The only
+symptom is that the running kernel does not match the source, which
+presents as a code bug -- and sends you debugging code that is not
+on the machine.
+
+**The reliable path.**  `./run` does `make clean` first, so the
+rebuild always happens:
+
+    make clean && make FAT_CONFIG=single && \
+        make -C 05_boot_kernel64 hdd-single.img && \
+        make -C 05_boot_kernel64 run-single
+
+**When an incremental build is safe.**  After a `make clean` in the
+same invocation.  A bare `make -C 04_kernel_64bit` is only reliable
+if the change is known to be older than the last link -- which is
+not something to rely on.
+
+**The tell.**  If a test fails in a way that suggests the source was
+not compiled in, and the source edit was recent, suspect the
+incremental build before the code.  Compare mtimes:
+
+    stat -c '%y %n' 04_kernel_64bit/user_syscall.c \
+                    04_kernel_64bit/kernel.bin
+
+If `kernel.bin` is newer than a source you just edited, the build
+skipped and the image is stale.
+
+**Where this shape recurs.**  Same family as the PIT-constant and
+`unlinkat` entries: a check that *looks* like it is doing the right
+thing -- "make says up to date" / "the number is consistent" / "the
+feature works" -- but is not checking the thing that matters.
+Timestamps say nothing about content; a constant matching a
+derivation says nothing about the input; a feature working says
+nothing about *why*.  In each case the fix is to check the source
+of truth -- mtimes against the edit, the call site for the constant,
+the caller's source for the feature.

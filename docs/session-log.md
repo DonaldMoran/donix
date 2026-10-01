@@ -1,3 +1,117 @@
+## Session 41 — `faccessat` and `utimensat` close the `*at` family
+
+Two commits on `dev`, scratch-tagged, unpushed.  Continues the
+`v0.6.8` `*at()` family and closes it: `faccessat` (269) and
+`utimensat` (280) were the last two `*at` syscalls with an actual
+gap rather than a missing consumer.  Both now resolve through
+`resolve_at`, the same resolver `openat`/`newfstatat`/`unlinkat`
+use.
+
+| Tag | What |
+|---|---|
+| `20261001-faccessat` | `access_resolved` extracted; `sys_faccessat` routes through `resolve_at`; flags NOT validated |
+| `20261001-utimensat` | `sys_utimensat` routes through `resolve_at`; flags validated |
+
+**Commit 1** (`faccessat`): `sys_faccessat` was a direct alias of
+`sys_access`, so `faccessat(dirfd, "rel", ...)` with a real dirfd
+resolved against the cwd, not the dirfd — the bug `open-issues.md`
+had carried since the `*at` work began.  Fixed by extracting the
+existence-check body into `static access_resolved(abs_path)` and
+routing `sys_faccessat` through `resolve_at`; `sys_access` keeps
+resolving against the cwd (`access(2)` has no dirfd) and shares
+`access_resolved`.  No behavior change to `sys_access`.
+
+**Commit 2** (`utimensat`): `sys_utimensat` ignored `dirfd` **and**
+never called `resolve_against_cwd`, so both a real dirfd and a
+relative path were mishandled.  Routed through `resolve_at` and
+`access_resolved` (it stores nothing, so the existence check is the
+whole body).  The NULL-path return changed from `-EINVAL` to
+`-EFAULT`, matching Linux.
+
+**The finding that matters — the flags register.**  The first
+version of `sys_faccessat` validated its flags argument the way
+`sys_newfstatat` and `sys_unlinkat` do: unknown bits → `-EINVAL`.
+That was wrong, and `at_step1` caught it:
+
+    [faccessat] dirfd=3 flags=0x00000000FFFFFFEA
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
+
+`0xFFFFFFEA` is `-22` — the **return value of the previous syscall**
+(section 7's bad-flag `fstatat`, which returns `-EINVAL`) still
+sitting in `%r10`, the register the kernel reads as the fourth
+argument.  musl calls this syscall with **three** arguments
+(`syscall(SYS_faccessat, fd, filename, amode)` in
+`third_party/musl-src/src/unistd/faccessat.c`), so it never writes
+`%r10`, and the kernel was reading whatever the last call left
+there.  The mask turned a valid call into `-EINVAL`, deterministically.
+
+The fix is not "mask more carefully" — it is **do not validate an
+argument the caller's wrapper does not set**.  Linux's own
+`faccessat(2)` does not validate flags; only `faccessat2(2)` (439)
+does, and donix does not implement 439.  `sys_faccessat` now accepts
+and ignores `flags`.  See `gotchas.md`, "A syscall argument the
+caller did not set holds the previous syscall's return value."
+
+`sys_utimensat` is the opposite case and keeps its mask: musl passes
+`utimensat`'s flags in the fourth argument (the `#else` branch of
+`third_party/musl-src/src/stat/utimensat.c`, which is what runs on
+x86_64 since there is no 32-bit `time_t`).  `AT_SYMLINK_NOFOLLOW` is
+accepted and ignored; `AT_EMPTY_PATH` is refused with `-EINVAL`.
+**The two syscalls differ on purpose, and the difference is which
+one musl passes four arguments to** — not a style choice.
+
+**Tested.**  `at_step1.c` gains sections 8–11: `faccessat(dfd,
+"busybox")` → exists; `faccessat(AT_FDCWD, "busybox")` → `ENOENT`
+(the control — proves dirfd is not ignored); `utimensat(dfd,
+"busybox")` → 0.  Section 10 (the old `faccessat` bad-flag check)
+was **removed**: its `EINVAL` comes from musl, before any syscall
+is issued, so it never reached the kernel and could not fail.  A
+test that cannot fail is not a test.  `at_step1` is 10/10, read-only,
+not a canary row.
+
+**Canary:** green.  Boot spine, `busybox ls`, `busybox pwd`,
+`busybox ash` (with `pwd`/`cd /bin`/`pwd`/`ls`/`exit` inside it),
+and the `rm`/`rmdir` rows (`touch`/`rm`, `mkdir`/`rmdir`, `rm -r` on
+a tree) all behave.  No `Unknown syscall:` lines.
+
+**A `musl_wait` observation, recorded because it prompted a
+bisect.**  `musl_wait`'s WNOHANG loop prints a dot per poll and
+visibly spun longer this session than remembered.  A bisect in a
+scratch copy (`v0.6.6` vs `v0.6.7`) established:
+
+- The spin is **pre-existing** — present at `v0.6.6`, so not from
+  any `v0.6.8` work.  It is already on `open-issues.md`'s list
+  ("`musl_wait`'s WNOHANG loop spins").
+- The **wall-clock duration** increased between `v0.6.6` and
+  `v0.6.7` — the interval in which the console changed from VGA
+  text to the framebuffer.  Hypothesis: cost per `putchar` (glyph
+  blit vs two text-memory writes), not dot count.  **Not isolated**
+  by a raw character-output comparison; recorded as a hypothesis.
+- The dot *count* was not measured at either tag.
+
+**Not** a regression in `fork`, `wait4`, or anything this session
+touched.  The `fork` eager copy (~7 MB per fork, including
+read-only pages, per `sys_fork`'s own comment) is a standing
+inefficiency, present at `v0.6.6` too; it is already the first
+bullet under "Kernel hardening" in `ROADMAP.md`, and that bullet
+now records that it is a standing cost, not a regression.
+
+**A `make` staleness trap, recorded because it cost time.**
+`make -C 04_kernel_64bit` reported "Nothing to be done" while
+`user_syscall.c` had just been edited, because `kernel.bin`'s mtime
+was newer than the source's — the incremental kernel build is not
+trustworthy after a source edit.  The reliable path is `./run`,
+which does `make clean` first.  See `gotchas.md`, "The incremental
+kernel build can silently skip."
+
+**Gotchas added:** "A syscall argument the caller did not set holds
+the previous syscall's return value"; "The incremental kernel build
+can silently skip."
+
+**Scratch tags kept:** `20261001-faccessat` and
+`20261001-utimensat` are local, not pushed, part of the open
+`v0.6.8` milestone (dropped when the milestone is pushed).
+
 ## Session 40 — `unlinkat` (263); `unlink`/`rmdir` gain the type check
 
 Two commits on `dev`, scratch-tagged, unpushed.  Continues the

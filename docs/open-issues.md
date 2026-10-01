@@ -78,30 +78,27 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
-Also open: Ctrl- `[` not mapped to ESC; `sys_utimensat` lacks
-`resolve_against_cwd`; `sys_munmap` is a stub returning 0; `sys_brk`'s
-fixed `heap_base` and the 4 MB mmap window are latent collisions;
-real FatFs timestamp storage (the three timestamp syscalls return 0
-without storing); `prctl` is minimal (`PR_SET_NAME` accepted and
-dropped); busybox applet symlinks not installed; syscall-table audit
-script; `musl_wait`'s WNOHANG loop spins; `sys_mmap` rejects all
-non-anonymous mappings (a file-backed `mmap` caller will get
-`-ENOMEM` and must fall back to `read`; **a Wayland prerequisite --
-see `ROADMAP.md`**); **pipes support one
-concurrent reader and one concurrent writer** (see `pipe_t`'s comment
-in `user_syscall.c` — a second blocked reader on the same pipe end
-has nowhere to record itself and will only wake on a keyboard IRQ);
-**`put_file_slot`'s pipe wake is coupled to `sys_close`'s wake** (if
-`sys_close`'s wake is ever removed on the theory that `put_file_slot`
-covers everything, non-final closes in a `dup`'d chain stop waking
-the peer and the peer hangs until a keystroke — read the
-`put_file_slot` comment and this entry before touching either);
-**`faccessat` (269) ignores its `dirfd` and `flags`** — it is a
-direct alias of `sys_access`, so `faccessat(dirfd, "rel", ...)` with
-a real dirfd resolves against the cwd, not the dirfd.  Correct for
-the only case that reaches it today (`AT_FDCWD`, no flags), but not
-a correct alias in general; fix it with `resolve_at` if a caller
-ever passes a real dirfd.
+Also open: Ctrl- `[` not mapped to ESC; `sys_munmap` is a stub
+returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
+are latent collisions; real FatFs timestamp storage (the three
+timestamp syscalls return 0 without storing); `prctl` is minimal
+(`PR_SET_NAME` accepted and dropped); busybox applet symlinks not
+installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
+spins (pre-existing; the spin's wall-clock duration increased
+between `v0.6.6` and `v0.6.7`, when the console changed from VGA
+text to framebuffer — see `session-log.md`, session 41, for the
+bisect); `sys_mmap` rejects all non-anonymous mappings (a
+file-backed `mmap` caller will get `-ENOMEM` and must fall back to
+`read`; **a Wayland prerequisite -- see `ROADMAP.md`**); **pipes
+support one concurrent reader and one concurrent writer** (see
+`pipe_t`'s comment in `user_syscall.c` — a second blocked reader on
+the same pipe end has nowhere to record itself and will only wake
+on a keyboard IRQ); **`put_file_slot`'s pipe wake is coupled to
+`sys_close`'s wake** (if `sys_close`'s wake is ever removed on the
+theory that `put_file_slot` covers everything, non-final closes in
+a `dup`'d chain stop waking the peer and the peer hangs until a
+keystroke — read the `put_file_slot` comment and this entry before
+touching either).
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
@@ -130,6 +127,14 @@ harmless, and the reason `vi` fills the screen.  No action.
 - **`at_step2` is not a canary either.**  Session 40 added it: it
   creates and removes fixtures under `/`, so it **mutates the
   disk**.  Run it when changing `resolve_at`, the `unlink`/`rmdir`/
-  `unlinkat` family, or `unlink_body`.  `at_step1` (session 39) is
-  read-only and is the analogous suite for `resolve_at` and the
-  stat family.
+  `unlinkat` family, or `unlink_body`.  `at_step1` (session 39,
+  extended in session 41) is read-only and is the analogous suite
+  for `resolve_at`, the stat family, `faccessat`, and `utimensat`.
+
+- **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
+  `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.
+  Section 8–9 exercise `faccessat` dirfd resolution and the
+  `AT_FDCWD` control.  Section 11 exercises `utimensat` dirfd
+  resolution.  (There is no section 10; it was removed — it tested a
+  kernel-side flag check that does not exist, because musl returns
+  the `EINVAL` itself.  See `gotchas.md`, session 41.)
