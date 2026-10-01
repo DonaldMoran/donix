@@ -1,3 +1,125 @@
+## Session 42 — envp: `execve` passes the environment through
+
+Two commits on `dev`, scratch-tagged, unpushed.  Opens the `v0.6.9`
+milestone.  `sys_execve` ignored its third argument and wrote a
+single NULL as the envp terminator, so every program ran with an
+empty environment: `getenv` returned NULL, `env`/`printenv` printed
+nothing, and `$VAR` expansion in ash was always empty.
+
+| Tag | What |
+|---|---|
+| `20261001-envp` | `sys_execve` copies `envp` onto the new stack, as Linux does; argv region 4 KB → 16 KB; envp snapshot kmalloc'd, not a stack array |
+| `20261001-env-applets` | config: enable busybox `env` and `printenv` |
+
+**Commit 1** (`envp`): Linux semantics — `execve` passes the
+caller's `envp` through **verbatim**; it does not synthesize an
+environment.  The shell is the layer that builds `envp` and hands
+it down.  So the change is "copy `user_envp` the way `user_argv`
+is copied," not "invent `PATH=...` in the kernel."
+
+`sys_execve` section 3 snapshots `envp` from the OLD address space
+before the teardown in section 5, exactly as argv is snapshotted.
+Section 6 writes the SysV process-entry layout:
+
+    rsp_init  -> argc
+                 argv[0] ... argv[argc-1] NULL
+                 envp[0] ... envp[envc-1] NULL
+                 (argv strings, then envp strings, packed)
+
+Before the change, the slot after the argv array held a single NULL
+(that was the whole envp); now it holds the envp pointer array,
+NULL-terminated, and the strings follow.  The `%rdi`/`%rsi` frame
+slots in section 7 are untouched — musl reads the SysV stack layout,
+not registers; `envp` lives in the stack layout.
+
+**Two decisions worth recording.**
+
+- **The argv region grew from 4 KB to 16 KB.**  The 4 KB figure was
+  sized when only argv was written.  A shell's environment (`PATH`,
+  `HOME`, `TERM`, `PWD`, `OLDPWD`, `IFS`, `USER`, `SHELL`,
+  `HOSTNAME`, `PS1`, ...) plus argv could approach it, and
+  `MAINTENANCE.md` item 3l (frozen) warned that the gap between the
+  argv region and the child's downward-growing stack shrinks when
+  envp is added.  The user stack is 64 KB; 16 KB of region leaves
+  48 KB for frames, which retires that landmine.
+
+- **The envp snapshot is `kmalloc`'d, not a stack array.**  At
+  `EXEC_MAX_ENVC` 64 and `EXEC_MAX_ARG_LEN` 256, a stack array would
+  be 16 KB on its own — and `PROC_STACK_SIZE` is 16 KB
+  (`process.h`), already sized for syscall entry + a nested timer
+  frame + `sys_read` blocking headroom.  A 16 KB scratch array on
+  that stack would overflow.  The argv snapshot stays a stack array
+  (4 KB).  See `gotchas.md`, "The kernel stack is 16 KB; do not put
+  a large scratch buffer on it."
+
+**Commit 2** (`env-applets`): `CONFIG_ENV=y` and `CONFIG_PRINTENV=y`
+in `configs/busybox.config`.  Both read the environment, so both are
+only *useful* now that `execve` passes it.  Before this commit
+`busybox env` reported "applet not found" — the applets were not
+enabled, which is not the same as broken.
+
+**Tested — the `$FOO` round trip is the proof.**
+
+    $ export FOO=bar
+    $ echo $FOO
+    bar
+
+That is the whole feature.  `export` puts `FOO` in ash's
+environment; `execve` carries it into the child; the child reads it.
+Before this session, `$FOO` expanded to empty because ash's
+environment was empty.
+
+The `env` applet confirms it directly:
+
+    $ env
+    PWD=/
+    $ export FOO=bar
+    $ env
+    FOO=bar
+    PWD=/
+
+**The `PATH` finding, recorded so a future session does not
+rediscover it.**  `echo $PATH` inside ash expands to
+`/sbin:/usr/sbin:/bin:/usr/bin`, and command lookup works — but
+`printenv PATH` prints nothing and `env` does not list `PATH`.
+That is because **busybox ash keeps `PATH` as a shell variable and
+does not export it.**  A variable must be exported to appear in a
+child's `envp`; ash exports `PWD` (hence `env` showing it) and
+whatever the user `export`s, but not `PATH` by default.  `export
+PATH` then `printenv PATH` prints the path, which confirms the
+mechanism: the variable is real, exporting it puts it in the
+environment, and the child reads it.  **This is ash's behavior, not
+a donix bug** — a normal Linux with busybox ash behaves the same
+way — but it means every child applet runs with no `PATH` in its
+environment, which is a difference from a distro Linux where `PATH`
+is exported at login.
+
+**Canary:** green.  Boot spine (`pwd`, `cd /bin`, `pwd`, `cd ..`,
+`pwd`, `ls`, `exit`, `donix>`, `cd /`, `pwd`, `ls hello-world.txt`,
+`hello`), `memtest`, `musl_fork`, `musl_exec2`, `musl_wait`,
+`busybox ls`, `busybox pwd`, `busybox ash` (with `pwd`/`cd /bin`/
+`pwd`/`ls`/`exit` inside), the pipeline and redirection rows
+(`cat hello-world.txt | head -n 2`, `echo hi | wc`,
+`echo hi > out.txt ; cat out.txt`, `echo hi2 >> out.txt ; cat
+out.txt`, `cat < out.txt`, `busybox cat < out.txt`), the `find`
+rows, and the `rm`/`rmdir` rows — all behave.  No `Unknown
+syscall:` lines.  No `sys_execve: envp region overflow`, no
+`bad envp[N]` — the 16 KB region is ample and no envp pointer was
+bad.  The pipelines and `find` matter most for this change: each
+forks and execs through the new section-6 layout, and all produce
+correct output, which is what confirms the argv layout is intact.
+
+**Gotcha added:** "The kernel stack is 16 KB; do not put a large
+scratch buffer on it."
+
+**Scratch tags kept:** `20261001-envp` and `20261001-env-applets`
+are local, not pushed, part of the open `v0.6.9` milestone.
+
+**Note for the milestone narrative:** `v0.6.8` was bumped and
+pushed mid-session (tag `v0.6.8` at `b64a4fa`, merged to `main`),
+and the nine `2026*` scratch tags for that milestone were dropped at
+the bump.  The `v0.6.9` work begins with `20261001-envp`.
+
 ## Session 41 — `faccessat` and `utimensat` close the `*at` family
 
 Two commits on `dev`, scratch-tagged, unpushed.  Continues the

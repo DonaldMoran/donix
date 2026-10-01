@@ -371,3 +371,61 @@ derivation says nothing about the input; a feature working says
 nothing about *why*.  In each case the fix is to check the source
 of truth -- mtimes against the edit, the call site for the constant,
 the caller's source for the feature.
+
+## The kernel stack is 16 KB; do not put a large scratch buffer on it
+
+*Session 42 (envp).  A sizing decision that would have become a
+stack overflow.*
+
+`sys_execve` had to snapshot the caller's `envp` array and strings
+out of the old address space before tearing it down, the way it
+already snapshots `argv`.  The obvious shape — mirror the argv
+snapshot, a stack array `char envp_scratch[EXEC_MAX_ENVC]
+[EXEC_MAX_ARG_LEN]` — would have been:
+
+    EXEC_MAX_ENVC   = 64
+    EXEC_MAX_ARG_LEN = 256
+    sizeof(envp_scratch) = 64 * 256 = 16384 bytes
+
+**16 KB, on a kernel stack that is 16 KB.**  From `process.h`:
+
+    #define PROC_STACK_SIZE  16384   // 16KB: syscall entry +
+                                     // nested timer frame +
+                                     // sys_read blocking headroom
+
+That comment is not decoration; the 16 KB is already committed to
+three specific things, and `sys_execve` adds its own frame on top
+(`path`, `exec_path`, `argv_scratch[16][256]` = 4 KB, `proc_name`,
+the ELF-validation locals).  A 16 KB scratch array would put the
+frame well past the top of the stack.  The failure mode is not a
+clean fault — it corrupts whatever is below the stack, which is the
+syscall-entry frame or the adjacent kernel stack slot.
+
+**The fix, and the rule.**  The envp snapshot is `kmalloc`'d, like
+`elf_buf`, and freed on every exit path.  The argv snapshot stayed
+a stack array because 4 KB is affordable; the envp one did not,
+because 16 KB is not.
+
+> **Before adding a scratch buffer to a syscall, check
+> `PROC_STACK_SIZE` in `process.h` and count the bytes.**  Anything
+> over a couple of KB belongs in a `kmalloc`'d buffer, not on the
+> stack.  The kernel stack is 16 KB and is shared with the
+> syscall-entry frame and any nested interrupt frame.
+
+**How to size it.**  `PROC_STACK_SIZE` is one number in one place.
+Grep it:
+
+    grep -rn "PROC_STACK_SIZE" 04_kernel_64bit/
+
+and read the comment on it — the headroom it describes is for
+specific existing consumers, not slack for new ones.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39): a
+number that was plausible, matched something nearby (the argv
+snapshot's 4 KB), and was never checked against the limit that
+defines truth (the 16 KB stack).  Here the check was cheap — one
+grep for `PROC_STACK_SIZE` — and it was done before the code was
+written, not after a crash.  The rule is the same: go to the
+definition and read it; do not infer a limit from a neighboring
+example.
