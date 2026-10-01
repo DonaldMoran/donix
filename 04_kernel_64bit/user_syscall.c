@@ -4492,8 +4492,8 @@ long sys_chdir(const char* user_path) {
  *
  * TIMEOUT HANDLING.  For timeout >= 0 this handler still does
  * not actually wait.  A real implementation would arm a
- * deadline (g_ticks is available; PIT frequency is 500 Hz so
- * 1 tick == 2 ms) and loop on hlt until the deadline or
+ * deadline (g_ticks is available; PIT frequency is 100 Hz so
+ * 1 tick == 10 ms) and loop on hlt until the deadline or
  * readability.  That is more machinery than ash needs -- ash
  * passes timeout == -1 -- and adding it now would mean writing
  * and testing a timeout path no current caller exercises.  The
