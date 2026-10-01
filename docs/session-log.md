@@ -1,3 +1,326 @@
+## Session 41 — `faccessat` and `utimensat` close the `*at` family
+
+Two commits on `dev`, scratch-tagged, unpushed.  Continues the
+`v0.6.8` `*at()` family and closes it: `faccessat` (269) and
+`utimensat` (280) were the last two `*at` syscalls with an actual
+gap rather than a missing consumer.  Both now resolve through
+`resolve_at`, the same resolver `openat`/`newfstatat`/`unlinkat`
+use.
+
+| Tag | What |
+|---|---|
+| `20261001-faccessat` | `access_resolved` extracted; `sys_faccessat` routes through `resolve_at`; flags NOT validated |
+| `20261001-utimensat` | `sys_utimensat` routes through `resolve_at`; flags validated |
+
+**Commit 1** (`faccessat`): `sys_faccessat` was a direct alias of
+`sys_access`, so `faccessat(dirfd, "rel", ...)` with a real dirfd
+resolved against the cwd, not the dirfd — the bug `open-issues.md`
+had carried since the `*at` work began.  Fixed by extracting the
+existence-check body into `static access_resolved(abs_path)` and
+routing `sys_faccessat` through `resolve_at`; `sys_access` keeps
+resolving against the cwd (`access(2)` has no dirfd) and shares
+`access_resolved`.  No behavior change to `sys_access`.
+
+**Commit 2** (`utimensat`): `sys_utimensat` ignored `dirfd` **and**
+never called `resolve_against_cwd`, so both a real dirfd and a
+relative path were mishandled.  Routed through `resolve_at` and
+`access_resolved` (it stores nothing, so the existence check is the
+whole body).  The NULL-path return changed from `-EINVAL` to
+`-EFAULT`, matching Linux.
+
+**The finding that matters — the flags register.**  The first
+version of `sys_faccessat` validated its flags argument the way
+`sys_newfstatat` and `sys_unlinkat` do: unknown bits → `-EINVAL`.
+That was wrong, and `at_step1` caught it:
+
+    [faccessat] dirfd=3 flags=0x00000000FFFFFFEA
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
+
+`0xFFFFFFEA` is `-22` — the **return value of the previous syscall**
+(section 7's bad-flag `fstatat`, which returns `-EINVAL`) still
+sitting in `%r10`, the register the kernel reads as the fourth
+argument.  musl calls this syscall with **three** arguments
+(`syscall(SYS_faccessat, fd, filename, amode)` in
+`third_party/musl-src/src/unistd/faccessat.c`), so it never writes
+`%r10`, and the kernel was reading whatever the last call left
+there.  The mask turned a valid call into `-EINVAL`, deterministically.
+
+The fix is not "mask more carefully" — it is **do not validate an
+argument the caller's wrapper does not set**.  Linux's own
+`faccessat(2)` does not validate flags; only `faccessat2(2)` (439)
+does, and donix does not implement 439.  `sys_faccessat` now accepts
+and ignores `flags`.  See `gotchas.md`, "A syscall argument the
+caller did not set holds the previous syscall's return value."
+
+`sys_utimensat` is the opposite case and keeps its mask: musl passes
+`utimensat`'s flags in the fourth argument (the `#else` branch of
+`third_party/musl-src/src/stat/utimensat.c`, which is what runs on
+x86_64 since there is no 32-bit `time_t`).  `AT_SYMLINK_NOFOLLOW` is
+accepted and ignored; `AT_EMPTY_PATH` is refused with `-EINVAL`.
+**The two syscalls differ on purpose, and the difference is which
+one musl passes four arguments to** — not a style choice.
+
+**Tested.**  `at_step1.c` gains sections 8–11: `faccessat(dfd,
+"busybox")` → exists; `faccessat(AT_FDCWD, "busybox")` → `ENOENT`
+(the control — proves dirfd is not ignored); `utimensat(dfd,
+"busybox")` → 0.  Section 10 (the old `faccessat` bad-flag check)
+was **removed**: its `EINVAL` comes from musl, before any syscall
+is issued, so it never reached the kernel and could not fail.  A
+test that cannot fail is not a test.  `at_step1` is 10/10, read-only,
+not a canary row.
+
+**Canary:** green.  Boot spine, `busybox ls`, `busybox pwd`,
+`busybox ash` (with `pwd`/`cd /bin`/`pwd`/`ls`/`exit` inside it),
+and the `rm`/`rmdir` rows (`touch`/`rm`, `mkdir`/`rmdir`, `rm -r` on
+a tree) all behave.  No `Unknown syscall:` lines.
+
+**A `musl_wait` observation, recorded because it prompted a
+bisect.**  `musl_wait`'s WNOHANG loop prints a dot per poll and
+visibly spun longer this session than remembered.  A bisect in a
+scratch copy (`v0.6.6` vs `v0.6.7`) established:
+
+- The spin is **pre-existing** — present at `v0.6.6`, so not from
+  any `v0.6.8` work.  It is already on `open-issues.md`'s list
+  ("`musl_wait`'s WNOHANG loop spins").
+- The **wall-clock duration** increased between `v0.6.6` and
+  `v0.6.7` — the interval in which the console changed from VGA
+  text to the framebuffer.  Hypothesis: cost per `putchar` (glyph
+  blit vs two text-memory writes), not dot count.  **Not isolated**
+  by a raw character-output comparison; recorded as a hypothesis.
+- The dot *count* was not measured at either tag.
+
+**Not** a regression in `fork`, `wait4`, or anything this session
+touched.  The `fork` eager copy (~7 MB per fork, including
+read-only pages, per `sys_fork`'s own comment) is a standing
+inefficiency, present at `v0.6.6` too; it is already the first
+bullet under "Kernel hardening" in `ROADMAP.md`, and that bullet
+now records that it is a standing cost, not a regression.
+
+**A `make` staleness trap, recorded because it cost time.**
+`make -C 04_kernel_64bit` reported "Nothing to be done" while
+`user_syscall.c` had just been edited, because `kernel.bin`'s mtime
+was newer than the source's — the incremental kernel build is not
+trustworthy after a source edit.  The reliable path is `./run`,
+which does `make clean` first.  See `gotchas.md`, "The incremental
+kernel build can silently skip."
+
+**Gotchas added:** "A syscall argument the caller did not set holds
+the previous syscall's return value"; "The incremental kernel build
+can silently skip."
+
+**Scratch tags kept:** `20261001-faccessat` and
+`20261001-utimensat` are local, not pushed, part of the open
+`v0.6.8` milestone (dropped when the milestone is pushed).
+
+## Session 40 — `unlinkat` (263); `unlink`/`rmdir` gain the type check
+
+Two commits on `dev`, scratch-tagged, unpushed.  Continues the
+`v0.6.8` `*at()` family.  Opened as "implement `unlinkat` so
+busybox `rm -r` works" and closed with `unlinkat` implemented,
+tested, and — importantly — shown to have **no consumer** in
+busybox as configured.  The feature that actually made `rm -r`
+work was the `unlink`/`rmdir` type check that landed in the same
+commit.
+
+| Tag | What |
+|---|---|
+| `20261001-atrefactor` | `unlink_body` extracted; `sys_unlink`/`sys_rmdir` become `resolve_at` wrappers |
+| `20261001-unlinkat` | `unlinkat` (263); `want_dir` + `f_stat_with_retry` type check; `cli` critical section; `at_step2.c` |
+
+**Commit 1** (`atrefactor`): pure refactor.  `sys_unlink` and
+`sys_rmdir` were byte-identical except for their diagnostic
+string; both now call a shared `static unlink_body(in_path, tag)`
+and resolve their path with `resolve_at(AT_FDCWD_, ...)`, the
+same resolver `openat`/`newfstatat` use.  No behavior change.
+`unlink_body` does `path_copy` → `strip_dot_prefix` → `f_unlink`
+→ `fatfs_errno`.  Canary green; neither wrapper is on a canary
+path, so the refactor is invisible to it, which is the point.
+
+**Commit 2** (`unlinkat`): `unlink_body` gains `want_dir` and a
+type check via `f_stat_with_retry`:
+
+    unlink(path) on a directory  -> -EISDIR   (was: succeeded)
+    rmdir(path) on a file        -> -ENOTDIR  (was: succeeded)
+    rmdir("/")                   -> -EBUSY    (root is not removable)
+
+Both were bugs: `f_unlink` accepts files and directories alike, so
+the two syscalls were silently interchangeable.  Added
+`sys_unlinkat` (263), a thin wrapper over `resolve_at` +
+`unlink_body` with `AT_REMOVEDIR` selecting the directory case;
+unknown flag bits are `-EINVAL`.  Added `SYS_UNLINKAT 263` and a
+dispatch case.
+
+The check and the unlink are one critical section, held with
+`cli` and released by restoring the caller's saved RFLAGS (not
+`sti`'d — `unlink_body` can run inside `sys_execve`'s `cli`).  This
+was a deliberate reversal of an initial "no race today, skip it"
+call; see the session note below.
+
+Also fixed a stale `sys_chdir` comment claiming `sys_unlink` and
+`sys_mkdir` do not resolve against the cwd.  They do; since
+`v0.6.4`.
+
+**Tested.**  `at_step2.c` (new), all 8 checks pass: unlinkat file
+→ 0; dir without `AT_REMOVEDIR` → `EISDIR`; dir `AT_REMOVEDIR`
+→ 0; file `AT_REMOVEDIR` → `ENOTDIR`; `unlinkat(dirfd, rel)` → 0;
+bad flag → `EINVAL`; `unlink` missing → `ENOENT`; `rmdir` empty dir
+→ 0.  It creates and removes fixtures under `/`, so it **mutates
+the disk** and is **not a canary row**.  From busybox:
+`touch`/`rm`, `mkdir`/`rmdir`, and `rm -r` on a tree all succeed
+silently.
+
+**Canary:** green.  Boot spine — `ls`, `cd /bin`, `pwd`, `cd ..`,
+`pwd`, `exit` — all behave.  No `Unknown syscall:` lines.
+(`find` rows and the pipe/redirection suites were *not* re-run:
+commit 2 touches nothing on those paths.  The `rm`/`rmdir` behavior
+change was verified through busybox instead.)
+
+**The `rm -r` finding — the reason this session is worth a log
+entry.**  `unlinkat` was added on the belief that busybox `rm -r`
+needs it.  It does not.  A tree-wide grep:
+
+    grep -rn "unlinkat" third_party/busybox/ \
+        --include='*.c' --include='*.h' | grep -v testsuite
+
+returns **nothing**.  `rm -r` is `libbb/remove_file.c`: `lstat`,
+then either `opendir`+`readdir`+recursive `remove_file` with a
+concatenated path string and a final `rmdir`, or `unlink`.  No
+dirfd anywhere.  So `unlinkat` (263) is implemented, correct, and
+tested, but **has no consumer in the current applet set**.
+
+What actually made `rm -r` work correctly was the type check in
+the *same* commit: `remove_file`'s `lstat`-branching was advisory
+while `f_unlink` accepted both kinds; the type check made it
+load-bearing.  The commit message was corrected before the commit
+was made — the false sentence never entered history.  See
+`gotchas.md`, "A consumer inferred from behavior is not a
+consumer."
+
+**A process note, recorded because it cost time twice.**  The first
+commit block for this work put `git commit`/`git tag` in the same
+paste as the build, with the test *after* — so the commit could
+land on a red test.  The second block was an `--amend` for a
+commit that had never been made, because the first `git commit`
+had not actually run.  Both were caught by asking for `git status`
+and `git log` before the block.  The rule carried forward: **the
+state check comes before the command block.**
+
+**A design note, recorded because the first answer was wrong.**
+The initial decision was to *skip* `cli`/`sti` around the type
+check and `f_unlink`, on the grounds that nothing races on one
+path today.  That was reversed: "nothing races today" is true of
+every race before it happens, and the check is meaningless if the
+object can change between the check and the action.  The mechanism
+was verified against the source before adopting it — `diskio.c`'s
+`disk_read`/`disk_write` and `ata.c`'s `ata_read_sectors_drive`/
+`ata_write_sectors_drive` spin on the ATA status port
+(`ata_poll_bsy_clear`, `ata_poll_drq`) and never `hlt` or wait on
+an IRQ, so `cli` across FatFs cannot hang.
+
+**Gotcha added:** "A consumer inferred from behavior is not a
+consumer."
+
+**Scratch tags kept:** `20261001-atrefactor` and
+`20261001-unlinkat` are local, not pushed, and are part of the
+open `v0.6.8` milestone (dropped when the milestone is pushed).
+`20261001-docs` is likewise local.
+
+**`20261001-docs` (between sessions 39 and 40).**  A small docs
+commit: the Wayland long-horizon section in `ROADMAP.md` plus
+cross-references.  No code.  It sits between `20260930-cursor` and
+`20261001-atrefactor` on `dev`.
+
+## Session 39 — `20260930-at` (opens `v0.6.8`)
+
+| Tag | What |
+|---|---|
+| `20260930-at` | `resolve_at`, `file_slot_t.dir_path`, `newfstatat` (262), `openat` (257); stat family inverted; `find` enabled with `-type` |
+| `20260930-cursor` | software block cursor on the framebuffer; no trail; 500 ms blink at 100 Hz; PIT-rate comment fix |
+
+**Commit 1** (`at: resolve_at, newfstatat(262), openat(257)`):
+implemented the `*at()` path-resolution rule in one place
+(`resolve_at`), added `file_slot_t.dir_path` so a directory fd
+remembers its absolute path, inverted the stat family so
+`sys_newfstatat` is the general implementation and
+`sys_stat`/`sys_lstat`/`sys_fstat` are wrappers, split `open(2)`
+into `open_resolved` + `sys_open`/`sys_openat`.  Strict flag
+handling in `newfstatat`: `AT_SYMLINK_NOFOLLOW` and
+`AT_NO_AUTOMOUNT` are no-ops, `AT_EMPTY_PATH` is the fstat form,
+unknown bits are `-EINVAL`.  Added `tests/at_step1.c`.
+
+**Commit 2** (`config: enable busybox find with -type`): enabled
+`CONFIG_FIND=y` and `CONFIG_FEATURE_FIND_TYPE=y`.  Other
+`FEATURE_FIND_*` predicates deliberately off.
+
+**Canary:** green.  `at_step1` 7/7.  `find /bin`,
+`find / -type d`, `find / -type f -name busybox` all behave.  No
+`Unknown syscall:` lines for 257 or 262.
+
+**Notes for the milestone narrative:**
+- musl 1.2.5 on x86_64 does **not** reach syscall 262 for the
+  common stat cases — its `fstatat_kstat()` fast-paths
+  `stat`/`lstat`/`fstat` to 4/6/5.  Syscall 262 is reached only
+  for a real dirfd + relative path, or non-standard flags.
+  `statx` (332) is unreachable: `SYS_fstatat` is defined as
+  `SYS_newfstatat`, so musl compiles the `fstatat_kstat` branch,
+  not the statx branch.  Confirmed by grep: no `statx` in the
+  kernel, and `SYS_statx` never called.
+- `sys_fstat_body` was factored out of `sys_fstat` so that
+  `sys_newfstatat`'s `AT_EMPTY_PATH` case can call it without
+  recursing through `newfstatat`.  `sys_fstat` is now a wrapper.
+- The `sys_execve` three-attempt path block was **not** touched.
+  It does a different job (bare-name search) and remains the VFS
+  shim it was.
+- `resolve_at` needs `get_file_slot_any`, which is defined much
+  lower in the file.  A forward declaration was added just above
+  `resolve_at`, not at the top, because `file_slot_t` is not yet
+  in scope at the top.  See the build error it fixed: implicit
+  declaration, then "static declaration follows non-static
+  declaration."
+
+**Gotchas added:** "The kernel syscall name and the libc name
+differ"; "When the count disagrees with the lines, suspect the
+test."
+
+**Scratch tag kept:** `20260930-at` is local, not pushed, and is
+part of the open `v0.6.8` milestone (not dropped until the
+milestone is pushed).
+
+**Cursor (`20260930-cursor`).**  The framebuffer console had lost
+its cursor because the VGA text backend had a hardware cursor and
+the framebuffer has none; nothing drew a software replacement.
+The fix is a software block cursor: an inverse-video repaint of
+the cursor cell, drawn and erased through the existing
+`paint_cell` chokepoint, so both backends share one draw path and
+the VGA text hardware-cursor path is untouched (`con_is_fb`
+early-outs).  Erase-then-redraw lives in
+`vga_update_hardware_cursor`, which every cursor move already
+calls, so no other call site changed.  The bulk-repaint functions
+(scroll, erase display, insert/delete chars, alt-screen) erase the
+cursor at the top and the trailing update call redraws it.
+
+The first version left an inverted trail: callers move
+`cursor_row`/`cursor_col` before calling
+`vga_update_hardware_cursor`, so the erase hit the new cell and the
+old paint stayed.  `cursor_painted_row`/`cursor_painted_col` now
+track the last painted position, which is the only position the
+erase can meaningfully hit.
+
+Blink is driven from the PIT tick via `vga_cursor_tick`, called
+from `timer_preempt_handler`.  No lock is taken: the tick runs
+from the ISR with interrupts off, so its one-cell repaint cannot
+interleave with a `vga_putc`, and `serial_lock` there would
+deadlock against a `vga_putc` the tick preempted.  Blink is 500 ms
+per state (`CURSOR_BLINK_TICKS 50` at the actual 100 Hz PIT
+rate).
+
+The PIT rate itself was corrected in a separate comment-only
+commit: `sys_poll`'s timeout comment claimed 500 Hz, and the same
+wrong figure had propagated into three comments in `vga.c`.  All
+now say 100 Hz, verified against `pit_init(100)` in `kmain.c`.
+See the gotchas entry "A wrong constant propagated because it was
+consistent with itself."
+
 ## Session 38 — framebuffer console, Terminus, `vi` fills the screen
 
 Eight commits on `dev`, scratch-tagged, unpushed.  **No milestone

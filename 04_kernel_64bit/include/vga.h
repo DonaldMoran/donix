@@ -21,7 +21,13 @@ int vga_cols(void);
 void vga_set_cursor(int row, int col);
 void vga_set_cursor_shape(uint8_t start_scanline, uint8_t end_scanline);
 void vga_hide_cursor(void);
-
+/*
+ * Advance the software cursor blink.  Called from the PIT ISR on
+ * every tick.  No-op on the VGA text backend (the CRTC blinks the
+ * cursor itself).  Must not take any lock -- see the definition in
+ * vga.c for why.
+ */
+void vga_cursor_tick(void);
 void vga_print_hex_cur(uint64_t val);
 void vga_print_dec_cur(uint64_t val);
 

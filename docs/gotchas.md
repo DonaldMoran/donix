@@ -1,453 +1,373 @@
-## Low fds (0/1/2) are first-class
+## A consumer inferred from behavior is not a consumer
 
-**Symptom.** `busybox uniq FILE` hangs — with or without `-c`, on any
-file.  `uniq -c < file` works.  The session-33 handoff recorded this
-as "`uniq` hangs, cause unknown, trace-first investigation needed."
-That diagnosis was wrong.  `uniq` was never the problem; the kernel's
-fd allocation was.
+*Session 40 (`unlinkat`), commit `20261001-unlinkat`. Not a kernel
+bug -- a wrong claim in a commit message, caught before the commit
+was made.*
 
-**Root cause, part 1 — `open` did not return the lowest free fd.**
+`unlinkat(2)` was added because busybox `rm -r` was believed to
+need it.  The reasoning was: `rm -r` walks a directory and removes
+entries by name; on Linux that is `unlinkat(dirfd, name, ...)`; the
+`openat`/`newfstatat` work in session 39 was for `find`, and this
+would be the same shape for `rm`.  It is a plausible story.
 
-busybox `uniq.c` does:
+It is also false.  A tree-wide grep settles it:
 
-    close(STDIN_FILENO);              /* frees fd 0 */
-    xopen(input_filename, O_RDONLY);  /* expects fd 0 back */
-    ...
-    while ((cur_line = xmalloc_fgetline(stdin)) != NULL) { ... }
+    grep -rn "unlinkat" third_party/busybox/ \
+        --include='*.c' --include='*.h' | grep -v testsuite
 
-so it closes fd 0, reopens the input file expecting fd 0 back, and
-then reads from `stdin` (fd 0).  This is the normal Unix idiom —
-`open(2)` returns the lowest free fd, and after `close(0)` that is 0.
+returns nothing.  `rm -r` is `libbb/remove_file.c`, and what it
+actually does is:
 
-donix's `alloc_file_slot` started its search at fd 3:
-
-    for (int i = 3; i < MAX_PROCESS_FILES; i++) { ... }
-
-so the open landed on fd 3.  `stdin` (fd 0) stayed pointed at the
-now-closed fd 0.  `read(0, ...)` then took the fd-0 keyboard path in
-`sys_read` (because `get_file_slot_any(0)` returned NULL), and the
-applet blocked forever waiting for a keystroke that would never come.
-The file was open the whole time — as fd 3 — and never read.
-
-`uniq -c < file` worked because shell redirection uses `dup2` to
-install the file on fd 0, and `sys_dup2` accepts `newfd = 0`.  Only
-the `close(0); open(file)` idiom broke.
-
-**The fix, part 1 — console sentinels.**
-
-fds 0/1/2 must be *occupied* at process start, not NULL, so a fresh
-process's first `open()` returns fd 3 — matching Linux, where stdio
-fds are always held by the tty or a pipe.
-
-`process_create` now calls `user_syscall_init_console_fds`, which
-installs a `FILE_KIND_CONSOLE` sentinel slot in each of fds 0/1/2.
-The sentinel carries no obj.  `sys_read` and `sys_write` recognize it
-by kind and take their existing keyboard/screen path (they check
-`slot->kind != FILE_KIND_FILE`, and CONSOLE is not FILE, so they fall
-through correctly with no code change).  `put_file_slot` frees a
-console slot without calling `f_close`.
-
-**The fix, part 2 — lowest-free-fd open.**
-
-`alloc_file_slot` now starts at fd 0.  With the sentinels in place:
-
-  - a fresh process's first `open()` returns fd 3 (0/1/2 held);
-  - after `close(0)` — the `uniq` idiom — `open()` returns fd 0.
-
-Both behaviors are now Linux-identical.
-
-**Root cause, part 3 — `dup2` and `fcntl` refused low fds.**
-
-With parts 1 and 2 in, `uniq FILE` worked, but a *second* redirect in
-the same shell broke:
-
-    $ echo hi > out.txt          # works
-    $ cat out.txt                # works
-    $ cat < hello-world.txt
-    sh: 1: Bad file descriptor
-
-The fd-lifecycle trace showed why.  By that point in the shell's life,
-an earlier redirect's save/restore had left a low fd free, so:
-
-    [fd] pid=10 open  hello-world.txt -> fd=1 kind=FILE
-    [fd] pid=10 fcntl fd=0 cmd=1030 -> EBADF
-    [fd] pid=10 dup2  old=1 new=0 -> EBADF
-    sh: 1: Bad file descriptor
-
-`open()` returning fd 1 is *correct* — fd 1 was free, and lowest-free-
-fd says reuse it.  The failure was downstream:
-
-  - `sys_dup2(1, 0)` called `get_file_slot(oldfd, 0)`, which refuses
-    `fd < 3`, so `oldfd = 1` returned NULL and `sys_dup2` returned
-    `EBADF`.  ash installs a redirect with `dup2(file_fd, 1)` (or
-    `dup2(file_fd, 0)`), so a redirect whose scratch fd landed in
-    0/1/2 failed.
-  - `sys_fcntl` had the same `get_file_slot` at the top, so ash's
-    save-stdout step — `fcntl(1, F_DUPFD_CLOEXEC, ...)` — returned
-    `EBADF`.  ash tolerates *that* one (it proceeds to `dup2`
-    anyway), but it is the same bug.
-
-Fix: `sys_dup2` uses `get_file_slot_any(oldfd)` (accepts 0/1/2).
-`sys_fcntl` uses `get_file_slot_any` for `F_DUPFD` and
-`F_DUPFD_CLOEXEC` only; its other subcommands still refuse `fd < 3`,
-and the new fd from `F_DUPFD` still lands on `fd >= 3`.
-
-After the fix the trace reads:
-
-    [fd] pid=3 open  out.txt -> fd=3 kind=FILE
-    [fd] pid=3 fcntl DUPFD fd=1 min=10 -> 10
-    [fd] pid=3 dup2  old=3 new=1 kind=FILE -> 1
-    [fd] pid=3 close fd=3 kind=FILE -> 0
-    [fd] pid=4 close fd=10 kind=CONSOLE -> 0
-    EXIT: pid=4 ...
-    [fd] pid=3 dup2  old=10 new=1 kind=CONSOLE -> 1
-    [fd] pid=3 close fd=10 kind=CONSOLE -> 0
-
-The `fcntl DUPFD ... -> 10` is the save; `dup2(10, 1)` is the restore.
-Both now succeed, so repeated redirects in one shell work.
-
-**Method note — the trace that found it.**
-
-This was pinned with a temporary `DEBUG_FD_TRACE` in `user_syscall.c`
-that logged every `open`/`close`/`dup2`/`fcntl` with pid, fd, slot
-kind, and return value, in the `[read]` trace style used for the
-session-33 redirection fix.  Two lessons:
-
-  - The good-vs-bad comparison was **useless** until part 3 was fixed.
-    With only parts 1 and 2 in, the "bad" trace (`i = 0`) and the
-    "good" trace (`i = 3`) were byte-for-byte identical, because the
-    failure was downstream of `open`: `open` returned fd 3 in both,
-    and `uniq` was the only thing that differed.  The moment
-    `fcntl DUPFD fd=1 -> 10` appeared instead of `-> EBADF`, the
-    whole picture fell out.
-  - The `sys_dup2`/`sys_fcntl` guards were invisible from reading the
-    code alone — they look like intentional policy ("don't treat
-    stdio as a file"), not a bug.  It took the trace of ash's actual
-    redirect save/restore sequence to see that the guards were
-    refusing a real file that had been installed on a low fd.
-
-Lesson for next time: when a shell misbehaves on the second redirect
-but not the first, suspect the redirect save/restore bookkeeping and
-trace the `fcntl`/`dup2` sequence, not `open`/`read`.
-
-## Negative fd-kind tests don't extend to new kinds
-
-*Session 36 (v0.6.6). Same class as the session-34 `uniq` hang: a
-low-fd dispatch that was correct for files and silently wrong when a
-new fd kind appeared.*
-
-`sys_read` and `sys_write` have a fast path that routes fd 0
-(keyboard) and fds 1/2 (screen) to the console instead of the
-general fd table. Before v0.6.6 the guard was:
-
-    if (fd == 0 && (!slot || slot->kind != FILE_KIND_FILE)) {
-        /* keyboard */
+    lstat(path, &st);              // syscall 6
+    if (S_ISDIR(st.st_mode)) {
+        dp = opendir(path);
+        while ((d = readdir(dp))) {
+            new_path = concat_subpath_file(path, d->d_name);
+            remove_file(new_path, flags);   // RECURSIVE, by string
+        }
+        rmdir(path);               // syscall 84
+    } else {
+        unlink(path);              // syscall 87
     }
 
-which was written when a *file* was the only thing `dup2` could
-put on fd 0. The guard means "fd 0 is the keyboard only when
-nothing is redirected onto it," and `!= FILE_KIND_FILE` was a
-fine proxy for "nothing is redirected onto it" at the time.
+`concat_subpath_file` builds a path string; the recursion carries
+the full path down.  No dirfd is opened, no `*at` syscall is made.
+`find` uses `openat` + `newfstatat` because it *recurses*; `rm -r`
+uses neither because it does not need a dirfd to remove a file it
+can name.
 
-Then `pipe(2)` landed (v0.6.6) and a pipe end acquired a new
-kind, `FILE_KIND_PIPE`. A shell pipeline does exactly what the
-guard is meant to detect -- it `dup2`s a pipe end onto the
-child's fd 0 (for `cmd | other`, the read end onto `other`'s
-stdin) and fd 1 (the write end onto `cmd`'s stdout). But a pipe
-slot has `kind == FILE_KIND_PIPE`, which is `!= FILE_KIND_FILE`,
-so the guard was *true* and a piped stdin took the keyboard path.
+**The rule.**  A commit message that names what a feature is *for*
+is making a factual claim about another program's source.  Read
+that source before writing the sentence.  "The syscall busybox
+`rm -r` reaches" is checkable in one grep and was checked only
+after the sentence was drafted, at which point it was wrong.
 
-The symptom is the worst kind: not a wrong answer, but a hang.
-`cat file | head` forked `cat` with fd 1 = write end of a pipe,
-`cat` wrote into the pipe correctly, and `head` forked with
-fd 0 = read end of the pipe and blocked forever in the keyboard
-path -- waiting for a keystroke that would never come, while the
-bytes it wanted sat unread in the pipe's ring buffer. The only
-way to unstick it was to press a key, at which point `head`
-consumed a *keystroke* as its stdin and the pipeline produced
-nonsense.
+**The tell, and why it was easy to miss.**  `rm -r` *worked*.
+Running it on a tree succeeded, which felt like confirmation.  But
+success was consistent with both stories -- `rm -r` via `unlinkat`,
+and `rm -r` via `unlink`+`rmdir` -- and only one of them was true.
+Behavior that two mechanisms both explain is not evidence for
+either.  The confirmation was in the source, not in the run.
 
-### The rule
+**What made `rm -r` work, for the record.**  Not `unlinkat`.  It
+was the `unlink`/`rmdir` type check in the same commit: before it,
+`f_unlink` accepted files and directories alike, so `remove_file`'s
+`lstat`-then-branch was advisory -- either branch produced the same
+result.  After the check, the branch is load-bearing: `unlink` on a
+directory is `-EISDIR`, `rmdir` on a file is `-ENOTDIR`.
+`remove_file` was already correct; the kernel started enforcing
+what it assumed.  The feature that mattered and the feature that
+was *believed* to matter were different.
 
-**A negative test on a kind (`!= KIND_X`) silently changes meaning
-every time a new kind is added.** The correct form is a positive
-test on the set that should take the special path. The v0.6.6 fix
-inverts both guards:
+**A companion failure, same session.**  The first commit block for
+this work was written against an assumed repository state and
+included `git commit` and `git tag` in the same paste as the build,
+with the test *after*.  The order was wrong: the commit should not
+exist until the test is green.  The second block was an `--amend`
+for a commit that had never been made -- the earlier `git commit`
+had not run, so there was nothing to amend, and the amend would
+have folded the feature into the *refactor* commit.  Both were
+caught by asking for `git status` and `git log` before the block
+rather than after.  The fix, now a rule: **the state check comes
+before the command block, not after.**
 
-    if (fd == 0 && (!slot || slot->kind == FILE_KIND_CONSOLE)) {
-        /* keyboard */
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39):
+one assertion, copied or inferred, never checked against the thing
+that defines truth.  The PIT case was a wrong *number*; this is a
+wrong *causal claim*.  Both were caught by going to the source --
+`grep` for the number, `grep` for the symbol -- and both had a
+plausible story that made the check feel unnecessary.
+
+## The kernel syscall name and the libc name differ
+
+*Session 39 (`*at` work), userspace test. Not a bug -- a naming
+convention that cost ten minutes.*
+
+`newfstatat` is the **kernel** name: the syscall number 262 is
+`__NR_newfstatat` in Linux's table, and the kernel handler is
+`sys_newfstatat`.  The **libc** name is `fstatat` -- there is no
+`newfstatat` function in musl's `<sys/stat.h>`, and a userspace
+program that calls `newfstatat(...)` gets:
+
+    error: implicit declaration of function 'newfstatat';
+    did you mean 'fstatat'?
+
+The two are the same syscall.  musl's `fstatat.c` calls
+`__syscall(SYS_fstatat, ...)`, and `SYS_fstatat` is `#define`d to
+`SYS_newfstatat` on x86_64 in `musl-src/src/internal/syscall.h`.
+The kernel-side name reflects the number; the libc-side name
+reflects the POSIX function.
+
+**The rule.**  When writing a userspace test for a syscall, use the
+**libc** name, not the kernel name.  `openat`, `fstatat`,
+`unlinkat` -- these are the functions.  The kernel's `case
+SYS_NEWFSTATAT:` is reached from `fstatat`, not from a
+`newfstatat` function that does not exist.
+
+Watch for the same shape elsewhere: `newfstat`, `newlstat`,
+`newuname` are kernel names with no libc equivalent (the libc
+names are `fstat`, `lstat`, `uname`).  If a compile fails with an
+implicit declaration, the first thing to check is whether you are
+calling the kernel name from userspace.
+
+## When the count disagrees with the lines, suspect the test
+
+*Session 39 (`*at` work), test bookkeeping. Not a kernel bug.*
+
+A test printed `ok 1` through `ok 7` -- every line said the check
+passed -- and then a summary line reading `FAILED (1 failures)`.
+The natural reading is "one check passed its print but the count
+disagrees; something is wrong."  What was actually wrong was the
+test code: the success branch of check 7 incremented the failure
+counter by mistake:
+
+    if (fstatat(AT_FDCWD, "/hello-world.txt", &st, 0x4000) == -1 &&
+        errno == EINVAL) {
+        printf("ok 7: bad flag -> EINVAL\n");
+        fails++;              /* <-- wrong; this branch is success */
+    } else {
+        printf("FAIL 7: bad flag did not give EINVAL\n");
+        fails++;
     }
 
-which is what the guard always *meant* -- the keyboard/screen path
-exists exactly for the console sentinels installed by
-`user_syscall_init_console_fds`, so anything else on a low fd is a
-real fd. New fd kinds now route correctly by default instead of
-needing to be added to the negative test.
+The kernel was correct: `fstatat(..., 0x4000)` returned `-EINVAL`
+and errno was `EINVAL`.  The test's bookkeeping was not.
 
-### How to notice this class early
+**The rule.**  When a summary count disagrees with the per-line
+output, the *test* is the first suspect, not the code under test.
+The lines are the record of what actually happened; the count is
+derived.  A mismatch is almost always a bookkeeping bug: an
+increment in the wrong branch, a counter not reset, a branch that
+prints `ok` but does not increment the success count, or the
+inverse.
 
-When adding a new `FILE_KIND_*`, grep for every `FILE_KIND_` it
-appears in the same condition as:
+**Also worth fixing when you find one:** reset `errno` to 0 before
+each call whose result you are about to compare against a specific
+`errno` value.  A stale `errno` from an earlier call can make a
+check pass or fail for the wrong reason, and the failure looks
+like a kernel bug when it is a test bug.  The `errno = 0;` at the
+top of each check is cheap insurance:
 
-    grep -n "FILE_KIND_FILE" 04_kernel_64bit/user_syscall.c
+    errno = 0;
+    int r = fstatat(...);
+    if (r == -1 && errno == EINVAL) { /* real pass */ }
 
-Every site that says `!= FILE_KIND_FILE` or `== FILE_KIND_FILE`
-is a place the new kind's behavior is implicitly decided. Read
-each one and ask "should the new kind take this path?" -- do not
-assume the answer is "no, because it isn't a file."
+Capture the return value too -- if the check fails, printing
+`r=%d errno=%d (%s)` tells you exactly what the kernel returned
+rather than leaving you to guess.
 
-This is the second bug of this exact shape. The first (session 34,
-`uniq` hang) was `alloc_file_slot` starting its search at fd 3,
-which was correct when the only low fds were stdio and wrong once
-a program `close(0)`'d and expected `open` to hand fd 0 back. Both
-are "a decision encoded as a test on the current set of kinds /
-fd numbers, invalidated by a new one."
+## A wrong constant propagated because it was consistent with itself
 
-A third instance of the same *shape* -- a decision correct only for
-the set of cases known at the time -- appeared the next session, in
-userland rather than the kernel: see "Multi-write output races the
-child's kernel prints" below. And a fourth, in the framebuffer work
-(session 38): two assumed byte conventions, both wrong until tested.
-See "Assumed byte-order conventions" below.
+*Session 39 (framebuffer cursor).  Four instances of the same
+wrong number in one session, none of them verified against the
+source of truth.*
 
-## Multi-write output races the child's kernel prints
+The PIT rate was asserted as **500 Hz** in a comment on `sys_poll`
+in `user_syscall.c`:
 
-*Session 37 (musl_sh work), userland. Three instances of one
-pattern, all in `userland/musl/apps/musl_sh.c` or its debug
-scaffolding.*
+    * deadline (g_ticks is available; PIT frequency is 500 Hz so
+    * 1 tick == 2 ms) and loop on hlt until the deadline or
 
-**Symptom.** A line of output is missing its tail -- a closing
-`]`, a trailing `\n` -- or two unrelated lines run together with no
-separator between them. It happens on *some* lines and not others,
-and the discriminator is not obvious from the text alone.
+The actual rate is **100 Hz** (`pit_init(100)` in `kmain.c`), so
+1 tick is 10 ms.  The 500 Hz figure in that comment was inferred,
+at some earlier date, from the divisor math in `pit_init`:
 
-**Root cause.** Output produced as several separate `write` calls
-(`puts_raw` is one `write` per call) can be interleaved with output
-the *kernel* prints during a child's `fork`/`exec`, or with the next
-thing the shell prints. Each `puts_raw` is its own `sys_write`; the
-scheduler can run the child -- which prints `sys_execve: ...`, or
-`EXIT: ...` -- between two of them. The bytes are not lost, they are
-*reordered*, and the ordering matters.
+    uint32_t divisor = 1193180 / freq;
 
-**The three instances.**
+`1193180 / 500 = 2386`, a clean divisor; `1193180 / 100 = 11931`,
+also a clean divisor.  Both are plausible.  Nobody checked the
+argument at the call site.
 
-1. **The tokenizer debug print (fixed).** The line
+Then, in this session, three more comments were written that
+asserted 500 Hz:
 
-       puts_raw("[", 1);
-       for (...) { if (i) puts_raw("|", 1); puts_z(argv[i]); }
-       puts_raw("]\n", 2);
+- `vga.c`, above the cursor state: "the PIT runs at 500 Hz (see
+  pit_init).  250 ticks = 500 ms".
+- `vga.c`, above `vga_cursor_tick`: "Called on every PIT tick
+  (500 Hz)".
+- a `#define CURSOR_BLINK_TICKS 250 /* 500 ms at 500 Hz */`.
 
-   produced `[echo|x y` with no `]\n` on lines where the next thing
-   was a child's `sys_execve: ...` print. Building the whole line
-   into one buffer and issuing a single `puts_raw` fixed it. This is
-   the instance that named the pattern.
+The pattern is visible in how the second and third appeared: the
+first was read, it was consistent with the divisor math the author
+had also looked at, and the number was copied forward.  Nothing
+about the number was *verified* -- nothing ran a `grep` for
+`pit_init` and read the argument.  All three were wrong, and the
+`CURSOR_BLINK_TICKS` value had to be retuned by eye (to 75, then
+to 50) before anyone asked why the computed rate did not match
+what was on screen.
 
-2. **`sh: cannot open <file>` (open).** In the redirection failure
-   path, `fork_child` does three writes:
+The correction came from one command:
 
-       puts_z("sh: cannot open ");
-       puts_z(redir_file);
-       puts_raw("\n", 1);
+    grep -rn "pit_init" 04_kernel_64bit/
 
-   Same exposure. Cosmetic (it is an error path), but the same bug.
+which printed, among other lines:
 
-3. **`cd: cannot cd to <path>` (open).** `builtin_cd`'s failure
-   path does three writes:
+    04_kernel_64bit/kmain.c:1300:    pit_init(100);
 
-       puts_z("cd: cannot cd to ");
-       puts_z(target);
-       puts_raw("\n", 1);
+That is the source of truth.  It is the only place the argument
+appears.  Everything else in the tree was an assertion of a rate,
+and every assertion was wrong.
 
-   Observed in the step-2 run: `cd: cannot cd to /nopedonix>` --
-   the newline was reordered past the next prompt.
+**The rule.** A fact asserted in several places is not evidence of
+anything; it is one assertion, copied.  When a comment, a define,
+or a doc says a hardware or timing constant -- a frequency, a
+resolution, a rate, a bit width, a pin number -- go to the call
+site, the definition, or the hardware, and read it there.  Do not
+verify it against another comment; the other comment may be the
+same inference made twice.
 
-**The rule.** When the *ordering* of your output relative to
-anything else matters -- and it does whenever a child may print
-between your writes, or the shell may print next -- build the whole
-line in one buffer and issue **one** `write`. Several
-`puts_raw`/`puts_z` calls in a row are several writes and are not
-atomic with respect to each other.
+**A related tell.** In this session the wrong number survived
+review because it matched *the math that was used to derive it*.
+The divisor formula is correct; the argument to it was guessed.
+When a value has a derivation, the derivation is not the check.
+The check is the input to the derivation.
 
-**Note the connection.** This is the same lesson as "Negative
-fd-kind tests don't extend to new kinds," in a different medium:
-a choice (split the output into several writes) that was harmless
-while the set of things that could print between them was small,
-and stopped being harmless when that set grew (a forking pipeline,
-a child that prints on exit). It is the third instance of that
-shape. Expect more; the shape recurs across subsystems.
+**Where this shape recurs.** This is the same family as "Assumed
+byte-order conventions are the same shape" (session 38): a
+decision that was plausible, matched something else nearby, and
+was never tested against the thing that defines truth.  The
+byte-order case was caught by drawing a test pattern and looking
+at it; this case was caught by a `grep`.  Both are cheap and both
+are the only thing that actually settles the question.
 
-## Assumed byte-order conventions are the same shape
+## A syscall argument the caller did not set holds the previous syscall's return value
 
-*Session 38 (framebuffer console), kernel and boot chain. Two
-instances, both "we assumed a convention and it was the other
-one."*
+*Session 41 (`faccessat`), commit `20261001-faccessat`. Not a kernel
+bug in the end -- a validation that should not have been there.*
 
-This is the fourth instance of the shape named in "Negative
-fd-kind tests don't extend to new kinds": a decision that was
-wrong, or would have been wrong, because a convention was assumed
-rather than verified. The two framebuffer cases are both about
-**byte order within a pixel or a glyph row.**
+`sys_faccessat` was rewritten to route through `resolve_at` and, by
+analogy with `sys_newfstatat` and `sys_unlinkat`, to validate its
+`flags` argument: unknown bits → `-EINVAL`.  `at_step1` section 8
+then failed:
 
-**Instance 1 — framebuffer pixels are BGR, not RGB.**
-`fb.c`'s `fb_putpixel` initially packed pixels as
-`p[0]=r; p[1]=g; p[2]=b`.  The test pattern came out with red and
-blue swapped: a "dark blue" fill rendered red, a "red" rectangle
-rendered blue, green (the middle byte) rendered correctly.  QEMU's
-Bochs VBE stores 24bpp and 32bpp pixels in **BGR** order -- byte 0
-is blue.  Fixed with `FB_BYTE_R/G/B` macros in `fb.c`, so callers
-still pass `(r, g, b)` and the quirk lives in one documented place.
+    [faccessat] dirfd=3 flags=0x00000000FFFFFFEA
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
 
-**The tell:** when R and B swap, only red and blue change; green
-stays.  If a color test shows "red and blue swapped but green
-fine," it is a byte order, not a palette.
+`0xFFFFFFEA` is `-22`.  It is not random garbage and it is not
+uninitialized memory.  It is the **return value of the previous
+syscall** -- section 7's bad-flag `fstatat`, which returns `-EINVAL`
+-- still sitting in `%r10`, the register the kernel reads as the
+fourth syscall argument.  Section 9 showed the same thing with a
+different leftover: `flags=0x1`, the return of whatever ran before.
 
-**Instance 2 — PSF glyph rows are MSB-first, not LSB-first.**
-`fb_putchar` initially read a glyph row's bits with
-`if (bits & (1u << col))`, treating bit 0 as the leftmost pixel.
-Terminus PSF rows are packed **most-significant-bit first**: the
-leftmost pixel is the highest bit of the row.  Every glyph rendered
-mirrored -- `donix` read as a horizontal flip of itself.  Fixed by
-reading bit `(FB_FONT_W - 1 - col)` instead.
+**Why the register was stale.**  musl calls this syscall with
+**three** arguments:
 
-**The tell:** mirrored glyphs, same size, same spacing, correct
-shapes but flipped, means the bit order within the row is reversed.
+    third_party/musl-src/src/unistd/faccessat.c:
+        return syscall(SYS_faccessat, fd, filename, amode);
 
-**The rule.** A byte-order or bit-order convention is a
-*guess* until a test confirms it.  Both of these were caught only
-because a test pattern was drawn and *looked at* -- the code was
-self-consistent and would have passed any test that did not check
-actual colors or actual glyph orientation.  When you write code
-that packs or unpacks bytes against a hardware or file-format
-convention, verify with a known input whose correct output you can
-recognize (a color you can name, a letter you can read), not just
-with round-trip tests.
+The kernel's syscall entry reads `%rdi`, `%rsi`, `%rdx`, `%r10`,
+`%r8`, `%r9` for arguments 1..6.  A three-argument call does not
+write `%r10`, so it holds whatever the last thing to use it left
+behind -- and on this path that is the previous syscall's return
+value, because the syscall-return path puts the result in `%rax`
+but nothing clears `%r10`.
 
-## The option name describes its most visible effect, not its scope
+So the failure was **deterministic**, not flaky: `faccessat` after
+a call that returned `-EINVAL` always saw `0xFFFFFFEA`; after a call
+that returned `1` always saw `0x1`.  That is why the trace showed a
+clean `-22` rather than noise.
 
-*Session 38. A reasoning error, caught by trying it.*
+**The rule.**  Before validating a syscall argument, find out
+whether the caller's wrapper actually sets it.  Read the libc
+source (or the syscall's own kernel entry comment) and count the
+arguments.  **Do not add a validation because a sibling syscall has
+one** -- the sibling may be called differently.
 
-`busybox vi` sized itself to 24×80 on the framebuffer console even
-though it calls `TIOCGWINSZ` and the kernel correctly answers
-42×102 (confirmed with a temporary print in
-`fill_kernel_winsize`).  The fix turned out to be:
+**The specific asymmetry, for the record.**  `faccessat` and
+`utimensat` are both `*at` syscalls, both now route through
+`resolve_at`, and they differ on exactly this point:
 
-    CONFIG_FEATURE_VI_WIN_RESIZE=y
+- `sys_faccessat` does **not** validate flags.  musl calls it with
+  three arguments.  Linux's `faccessat(2)` does not validate flags
+  either; only `faccessat2(2)` (439) does, and donix does not
+  implement 439.
+- `sys_utimensat` **does** validate flags.  musl calls it with four
+  (the `#else` branch of `third_party/musl-src/src/stat/utimensat.c`,
+  which is what runs on x86_64 -- no 32-bit `time_t`, so the
+  `_time64` path is compiled out).  The fourth register is set, so
+  a mask is safe.
 
-in `configs/busybox.config`.
+The difference is not a style choice.  It is **which one musl passes
+four arguments to**, read from musl's source.
 
-**The wrong reasoning.** This option was initially dismissed:
-"`FEATURE_VI_WIN_RESIZE` handles SIGWINCH -- the terminal-resized
-signal -- and donix has no signal delivery, so the handler would
-never fire and the option does nothing."  The first two facts are
-true.  The conclusion was wrong.  The option **also gates the code
-that consults `TIOCGWINSZ` at startup** -- which is the part that
-was needed.  Enabling it made `vi` read the winsize, and it filled
-the screen.
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"A consumer inferred from behavior is not a consumer" (session 40):
+a decision that was plausible, matched something nearby, and was
+never tested against the thing that defines truth.  The PIT case
+was a wrong *number*, the `unlinkat` case a wrong *causal claim*,
+this one a wrong *assumption about the ABI*.  All three were caught
+by going to the source -- `grep` for the number, `grep` for the
+symbol, `cat` for the caller -- and all three had a plausible story
+that made the check feel unnecessary.
 
-**The rule.** A config option's *name* describes its most visible
-or most distinctive effect, not its full scope.  `FEATURE_VI_WIN_RESIZE`
-sounds like "handle resize events," but in busybox `vi.c` it also
-gates the startup size query.  Do not conclude "this option is
-irrelevant" from its name alone -- read the source, or try it.
-The cost of trying was one config line and a rebuild; the cost of
-the wrong conclusion was a documented limitation that was not
-actually a limitation.
+**A related tell.**  A validation added "for consistency" is a
+validation whose correctness depends on every caller, not on the
+value being validated.  If the goal is consistency, the honest move
+is to check whether the consistency holds -- here, whether both
+syscalls are called the same way -- before copying the pattern.
 
-## `argv[cmd_argc] = 0` mutates argv in the child
+## The incremental kernel build can silently skip
 
-*Session 37 (musl_sh work), userland.*
+*Session 41, build hygiene. Not a kernel bug -- a make dependency
+that does not do what it looks like it does.*
 
-`fork_child` terminates the command's argv by writing a NUL at
-`argv[cmd_argc]`, because `execve` reads argv to its NUL and the
-command may be a prefix of a longer token list (`echo hi > f` --
-the command is `echo hi`, the `>` and `f` are the redirection):
+After editing `04_kernel_64bit/user_syscall.c`, `make -C
+04_kernel_64bit` printed:
 
-    argv[cmd_argc] = (char*)0;
-    execve(argv[0], argv, (char**)0);
+    make: Entering directory '/home/noneya/code/donix/04_kernel_64bit'
+    make: Nothing to be done for 'all'.
+    make: Leaving directory '/home/noneya/code/donix/04_kernel_64bit'
 
-`argv[cmd_argc]` is either the operator token or the line's existing
-NUL, so the write is in bounds. It is safe **because the child execs
-or `_exit`s immediately afterward** -- no code re-reads argv after
-this point.
+with the source already saved.  The build that followed staged an
+image whose `kernel.bin` did **not** contain the edit, and the
+result was a test failure that looked like a code bug:
 
-**The hazard.** This is a decision that is correct only because of
-what happens next. If `execve` fails and the child were to *continue*
-rather than `_exit`, it would see a truncated argv: everything from
-`cmd_argc` on is now unreachable (`argv[cmd_argc]` reads as the
-terminator). Nothing does that today -- the child's next statement
-is `_exit(127)` -- but it is the kind of coupling worth naming, in
-the same family as the blunt-fd-close entry below.
+    FAIL 8: faccessat(dfd, "busybox"): Invalid argument
 
-**If you change the child's post-`execve` path**, check this
-mutation first. If the child ever needs the full argv after a failed
-`execve`, terminate the command some other way (a separate
-`char* cmd_argv[SH_MAX_ARGS]` copy, or save/restore the byte).
+The reason: `kernel.bin`'s mtime was **newer** than
+`user_syscall.c`'s.  `make` compares timestamps, and a newer output
+than input means "up to date."  The edit and a previous build had
+landed close enough together that the output's timestamp was later,
+so make skipped the rebuild -- and the image was built against a
+stale `kernel.bin`.
 
-## Blunt fd close in `fork_child` is correct only for the current shell
+**Why it is easy to miss.**  The build *succeeded*.  No error, no
+warning, no "nothing to do" that looks wrong on its own.  The only
+symptom is that the running kernel does not match the source, which
+presents as a code bug -- and sends you debugging code that is not
+on the machine.
 
-*Session 37 (musl_sh work), userland.*
+**The reliable path.**  `./run` does `make clean` first, so the
+rebuild always happens:
 
-`fork_child` closes **every** fd from 3 to 63 in the child, just
-before `execve`:
+    make clean && make FAT_CONFIG=single && \
+        make -C 05_boot_kernel64 hdd-single.img && \
+        make -C 05_boot_kernel64 run-single
 
-    for (int fd = 3; fd < 64; fd++) close(fd);
+**When an incremental build is safe.**  After a `make clean` in the
+same invocation.  A bare `make -C 04_kernel_64bit` is only reliable
+if the change is known to be older than the last link -- which is
+not something to rely on.
 
-**Why it is there.** In a pipeline `a | b | c`, the middle command
-`b` inherits the parent's copies of *both* pipe ends as well as its
-own. `in_fd`/`out_fd` become its fd 0 and fd 1, but the *other* ends
-are still open on raw fds above 2. If `b` keeps the upstream write
-end open, then when `a` exits the reader (`b` itself) never sees
-EOF -- there is still a writer holding the pipe -- and the pipeline
-deadlocks. Closing all inherited fds above 2 is the standard fix.
+**The tell.**  If a test fails in a way that suggests the source was
+not compiled in, and the source edit was recent, suspect the
+incremental build before the code.  Compare mtimes:
 
-**Why it is a gotcha.** Closing 3..63 unconditionally is a
-sledgehammer. It is correct **only because the shell holds no fd
-above 2 at exec time** -- it opens nothing persistent. If the shell
-ever does (a history file, a script fd, a directory fd held across a
-command), this close would silently kill it in every child.
+    stat -c '%y %n' 04_kernel_64bit/user_syscall.c \
+                    04_kernel_64bit/kernel.bin
 
-**If you give the shell any fd above 2**, replace the blanket close
-with an explicit "close these fds" list threaded through
-`fork_child`. Do not just widen or narrow the range; the range is
-the wrong shape. This is the same family as the `argv[cmd_argc] = 0`
-entry above: correct because of what the shell happens to hold
-today, not because of anything structural.
+If `kernel.bin` is newer than a source you just edited, the build
+skipped and the image is stale.
 
-## `capture.txt` shows backspace history, not the corrected line
-
-*Session 37 (musl_sh work), diagnostic note -- not a bug.*
-
-**Symptom.** A line in `capture.txt` reads as garbage -- the typed
-text, an erase, more text -- and does not match what the shell
-actually ran. Example:
-
-    donix> echo "a b c"    " c
-    sys_execve: pid=4 ... argc=3 (echo)
-    a b c
-
-which looks like it tokenized `echo "a b c" " c` into three tokens
-and printed something that does not match. It did not.
-
-**Root cause.** The shell's line editor erases a character by
-emitting `\b \b` to the console:
-
-    if (c == '\b' || c == 0x7f) {
-        if (n > 0) { n--; puts_raw("\b \b", 3); }
-        continue;
-    }
-
-On a real terminal (the VGA/SDL display), `\b \b` visually erases
-the character, so the screen shows the corrected line. On **serial**
--- which is what `capture.txt` records -- the `\b \b` bytes are
-captured *literally*, and a transcript does not retroactively edit
-itself. So `capture.txt` shows the full typed history, backspaces
-and all, while `line[]` (what the tokenizer saw) and the VGA both
-show the corrected line.
-
-**How to read a backspaced capture line.** Do not read the echoed
-line as the shell's input. Read the `sys_execve: ... argc=N`
-line -- that is the real argument count -- or read the VGA. A
-transcript of an edit is not the edited text.
-
-**Not a bug.** The shell is correct; the capture is a faithful
-record of the byte stream including the erase sequences.
+**Where this shape recurs.**  Same family as the PIT-constant and
+`unlinkat` entries: a check that *looks* like it is doing the right
+thing -- "make says up to date" / "the number is consistent" / "the
+feature works" -- but is not checking the thing that matters.
+Timestamps say nothing about content; a constant matching a
+derivation says nothing about the input; a feature working says
+nothing about *why*.  In each case the fix is to check the source
+of truth -- mtimes against the edit, the call site for the constant,
+the caller's source for the feature.

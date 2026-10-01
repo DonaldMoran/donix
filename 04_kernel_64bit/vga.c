@@ -123,6 +123,51 @@ static int cursor_col = 0;
 static uint8_t cursor_attr = VGA_DEFAULT_ATTR;
 static int cursor_visible = 1;
 
+/*
+ * Software block cursor state (framebuffer backend only).
+ *
+ * On VGA text, the CRTC draws a blinking cursor in hardware; we just
+ * tell it the scanlines and position.  On the framebuffer there is no
+ * hardware cursor, so we draw one ourselves: the cell at
+ * (cursor_row, cursor_col) is repainted with foreground and
+ * background swapped.  This is the classic "block cursor" look
+ * (PC BIOS, VT100) -- the character stays readable, the cell inverts.
+ *
+ * `cursor_drawn` is whether the cursor is currently painted on the
+ * fb.  It is only ever touched from vga_update_hardware_cursor() and
+ * vga_cursor_tick(), and vga_cursor_tick() runs from the PIT ISR with
+ * interrupts off, so no lock is needed: a tick cannot interleave with
+ * a vga_putc that is mid-flight, because the tick IS the reason no
+ * other code is running.
+ *
+ * Blink: the PIT runs at 100 Hz (pit_init(100) in kmain.c), so one
+ * tick is 10 ms.  CURSOR_BLINK_TICKS is the number of ticks per
+ * half-blink: 50 ticks = 500 ms per state, 1 s full cycle -- the
+ * classic terminal rate.  Lower toward 25 for a brisker 250 ms/state
+ * blink; raise toward 75 for a slower, lazier one.
+ */
+static int cursor_drawn   = 0;    /* cursor currently painted on fb? */
+static uint32_t cursor_blink_ticks = 0;   /* counts PIT ticks */
+
+/*
+ * The position the cursor is currently PAINTED at (not the logical
+ * cursor_row/cursor_col).  Every caller of vga_update_hardware_cursor
+ * updates cursor_row/cursor_col BEFORE the call, so the previous
+ * paint position would be lost if we read the live values.  These
+ * two track the last actual paint so the erase hits the right cell.
+ * Valid only while cursor_drawn == 1.
+ */
+static int cursor_painted_row = 0;
+static int cursor_painted_col = 0;
+
+#define CURSOR_BLINK_TICKS 50    
+
+/* True when the framebuffer is the active backend.  Small helper so
+ * the cursor code reads cleanly. */
+static int con_is_fb(void) {
+    return fb_get_info()->available;
+}
+
 enum ansi_state {
     ANSI_NORMAL = 0,
     ANSI_ESC,
@@ -260,15 +305,121 @@ static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static void vga_update_hardware_cursor(void) {
-    /* The VGA hardware cursor only exists in text mode.  When the
-     * framebuffer is active there is no CRTC text cursor to move;
-     * the visible cursor is drawn by the framebuffer backend (a
-     * later change).  Skip the port writes entirely then, so we do
-     * not poke CRTC registers while in a graphics mode. */
-    const fb_info_t* fb = fb_get_info();
-    if (fb->available) return;
+/* ------------------------------------------------------------------ */
+/* Software cursor (framebuffer backend)                               */
+/* ------------------------------------------------------------------ */
 
+/*
+ * Paint or erase the cursor cell at (cursor_row, cursor_col).
+ *
+ * `drawn` selects between the two: on 1, repaint the cell with its
+ * attribute inverted (the cursor is visible); on 0, repaint it with
+ * its stored attribute (the cursor is hidden).
+ *
+ * Reads the cell from the shadow, so it does not disturb the
+ * character -- only the visual.  On VGA text this is a no-op; the
+ * hardware cursor is moved by vga_update_hardware_cursor instead.
+ *
+ * Callers must NOT hold serial_lock: this is called from
+ * vga_cursor_tick, which runs in the PIT ISR.  It is safe without a
+ * lock because the ISR runs with interrupts disabled -- nothing else
+ * can be touching the shadow or the framebuffer at that moment.
+ */
+static void con_cursor_paint(int drawn) {
+    if (!con_is_fb()) return;
+    if (!cursor_visible) { drawn = 0; }
+
+    /*
+     * Erase uses the position we last PAINTED at, not the live
+     * cursor_row/cursor_col.  Every caller of
+     * vga_update_hardware_cursor has already moved the logical
+     * position by the time we get here, so reading the live
+     * position would erase the new cell (blank) and leave the old
+     * cell inverted -- the "trail" seen on screen.
+     */
+    int row, col;
+    if (drawn) {
+        row = cursor_row;
+        col = cursor_col;
+    } else {
+        if (!cursor_drawn) return;   /* nothing painted, nothing to erase */
+        row = cursor_painted_row;
+        col = cursor_painted_col;
+    }
+
+    uint16_t cell = shadow_get(row, col);
+    uint8_t ch   = (uint8_t)(cell & 0xFF);
+    uint8_t attr = (uint8_t)(cell >> 8);
+
+    if (drawn) {
+        attr = (uint8_t)(((attr & 0x0F) << 4) | ((attr & 0xF0) >> 4));
+    }
+
+    paint_cell(row, col, ((uint16_t)attr << 8) | ch);
+
+    if (drawn) {
+        cursor_painted_row = row;
+        cursor_painted_col = col;
+    }
+    cursor_drawn = drawn;
+}
+
+/*
+ * Called on every PIT tick (100 Hz) from timer_preempt_handler.
+ *
+ * Runs in interrupt context, interrupts already disabled.  Does NOT
+ * take any lock -- see the comment on con_cursor_paint for why that
+ * is safe.
+ *
+ * On VGA text this is a no-op: the CRTC blinks the cursor itself.
+ * On the framebuffer, it toggles the cursor every CURSOR_BLINK_TICKS
+ * ticks.  At 100 Hz with CURSOR_BLINK_TICKS 50 that is 500 ms on,
+ * 500 ms off -- the classic terminal rate.
+ */
+void vga_cursor_tick(void) {
+    if (!con_is_fb()) return;
+    if (!cursor_visible) {
+        /* Cursor was hidden (vi, or ?25l); if it is still painted,
+         * erase it now, once, and stop. */
+        if (cursor_drawn) {
+            con_cursor_paint(0);
+        }
+        return;
+    }
+
+    if (++cursor_blink_ticks < CURSOR_BLINK_TICKS) return;
+    cursor_blink_ticks = 0;
+
+    con_cursor_paint(!cursor_drawn);
+}
+
+static void vga_update_hardware_cursor(void) {
+    /*
+     * On VGA text: move the CRTC hardware cursor (or park it
+     * off-screen when hidden).  On the framebuffer: there is no
+     * hardware cursor, so redraw the software one.  Before either,
+     * erase the software cursor from its old position if it is
+     * currently painted -- otherwise moving the cursor would leave
+     * an inverted cell behind.
+     *
+     * Every cursor move in this file goes through this function, so
+     * the erase/redraw discipline lives here and nowhere else.
+     */
+    if (con_is_fb()) {
+        /* con_cursor_paint(0) erases at the tracked painted position
+         * (which is why it takes no live coordinates); then we paint
+         * at the new cursor_row/cursor_col.  Redraw solid and reset
+         * the blink counter, so the cursor does not blink off right
+         * after a keystroke. */
+        con_cursor_paint(0);
+        cursor_blink_ticks = 0;
+        if (cursor_visible) {
+            con_cursor_paint(1);
+        }
+        return;
+    }
+
+    /* ---- VGA text backend (unchanged behavior) ---- */
     if (!cursor_visible) {
         outb(VGA_CRTC_INDEX, CURSOR_HIGH);
         outb(VGA_CRTC_DATA, 0x20);
@@ -363,6 +514,8 @@ static void vga_serial_reply_da(void) {}
 /* ------------------------------------------------------------------ */
 
 static void vga_scroll(void) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     const int rows = con_rows();
 
@@ -387,6 +540,8 @@ static void vga_scroll(void) {
 }
 
 static void vga_scroll_region_up(int top, int bottom, int n) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     const int rows = con_rows();
     if (top < RESERVED_ROWS) top = RESERVED_ROWS;
@@ -410,9 +565,12 @@ static void vga_scroll_region_up(int top, int bottom, int n) {
             paint_cell(row, col, shadow_get(row, col));
         }
     }
+    vga_update_hardware_cursor();
 }
 
 static void vga_scroll_region_down(int top, int bottom, int n) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     const int rows = con_rows();
     if (top < RESERVED_ROWS) top = RESERVED_ROWS;
@@ -436,6 +594,7 @@ static void vga_scroll_region_down(int top, int bottom, int n) {
             paint_cell(row, col, shadow_get(row, col));
         }
     }
+    vga_update_hardware_cursor();
 }
 
 /* ESC[K family. mode: 0=to end of line, 1=to start, 2=whole line. */
@@ -455,6 +614,8 @@ static void vga_erase_line(int mode) {
 
 /* ESC[J family. mode: 0=below, 1=above, 2=all. */
 static void vga_erase_display(int mode) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     const int rows = con_rows();
 
@@ -479,6 +640,8 @@ static void vga_erase_display(int mode) {
 }
 
 static void vga_delete_chars(int n) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     if (n < 1) n = 1;
     if (n > cols - cursor_col) n = cols - cursor_col;
@@ -496,6 +659,8 @@ static void vga_delete_chars(int n) {
 }
 
 static void vga_insert_chars(int n) {
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     if (n < 1) n = 1;
     if (n > cols - cursor_col) n = cols - cursor_col;
@@ -630,6 +795,9 @@ static void vga_apply_sgr(void) {
 
 static void vga_alt_screen_enter(int clear) {
     if (alt_screen_active) return;
+
+    if (cursor_drawn) con_cursor_paint(0);
+
     alt_saved_row = cursor_row;
     alt_saved_col = cursor_col;
 
@@ -665,6 +833,8 @@ static void vga_alt_screen_enter(int clear) {
 
 static void vga_alt_screen_leave(void) {
     if (!alt_screen_active) return;
+
+    if (cursor_drawn) con_cursor_paint(0);
 
     /*
      * Restore: write the saved cells back into the shadow and
@@ -1048,6 +1218,8 @@ void vga_print_dec_cur(uint64_t val) {
 
 void vga_clear(void) {
     serial_lock();
+    if (cursor_drawn) con_cursor_paint(0);
+
     const int cols = con_cols();
     const int rows = con_rows();
     for (int r = 0; r < rows; r++) {
