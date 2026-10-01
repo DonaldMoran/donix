@@ -185,11 +185,28 @@
  * arg0: const char* path        (user pointer, NUL-terminated)
  * arg1: char* const argv[]      (user pointer to array of user string
  *                                pointers; NULL if argc == 0)
- * arg2: char* const envp[]      (ignored for now)
+ * arg2: char* const envp[]      (user pointer to array of user string
+ *                                pointers; NULL if envc == 0)
  * returns: only on failure, as -errno
+ *
+ * envp is passed through VERBATIM, as Linux does: execve copies
+ * the caller's environment onto the new stack; it does not
+ * synthesize one.  The shell (busybox ash, musl_sh) is the layer
+ * that builds envp and hands it down.  Before session 42, arg2 was
+ * ignored and a single NULL was written as the envp terminator, so
+ * every program ran with an empty environment: getenv returned
+ * NULL, env/printenv printed nothing, and $VAR expansion in ash
+ * was always empty.
+ *
+ * EXEC_MAX_ENVC bounds the kernel-side snapshot.  The snapshot
+ * buffer is kmalloc'd, NOT a stack array: at EXEC_MAX_ENVC 64 and
+ * EXEC_MAX_ARG_LEN 256 a stack buffer would be 16 KB on its own,
+ * and PROC_STACK_SIZE is 16 KB.  See the comment at the snapshot
+ * site in user_syscall.c.
  */
 #define EXEC_MAX_ARGC 16
 #define EXEC_MAX_ARG_LEN 256
+#define EXEC_MAX_ENVC 64
 
 /*
  * SYS_WAIT4 (61) — wait for a child to exit.

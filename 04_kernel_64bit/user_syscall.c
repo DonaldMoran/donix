@@ -3352,7 +3352,18 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -(long)EIO_;
     }
 
-    /* ---- 3. Snapshot argv from the OLD address space. ---- */
+    /* ---- 3. Snapshot argv and envp from the OLD address space. ----
+     *
+     * argv is snapshotted into a stack array, as before.  envp is
+     * snapshotted into a KMALLOC'D array, not a stack array:
+     * EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN is 16 KB at the current
+     * values, and PROC_STACK_SIZE (process.h) is 16 KB.  A stack
+     * array that size, on top of argv_scratch (4 KB) and the rest
+     * of sys_execve's locals, would overflow the kernel stack.
+     *
+     * envp_scratch is NULL when there is no environment, and is
+     * freed on every exit path below.  envc is 0 in that case.
+     */
     int argc = 0;
     char argv_scratch[EXEC_MAX_ARGC][EXEC_MAX_ARG_LEN];
 
@@ -3376,6 +3387,54 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] string\n");
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -(long)EFAULT_;
+            }
+        }
+    }
+
+    /*
+     * envp.  Passed through verbatim, as Linux does.
+     *
+     * We copy each pointer and each string out of the OLD address
+     * space now, before the teardown in section 5, exactly as argv
+     * is copied.  After section 5 the old address space is gone.
+     */
+    int envc = 0;
+    char (*envp_scratch)[EXEC_MAX_ARG_LEN] = NULL;
+
+    if (user_envp) {
+        envp_scratch = (char (*)[EXEC_MAX_ARG_LEN])
+            kmalloc((size_t)EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN);
+        if (!envp_scratch) {
+            serial_print("sys_execve: kmalloc failed for envp snapshot\n");
+            kfree(elf_buf);
+            __asm__ volatile("sti");
+            return -(long)ENOMEM_;
+        }
+
+        for (envc = 0; envc < EXEC_MAX_ENVC; envc++) {
+            uint64_t user_str_va = 0;
+            if (safe_copy_from_user(&user_str_va,
+                                    (const char**)user_envp + envc,
+                                    sizeof(user_str_va)) != 0) {
+                serial_print("sys_execve: bad envp[");
+                serial_print_dec(envc);
+                serial_print("] pointer\n");
+                kfree(envp_scratch);
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -(long)EFAULT_;
+            }
+            if (user_str_va == 0) break;
+
+            if (copy_user_string(envp_scratch[envc], EXEC_MAX_ARG_LEN,
+                                 (const char*)user_str_va) != 0) {
+                serial_print("sys_execve: bad envp[");
+                serial_print_dec(envc);
+                serial_print("] string\n");
+                kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -3428,20 +3487,52 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -1;  /* unreachable */
     }
 
-    /* ---- 6. Lay out argv on the new stack. ---- */
+    /* ---- 6. Lay out argc, argv, and envp on the new stack. ----
+     *
+     * SysV process-entry layout, growing down from the top of the
+     * stack:
+     *
+     *     rsp_init  -> argc
+     *                  argv[0] ... argv[argc-1] NULL
+     *                  envp[0] ... envp[envc-1] NULL
+     *                  (argv strings, then envp strings, packed)
+     *
+     * REGION SIZE.  The region is 16 KB, up from 4 KB.  The 4 KB
+     * figure was sized when only argv was written; with envp added,
+     * a shell's environment (PATH, HOME, TERM, PWD, OLDPWD, IFS,
+     * USER, SHELL, HOSTNAME, PS1, ...) plus argv could approach it.
+     * MAINTENANCE.md item 3l (frozen) warned that the gap between
+     * argv and the child's downward-growing stack shrinks when envp
+     * is added.  16 KB of the 64 KB user stack leaves 48 KB for
+     * stack frames, which is ample, and retires that landmine.
+     *
+     * The region sits at the TOP of the user stack; rsp_init is one
+     * slot below its bottom, so the child's own stack frames grow
+     * down from argv_region_bottom - 8 and do not touch the region
+     * until they have consumed the whole 48 KB below it.
+     */
     uint64_t rsp_init = 0;
     uint64_t argv_array_base = 0;   /* for %rsi below; 0 when argc == 0 */
 
-    if (argc > 0) {
+    {
         uint64_t argv_region_top    = new_user_stack_top;
-        uint64_t argv_region_bottom = argv_region_top - 4096;
+        uint64_t argv_region_bottom = argv_region_top - (16 * 1024);
 
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
-        uint64_t array_base    = argv_region_bottom;
-        uint64_t strings_start = argv_region_bottom + array_bytes + 8;
+        size_t envp_bytes  = ((size_t)envc + 1) * sizeof(uint64_t);
 
+        uint64_t array_base    = argv_region_bottom;
+        uint64_t envp_array_base = argv_region_bottom + array_bytes;
+        uint64_t strings_start = argv_region_bottom + array_bytes + envp_bytes;
+
+        /*
+         * Pack argv strings, then envp strings, growing up from
+         * strings_start.  A single cursor so the two pools cannot
+         * overlap.
+         */
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
+        uint64_t env_vaddrs[EXEC_MAX_ENVC];
 
         for (int i = 0; i < argc; i++) {
             size_t slen = 0;
@@ -3450,6 +3541,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (cursor + slen > argv_region_top) {
                 serial_print("sys_execve: argv region overflow\n");
+                kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
                 return -1;  /* unreachable */
@@ -3461,6 +3553,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("sys_execve: failed to write argv[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
                 return -1;  /* unreachable */
@@ -3469,6 +3562,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             cursor += slen;
         }
 
+        for (int i = 0; i < envc; i++) {
+            size_t slen = 0;
+            while (slen < EXEC_MAX_ARG_LEN && envp_scratch[i][slen] != '\0') slen++;
+            slen++;
+
+            if (cursor + slen > argv_region_top) {
+                serial_print("sys_execve: envp region overflow\n");
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t dst = cursor;
+
+            if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
+                                      envp_scratch[i], slen) != 0) {
+                serial_print("sys_execve: failed to write envp[");
+                serial_print_dec(i);
+                serial_print("]\n");
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            env_vaddrs[i] = dst;
+            cursor += slen;
+        }
+
+        /*
+         * argv pointer array, NULL-terminated, then envp pointer
+         * array, NULL-terminated.  Both live in the region; the
+         * envp array is at argv_array_base + array_bytes, which is
+         * exactly where the old single envp NULL used to be.
+         *
+         * Write the arrays even when argc or envc is 0: the terminator
+         * is what the child's libc walks.
+         */
         uint64_t array_data[EXEC_MAX_ARGC + 1];
         for (int i = 0; i < argc; i++) array_data[i] = arg_vaddrs[i];
         array_data[argc] = 0;
@@ -3476,6 +3606,25 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         if (safe_copy_to_user_cr3(self->cr3, (void*)array_base,
                                   array_data, array_bytes) != 0) {
             serial_print("sys_execve: failed to write argv array\n");
+            kfree(envp_scratch);
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+
+        /*
+         * envp array: envc pointers followed by NULL.  Built in a
+         * bounded stack buffer; EXEC_MAX_ENVC is 64, so this is
+         * 520 bytes, not 16 KB.
+         */
+        uint64_t envp_data[EXEC_MAX_ENVC + 1];
+        for (int i = 0; i < envc; i++) envp_data[i] = env_vaddrs[i];
+        envp_data[envc] = 0;
+
+        if (safe_copy_to_user_cr3(self->cr3, (void*)envp_array_base,
+                                  envp_data, envp_bytes) != 0) {
+            serial_print("sys_execve: failed to write envp array\n");
+            kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
             return -1;  /* unreachable */
@@ -3483,35 +3632,28 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         argv_array_base = array_base;
 
+        /*
+         * argc sits one slot below the region, so the child's RSP
+         * on entry points at it.  The whole region is above.
+         */
         rsp_init = argv_region_bottom - 8;
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
                                   &argc_slot, sizeof(argc_slot)) != 0) {
             serial_print("sys_execve: failed to write argc\n");
+            kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
             return -1;  /* unreachable */
         }
+    }
 
-        uint64_t envp_null = 0;
-        if (safe_copy_to_user_cr3(self->cr3,
-                                  (void*)(argv_region_bottom + array_bytes),
-                                  &envp_null, sizeof(envp_null)) != 0) {
-            serial_print("sys_execve: failed to write envp terminator\n");
-            __asm__ volatile("sti");
-            sys_exit(-1);
-            return -1;  /* unreachable */
-        }
-    } else {
-        rsp_init = new_user_stack_top - 16;
-        uint64_t zero = 0;
-        if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
-                                  &zero, sizeof(zero)) != 0) {
-            serial_print("sys_execve: failed to write argc=0\n");
-            __asm__ volatile("sti");
-            sys_exit(-1);
-            return -1;  /* unreachable */
-        }
+    /* The envp snapshot is no longer needed: it has been copied into
+     * the new address space.  Free it before returning to the new
+     * program. */
+    if (envp_scratch) {
+        kfree(envp_scratch);
+        envp_scratch = NULL;
     }
 
     /* ---- 7. Rewrite the syscall-entry frame. ---- */
