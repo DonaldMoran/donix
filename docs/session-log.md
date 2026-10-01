@@ -1,21 +1,36 @@
-## Session 42 — envp: `execve` passes the environment through
+## Session 42 — envp, the `/usr/bin` layout, and the shim removal
 
-Two commits on `dev`, scratch-tagged, unpushed.  Opens the `v0.6.9`
-milestone.  `sys_execve` ignored its third argument and wrote a
-single NULL as the envp terminator, so every program ran with an
-empty environment: `getenv` returned NULL, `env`/`printenv` printed
-nothing, and `$VAR` expansion in ash was always empty.
+Six commits on `dev`, scratch-tagged, unpushed.  Opens `v0.6.9`
+with envp, and then — because envp exposed it — moves the binaries
+to `/usr/bin` and removes the kernel's bare-name resolution.  Two
+subjects, one session, in the order they happened.
 
 | Tag | What |
 |---|---|
-| `20261001-envp` | `sys_execve` copies `envp` onto the new stack, as Linux does; argv region 4 KB → 16 KB; envp snapshot kmalloc'd, not a stack array |
+| `20261001-envp` | `sys_execve` copies `envp` onto the new stack; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
 | `20261001-env-applets` | config: enable busybox `env` and `printenv` |
+| `20261001-envdocs` | session-42 docs (the first pass) |
+| `20261001-usrbin` | executables to `/usr/bin`; `canary.c` the smoke test |
+| `20261001-nosuffix` | drop the `.ELF` suffix; binaries staged bare |
+| `20261001-noshim` | `execve`: remove the bare-name attempt; (a) and (b) remain |
+
+**`v0.6.8` was bumped and pushed mid-session** (tag `v0.6.8` at
+`b64a4fa`, merged to `main`), and the nine `2026*` scratch tags for
+that milestone were dropped at the bump.  The `v0.6.9` work begins
+with `20261001-envp`.
+
+---
+
+### envp — `execve` passes the environment through
+
+`sys_execve` ignored its third argument and wrote a single NULL as
+the envp terminator, so every program ran with an empty
+environment: `getenv` returned NULL, `env`/`printenv` printed
+nothing, `$VAR` expansion in ash was always empty.
 
 **Commit 1** (`envp`): Linux semantics — `execve` passes the
 caller's `envp` through **verbatim**; it does not synthesize an
-environment.  The shell is the layer that builds `envp` and hands
-it down.  So the change is "copy `user_envp` the way `user_argv`
-is copied," not "invent `PATH=...` in the kernel."
+environment.  The shell builds it, the kernel carries it.
 
 `sys_execve` section 3 snapshots `envp` from the OLD address space
 before the teardown in section 5, exactly as argv is snapshotted.
@@ -26,37 +41,28 @@ Section 6 writes the SysV process-entry layout:
                  envp[0] ... envp[envc-1] NULL
                  (argv strings, then envp strings, packed)
 
-Before the change, the slot after the argv array held a single NULL
-(that was the whole envp); now it holds the envp pointer array,
-NULL-terminated, and the strings follow.  The `%rdi`/`%rsi` frame
-slots in section 7 are untouched — musl reads the SysV stack layout,
-not registers; `envp` lives in the stack layout.
+The slot after the argv array, which held a single NULL (the whole
+envp), now holds the envp pointer array, NULL-terminated, with the
+strings following.
 
-**Two decisions worth recording.**
+**Two sizing decisions.**
 
-- **The argv region grew from 4 KB to 16 KB.**  The 4 KB figure was
-  sized when only argv was written.  A shell's environment (`PATH`,
-  `HOME`, `TERM`, `PWD`, `OLDPWD`, `IFS`, `USER`, `SHELL`,
-  `HOSTNAME`, `PS1`, ...) plus argv could approach it, and
-  `MAINTENANCE.md` item 3l (frozen) warned that the gap between the
-  argv region and the child's downward-growing stack shrinks when
-  envp is added.  The user stack is 64 KB; 16 KB of region leaves
-  48 KB for frames, which retires that landmine.
+- **The argv region grew from 4 KB to 16 KB.**  A shell's
+  environment plus argv could approach 4 KB, and `MAINTENANCE.md`
+  item 3l (frozen) warned the gap between the region and the
+  child's downward-growing stack shrinks when envp is added.  The
+  user stack is 64 KB; 16 KB of region leaves 48 KB for frames.
+- **The envp snapshot is `kmalloc`'d, not a stack array.**
+  `EXEC_MAX_ENVC` × `EXEC_MAX_ARG_LEN` is 64 × 256 = 16 KB, and
+  `PROC_STACK_SIZE` is 16 KB (`process.h`).  A stack array that
+  size on top of `sys_execve`'s existing frame would overflow.
+  See `gotchas.md`, "The kernel stack is 16 KB; do not put a large
+  scratch buffer on it."
 
-- **The envp snapshot is `kmalloc`'d, not a stack array.**  At
-  `EXEC_MAX_ENVC` 64 and `EXEC_MAX_ARG_LEN` 256, a stack array would
-  be 16 KB on its own — and `PROC_STACK_SIZE` is 16 KB
-  (`process.h`), already sized for syscall entry + a nested timer
-  frame + `sys_read` blocking headroom.  A 16 KB scratch array on
-  that stack would overflow.  The argv snapshot stays a stack array
-  (4 KB).  See `gotchas.md`, "The kernel stack is 16 KB; do not put
-  a large scratch buffer on it."
-
-**Commit 2** (`env-applets`): `CONFIG_ENV=y` and `CONFIG_PRINTENV=y`
-in `configs/busybox.config`.  Both read the environment, so both are
-only *useful* now that `execve` passes it.  Before this commit
-`busybox env` reported "applet not found" — the applets were not
-enabled, which is not the same as broken.
+**Commit 2** (`env-applets`): `CONFIG_ENV=y` and `CONFIG_PRINTENV=y`.
+Both read the environment, so both are only useful now that `execve`
+passes it.  Before this commit `busybox env` reported "applet not
+found" — disabled, not broken.
 
 **Tested — the `$FOO` round trip is the proof.**
 
@@ -64,12 +70,9 @@ enabled, which is not the same as broken.
     $ echo $FOO
     bar
 
-That is the whole feature.  `export` puts `FOO` in ash's
-environment; `execve` carries it into the child; the child reads it.
-Before this session, `$FOO` expanded to empty because ash's
-environment was empty.
-
-The `env` applet confirms it directly:
+That is the whole feature: `export` puts `FOO` in ash's
+environment, `execve` carries it into the child, the child reads
+it.  `env` confirms it directly:
 
     $ env
     PWD=/
@@ -78,47 +81,160 @@ The `env` applet confirms it directly:
     FOO=bar
     PWD=/
 
-**The `PATH` finding, recorded so a future session does not
-rediscover it.**  `echo $PATH` inside ash expands to
+**The `PATH` finding.**  `echo $PATH` inside ash expands to
 `/sbin:/usr/sbin:/bin:/usr/bin`, and command lookup works — but
 `printenv PATH` prints nothing and `env` does not list `PATH`.
 That is because **busybox ash keeps `PATH` as a shell variable and
-does not export it.**  A variable must be exported to appear in a
-child's `envp`; ash exports `PWD` (hence `env` showing it) and
-whatever the user `export`s, but not `PATH` by default.  `export
-PATH` then `printenv PATH` prints the path, which confirms the
-mechanism: the variable is real, exporting it puts it in the
-environment, and the child reads it.  **This is ash's behavior, not
-a donix bug** — a normal Linux with busybox ash behaves the same
-way — but it means every child applet runs with no `PATH` in its
-environment, which is a difference from a distro Linux where `PATH`
-is exported at login.
+does not export it.**  `export PATH` then `printenv PATH` prints
+the path, confirming the mechanism.  This is ash's behavior, not a
+donix bug, but it means every child applet runs with no `PATH` in
+its environment.
 
-**Canary:** green.  Boot spine (`pwd`, `cd /bin`, `pwd`, `cd ..`,
-`pwd`, `ls`, `exit`, `donix>`, `cd /`, `pwd`, `ls hello-world.txt`,
-`hello`), `memtest`, `musl_fork`, `musl_exec2`, `musl_wait`,
-`busybox ls`, `busybox pwd`, `busybox ash` (with `pwd`/`cd /bin`/
-`pwd`/`ls`/`exit` inside), the pipeline and redirection rows
-(`cat hello-world.txt | head -n 2`, `echo hi | wc`,
-`echo hi > out.txt ; cat out.txt`, `echo hi2 >> out.txt ; cat
-out.txt`, `cat < out.txt`, `busybox cat < out.txt`), the `find`
-rows, and the `rm`/`rmdir` rows — all behave.  No `Unknown
-syscall:` lines.  No `sys_execve: envp region overflow`, no
-`bad envp[N]` — the 16 KB region is ample and no envp pointer was
-bad.  The pipelines and `find` matter most for this change: each
-forks and execs through the new section-6 layout, and all produce
-correct output, which is what confirms the argv layout is intact.
+---
+
+### The `/usr/bin` layout
+
+Moving the binaries was not part of the envp milestone.  It came
+from a question — "should the custom ELFs be somewhere other than
+the FAT root?" — and the answer was yes, for a reason the two
+shells make concrete:
+
+- **ash's applets never consult `PATH`.**  So busybox always wins
+  there, and `/bin` is where busybox lives.
+- **`musl_sh` does consult its search list**, so a bare name should
+  resolve to the donix-native tool.
+
+That is the same precedence a normal Unix gives `/usr/local/bin`
+over `/usr/bin`, and it *requires* the two tool sets to be in
+different directories.  The layout became:
+
+    /bin         busybox (the base toolset)
+    /usr/bin     the donix-native ELFs (apps + tests)
+    /tmp         empty
+    /            HELLO-WORLD.TXT and other data
+
+**`20261001-usrbin`**: `musl_sh`'s `run_external` searches
+`/usr/bin/NAME` then `/bin/NAME`; `kmain` boots the shell from
+`0:/usr/bin/MUSL_SH`; the Makefile stages every ELF to `::/usr/bin/`
+and creates the directories **before** the copies.
+
+**The mtools finding:** `mcopy` does not create intermediate
+directories, and the first version put the `mmd` calls after the
+copies.  Every copy failed with `no match for target`.  The mkdirs
+have to run right after `mkfs.vfat`, before anything is copied.
+
+**`20261001-canary`** (in the same commit): `tests/canary.c`, the
+post-change smoke test.  The canary used to be a list of lines in
+`handoff.md` a human read and retyped, and that drifts — the list
+said `find / -type d` prints `/` and `/bin`, and after the layout
+move it printed five directories, a change nobody noticed.  The
+program runs every non-interactive canary row, checks exit status
+and output substrings, and reports pass/fail.  `canary` is
+read-only; `canary --full` includes the mutating rows.
+
+**Two failures in the canary's own first run, both worth
+recording.**
+
+- **Every direct binary path was missing its `.ELF` suffix.**
+  `canary.c` calls `execve` directly and does not get `musl_sh`'s
+  suffix-adding search, so `/usr/bin/CAT` failed with 127 where
+  `/usr/bin/CAT.ELF` was the file.  Seven rows failed for this one
+  reason.
+- **`find / -type f -name busybox` is a seven-word command line.**
+  The `check4` and `check5` helpers cover four and five words; a
+  row that uses the wrong helper does not fail loudly, it silently
+  drops the trailing words and tests something else.  `check4` on
+  that row ran `find / -type` with no argument.  It needed a manual
+  `argv[]` build.
+
+---
+
+### The suffix removal
+
+**`20261001-nosuffix`**: drop `.ELF` from the staged names and from
+every search.
+
+The `.ELF` suffix was a convention from when binaries lived at the
+FAT root and the kernel guessed the name.  It became a problem the
+moment the layout moved: **ash's `execvp` walks `$PATH` looking for
+an exact filename and does not guess suffixes**, so `/usr/bin/HELLO.ELF`
+is invisible to `hello`.  The suffix had to go for bare-name
+lookup to work from ash at all.
+
+Staged names became `/usr/bin/HELLO`, `/usr/bin/LS`, ...; `musl_sh`'s
+`run_external` builds one form per directory; `kmain` loads
+`0:/usr/bin/MUSL_SH`; `canary.c` names the binaries as staged.
+
+**Verified from both shells, same result:**
+
+    donix> canary --full   27 passed, 0 failed
+    ash:   canary --full   27 passed, 0 failed
+    hello, musl_printf      run by bare name from both shells
+
+---
+
+### The shim removal
+
+**`20261001-noshim`**: remove `sys_execve`'s bare-name attempt.
+
+`sys_execve` tried three spellings of a path: (a) the path as given,
+(b) `"0:" + path` for an absolute path, (c) if the path was a bare
+name, uppercase it, append `.ELF`, try it at the root and in
+`/bin`.  **Attempt (c) could no longer succeed** — the binaries are
+staged bare and live under `/usr/bin`, so all three sub-attempts
+found nothing.
+
+**Removed:** the attempt-(c) block, `exec_resolve_bare_name`,
+`exec_resolve_bin_name`, their forward declaration, and **the retry
+call in `f_stat_with_retry`**.
+
+**The `f_stat_with_retry` call was the surprise.**  It was added in
+session 22 for ash's `find_execable`, which calls
+`access(candidate, X_OK)` on each `PATH` entry before exec'ing.
+Without the retry, `access("sbin/ls")` failed and ash concluded the
+command did not exist.  **But with the binaries in `/usr/bin`, the
+`PATH` probe reaches `access("/usr/bin/ls", X_OK)`, and FatFs
+resolves the multi-component path directly** — the retry never
+fires.  The canary's `ls` rows passing **from ash** is the proof:
+they go through `find_execable` → `access` → `f_stat_with_retry`,
+and they found every binary.
+
+**What remains** in `sys_execve` is (a) the path as given and
+(b) the `"0:"` prefix translation — the smallest the shim can be
+without a VFS.
+
+**The lesson, and it recurred three times.**  "This code has no
+consumer" was wrong three times this session:
+
+1. **The shim itself.**  I reasoned that attempt (c) was dead code
+   because the canary passed.  It passed because every row went
+   through `canary.c`'s full paths or ash's *applets*.  The
+   experiment — typing `hello` from ash with the binary only at the
+   root — showed ash reaching the kernel's bare-name code.  The
+   canary could not see the consumer.
+2. **The `f_stat_with_retry` retry.**  I told you to delete the
+   helper without checking its callers, and the compiler caught a
+   call site I had not seen.  The fix was to delete the call too,
+   but only after the canary proved the retry was dead.
+3. **The kernel-side record of session 42** (below).
+
+**The pattern:** a decision that was plausible, matched something
+nearby, and was never tested against the thing that defines truth.
+**The check is an experiment, not an inference** — run the thing and
+see, rather than reason about whether it can work.  See
+`gotchas.md`.
+
+---
 
 **Gotcha added:** "The kernel stack is 16 KB; do not put a large
 scratch buffer on it."
 
-**Scratch tags kept:** `20261001-envp` and `20261001-env-applets`
-are local, not pushed, part of the open `v0.6.9` milestone.
+**Canary:** green from both shells, `27 passed, 0 failed`, with
+`canary.c` now the executable form of what used to be a hand-typed
+list.
 
-**Note for the milestone narrative:** `v0.6.8` was bumped and
-pushed mid-session (tag `v0.6.8` at `b64a4fa`, merged to `main`),
-and the nine `2026*` scratch tags for that milestone were dropped at
-the bump.  The `v0.6.9` work begins with `20261001-envp`.
+**Scratch tags kept:** all six are local, not pushed, part of the
+open `v0.6.9` milestone.
 
 ## Session 41 — `faccessat` and `utimensat` close the `*at` family
 

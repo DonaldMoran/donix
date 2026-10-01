@@ -1,10 +1,12 @@
 ### Open
 
-1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are both shims.  When a VFS
-   lands, delete them; do not extend.  (A VFS is on the critical
-   path for donix generally, **not** for Wayland -- see
-   `ROADMAP.md`.)
+1. **VFS layer (eventual).**  `sys_execve`'s two remaining path
+   attempts — the path as given, and the `"0:"` prefix translation
+   for an absolute path — and `resolve_against_cwd` are all shims.
+   When a VFS lands, delete them; do not extend.  (The bare-name
+   attempt was removed in session 42; see `session-log.md`.  A VFS
+   is on the critical path for donix generally, **not** for
+   Wayland -- see `ROADMAP.md`.)
 
 2. **Redirection of a builtin is silently ignored.**  `musl_sh`'s
    builtins (`cd`, `pwd`) run in the parent, before any fork, so
@@ -138,3 +140,12 @@ harmless, and the reason `vi` fills the screen.  No action.
   resolution.  (There is no section 10; it was removed — it tested a
   kernel-side flag check that does not exist, because musl returns
   the `EINVAL` itself.  See `gotchas.md`, session 41.)
+
+- **The canary is now `canary`, a program.**  Session 42 replaced
+  the hand-typed list with `userland/musl/tests/canary.c`: it runs
+  every non-interactive canary row, checks exit status and output
+  substrings, and reports pass/fail.  `canary` (read-only) and
+  `canary --full` (also the mutating rows).  Run from `donix>` or
+  from ash; both search lists find `/usr/bin/CANARY`.  The rows it
+  does not cover (interactive `busybox ash`, `vi`) stay manual and
+  are printed at the end of a run.

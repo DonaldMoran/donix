@@ -429,3 +429,109 @@ grep for `PROC_STACK_SIZE` — and it was done before the code was
 written, not after a crash.  The rule is the same: go to the
 definition and read it; do not infer a limit from a neighboring
 example.
+
+## A shim's dead code is only dead if you watch it not run
+
+*Session 42 (the layout move and the shim removal).  Three times in
+one session, "this code has no consumer" was wrong.*
+
+The session removed a chunk of `sys_execve` that guessed where a
+bare command name lived: uppercase it, append `.ELF`, try it at the
+root and in `/bin`.  The reasoning for removing it was sound on its
+face — the binaries had moved to `/usr/bin`, the suffix was gone,
+so every sub-attempt of the guess would find nothing.  **The
+reasoning was right.  The way it was reached was wrong, three
+times, and each time the correction came from running the thing,
+not from thinking about it.**
+
+### One — the shim was not dead, and the canary could not see it
+
+The first claim was "the bare-name attempt is dead code, the canary
+passes without it."  The canary *did* pass.  But every canary row
+goes through `canary.c`'s own full-path `execve` calls or through
+ash's built-in applets — **neither of which uses the kernel's
+bare-name guess.**  The canary was passing without exercising the
+code the claim was about.
+
+The counter-evidence came from a single experiment: copy a binary to
+the root as `HELLO.ELF`, type `hello` at the ash prompt, and watch
+the serial log.
+
+    $ hello
+    sys_execve: pid=11 entry=0x400221 argc=1 ... (hello)
+    hello from donix (musl)
+
+The log shows `(hello)` — the **bare name**, not a resolved path.
+Ash's `execvp`, finding no `PATH` entry (ash does not export
+`PATH`), fell through to `execve("hello")`, and the kernel's
+bare-name guess is what found `/HELLO.ELF`.  **The guess had a
+consumer the canary could not reach.**
+
+### Two — the helper had a caller the deletion missed
+
+The removal deleted the two helper functions.  The build failed:
+
+    error: call to undeclared function 'exec_resolve_bare_name'
+
+Line 2417, in `f_stat_with_retry` — the **stat** path, not the exec
+path.  It used the same helper to retry a failed `f_stat` as
+`0:/NAME.ELF`, and it was added in session 22 for ash's
+`find_execable` probe.  The deletion was written against a
+remembered version of the file and missed the caller.
+
+The compiler caught it.  **That is the cheap case** — the failure
+was loud and immediate.  The expensive version of the same mistake
+is deleting code whose caller fails silently at runtime.
+
+### Three — the guess was dead this time, and one run proved it
+
+The retry *looked* load-bearing: ash probes `PATH` with
+`access(name, X_OK)` before exec'ing, and that probe goes through
+`f_stat_with_retry`.  If the retry were doing the work, deleting it
+would break every `PATH` lookup and no command would run from ash.
+
+The evidence it was dead: **ash's `PATH` includes `/usr/bin`, the
+binaries are in `/usr/bin`, and FatFs resolves a multi-component
+path.**  So `access("/usr/bin/ls", X_OK)` succeeds directly and the
+retry never fires.  The proof was the canary's `ls` rows passing
+**from ash** — they go through `find_execable` → `access` →
+`f_stat_with_retry`, and they found every binary.
+
+This time the reasoning was sound.  But it was the same shape as
+the two wrong calls before it, and the thing that made it different
+was that the run confirmed it.
+
+### The rule
+
+> **Before deleting code as "no consumer," make the consumer
+> attempt to use it and watch.**  Passing tests are not evidence
+> the code is unused — they are evidence the tests do not reach it.
+> A dead-code claim needs a run where the code *fails to be
+> needed*, not a run where it is simply not noticed.
+
+**The specific tell.**  Three claims, three times, the same error:
+the evidence was "it works without this" when the real question was
+"does the path that uses this still work."  A canary that passes
+tells you what *is* covered.  It says nothing about what is not.
+
+### Where this shape recurs
+
+Same family as "A consumer inferred from behavior is not a
+consumer" (session 40) and "A syscall argument the caller did not
+set holds the previous syscall's return value" (session 41).  Each
+was a plausible claim that matched something nearby and was never
+tested against the thing that defines truth.  The `unlinkat` case
+was a wrong *claim about busybox's source*; the `faccessat` case a
+wrong *assumption about the ABI*; this one a wrong *claim about
+reachability*.  In every case the fix was to go to the source —
+`grep` for the caller, `cat` for the wrapper, **run the path and
+watch the log** — and in every case the plausible story made the
+check feel unnecessary.
+
+**A related note.**  Deleting code is the one edit a test cannot
+guard.  An addition is caught by a test that exercises the new
+path.  A deletion is caught only by a test that exercises the
+*old* path — and if the old path is genuinely dead, no test
+exercises it, which is exactly when the deletion is safe and
+exactly when there is no test to say so.  That asymmetry is why
+deletion wants a run, not a review.

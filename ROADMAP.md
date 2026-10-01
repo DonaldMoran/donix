@@ -55,14 +55,49 @@ The narratives are in the annotated scratch tags,
 
 ---
 
-## v0.6.8 — the `*at()` family (ready to close)
+## v0.6.9 — envp, `/usr/bin`, and the shim removal (in progress)
 
-Opened in session 39 (`20260930-at`).  The theme is the `*at()`
-family: one path resolver shared by every syscall that takes a
-dirfd.  `resolve_at` is that resolver; `newfstatat` (262),
-`openat` (257), `unlinkat` (263), `faccessat` (269), and
-`utimensat` (280) all route through it.  The stat family is
-inverted to wrappers as on Linux.  busybox `find` (with `-type`)
+Opened in session 42 (`20261001-envp`).  Two subjects: the
+milestone's original `envp` theme, and the FAT-layout work that
+grew out of it.
+
+**envp.**  `sys_execve` ignored its third argument, so every program
+ran with an empty environment.  It now passes the caller's `envp`
+through verbatim, Linux-style — the shell builds the environment,
+the kernel carries it.  `export FOO=bar` in ash, then `echo $FOO`,
+prints `bar`.  `env` and `printenv` are enabled and read it.
+
+**The `/usr/bin` layout.**  The donix-native ELFs moved from the FAT
+root to `/usr/bin`, `busybox` stays in `/bin`, `/tmp` was created.
+This is the split the two shells' search rules need: ash's applets
+never consult `PATH`, so busybox always wins there; `musl_sh`
+searches `/usr/bin` first, so a bare name resolves to the
+donix-native tool.
+
+**The shim removal.**  `sys_execve`'s bare-name attempt — uppercase
+the name, append `.ELF`, try the root and `/bin` — is gone, along
+with the helpers it called and a `f_stat` retry that used the same
+guesser.  What remains is (a) the path as given and (b) the `"0:"`
+prefix translation for an absolute path, which is the smallest the
+shim can be without a VFS.
+
+**The canary is now a program.**  `tests/canary.c` runs every
+non-interactive canary row and reports pass/fail.  It replaces the
+hand-typed list, which had already drifted once.
+
+The live state, the canary rows, and the NEXT SESSION list are in
+[`handoff.md`](handoff.md).
+
+---
+
+## v0.6.8 — the `*at()` family (shipped)
+
+Opened in session 39 (`20260930-at`), shipped and pushed in session
+42.  The theme was the `*at()` family: one path resolver shared by
+every syscall that takes a dirfd.  `resolve_at` is that resolver;
+`newfstatat` (262), `openat` (257), `unlinkat` (263), `faccessat`
+(269), and `utimensat` (280) all route through it.  The stat family
+is inverted to wrappers as on Linux.  busybox `find` (with `-type`)
 is enabled and works.
 
 **Every `*at` syscall with a consumer is implemented.**  The
@@ -80,17 +115,6 @@ See `open-issues.md` item 7 and `gotchas.md`, "A consumer inferred
 from behavior is not a consumer," for the `unlinkat` finding: it
 was added on the belief that `rm -r` needs it, and `rm -r` does
 not.
-
-The milestone is **closeable**.  The next milestone is `v0.6.9`,
-`envp`: `sys_execve` currently ignores its third argument, so `env`
-and `printenv` run but show an empty environment and `$VAR`
-expansion is always empty.  Env passing has a real, readable
-consumer (every applet that reads the environment), is a
-self-contained change to `sys_execve`'s argv-layout code, and is
-what makes the environment-using half of busybox actually work.
-
-The live state, the canary rows, and the NEXT SESSION list are in
-[`handoff.md`](handoff.md).
 
 ---
 

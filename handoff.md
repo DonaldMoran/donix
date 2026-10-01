@@ -3,15 +3,17 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-01 (session 42, envp)
-**Current HEAD:** branch `dev`, two commits past `v0.6.8`; scratch
-tags `20261001-envp`, `20261001-env-applets` (both local)
+**Last updated:** 2026-10-01 (session 42)
+**Current HEAD:** branch `dev`, six commits past `origin/dev`;
+scratch tags `20261001-envp`, `20261001-env-applets`,
+`20261001-envdocs`, `20261001-usrbin`, `20261001-nosuffix`,
+`20261001-noshim` (all local)
 **Last milestone:** `v0.6.8` (published) — the `*at()` family;
 `resolve_at`, `newfstatat` (262), `openat` (257), `unlinkat` (263),
 `faccessat` (269), `utimensat` (280), all through one resolver
-**Milestone status:** **`v0.6.9` open — envp.**  `20261001-envp`
-and `20261001-env-applets` are the first two commits.  The milestone
-is small on purpose: one subsystem, with a real consumer.
+**Milestone status:** **`v0.6.9` open — envp, the `/usr/bin`
+layout, and the shim removal.**  Six commits; two subjects; one
+session.  Not bumping yet.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`2026*`) are local scratch restore points** — they exist while a
@@ -61,45 +63,62 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Where we are — `v0.6.9` (envp) in progress
+## Where we are — `v0.6.9` (envp, layout, shim) in progress
 
-`v0.6.8` shipped the `*at()` family and is pushed.  `v0.6.9` is
-**envp**: `sys_execve` ignored its third argument, so every program
-ran with an empty environment.  That is now fixed.
+`v0.6.8` shipped the `*at()` family and is pushed.  `v0.6.9` opened
+as **envp** and grew, in the same session, into the **`/usr/bin`
+layout** and the **removal of `execve`'s bare-name guess**.
 
-### Session 42 — envp
+### Session 42 — three themes, six commits
 
 | Tag (kept, milestone open) | What |
 |---|---|
-| `20261001-envp` | `sys_execve` copies `envp` onto the new stack, as Linux does; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
+| `20261001-envp` | `sys_execve` copies `envp` onto the new stack; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
 | `20261001-env-applets` | config: enable busybox `env` and `printenv` |
+| `20261001-envdocs` | session-42 docs (first pass) |
+| `20261001-usrbin` | executables to `/usr/bin`; `canary.c` the smoke test |
+| `20261001-nosuffix` | drop the `.ELF` suffix; binaries staged bare |
+| `20261001-noshim` | `execve`: bare-name attempt and the `.ELF` helpers removed |
 
-**What it means:** `execve` now passes the caller's environment
-through **verbatim** (Linux semantics — the shell builds it, the
-kernel carries it).  `export FOO=bar` in ash, then `echo $FOO`,
-prints `bar`; before this session it printed empty.  `busybox env`
-lists `VAR=value` lines.
+**What it means:**
+
+- **envp:** `execve` passes the caller's environment through
+  verbatim.  `export FOO=bar` then `echo $FOO` prints `bar`;
+  `busybox env` lists variables.
+- **The layout:** `/bin` holds busybox, `/usr/bin` holds the
+  donix-native ELFs, `/tmp` is empty, `/` holds data.  **This is
+  the split the two shells' search rules need** — ash's applets
+  never consult `PATH` so busybox wins there; `musl_sh` searches
+  `/usr/bin` first so a bare name resolves to the donix-native tool.
+- **The shim:** `sys_execve`'s bare-name attempt is gone.  It tried
+  three spellings of a path; the third (bare name → uppercase →
+  append `.ELF` → try the root and `/bin`) could not succeed once
+  the binaries moved to `/usr/bin` and lost the suffix.  What
+  remains is (a) the path as given and (b) the `"0:"` prefix
+  translation — the smallest the shim can be without a VFS.
 
 **Key facts for future work:**
+
+- **Every donix-native binary is staged BARE.**  `/usr/bin/HELLO`,
+  not `HELLO.ELF`; `/bin/busybox`, no suffix.  The `.ELF` suffix is
+  gone from the Makefile, from `musl_sh`'s search, from `kmain`'s
+  boot path, and from `canary.c`'s paths.  **A file named with
+  `.ELF` will not be found by anything.**
+- **`execve` now takes a path.**  No bare-name resolution.  Callers
+  pass `/usr/bin/NAME` or `/bin/NAME`.  `musl_sh`'s `run_external`
+  builds those; ash's `execvp` walks `$PATH` and passes the resolved
+  path.
+- **ash does not export `PATH`.**  It keeps `PATH` as a shell
+  variable, so `$PATH` expands and command lookup works, but a child
+  does not see `PATH` in its environment.  A difference from a
+  distro Linux where `PATH` is exported at login.
 - **The envp snapshot is `kmalloc`'d, not a stack array.**
-  `PROC_STACK_SIZE` is 16 KB (`process.h`); `EXEC_MAX_ENVC` ×
-  `EXEC_MAX_ARG_LEN` is 64 × 256 = 16 KB.  A stack array that size
-  would overflow.  The argv snapshot stayed a stack array (4 KB).
-  See `docs/gotchas.md`, "The kernel stack is 16 KB; do not put a
-  large scratch buffer on it."  **Before adding a scratch buffer to
-  a syscall, check `PROC_STACK_SIZE` and count bytes.**
-- **The argv region is now 16 KB, not 4 KB.**  It sits at the top
-  of the 64 KB user stack; `rsp_init` is one slot below its bottom.
-  A larger region only matters if a shell's argv+envp approaches
-  16 KB, which it does not.
-- **busybox ash does not export `PATH`.**  It keeps `PATH` as a
-  shell variable, so `$PATH` expands and command lookup works, but
-  a child does not see `PATH` in its environment unless the user
-  runs `export PATH`.  This is ash's behavior, not a donix bug, but
-  it means every child applet runs with no `PATH` in `envp`.
-- **`env` and `printenv` are now enabled.**  Before
-  `20261001-env-applets` they reported "applet not found" —
-  disabled, not broken.
+  `EXEC_MAX_ENVC` × `EXEC_MAX_ARG_LEN` = 16 KB, and
+  `PROC_STACK_SIZE` is 16 KB.  See `docs/gotchas.md`, "The kernel
+  stack is 16 KB."
+- **The canary is now `canary`, a program.**  `tests/canary.c`
+  replaces the hand-typed list.  Run from `donix>` or ash, both find
+  `/usr/bin/CANARY` via their search rules.
 
 ### What `v0.6.8` contributed (prior milestone, pushed)
 
@@ -109,7 +128,7 @@ dirfd-taking syscall.  `newfstatat` (262), `openat` (257),
 through it; the stat family is inverted to wrappers as on Linux.
 busybox `find` (with `-type`) is enabled and works.
 
-The two findings that milestone recorded, still load-bearing:
+The findings that milestone recorded, still load-bearing:
 - **`unlinkat` has no consumer in busybox.**  `rm -r`
   (`libbb/remove_file.c`) and `find -delete`
   (`findutils/find.c:923-925`) construct path strings and call
@@ -136,23 +155,20 @@ The two findings that milestone recorded, still load-bearing:
 
 ## NEXT SESSION — pick one
 
-`v0.6.9` is one subsystem and is closeable.  Candidates, in the
-order I'd rank them:
+`v0.6.9` has six commits and is closeable once the layout and the
+shim work have settled.  Candidates:
 
 ### Finishing `v0.6.9`
 
 1. **A dedicated envp regression test.**  The `$FOO` round trip is
    proven by hand; a `userland/musl/tests/` app that forks, sets a
    variable, `execve`s a helper that prints `getenv`, and checks the
-   value would make it a one-command check.  Small, and it closes
-   the milestone with a regression suite rather than a manual run.
+   value would make it a one-command check.
 2. **The free busybox applets.**  `basename`, `dirname`, `readlink`,
    `realpath`, `truncate`, `sleep`, `usleep`, `unlink`.  Each is
    gated on a syscall donix has or a small one; each is pure
    userland or a thin wrapper.  Add one at a time, exercising the
-   applet before the commit.  **`env`/`printenv` are done**; the
-   rest of the environment-using half is now unblocked by the envp
-   change.
+   applet before the commit.  **`env`/`printenv` are done.**
 
 ### Small, close gaps (non-theme)
 
@@ -171,8 +187,8 @@ order I'd rank them:
   the prerequisite for job control and `kill(2)`, and for a Wayland
   `wl_shm` client's `SIGBUS`.
 - **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
-  shims when it lands, do not extend them.  Note: the VFS is
-  **not** a Wayland prerequisite; see `ROADMAP.md`.
+  remaining shims when it lands, do not extend them.  Note: the VFS
+  is **not** a Wayland prerequisite; see `ROADMAP.md`.
 - **Wayland (long horizon).**  See `ROADMAP.md`.  Not a `v0.6.x`
   target; the one concrete kernel gap it shares with existing work
   is non-anonymous `mmap`.
@@ -254,83 +270,30 @@ commit.  Do not batch-enable without exercising.
 
 ## Canary state
 
-**The focused canary is green as of `20261001-env-applets`.**  Full
+**The focused canary is green as of `20261001-noshim`.**  Full
 table in `docs/session-log.md`.
 
-    # on boot, ash is already running
-    pwd                         # /
-    cd /bin
-    pwd                         # /bin
-    ls                          # busybox
-    cd ..
-    pwd                         # /
-    ls                          # full root listing
-    exit                        # back to donix>
-    pwd                         # /
-    cd /bin
-    pwd                         # /bin
-    ls                          # busybox (donix-native ls)
-    cd /
-    pwd                         # /
-    ls hello-world.txt
-    memtest
-    musl_fork
-    musl_exec2
-    musl_wait
-    busybox ls
-    busybox pwd                 # / (after cd /)
-    busybox ash
-    # at the ash prompt: pwd, cd /bin, pwd, ls, exit
-    # back at donix>: hello
+**The canary is now a program: `canary`.**  `tests/canary.c` runs
+every non-interactive canary row, checks exit status and output
+substrings, and reports pass/fail.  Run from `donix>` or ash; both
+find `/usr/bin/CANARY` via their search rules.
 
-**Read-only `uniq` rows (added v0.6.5):**
+    canary          # read-only rows
+    canary --full   # also the mutating rows (create/remove under /)
 
-    uniq hello-world.txt
-    uniq -c < hello-world.txt
+**What `canary` covers** — file reads, listing, the shell spine,
+`find` (including the two-level `/usr/bin` walk), the applets
+through busybox, and the `printenv PATH` empty-output check.
 
-**Pipeline rows (added v0.6.6):**
+**What stays manual**, printed at the end of a `canary` run:
 
-    cat hello-world.txt | head -n 2
-    echo hi | wc
-    echo hello | cat
+    busybox ash      # interactive; then pwd, cd /bin, ls, exit
+    vi test          # fills screen; :wq; ./test
 
-**Redirection rows (added v0.6.7):**
-
-    echo hi > out.txt ; cat out.txt
-    echo hi2 >> out.txt ; cat out.txt
-    cat < out.txt
-    busybox cat < out.txt
-
-**`find` rows (added `20260930-at`):**
-
-    find /bin                  # /bin, /bin/busybox
-    find / -type d             # /, /bin
-    find / -type f -name busybox
-
-**`rm`/`rmdir` rows (added `20261001-unlinkat`, from busybox):**
-
-    busybox touch /t ; busybox rm /t            # file: create, remove
-    busybox mkdir /d ; busybox rmdir /d         # empty dir: create, remove
-    busybox mkdir /d ; busybox rm /d            # rm on a dir -> busybox reports an error
-    busybox mkdir /t ; busybox touch /t/a ; busybox rm -r /t   # recursive
-
-These are one-offs, not canary rows (they mutate the disk).
-
-**envp rows (added `20261001-env-applets`, not canary rows — they
-mutate the shell's environment):**
-
-    # from ash:
-    export FOO=bar
-    echo $FOO                   # bar
-    env                         # FOO=bar, PWD=/
-    export PATH
-    printenv PATH               # /sbin:/usr/sbin:/bin:/usr/bin
-
-`env` showing `PWD=/` is ash exporting `PWD`; `FOO=bar` after
-`export FOO=bar` is the environment round-tripping through
-`execve`.  `printenv PATH` is empty **until** `export PATH`, because
-busybox ash does not export `PATH` — that is ash's behavior, not a
-bug.
+**The old hand-typed rows** remain in `docs/session-log.md` for
+history.  The rows `canary` runs are those, minus the interactive
+ones, plus the checks that changed with the `/usr/bin` layout and
+the suffix removal.
 
 **`*at` regression tests (`userland/musl/tests/`, not canary rows):**
 
@@ -350,41 +313,25 @@ Run these when changing `sys_read`/`sys_write`/`sys_close`/
 Not canary rows (they fork), but they are the only pipe regression
 suite.
 
-**Framebuffer / `vi` verification (added v0.6.7, not canary rows):**
-
-    vi test            # fills the screen; status line on the last row
-    # edit, :wq
-    ./test             # the saved script runs
-
-**Cursor (added `20260930-cursor`, not a canary row):**
-
-    # At any shell prompt on the framebuffer console, the block
-    # cursor at the current input position blinks at 500 ms per
-    # state.  Type a character: the cursor moves and does not leave
-    # an inverted cell behind.  `vi test` puts the cursor at the
-    # edit position; it is hidden while the screen is redrawn and
-    # restored on exit.
-
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
-
-**Canary rows must not mutate the disk.**  Read-only applets can be
-canary rows; `tee`, `cp`, `mv`, redirection, pipelines, and `vi`
-mutate or fork, so they stay one-offs.
 
 **Expected noise:** no `Unknown syscall:` lines; no `[fd]` lines
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
 trace line (session-41 diagnostic, removed).  The `FB: mapped N
 pages ...` line is expected.  The `sys_open: f_open FAIL path=...`
 lines from `vi` on a new file, and from `busybox stat` on
-nonexistent paths, are expected diagnostics.
+nonexistent paths, are expected diagnostics.  **`sys_execve: f_open
+FAIL` lines no longer appear** — the exec path tries two attempts
+and, since callers pass resolved paths, the first or second
+succeeds.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are shims a VFS would
+1. **VFS layer (eventual).**  `sys_execve`'s two remaining path
+   attempts and `resolve_against_cwd` are shims a VFS would
    subsume.  When a VFS lands, delete them; do not extend.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
@@ -410,6 +357,13 @@ wake is coupled to `sys_close`'s wake.
 
 **Real project root:** `/home/noneya/code/donix/`.
 
+**The FAT layout (as of `20261001-usrbin`):**
+
+    /            HELLO-WORLD.TXT and other data
+    /bin         busybox
+    /usr/bin     the donix-native ELFs (apps + tests), staged BARE
+    /tmp         empty
+
 - `configs/busybox.config` — tracked canonical busybox config.
   Enabled applets: `cat`, `cp`, `cut`, `echo`, `env`, `false`,
   `find`, `head`, `ls`, `mkdir`, `mv`, `od`, `printenv`, `pwd`,
@@ -418,17 +372,15 @@ wake is coupled to `sys_close`'s wake.
   `grep`, `sed`, `vi`, `clear`, plus `ash`.
   `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  `CONFIG_FIND=y` and
   `CONFIG_FEATURE_FIND_TYPE=y`.  `CONFIG_ENV=y`,
-  `CONFIG_PRINTENV=y` (added `20261001-env-applets`).  The other
-  `FEATURE_FIND_*` predicates are off deliberately.  Off (with
-  reasons): `diff` (deliberate), `chmod`/`ln`/`mount` (need kernel
-  work).  See "Busybox enablement" above for what can be turned on
-  next.
+  `CONFIG_PRINTENV=y`.  The other `FEATURE_FIND_*` predicates are
+  off deliberately.  Off (with reasons): `diff` (deliberate),
+  `chmod`/`ln`/`mount` (need kernel work).  See "Busybox
+  enablement" above.
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
-  `05_boot_kernel64/Makefile`.  `tests/at_step1.c` (sessions 39,
-  41) and `tests/at_step2.c` (session 40) are the `*at` regression
-  suites.
+  `05_boot_kernel64/Makefile`.  `tests/canary.c` is the smoke test;
+  `tests/at_step1.c`/`at_step2.c` are the `*at` regression suites.
 - `04_kernel_64bit/fonts/ter-u18n.psf` — tracked font source.  The
   `.psf` is tracked; the generated `ter_u18n_data.c` is gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
@@ -457,9 +409,10 @@ needs it.  Paths relative to the tree root
   (session 39), "A consumer inferred from behavior is not a
   consumer" (session 40), "A syscall argument the caller did not
   set holds the previous syscall's return value" and "The
-  incremental kernel build can silently skip" (session 41), and
-  "The kernel stack is 16 KB; do not put a large scratch buffer on
-  it" (session 42).  Read them together; expect more.
+  incremental kernel build can silently skip" (session 41), "The
+  kernel stack is 16 KB" and "A shim's dead code is only dead if
+  you watch it not run" (session 42).  Read them together; expect
+  more.
 - `docs/session-log.md` — commit tables and per-test canary notes.
   Rows named by scratch tag.
 - `docs/open-issues.md` — full open-issues list.
@@ -477,11 +430,13 @@ needs it.  Paths relative to the tree root
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` shipped the shell and the framebuffer;
-`v0.6.8` shipped the `*at()` family.  `v0.6.9` is envp, and it is
-in progress: `execve` now passes the caller's environment through
-verbatim, so `export FOO=bar` then `echo $FOO` prints `bar`, and
-`busybox env` lists variables.  The envp snapshot is kmalloc'd
-because the kernel stack is 16 KB.  One change at a time.**
+`v0.6.8` shipped the `*at()` family.  `v0.6.9` is in progress and
+covers three things: `execve` now passes the environment through,
+the donix-native binaries live in `/usr/bin` (busybox in `/bin`,
+bare names, no `.ELF` suffix), and `sys_execve`'s bare-name guess
+is gone — it takes a path.  The canary is now the `canary` program,
+green from both shells.  Six scratch tags, not bumped.  One change
+at a time.**
 
 ---
 
