@@ -110,39 +110,39 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	        exit 1; \
 	    fi \
 	}; \
-	mcopy_one "$(USERLAND_BIN)/hello.elf"          HELLO.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/echo.elf"           ECHO.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/cat.elf"            CAT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/ls.elf"             LS.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/memtest.elf"        MEMTEST.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_stat.elf"      MUSL_STAT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_min.elf"       MUSL_MIN.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_printf.elf"    MUSL_PRINTF.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_malloc.elf"    MUSL_MALLOC.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_fork.elf"      MUSL_FORK.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_fork_raw.elf"  MUSL_FORK_RAW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/printnum.elf"       PRINTNUM.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brk_verify.elf"     BRK_VERIFY.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_exec2.elf"     MUSL_EXEC2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_dupfd.elf"     MUSL_DUPFD.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_ids.elf"       MUSL_IDS.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_getcwd.elf"    MUSL_GETCWD.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/fault_pf.elf"       FAULT_PF.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step1.elf"     PIPE_STEP1.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step2.elf"     PIPE_STEP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step3.elf"     PIPE_STEP3.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/at_step2.elf"       AT_STEP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/canary.elf"         CANARY.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
+	mcopy_one "$(USERLAND_BIN)/hello.elf"          HELLO ; \
+	mcopy_one "$(USERLAND_BIN)/echo.elf"           ECHO ; \
+	mcopy_one "$(USERLAND_BIN)/cat.elf"            CAT ; \
+	mcopy_one "$(USERLAND_BIN)/ls.elf"             LS ; \
+	mcopy_one "$(USERLAND_BIN)/memtest.elf"        MEMTEST ; \
+	mcopy_one "$(USERLAND_BIN)/musl_stat.elf"      MUSL_STAT ; \
+	mcopy_one "$(USERLAND_BIN)/musl_min.elf"       MUSL_MIN ; \
+	mcopy_one "$(USERLAND_BIN)/musl_printf.elf"    MUSL_PRINTF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_malloc.elf"    MUSL_MALLOC ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork.elf"      MUSL_FORK ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork_raw.elf"  MUSL_FORK_RAW ; \
+	mcopy_one "$(USERLAND_BIN)/printnum.elf"       PRINTNUM ; \
+	mcopy_one "$(USERLAND_BIN)/brk_verify.elf"     BRK_VERIFY ; \
+	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW ; \
+	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec2.elf"     MUSL_EXEC2 ; \
+	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT ; \
+	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2 ; \
+	mcopy_one "$(USERLAND_BIN)/musl_dupfd.elf"     MUSL_DUPFD ; \
+	mcopy_one "$(USERLAND_BIN)/musl_ids.elf"       MUSL_IDS ; \
+	mcopy_one "$(USERLAND_BIN)/musl_getcwd.elf"    MUSL_GETCWD ; \
+	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR ; \
+	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/fault_pf.elf"       FAULT_PF ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step1.elf"     PIPE_STEP1 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step2.elf"     PIPE_STEP2 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step3.elf"     PIPE_STEP3 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B ; \
+	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1 ; \
+	mcopy_one "$(USERLAND_BIN)/at_step2.elf"       AT_STEP2 ; \
+	mcopy_one "$(USERLAND_BIN)/canary.elf"         CANARY ; \
+	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \

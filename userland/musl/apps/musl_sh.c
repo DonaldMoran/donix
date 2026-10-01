@@ -375,26 +375,22 @@ static int parse_redir(char** argv, int argc,
  * differ on purpose.
  *
  * NAME is uppercased, matching the FAT staging layout (the
- * Makefile copies LS.ELF, not ls).  FatFs lookup is
- * case-insensitive, so the uppercase form finds the file either
- * way.
+ * Makefile copies LS, not ls).  FatFs lookup is case-insensitive,
+ * so the uppercase form finds the file either way.
  *
- * Each directory is tried TWICE: once with ".ELF" appended, once
- * without.  The no-suffix form is what finds /bin/busybox, which
- * is staged without a suffix; the suffixed form finds every other
- * binary, which is staged with one.  The suffixed form is tried
- * first so a file that exists under both spellings resolves to
- * the suffixed one.
+ * NO SUFFIX.  The binaries are staged bare -- /usr/bin/HELLO,
+ * /bin/busybox -- so this search builds ONE form per directory.
+ * (An earlier version tried NAME.ELF first, because the files
+ * were staged with that suffix.  Dropping the suffix is what lets
+ * ash's execvp find them too: execvp looks for an exact filename
+ * in each $PATH directory and does not guess suffixes, so a file
+ * named HELLO.ELF is invisible to `hello`.  With the suffix gone,
+ * ash's PATH walk reaches the same files this loop does.)
  *
  * If argv[0] contains a '/', it is a path, not a name: exec it
  * as given, no search.  That is what makes `/bin/busybox sh` and
  * `./script` work, and it is what the kernel's attempt (b)
  * resolves (a leading '/' becomes the "0:" + path form).
- *
- * INTERIM: the binaries are still staged at the FAT root.  The
- * first directory tried is "/" (root); the commit that moves the
- * files to /usr/bin changes the first string in `dirs[]`.  See
- * the Makefile's mcopy_one chain.
  *
  * A future session that adds real $PATH support replaces `dirs[]`
  * with a split of $PATH; the shape of the loop stays.
@@ -410,52 +406,35 @@ static void run_external(char** argv) {
         }
     }
 
-    /* INTERIM: "/" (root) first, then "/bin/".  After the layout
-     * move, "/" becomes "/usr/bin/". */
     static const char* dirs[2] = { "/usr/bin/", "/bin/" };
     char path[128];
 
     for (int d = 0; d < 2; d++) {
-        /* suffix == 1: append ".ELF"; suffix == 0: leave bare. */
-        for (int suffix = 1; suffix >= 0; suffix--) {
-            size_t o = 0;
-            const char* base = dirs[d];
-            while (base[o] && o < sizeof(path) - 1) {
-                path[o] = base[o];
-                o++;
-            }
-
-            const char* s = name;
-            size_t nlen = 0;
-            while (s[nlen]) nlen++;
-
-            int have_elf = (nlen >= 4 &&
-                            s[nlen-4] == '.' &&
-                            (s[nlen-3] == 'e' || s[nlen-3] == 'E') &&
-                            (s[nlen-2] == 'l' || s[nlen-2] == 'L') &&
-                            (s[nlen-1] == 'f' || s[nlen-1] == 'F'));
-
-            for (size_t i = 0; i < nlen && o < sizeof(path) - 5; i++) {
-                char c = s[i];
-                if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-                path[o++] = c;
-            }
-            if (suffix && !have_elf) {
-                path[o++] = '.';
-                path[o++] = 'E';
-                path[o++] = 'L';
-                path[o++] = 'F';
-            }
-            path[o] = '\0';
-
-            execve(path, argv, (char**)0);
-            /* execve returned: this path did not resolve.  Try the
-             * next suffix / directory. */
+        size_t o = 0;
+        const char* base = dirs[d];
+        while (base[o] && o < sizeof(path) - 1) {
+            path[o] = base[o];
+            o++;
         }
+
+        const char* s = name;
+        size_t nlen = 0;
+        while (s[nlen]) nlen++;
+
+        for (size_t i = 0; i < nlen && o < sizeof(path) - 1; i++) {
+            char c = s[i];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            path[o++] = c;
+        }
+        path[o] = '\0';
+
+        execve(path, argv, (char**)0);
+        /* execve returned: not found here.  Try the next
+         * directory. */
     }
 
-    /* Neither directory, neither suffix.  Return so the caller
-     * prints EXEC-FAILED. */
+    /* Neither directory had it.  Return so the caller prints
+     * EXEC-FAILED. */
 }
 
 /*

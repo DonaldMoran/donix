@@ -5,7 +5,7 @@
  * mutating rows).  Exits 0 if every check passed, 1 otherwise.
  *
  * Runs from EITHER shell.  From `donix>`, musl_sh's run_external
- * finds /usr/bin/CANARY.ELF.  From ash, busybox's PATH search finds
+ * finds /usr/bin/CANARY.  From ash, busybox's PATH search finds
  * the same file.  The program does not know or care which shell
  * launched it -- it does its own fork/execve/wait4 for each row.
  *
@@ -36,18 +36,16 @@
  * CASE-INSENSITIVE, because busybox `ls` prints the FAT short name
  * (`HELLO-WORLD.TXT`) where a donix-native tool prints the long name.
  *
- * PATHS.  Every donix-native binary is named with its `.ELF` suffix
- * (`/usr/bin/LS.ELF`, not `/usr/bin/LS`), because execve is called
- * directly here and does NOT get musl_sh's suffix-adding search.
- * `busybox` is the one binary staged without a suffix, so it is
- * named `/bin/busybox`.
+ * PATHS.  Every donix-native binary is staged BARE -- /usr/bin/LS,
+ * not /usr/bin/LS.ELF -- so the paths here name them exactly, with
+ * no suffix.  execve is called directly and does not guess.
+ * `busybox` is staged bare too, at /bin/busybox.
  *
  * ARGV HELPERS.  check4 and check5 cover four- and five-word command
  * lines.  Rows with more words than that build argv by hand -- see
  * `find / -type f -name busybox`, which is seven words.  A row that
  * uses the wrong helper does not fail loudly; it silently drops the
- * trailing words and tests something else.  The first run of this
- * program had exactly that bug.
+ * trailing words and tests something else.
  *
  * MUTATING ROWS.  `echo hi > /cout.txt` and `rm -r /ctree` change
  * the disk.  They run only with --full, and each row cleans up after
@@ -249,7 +247,7 @@ static void run_readonly(void) {
     /* --- file reads ------------------------------------------------- */
     {
         static const char* const w[] = { "Hello", "single-drive", NULL };
-        check4("cat hello-world.txt", "/usr/bin/CAT.ELF",
+        check4("cat hello-world.txt", "/usr/bin/CAT",
                "hello-world.txt", NULL, NULL, w, 0);
     }
     {
@@ -262,16 +260,16 @@ static void run_readonly(void) {
     {
         static const char* const w[] = { "bin", "usr", "tmp",
                                          "hello-world.txt", NULL };
-        check4("ls /", "/usr/bin/LS.ELF", NULL, NULL, NULL, w, 0);
+        check4("ls /", "/usr/bin/LS", NULL, NULL, NULL, w, 0);
     }
     {
         static const char* const w[] = { "busybox", NULL };
-        check4("ls /bin", "/usr/bin/LS.ELF", "/bin", NULL, NULL, w, 0);
+        check4("ls /bin", "/usr/bin/LS", "/bin", NULL, NULL, w, 0);
     }
     {
-        static const char* const w[] = { "LS.ELF", "CAT.ELF",
-                                         "MUSL_SH.ELF", NULL };
-        check4("ls /usr/bin", "/usr/bin/LS.ELF", "/usr/bin", NULL, NULL,
+        static const char* const w[] = { "LS", "CAT",
+                                         "MUSL_SH", NULL };
+        check4("ls /usr/bin", "/usr/bin/LS", "/usr/bin", NULL, NULL,
                w, 0);
     }
     {
@@ -287,7 +285,7 @@ static void run_readonly(void) {
     }
     {
         static const char* const w[] = { "hello from donix", NULL };
-        check4("hello", "/usr/bin/HELLO.ELF", NULL, NULL, NULL, w, 0);
+        check4("hello", "/usr/bin/HELLO", NULL, NULL, NULL, w, 0);
     }
 
     /* --- find: the two-level walk ----------------------------------- */
@@ -298,8 +296,8 @@ static void run_readonly(void) {
     /*
      * find / -type d: the row that changed.  Before the layout move
      * it printed `/` and `/bin`; after, it walks /usr and /usr/bin.
-     * Five directories now.  Each is checked as a substring, so
-     * traversal order does not matter.
+     * Five directories now.  Checked as substrings, so traversal
+     * order does not matter.
      */
     {
         static const char* const w[] = { "/bin", "/tmp", "/usr",
@@ -417,7 +415,7 @@ static void run_mutating(void) {
     }
     {
         static const char* const w[] = { "cfile", NULL };
-        check4("ls /cfile", "/usr/bin/LS.ELF", "/cfile", NULL, NULL,
+        check4("ls /cfile", "/usr/bin/LS", "/cfile", NULL, NULL,
                w, 0);
     }
     {
@@ -427,7 +425,7 @@ static void run_mutating(void) {
     {
         /* LS on a file that is gone must fail. */
         char* argv[3];
-        argv[0] = (char*)"/usr/bin/LS.ELF";
+        argv[0] = (char*)"/usr/bin/LS";
         argv[1] = (char*)"/cfile";
         argv[2] = NULL;
         expect_nonzero("ls /cfile refuses a missing file", argv);
@@ -470,7 +468,7 @@ static void run_mutating(void) {
     }
     {
         static const char* const w[] = { "hi", NULL };
-        check4("cat /cout.txt", "/usr/bin/CAT.ELF", "/cout.txt",
+        check4("cat /cout.txt", "/usr/bin/CAT", "/cout.txt",
                NULL, NULL, w, 0);
     }
     {
