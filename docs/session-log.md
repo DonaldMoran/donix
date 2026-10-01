@@ -1,3 +1,121 @@
+## Session 40 — `unlinkat` (263); `unlink`/`rmdir` gain the type check
+
+Two commits on `dev`, scratch-tagged, unpushed.  Continues the
+`v0.6.8` `*at()` family.  Opened as "implement `unlinkat` so
+busybox `rm -r` works" and closed with `unlinkat` implemented,
+tested, and — importantly — shown to have **no consumer** in
+busybox as configured.  The feature that actually made `rm -r`
+work was the `unlink`/`rmdir` type check that landed in the same
+commit.
+
+| Tag | What |
+|---|---|
+| `20261001-atrefactor` | `unlink_body` extracted; `sys_unlink`/`sys_rmdir` become `resolve_at` wrappers |
+| `20261001-unlinkat` | `unlinkat` (263); `want_dir` + `f_stat_with_retry` type check; `cli` critical section; `at_step2.c` |
+
+**Commit 1** (`atrefactor`): pure refactor.  `sys_unlink` and
+`sys_rmdir` were byte-identical except for their diagnostic
+string; both now call a shared `static unlink_body(in_path, tag)`
+and resolve their path with `resolve_at(AT_FDCWD_, ...)`, the
+same resolver `openat`/`newfstatat` use.  No behavior change.
+`unlink_body` does `path_copy` → `strip_dot_prefix` → `f_unlink`
+→ `fatfs_errno`.  Canary green; neither wrapper is on a canary
+path, so the refactor is invisible to it, which is the point.
+
+**Commit 2** (`unlinkat`): `unlink_body` gains `want_dir` and a
+type check via `f_stat_with_retry`:
+
+    unlink(path) on a directory  -> -EISDIR   (was: succeeded)
+    rmdir(path) on a file        -> -ENOTDIR  (was: succeeded)
+    rmdir("/")                   -> -EBUSY    (root is not removable)
+
+Both were bugs: `f_unlink` accepts files and directories alike, so
+the two syscalls were silently interchangeable.  Added
+`sys_unlinkat` (263), a thin wrapper over `resolve_at` +
+`unlink_body` with `AT_REMOVEDIR` selecting the directory case;
+unknown flag bits are `-EINVAL`.  Added `SYS_UNLINKAT 263` and a
+dispatch case.
+
+The check and the unlink are one critical section, held with
+`cli` and released by restoring the caller's saved RFLAGS (not
+`sti`'d — `unlink_body` can run inside `sys_execve`'s `cli`).  This
+was a deliberate reversal of an initial "no race today, skip it"
+call; see the session note below.
+
+Also fixed a stale `sys_chdir` comment claiming `sys_unlink` and
+`sys_mkdir` do not resolve against the cwd.  They do; since
+`v0.6.4`.
+
+**Tested.**  `at_step2.c` (new), all 8 checks pass: unlinkat file
+→ 0; dir without `AT_REMOVEDIR` → `EISDIR`; dir `AT_REMOVEDIR`
+→ 0; file `AT_REMOVEDIR` → `ENOTDIR`; `unlinkat(dirfd, rel)` → 0;
+bad flag → `EINVAL`; `unlink` missing → `ENOENT`; `rmdir` empty dir
+→ 0.  It creates and removes fixtures under `/`, so it **mutates
+the disk** and is **not a canary row**.  From busybox:
+`touch`/`rm`, `mkdir`/`rmdir`, and `rm -r` on a tree all succeed
+silently.
+
+**Canary:** green.  Boot spine — `ls`, `cd /bin`, `pwd`, `cd ..`,
+`pwd`, `exit` — all behave.  No `Unknown syscall:` lines.
+(`find` rows and the pipe/redirection suites were *not* re-run:
+commit 2 touches nothing on those paths.  The `rm`/`rmdir` behavior
+change was verified through busybox instead.)
+
+**The `rm -r` finding — the reason this session is worth a log
+entry.**  `unlinkat` was added on the belief that busybox `rm -r`
+needs it.  It does not.  A tree-wide grep:
+
+    grep -rn "unlinkat" third_party/busybox/ \
+        --include='*.c' --include='*.h' | grep -v testsuite
+
+returns **nothing**.  `rm -r` is `libbb/remove_file.c`: `lstat`,
+then either `opendir`+`readdir`+recursive `remove_file` with a
+concatenated path string and a final `rmdir`, or `unlink`.  No
+dirfd anywhere.  So `unlinkat` (263) is implemented, correct, and
+tested, but **has no consumer in the current applet set**.
+
+What actually made `rm -r` work correctly was the type check in
+the *same* commit: `remove_file`'s `lstat`-branching was advisory
+while `f_unlink` accepted both kinds; the type check made it
+load-bearing.  The commit message was corrected before the commit
+was made — the false sentence never entered history.  See
+`gotchas.md`, "A consumer inferred from behavior is not a
+consumer."
+
+**A process note, recorded because it cost time twice.**  The first
+commit block for this work put `git commit`/`git tag` in the same
+paste as the build, with the test *after* — so the commit could
+land on a red test.  The second block was an `--amend` for a
+commit that had never been made, because the first `git commit`
+had not actually run.  Both were caught by asking for `git status`
+and `git log` before the block.  The rule carried forward: **the
+state check comes before the command block.**
+
+**A design note, recorded because the first answer was wrong.**
+The initial decision was to *skip* `cli`/`sti` around the type
+check and `f_unlink`, on the grounds that nothing races on one
+path today.  That was reversed: "nothing races today" is true of
+every race before it happens, and the check is meaningless if the
+object can change between the check and the action.  The mechanism
+was verified against the source before adopting it — `diskio.c`'s
+`disk_read`/`disk_write` and `ata.c`'s `ata_read_sectors_drive`/
+`ata_write_sectors_drive` spin on the ATA status port
+(`ata_poll_bsy_clear`, `ata_poll_drq`) and never `hlt` or wait on
+an IRQ, so `cli` across FatFs cannot hang.
+
+**Gotcha added:** "A consumer inferred from behavior is not a
+consumer."
+
+**Scratch tags kept:** `20261001-atrefactor` and
+`20261001-unlinkat` are local, not pushed, and are part of the
+open `v0.6.8` milestone (dropped when the milestone is pushed).
+`20261001-docs` is likewise local.
+
+**`20261001-docs` (between sessions 39 and 40).**  A small docs
+commit: the Wayland long-horizon section in `ROADMAP.md` plus
+cross-references.  No code.  It sits between `20260930-cursor` and
+`20261001-atrefactor` on `dev`.
+
 ## Session 39 — `20260930-at` (opens `v0.6.8`)
 
 | Tag | What |

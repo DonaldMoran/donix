@@ -14,8 +14,8 @@
    `<` and `>>`.
 
    Verified (session 37):
-   - `cd / > log` â€” no output, no error, no file; `cd` succeeded.
-   - `pwd > log` â€” prints `/` to the screen, not into `log`.
+   - `cd / > log` — no output, no error, no file; `cd` succeeded.
+   - `pwd > log` — prints `/` to the screen, not into `log`.
    - `ls` shows no `log`; `cat log` fails with `cannot open`.
 
    A loud failure would be better than silence; so would actually
@@ -51,13 +51,13 @@
    `SIGPIPE` does not.
 
    This gap is narrower than `v0.6.6`'s docs suggested.  Session 37
-   ran the case the old docs named as the poster child â€”
-   `busybox yes | busybox head -n 1` â€” and it does **not** hang:
+   ran the case the old docs named as the poster child —
+   `busybox yes | busybox head -n 1` — and it does **not** hang:
    `head` prints `y` and exits, `yes` gets `-EPIPE`, handles it,
    prints `yes: Broken pipe`, and exits.  busybox apps generally
    check `write`'s return value, so the common pipelines are fine.
    The remaining exposure is a program that expects to be *killed*
-   by `SIGPIPE` and does not check `write` â€” none has been found.
+   by `SIGPIPE` and does not check `write` — none has been found.
 
    Fixing this means implementing signal delivery: a real
    `sys_rt_sigaction`, per-process signal handlers, and a `SIGPIPE`
@@ -66,25 +66,42 @@
    for `SIGBUS` on buffer overrun** — see `ROADMAP.md`.  Doing it
    once serves both.
 
-Also open: `newfstatat` (262) reserved, no dispatch case; Ctrl- `[` not
-mapped to ESC; `sys_utimensat` lacks `resolve_against_cwd`;
-`sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base` and
-the 4 MB mmap window are latent collisions; real FatFs timestamp
-storage (the three timestamp syscalls return 0 without storing);
-`prctl` is minimal (`PR_SET_NAME` accepted and dropped); busybox
-applet symlinks not installed; syscall-table audit script;
-`musl_wait`'s WNOHANG loop spins; `sys_mmap` rejects all
+7. **`unlinkat` (263) has no consumer in busybox as configured.**
+   Implemented (session 40), correct, and tested by `at_step2.c`,
+   but a tree-wide grep for `unlinkat` in `third_party/busybox`
+   returns nothing.  busybox `rm -r` uses `lstat` + `unlink` +
+   `rmdir` with constructed path strings (`libbb/remove_file.c`);
+   `find` recurses with `openat` + `newfstatat` but removes
+   nothing.  `unlinkat` is part of the `*at` family and is correct
+   to have — it will serve the first tool that walks a directory and
+   removes entries relative to a dirfd — but nothing in the current
+   applet set calls it.  See `gotchas.md`, "A consumer inferred
+   from behavior is not a consumer."
+
+Also open: Ctrl- `[` not mapped to ESC; `sys_utimensat` lacks
+`resolve_against_cwd`; `sys_munmap` is a stub returning 0; `sys_brk`'s
+fixed `heap_base` and the 4 MB mmap window are latent collisions;
+real FatFs timestamp storage (the three timestamp syscalls return 0
+without storing); `prctl` is minimal (`PR_SET_NAME` accepted and
+dropped); busybox applet symlinks not installed; syscall-table audit
+script; `musl_wait`'s WNOHANG loop spins; `sys_mmap` rejects all
 non-anonymous mappings (a file-backed `mmap` caller will get
 `-ENOMEM` and must fall back to `read`; **a Wayland prerequisite --
 see `ROADMAP.md`**); **pipes support one
 concurrent reader and one concurrent writer** (see `pipe_t`'s comment
-in `user_syscall.c` â€” a second blocked reader on the same pipe end
+in `user_syscall.c` — a second blocked reader on the same pipe end
 has nowhere to record itself and will only wake on a keyboard IRQ);
 **`put_file_slot`'s pipe wake is coupled to `sys_close`'s wake** (if
 `sys_close`'s wake is ever removed on the theory that `put_file_slot`
 covers everything, non-final closes in a `dup`'d chain stop waking
-the peer and the peer hangs until a keystroke â€” read the
-`put_file_slot` comment and this entry before touching either).
+the peer and the peer hangs until a keystroke — read the
+`put_file_slot` comment and this entry before touching either);
+**`faccessat` (269) ignores its `dirfd` and `flags`** — it is a
+direct alias of `sys_access`, so `faccessat(dirfd, "rel", ...)` with
+a real dirfd resolves against the cwd, not the dirfd.  Correct for
+the only case that reaches it today (`AT_FDCWD`, no flags), but not
+a correct alias in general; fix it with `resolve_at` if a caller
+ever passes a real dirfd.
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
@@ -104,8 +121,15 @@ harmless, and the reason `vi` fills the screen.  No action.
   after framebuffer or console changes, not as part of the boot
   canary.
 
-- **Pipe regression suite is not a canary.**  `pipe_step1` â€¦
+- **Pipe regression suite is not a canary.**  `pipe_step1` …
   `pipe_step3b` fork and take seconds; run them when changing
   `sys_read`/`sys_write`/`sys_close`/`put_file_slot`/`sys_fork`/
   `sys_pipe` or adding a `FILE_KIND_*`, but not as part of the boot
   canary.
+
+- **`at_step2` is not a canary either.**  Session 40 added it: it
+  creates and removes fixtures under `/`, so it **mutates the
+  disk**.  Run it when changing `resolve_at`, the `unlink`/`rmdir`/
+  `unlinkat` family, or `unlink_body`.  `at_step1` (session 39) is
+  read-only and is the analogous suite for `resolve_at` and the
+  stat family.

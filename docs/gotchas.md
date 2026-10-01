@@ -1,3 +1,84 @@
+## A consumer inferred from behavior is not a consumer
+
+*Session 40 (`unlinkat`), commit `20261001-unlinkat`. Not a kernel
+bug -- a wrong claim in a commit message, caught before the commit
+was made.*
+
+`unlinkat(2)` was added because busybox `rm -r` was believed to
+need it.  The reasoning was: `rm -r` walks a directory and removes
+entries by name; on Linux that is `unlinkat(dirfd, name, ...)`; the
+`openat`/`newfstatat` work in session 39 was for `find`, and this
+would be the same shape for `rm`.  It is a plausible story.
+
+It is also false.  A tree-wide grep settles it:
+
+    grep -rn "unlinkat" third_party/busybox/ \
+        --include='*.c' --include='*.h' | grep -v testsuite
+
+returns nothing.  `rm -r` is `libbb/remove_file.c`, and what it
+actually does is:
+
+    lstat(path, &st);              // syscall 6
+    if (S_ISDIR(st.st_mode)) {
+        dp = opendir(path);
+        while ((d = readdir(dp))) {
+            new_path = concat_subpath_file(path, d->d_name);
+            remove_file(new_path, flags);   // RECURSIVE, by string
+        }
+        rmdir(path);               // syscall 84
+    } else {
+        unlink(path);              // syscall 87
+    }
+
+`concat_subpath_file` builds a path string; the recursion carries
+the full path down.  No dirfd is opened, no `*at` syscall is made.
+`find` uses `openat` + `newfstatat` because it *recurses*; `rm -r`
+uses neither because it does not need a dirfd to remove a file it
+can name.
+
+**The rule.**  A commit message that names what a feature is *for*
+is making a factual claim about another program's source.  Read
+that source before writing the sentence.  "The syscall busybox
+`rm -r` reaches" is checkable in one grep and was checked only
+after the sentence was drafted, at which point it was wrong.
+
+**The tell, and why it was easy to miss.**  `rm -r` *worked*.
+Running it on a tree succeeded, which felt like confirmation.  But
+success was consistent with both stories -- `rm -r` via `unlinkat`,
+and `rm -r` via `unlink`+`rmdir` -- and only one of them was true.
+Behavior that two mechanisms both explain is not evidence for
+either.  The confirmation was in the source, not in the run.
+
+**What made `rm -r` work, for the record.**  Not `unlinkat`.  It
+was the `unlink`/`rmdir` type check in the same commit: before it,
+`f_unlink` accepted files and directories alike, so `remove_file`'s
+`lstat`-then-branch was advisory -- either branch produced the same
+result.  After the check, the branch is load-bearing: `unlink` on a
+directory is `-EISDIR`, `rmdir` on a file is `-ENOTDIR`.
+`remove_file` was already correct; the kernel started enforcing
+what it assumed.  The feature that mattered and the feature that
+was *believed* to matter were different.
+
+**A companion failure, same session.**  The first commit block for
+this work was written against an assumed repository state and
+included `git commit` and `git tag` in the same paste as the build,
+with the test *after*.  The order was wrong: the commit should not
+exist until the test is green.  The second block was an `--amend`
+for a commit that had never been made -- the earlier `git commit`
+had not run, so there was nothing to amend, and the amend would
+have folded the feature into the *refactor* commit.  Both were
+caught by asking for `git status` and `git log` before the block
+rather than after.  The fix, now a rule: **the state check comes
+before the command block, not after.**
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39):
+one assertion, copied or inferred, never checked against the thing
+that defines truth.  The PIT case was a wrong *number*; this is a
+wrong *causal claim*.  Both were caught by going to the source --
+`grep` for the number, `grep` for the symbol -- and both had a
+plausible story that made the check feel unnecessary.
+
 ## The kernel syscall name and the libc name differ
 
 *Session 39 (`*at` work), userspace test. Not a bug -- a naming
