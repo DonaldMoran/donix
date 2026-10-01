@@ -55,60 +55,30 @@ The narratives are in the annotated scratch tags,
 
 ---
 
-## v0.6.7 — pick a direction
+## v0.6.8 — in progress, the `*at()` family
 
-The framebuffer was the big item and it is done.  What's left is a
-set of small, independent items and several larger subsystem
-questions.  Pick one, do it, test it, tag it.
+Opened in session 39 (`20260930-at`).  The theme is the `*at()`
+family: one path resolver shared by every syscall that takes a
+dirfd.  `resolve_at`, `newfstatat` (262), and `openat` (257) are
+done; the stat family is inverted to wrappers as on Linux; busybox
+`find` (with `-type`) is enabled and works.  The remaining
+syscalls (`unlinkat`, `mkdirat`, `renameat`, …) are wrappers plus
+dispatch cases.  `unlinkat` (263) is the smallest honest next step.
 
-### Small, close gaps
+The live state, the canary rows, and the NEXT SESSION list are in
+[`handoff.md`](handoff.md).  This file records *future* work; the
+`v0.6.8` items still outstanding are listed there.
 
-- **`newfstatat` (262).**  Number reserved, no dispatch case.
-  Delegates to `sys_stat` when `dirfd == AT_FDCWD` or the path is
-  absolute.  Unblocks `find`.
-- **Ctrl-`[` as ESC.**  `scancode_to_ascii` has no Ctrl parameter
-  yet.  Low urgency (the literal ESC key works).
-- **`sys_utimensat` cwd resolution.**  Calls `strip_dot_prefix` but
-  not `resolve_against_cwd`; one-line fix.
-- **`sys_fcntl` fd < 3 for the other subcommands.**  `F_GETFL`,
-  `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`.  Not on any
-  current path.
-- **`sys_open` `O_DIRECTORY`** — done in session 38 (returns
-  `-ENOTDIR` on a file).
-- **Redirection of a builtin is silently ignored.**  `docs/open-issues.md`
-  item 2.
-- **A builtin in a pipeline is refused.**  `docs/open-issues.md`
-  item 3.
+### Still open in this milestone (from `handoff.md`)
 
-### Broaden busybox coverage
-
-The file/text utility set is broad.  Still untried: `awk`, `tar`,
-and `find` (needs `newfstatat`).  Work through them one at a time,
-watching for `Unknown syscall: N`.  `ps`, `top`, `kill`, and job
-control need subsystems the kernel does not have yet.
-
-### Framebuffer follow-ups (optional, not urgent)
-
-The console is 10×18 at 1024×768.  If it strains:
-- **Bigger font** — swap `ter-u18n.psf` for `ter-u24n.psf` (12×24)
-  or `ter-u32n.psf` (16×32) and update `FB_FONT_*` in `fb.c`.  Data
-  change.
-- **Bigger mode** — a different VBE mode number in `stage2.asm`; the
-  kernel adapts (it reads the captured descriptor).  The grid becomes
-  `fb_width/10 × fb_height/18`.
-- **A scalable / anti-aliased GUI font later** — **Hack** (MIT) is
-  the code-oriented choice.  Out of scope for a console.
-
-### Larger subsystem questions
-
-- **Signal delivery.**  `sys_rt_sigaction`/`sys_rt_sigprocmask` are
-  stubs.  Prerequisite for `SIGPIPE`, job control, and `kill(2)`.
-  Larger than it sounds: per-process pending/blocked mask, a
-  delivery point on syscall return or interrupt, a user-mode handler
-  trampoline.  Its own milestone-scale effort.
-- **VFS layer.**  `sys_execve`'s three-attempt path resolution and
-  `resolve_against_cwd` are shims.  Delete them when a VFS lands; do
-  not extend them.
+- **`unlinkat` (263)** — `unlink`/`rmdir` in one syscall;
+  `AT_REMOVEDIR` selects.  Real consumer: `rm -r`.
+- **`mkdirat` (258)** — `mkdir` with a dirfd.
+- **`renameat` (264)** — two-path; `resolve_at` twice.
+- **`linkat` / `readlinkat` / `symlinkat`** — FAT has no links or
+  symlinks; honest `-EPERM`/`-ENOSYS` until a VFS exists.  Skip.
+- **`faccessat` / `fchmodat` / `fchownat`** — donix ignores
+  permissions and ownership.  Skip.
 
 ---
 
@@ -144,9 +114,53 @@ value.
 - **Per-process tty / console focus** — prerequisite for multiple
   concurrent shells.
 - **Serial console debug access** — kernel shell over COM1.
-- **Device drivers** — PCI enumeration, AHCI, PS/2 mouse.
+- **Device drivers** — PCI enumeration, AHCI, PS/2 mouse (see the
+  Wayland section below for what a mouse is and is not needed for).
 - **Scalable GUI font / richer graphics** — beyond the current
-  fixed-size text console.
+  fixed-size text console; a Wayland compositor is the far end of
+  this arc.
+
+---
+
+## Wayland (long horizon)
+
+Direction of travel: donix should eventually run a Wayland client —
+ideally a small `wl_shm` client written against the wire protocol,
+statically linked against musl, speaking to a compositor that is
+either `weston` (heavy: EGL, DRM, libinput, xkbcommon, mesa) or a
+minimal custom one.  The custom-compositor-plus-hand-written-client
+route is the honest first probe; Weston is a mountain of
+dependencies and should not be the opening move.
+
+Not a `v0.6.x` target.  Recorded here so the milestones above stay
+honest about what is and is not on that path.
+
+**Prerequisites, rough order:**
+
+- **A compositor, or a hand-written `wl_shm` client.**  The first
+  real decision and the biggest unknown.
+- **`AF_UNIX` sockets + `SCM_RIGHTS` fd passing.**  Wayland's
+  transport.  Not yet present.  Larger than mouse support.
+- **`mmap` of non-anonymous mappings** — a shared buffer from a
+  `memfd` or file.  Currently refused; see `open-issues.md`.
+- **`memfd_create` + `ftruncate`** for `wl_shm` pools.
+- **`poll` (or `epoll`)** — the client's main loop.
+- **`SIGBUS` on buffer overrun** — needs real signal delivery, the
+  same subsystem `SIGPIPE` needs (see `open-issues.md` item 6).
+- **`futex`** — verify it exists; musl threads need it anyway.
+
+**Explicitly not Wayland prerequisites, despite being commonly
+assumed:**
+
+- **Mouse support.**  Needed for an *interactive compositor*, not
+  for a `wl_shm` client driven by a canned event stream.  Its own
+  future milestone (already listed under "Longer term" above).
+- **A VFS.**  Wayland does not require one.  A `wl_shm` client needs
+  no device nodes at all; a DRM-backed compositor later can reach
+  `/dev/...` through the existing path layer.  The VFS is on the
+  critical path for *donix generally*, not for Wayland.
+
+Revisit when `v0.6.8` closes.
 
 ---
 

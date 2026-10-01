@@ -37,7 +37,8 @@ Userland is a tracked source tree at `userland/musl/`. Phase B
 (busybox) is well underway.
 
 Full strategy, rules, and the one-change-at-a-time discipline:
-`docs/strategy.md`.
+`docs/strategy.md`.  Direction of travel beyond the current
+milestone: `ROADMAP.md`.
 
 ---
 
@@ -194,11 +195,16 @@ smallest honest extension of the work just done.
   Also the prerequisite for job control and `kill(2)`.  Its own
   milestone-scale effort when ready.
 - **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
-  shims when it lands, do not extend them.
+  shims when it lands, do not extend them.  Note: the VFS is **not**
+  a Wayland prerequisite; see `ROADMAP.md`.
+- **Wayland (long horizon).**  See `ROADMAP.md`.  Not a `v0.6.x`
+  target; the one concrete kernel gap it shares with existing
+  work is non-anonymous `mmap`.
 - **PS/2 mouse driver + framebuffer cursor.**  Not on the roadmap
   yet, but the natural first step toward any interactive GUI.  The
   framebuffer console is the foundation; a mouse is what would make
-  it interactive.
+  it interactive.  See `ROADMAP.md` for what a mouse is and is not
+  needed for on the Wayland path.
 - **Font size / resolution.**  The console is 10×18 at 1024×768.
   A bigger glyph (`ter-u24n.psf`, 12×24) or a bigger mode is a
   data change, but **see the `v0.6.7` "changing the VBE mode" note
@@ -395,6 +401,8 @@ needs it.  Paths relative to the tree root
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
+- `ROADMAP.md` — future work only; direction of travel beyond the
+  current milestone (currently: the Wayland long-horizon section).
 
 ---
 
@@ -421,3 +429,4 @@ canary state, and next step.  Do not append.  New gotchas go to
 `docs/gotchas.md`; new commit rows go to `docs/session-log.md`;
 new open issues go to `docs/open-issues.md`.  This file never
 grows.  Name commits by tag only, never by SHA.
+[file content end]
