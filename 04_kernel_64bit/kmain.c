@@ -1389,7 +1389,7 @@ void kmain(BootInfo *info) {
 
     /*
      * Default boot shell: musl_sh, loaded from the FAT as
-     * 0:/MUSL_SH.ELF.
+     * 0:/usr/bin/MUSL_SH.ELF.
      *
      * The embedded newlib shell fallback was removed at A5 step 6.
      * If the FAT read fails, the file is missing, or the ELF load
@@ -1399,9 +1399,9 @@ void kmain(BootInfo *info) {
      */
     {
         size_t fat_len = 0;
-        uint8_t* fat_buf = load_file_to_buffer("0:/MUSL_SH.ELF", &fat_len);
+        uint8_t* fat_buf = load_file_to_buffer("0:/usr/bin/MUSL_SH.ELF", &fat_len);
         if (!fat_buf) {
-            serial_print("PANIC: 0:/MUSL_SH.ELF not loadable; no shell available\n");
+            serial_print("PANIC: 0:/usr/bin/MUSL_SH.ELF; no shell available\n");
             while (1) asm volatile("hlt");
         }
 

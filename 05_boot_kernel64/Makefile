@@ -58,6 +58,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/pipe_step3b.elf \
 	$(USERLAND_BIN)/at_step1.elf \
 	$(USERLAND_BIN)/at_step2.elf \
+	$(USERLAND_BIN)/canary.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -87,6 +88,11 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	dd if=../04_kernel_64bit/kernel.bin of=hdd-single.img bs=512 seek=128 conv=notrunc
 	mkfs.vfat -F 16 -h $(SINGLE_DRIVE_LBA) -n DONSOS \
 	    --offset=$(SINGLE_DRIVE_LBA) hdd-single.img
+	@echo "--- creating directories ---"
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp 2>/dev/null || true
 	@for f in ../test-files/*; do \
 	    if [ -f "$$f" ]; then \
 	        echo "mcopy $$f"; \
@@ -96,8 +102,9 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mcopy_one() { \
 	    local src="$$1"; local dst="$$2"; \
 	    if [ -f "$$src" ]; then \
-	        echo "mcopy $$src -> ::/$$dst"; \
-	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) "$$src" "::/$$dst" ; \
+	        echo "mcopy $$src -> ::/usr/bin/$$dst"; \
+	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	            "$$src" "::/usr/bin/$$dst" ; \
 	    else \
 	        echo "ERROR: $$src missing — did the musl userland build fail?"; \
 	        exit 1; \
@@ -134,10 +141,10 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/at_step2.elf"       AT_STEP2.ELF ; \
+	mcopy_one "$(USERLAND_BIN)/canary.elf"         CANARY.ELF ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
 
 	@echo "--- staging busybox at /bin/busybox ---"
-	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin 2>/dev/null || true
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
 	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
@@ -151,6 +158,10 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
 	@echo "--- /bin contents ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin || true
+	@echo "--- /usr/bin contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin || true
+	@echo "--- /tmp contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp || true
 	@echo "--- verifying FAT boot sector at LBA $(SINGLE_DRIVE_LBA) ---"
 	@dd if=hdd-single.img bs=512 skip=$(SINGLE_DRIVE_LBA) count=1 2>/dev/null | \
 	    xxd | head -2
