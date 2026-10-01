@@ -176,6 +176,7 @@ void fault_kill_current(int vec) {
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
     g_ticks++;
+    vga_cursor_tick();
     #define SCHED_QUANTUM 2
 
     pcb_t* current = process_get_current();
