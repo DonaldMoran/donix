@@ -1905,32 +1905,38 @@ long sys_dup(int fd) {
     return sys_fcntl(fd, F_DUPFD, 0);
 }
 
-long sys_unlink(const char* path) {
-    pcb_t* self = process_get_current();
-    if (!self || !path) return -(long)EFAULT_;
-
+/*
+ * The shared unlink body, given a path that is already an absolute
+ * Unix-form path (from resolve_at or a direct caller).
+ *
+ * sys_unlink, sys_rmdir, and (in the next commit) sys_unlinkat all
+ * funnel into this.  It is where the FatFs translation and the
+ * f_unlink call live.  It does NOT resolve a cwd or a dirfd -- the
+ * caller has done that with resolve_at.
+ *
+ * `in_path` must be absolute (leading '/') or a FatFs-form path
+ * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
+ * `tag` is the caller's diagnostic prefix, used only on the failure
+ * path.
+ *
+ * NOTE: FatFs's f_unlink removes both files and empty directories.
+ * This body does not distinguish them; the file-vs-directory
+ * decision is the caller's.  Today sys_unlink and sys_rmdir are
+ * the same call, which is why Linux's unlink-on-a-directory and
+ * rmdir-on-a-file both currently succeed where Linux would refuse.
+ * The next commit adds the type check, together with unlinkat.
+ */
+static long unlink_body(const char* in_path, const char* tag) {
     char local_path[USER_PATH_MAX];
-    char resolved[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
-        return -(long)EFAULT_;
-    }
-    if (resolve_against_cwd(self, local_path, resolved,
-                            sizeof(resolved)) != 0) {
+    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
         return -(long)ENAMETOOLONG_;
-    }
-    {
-        size_t i = 0;
-        while (resolved[i] && i < sizeof(local_path) - 1) {
-            local_path[i] = resolved[i];
-            i++;
-        }
-        local_path[i] = '\0';
     }
     strip_dot_prefix(local_path);
 
     FRESULT r = f_unlink(local_path);
     if (r != FR_OK) {
-        serial_print("sys_unlink: f_unlink FAIL path=");
+        serial_print(tag);
+        serial_print(": f_unlink FAIL path=");
         serial_print(local_path);
         serial_print(" r="); serial_print_dec(r);
         serial_print("\n");
@@ -1940,7 +1946,34 @@ long sys_unlink(const char* path) {
 }
 
 /*
- * Linux x86_64 rmdir(2) — syscall 84.
+ * Linux x86_64 unlink(2) -- syscall 87.
+ *
+ * unlink(p) is unlinkat(AT_FDCWD, p, 0).  Both funnel into
+ * unlink_body; this wrapper exists so there is exactly one unlink
+ * implementation, the same way open(2) and openat(2) share
+ * open_resolved.
+ *
+ * The path is copied from user space, resolved against the cwd
+ * (absolute paths pass through), and handed to unlink_body.
+ */
+long sys_unlink(const char* path) {
+    pcb_t* self = process_get_current();
+    if (!self || !path) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return unlink_body(resolved, "sys_unlink");
+}
+
+/*
+ * Linux x86_64 rmdir(2) -- syscall 84.
  *
  * Remove an empty directory.  FatFs's f_unlink handles both files
  * and empty directories; for a non-empty directory it returns
@@ -1949,43 +1982,23 @@ long sys_unlink(const char* path) {
  * failure either way; if a caller ever needs the exact errno,
  * special-case FR_DENIED in a dedicated check.
  *
- * Path resolution matches sys_unlink: copy the user string, resolve
- * against the cwd (so `rmdir x` in a non-root cwd removes that
- * directory, not a root one of the same name), strip the leading
- * "./" or "/", then call f_unlink.
+ * Shares unlink_body with sys_unlink; see the note there about the
+ * file-vs-directory distinction, which the next commit adds.
  */
 long sys_rmdir(const char* path) {
     pcb_t* self = process_get_current();
     if (!self || !path) return -(long)EFAULT_;
 
-    char local_path[USER_PATH_MAX];
-    char resolved[USER_PATH_MAX];
-    if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
         return -(long)EFAULT_;
     }
-    if (resolve_against_cwd(self, local_path, resolved,
-                            sizeof(resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
-    {
-        size_t i = 0;
-        while (resolved[i] && i < sizeof(local_path) - 1) {
-            local_path[i] = resolved[i];
-            i++;
-        }
-        local_path[i] = '\0';
-    }
-    strip_dot_prefix(local_path);
 
-    FRESULT r = f_unlink(local_path);
-    if (r != FR_OK) {
-        serial_print("sys_rmdir: f_unlink FAIL path=");
-        serial_print(local_path);
-        serial_print(" r="); serial_print_dec(r);
-        serial_print("\n");
-        return fatfs_errno(r);
-    }
-    return 0;
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return unlink_body(resolved, "sys_rmdir");
 }
 
 /*
