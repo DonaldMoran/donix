@@ -94,6 +94,7 @@
  * 257  openat            sys_openat        (resolve_at; find needs it)
  * 261  futimesat         sys_futimesat     (session 31; no-op stub)
  * 262  newfstatat        sys_newfstatat    (general stat; stat/lstat/fstat wrap it)
+ * 263  unlinkat          sys_unlinkat      (AT_REMOVEDIR; find/rm -r)
  * 269  faccessat         sys_faccessat
  * 273  set_robust_list   sys_set_robust_list
  * 280  utimensat         sys_utimensat     (session 31; no-op stub)
@@ -167,7 +168,8 @@
 #define SYS_UTIMES          235
 #define SYS_OPENAT          257
 #define SYS_FUTIMESAT       261
-#define SYS_NEWFSTATAT      262   /* number reserved; no dispatch case yet */
+#define SYS_NEWFSTATAT      262
+#define SYS_UNLINKAT        263
 #define SYS_FACCESSAT       269
 #define SYS_SET_ROBUST_LIST 273
 #define SYS_UTIMENSAT       280
@@ -228,6 +230,7 @@ long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
 long sys_rmdir(const char* path);
+long sys_unlinkat(int dirfd, const char* path, int flags);
 long sys_ftruncate(int fd, long length);
 long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);

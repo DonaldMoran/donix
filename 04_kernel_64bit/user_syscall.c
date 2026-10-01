@@ -90,6 +90,12 @@ static char g_write_bounce[WRITE_CHUNK];
 #define EPERM_   1
 #define ENOENT_  2
 #define EIO_     5
+#ifndef EBUSY_
+#define EBUSY_   16
+#endif
+#ifndef EISDIR_
+#define EISDIR_  21
+#endif
 #define EBADF_   9
 #define EAGAIN_  11
 #define ENOMEM_  12
@@ -1909,31 +1915,97 @@ long sys_dup(int fd) {
  * The shared unlink body, given a path that is already an absolute
  * Unix-form path (from resolve_at or a direct caller).
  *
- * sys_unlink, sys_rmdir, and (in the next commit) sys_unlinkat all
- * funnel into this.  It is where the FatFs translation and the
- * f_unlink call live.  It does NOT resolve a cwd or a dirfd -- the
- * caller has done that with resolve_at.
+ * sys_unlink, sys_rmdir, and sys_unlinkat all funnel into this.  It
+ * is where the FatFs translation, the file-vs-directory type check,
+ * and the f_unlink call live.  It does NOT resolve a cwd or a dirfd
+ * -- the caller has done that with resolve_at.
  *
  * `in_path` must be absolute (leading '/') or a FatFs-form path
  * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
  * `tag` is the caller's diagnostic prefix, used only on the failure
  * path.
  *
- * NOTE: FatFs's f_unlink removes both files and empty directories.
- * This body does not distinguish them; the file-vs-directory
- * decision is the caller's.  Today sys_unlink and sys_rmdir are
- * the same call, which is why Linux's unlink-on-a-directory and
- * rmdir-on-a-file both currently succeed where Linux would refuse.
- * The next commit adds the type check, together with unlinkat.
+ * `want_dir` selects the kind of object the caller means to remove,
+ * matching Linux:
+ *
+ *   want_dir == 0  (unlink)   the path must NOT be a directory;
+ *                             a directory is -EISDIR.
+ *   want_dir == 1  (rmdir,    the path MUST be a directory;
+ *                   AT_REMOVEDIR)  a file is -ENOTDIR.
+ *
+ * The root is never removable: want_dir == 1 gives -EBUSY, want_dir
+ * == 0 gives -EISDIR, and neither reaches f_unlink.  (Linux returns
+ * -EBUSY from rmdir("/").)
+ *
+ * ATOMICITY.  The type check and the removal are one critical
+ * section.  Without it there is a check-then-act race: between the
+ * f_stat and the f_unlink a timer IRQ can preempt us and the
+ * scheduler can run another process that removes or replaces the
+ * object, so the type we checked is not the type we remove.  The
+ * window is closed with cli.
+ *
+ * The critical section saves and restores the caller's interrupt
+ * flag rather than doing a bare sti on the way out, because
+ * unlink_body can be reached from a context that must stay
+ * interrupts-disabled (sys_execve holds cli across its work).  A
+ * bare sti here would re-enable interrupts inside sys_execve's
+ * critical section, which is a worse bug than the race.  Saving
+ * RFLAGS makes unlink_body correct regardless of caller.
+ *
+ * cli is safe across f_stat/f_unlink because FatFs on this target
+ * is synchronous and polling: diskio.c's disk_read/disk_write call
+ * ata_read_sectors_drive/ata_write_sectors_drive, which spin on the
+ * ATA status port and never sleep or yield.  If that ever stops
+ * being true -- if a disk operation ever waits on an IRQ -- this is
+ * the line that turns into a hang, and the fix is a lock or a
+ * per-volume flag, not cli.
  */
-static long unlink_body(const char* in_path, const char* tag) {
+static long unlink_body(const char* in_path, int want_dir,
+                        const char* tag) {
     char local_path[USER_PATH_MAX];
     if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
         return -(long)ENAMETOOLONG_;
     }
     strip_dot_prefix(local_path);
 
+    /* The root is a directory that cannot be removed, whatever the
+     * caller meant.  Synthesize the answer rather than handing "."
+     * or "0:/" to f_stat, which rejects them.  No shared state is
+     * touched, so this runs before the critical section. */
+    if (path_is_root(local_path)) {
+        return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
+    }
+
+    /* --- critical section: stat and unlink must be atomic --- */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    /*
+     * Type check.  f_stat_with_retry resolves bare names the same
+     * way stat does, so `rm foo` and `rmdir foo` see the same object
+     * the caller would stat.
+     */
+    FILINFO fno;
+    FRESULT sr = f_stat_with_retry(local_path, &fno);
+    if (sr != FR_OK) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return fatfs_errno(sr);
+    }
+    int is_dir = (fno.fattrib & AM_DIR) != 0;
+
+    if (want_dir && !is_dir) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return -(long)ENOTDIR_;
+    }
+    if (!want_dir && is_dir) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return -(long)EISDIR_;
+    }
+
     FRESULT r = f_unlink(local_path);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+
     if (r != FR_OK) {
         serial_print(tag);
         serial_print(": f_unlink FAIL path=");
@@ -1954,7 +2026,8 @@ static long unlink_body(const char* in_path, const char* tag) {
  * open_resolved.
  *
  * The path is copied from user space, resolved against the cwd
- * (absolute paths pass through), and handed to unlink_body.
+ * (absolute paths pass through), and handed to unlink_body with
+ * want_dir == 0: unlink removes files, and a directory is -EISDIR.
  */
 long sys_unlink(const char* path) {
     pcb_t* self = process_get_current();
@@ -1969,21 +2042,21 @@ long sys_unlink(const char* path) {
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
     if (rr != 0) return rr;
 
-    return unlink_body(resolved, "sys_unlink");
+    return unlink_body(resolved, 0, "sys_unlink");
 }
 
 /*
  * Linux x86_64 rmdir(2) -- syscall 84.
  *
- * Remove an empty directory.  FatFs's f_unlink handles both files
- * and empty directories; for a non-empty directory it returns
- * FR_DENIED, which fatfs_errno maps to -EPERM.  Linux returns
- * -ENOTEMPTY (39) for that case.  busybox's rmdir reports the
- * failure either way; if a caller ever needs the exact errno,
- * special-case FR_DENIED in a dedicated check.
+ * Remove an empty directory.  Shares unlink_body with sys_unlink;
+ * want_dir == 1 makes a non-directory path -ENOTDIR.
  *
- * Shares unlink_body with sys_unlink; see the note there about the
- * file-vs-directory distinction, which the next commit adds.
+ * FatFs's f_unlink removes both files and empty directories, and
+ * returns FR_DENIED for a non-empty directory, which fatfs_errno
+ * maps to -EPERM.  Linux returns -ENOTEMPTY (39) for that case.
+ * busybox's rmdir reports the failure either way; if a caller ever
+ * needs the exact errno, special-case FR_DENIED in unlink_body's
+ * f_unlink failure path.
  */
 long sys_rmdir(const char* path) {
     pcb_t* self = process_get_current();
@@ -1998,7 +2071,50 @@ long sys_rmdir(const char* path) {
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
     if (rr != 0) return rr;
 
-    return unlink_body(resolved, "sys_rmdir");
+    return unlink_body(resolved, 1, "sys_rmdir");
+}
+
+/*
+ * Linux x86_64 unlinkat(2) -- syscall 263.
+ *
+ * unlinkat(dirfd, path, flags): resolve `path` against `dirfd` (an
+ * absolute path ignores dirfd; AT_FDCWD means the cwd; any other
+ * dirfd is a directory slot whose stored path is the base), then
+ * remove the object exactly as unlink(2) or rmdir(2) would.
+ *
+ * AT_REMOVEDIR (0x200) selects: clear means unlink-a-file, set
+ * means rmdir-a-directory.  It is the only meaningful flag; any
+ * other bit is refused with -EINVAL, as Linux does.
+ *
+ * This is the syscall busybox `rm -r` reaches: it opens a
+ * directory, unlinks each entry by name against that dirfd, and
+ * finally unlinkat(dirfd, ".", AT_REMOVEDIR)s the directory
+ * itself.  The dirfd form is what makes recursive removal not
+ * need to build full paths.
+ *
+ * Deliberately a thin wrapper over resolve_at and unlink_body --
+ * it is not a second unlink.
+ */
+long sys_unlinkat(int dirfd, const char* path, int flags) {
+    if (!path) return -(long)EFAULT_;
+
+    /* AT_REMOVEDIR is the only flag unlinkat takes.  Anything else
+     * is a caller bug or a flag from a different *at syscall. */
+    if (flags & ~AT_REMOVEDIR_) {
+        return -(long)EINVAL_;
+    }
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    int want_dir = (flags & AT_REMOVEDIR_) != 0;
+    return unlink_body(resolved, want_dir, "sys_unlinkat");
 }
 
 /*
@@ -4335,11 +4451,11 @@ long sys_getcwd(char* buf, unsigned long size) {
  *     `cd /bin; ls busybox` look at `0:/BIN/BUSYBOX` instead of
  *     `0:/BUSYBOX`.
  *
- *   - sys_unlink and sys_mkdir do NOT call resolve_against_cwd yet;
- *     they only strip the leading "./" or "/".  So a remove or mkdir
- *     in a non-root cwd resolves against the FAT root instead of the
- *     cwd.  This is a known gap, tracked in docs/open-issues.md, and
- *     is part of the v0.6.4 basics work.
+ *   - sys_unlink, sys_rmdir, and sys_mkdir call resolve_at or
+ *     resolve_against_cwd too, so a remove or mkdir in a non-root
+ *     cwd resolves against the cwd.  (This was a gap before
+ *     v0.6.4; the comment here said so until session 40, by which
+ *     time all three had been fixed.)
  *
  * Validation uses f_stat_with_retry, so bare names and leading-slash
  * paths resolve the same way sys_stat resolves them.  The path must
@@ -5475,6 +5591,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
         case SYS_NEWFSTATAT:      return (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3);
+        case SYS_UNLINKAT:        return (uint64_t)sys_unlinkat((int)arg0, (const char*)arg1, (int)arg2);
         case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
         case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
         case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
