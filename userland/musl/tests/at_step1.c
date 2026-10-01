@@ -89,6 +89,70 @@ int main(void) {
         fails++;
     }
 
+    /*
+     * 8. faccessat(real dirfd, relative) -- resolves against the
+     *    dirfd, not the cwd.  dfd still names /bin and the cwd is
+     *    still /, so a bug that ignored dirfd and used the cwd
+     *    would look for /busybox and fail.
+     *
+     *    NOTE: this test relies on the staging layout -- busybox
+     *    lives at /bin/busybox, nothing lives at /busybox, and the
+     *    process cwd is / because nothing here chdir'd.  If that
+     *    layout changes, section 9 stops being a control (it would
+     *    pass even if dirfd were ignored).  Keep them together.
+     */
+    if (faccessat(dfd, "busybox", F_OK, 0) == 0) {
+        printf("ok 8: faccessat(dfd, \"busybox\") -> exists\n");
+    } else {
+        printf("FAIL 8: faccessat(dfd, \"busybox\"): %s\n",
+               strerror(errno));
+        fails++;
+    }
+
+    /*
+     * 9. Control for section 8: the same name against AT_FDCWD
+     *    resolves against the cwd, where /busybox does not exist.
+     *    Must fail with ENOENT.
+     */
+    errno = 0;
+    if (faccessat(AT_FDCWD, "busybox", F_OK, 0) == -1 && errno == ENOENT) {
+        printf("ok 9: faccessat(AT_FDCWD, \"busybox\") -> ENOENT\n");
+    } else {
+        printf("FAIL 9: faccessat(AT_FDCWD, \"busybox\"): errno=%d (%s)\n",
+               errno, strerror(errno));
+        fails++;
+    }
+
+    /*
+     * (section 10 removed: it asserted faccessat rejects unknown
+     *  flags with EINVAL, but that EINVAL comes from musl itself
+     *  -- third_party/musl-src/src/unistd/faccessat.c returns
+     *  -EINVAL for `flag & ~AT_EACCESS` before issuing any
+     *  syscall -- so the test never reached the kernel.  The
+     *  kernel deliberately does not validate faccessat's flags;
+     *  see the comment on sys_faccessat.  A test that cannot fail
+     *  is not a test.)
+     */
+
+    /*
+     * 11. utimensat(real dirfd, relative) -- the same resolution
+     *     rule, exercised through the other *at syscall this
+     *     session touches.  donix does not store timestamps, so
+     *     success just means the path resolved.
+     *
+     *     This FAILS against the pre-commit-2 sys_utimensat, which
+     *     ignores dirfd and resolves "busybox" against the cwd (/),
+     *     where it does not exist.  It passes once sys_utimensat
+     *     routes through resolve_at.  Seeing it flip is the point.
+     */
+    if (utimensat(dfd, "busybox", NULL, 0) == 0) {
+        printf("ok 11: utimensat(dfd, \"busybox\") -> 0\n");
+    } else {
+        printf("FAIL 11: utimensat(dfd, \"busybox\"): %s\n",
+               strerror(errno));
+        fails++;
+    }
+
     close(dfd);
     printf("%s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;

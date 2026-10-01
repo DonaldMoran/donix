@@ -55,6 +55,9 @@ static long sys_fstat_body(int fd, void* user_stat);
 /* Defined below, in the file table helpers section.  resolve_at
  * (in the *at() resolution section) calls it. */
 static file_slot_t* get_file_slot_any(int fd);
+/* Defined below, in the file-access section.  sys_access and
+ * sys_faccessat both call it. */
+static long access_resolved(const char* abs_path);
 
 /* ENOTDIR (20) on Linux x86_64.  Guarded, so the block in the
  * sys_chdir section further down is a no-op once this one is seen
@@ -651,6 +654,17 @@ static int resolve_against_cwd(pcb_t* self, const char* path,
 #define AT_SYMLINK_FOLLOW_   0x400
 #define AT_NO_AUTOMOUNT_     0x800
 #define AT_EMPTY_PATH_       0x1000
+/*
+ * AT_EACCESS -- faccessat/faccessat2's "use effective uid/gid"
+ * flag.  Same bit value as AT_REMOVEDIR_ (0x200); the meaning is
+ * per-syscall, exactly as on Linux.  donix has no uid/gid split,
+ * so the flag is accepted and ignored.
+ *
+ * faccessat's only other legal flag is AT_SYMLINK_NOFOLLOW_, which
+ * is a no-op on FAT (no symlinks).  Any other bit is -EINVAL, the
+ * same strictness sys_newfstatat and sys_unlinkat apply.
+ */
+#define AT_EACCESS_ 0x200
 
 /*
  * True if `path` is an absolute Unix path (starts with '/').
@@ -2563,51 +2577,30 @@ long sys_lstat(const char* user_path, void* user_stat) {
 }
 
 /*
- * Linux x86_64 access(2) — syscall 21.
+ * The shared existence-check body, given a path that is already an
+ * absolute Unix-form path (from resolve_at or resolve_against_cwd).
  *
- * Returns 0 if the path exists and the requested permission bits
- * are satisfiable, -errno otherwise.  donix does not track UNIX
- * permissions (FAT has none), so we only check existence: F_OK
- * (0), R_OK (4), W_OK (2), X_OK (1) all reduce to "does this
- * path resolve to something on the FAT".
+ * sys_access and sys_faccessat both funnel into this.  It does NOT
+ * resolve a cwd or a dirfd -- the caller has done that.
  *
- * The path is resolved against the process cwd first, then checked
- * with the same f_stat-with-retry used by sys_stat.
+ * donix does not track UNIX permissions (FAT has none), so every
+ * mode -- F_OK (0), R_OK (4), W_OK (2), X_OK (1) -- reduces to
+ * "does this path resolve to something on the FAT".  The mode
+ * argument is not passed in for that reason.
  *
- * Why this exists: busybox's find_execable() (libbb/find_execable.c)
- * calls access(path, X_OK) for each PATH candidate before deciding
- * whether to execve it.  On donix there is no sys_access, so the
- * probe hit "Unknown syscall: 21", returned -ENOSYS, and ash
- * concluded the command did not exist — before ever reaching
- * sys_stat or sys_execve.  That is why `sh: ls: not found`
- * appeared even though stat("ls") would now succeed.
+ * `abs_path` must be absolute (leading '/') or a FatFs-form path
+ * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
+ * The root aliases (".", "/", "0:/") always "exist".
  */
-long sys_access(const char* user_path, int mode) {
-    (void)mode;   /* permissions are not tracked; existence is all */
-
-    if (!user_path) return -(long)EFAULT_;
-
+static long access_resolved(const char* abs_path) {
     char path[USER_PATH_MAX];
-    char resolved[USER_PATH_MAX];
-    if (copy_user_string(path, sizeof(path), user_path) != 0) {
-        return -(long)EFAULT_;
-    }
-    if (resolve_against_cwd(process_get_current(), path, resolved,
-                            sizeof(resolved)) != 0) {
+    if (path_copy(path, sizeof(path), abs_path) != 0) {
         return -(long)ENAMETOOLONG_;
-    }
-    {
-        size_t i = 0;
-        while (resolved[i] && i < sizeof(path) - 1) {
-            path[i] = resolved[i];
-            i++;
-        }
-        path[i] = '\0';
     }
     strip_dot_prefix(path);
 
 #if DEBUG_STAT_TRACE
-    serial_print("sys_access: '");
+    serial_print("access_resolved: '");
     serial_print(path);
     serial_print("'\n");
 #endif
@@ -2623,6 +2616,107 @@ long sys_access(const char* user_path, int mode) {
         return fatfs_errno(r);
     }
     return 0;
+}
+
+/*
+ * Linux x86_64 access(2) -- syscall 21.
+ *
+ * Returns 0 if the path exists and the requested permission bits
+ * are satisfiable, -errno otherwise.  donix does not track UNIX
+ * permissions (FAT has none), so we only check existence; see
+ * access_resolved.
+ *
+ * access(2) has no dirfd: it resolves against the process cwd.
+ * The path is resolved with resolve_against_cwd, then handed to
+ * access_resolved.  sys_faccessat is the dirfd-taking form and
+ * shares access_resolved with this.
+ *
+ * The copy-back dance below (resolve into `resolved`, then copy
+ * `resolved` back into `local`) is how the pre-resolve_at
+ * callers drive resolve_against_cwd: it resolves into a separate
+ * buffer, and the caller then wants the resolved string in the
+ * buffer it goes on to strip.  sys_faccessat does not need it,
+ * because resolve_at already returns an absolute Unix-form path
+ * and access_resolved does its own path_copy + strip_dot_prefix.
+ * The asymmetry is deliberate; see the open(2)/openat(2) pair for
+ * the same shape.
+ *
+ * Why this exists: busybox's find_execable() (libbb/find_execable.c)
+ * calls access(path, X_OK) for each PATH candidate before deciding
+ * whether to execve it.  Before this, the probe hit "Unknown
+ * syscall: 21", returned -ENOSYS, and ash concluded the command
+ * did not exist -- before ever reaching sys_stat or sys_execve.
+ * That is why `sh: ls: not found` appeared even though stat("ls")
+ * would now succeed.
+ */
+long sys_access(const char* user_path, int mode) {
+    (void)mode;   /* permissions are not tracked; existence is all */
+
+    if (!user_path) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    char resolved[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+    if (resolve_against_cwd(process_get_current(), local, resolved,
+                            sizeof(resolved)) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    return access_resolved(resolved);
+}
+
+/*
+ * Linux x86_64 faccessat(2) -- syscall 269.
+ *
+ * faccessat(dirfd, path, mode, flags): resolve `path` against
+ * `dirfd` (an absolute path ignores dirfd; AT_FDCWD means the cwd;
+ * any other dirfd is a directory slot whose stored path is the
+ * base), then run the same existence check access(2) does.
+ *
+ * Flags (Linux x86_64):
+ *
+ *   AT_EACCESS          0x200   no-op (no uid/gid split; donix
+ *                               always "has" access)
+ *   AT_SYMLINK_NOFOLLOW 0x100   no-op (FAT has no symlinks)
+ *
+ * FLAGS ARE NOT VALIDATED.  musl calls this syscall with THREE
+ * arguments -- syscall(SYS_faccessat, fd, filename, amode) in
+ * third_party/musl-src/src/unistd/faccessat.c -- so the kernel
+ * reads %r10 for `flags`, and that register is not written by
+ * the call.  It holds the PREVIOUS syscall's return value: a
+ * faccessat after a call that returned -EINVAL sees 0xFFFFFFEA,
+ * one after a call that returned 1 sees 0x1.  Validating a
+ * register the caller did not set turns a valid call into
+ * -EINVAL, deterministically.  Linux's own faccessat(2) does
+ * not validate flags either; only faccessat2(2) (439) does,
+ * and donix does not implement 439.
+ *
+ * HISTORY: this was a direct alias of sys_access that ignored
+ * dirfd and flags, so faccessat(dirfd, "rel", ...) with a real
+ * dirfd resolved against the cwd instead of the directory.  It
+ * now routes through resolve_at like the rest of the *at family.
+ * musl's faccessat() with AT_EACCESS unset calls access() (21)
+ * and never reaches this, so the bug was latent; a caller that
+ * called syscall 269 directly, or musl's faccessat with
+ * AT_EACCESS set, saw the wrong resolution.
+ */
+long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
+    (void)mode;
+    (void)flags;
+
+    if (!user_path) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    return access_resolved(resolved);
 }
 
 /*
@@ -2679,22 +2773,6 @@ long sys_utimes(const char* path, const void* times) {
  */
 long sys_futimesat(int dirfd, const char* path, const void* times) {
     return sys_utimensat(dirfd, path, times, 0);
-}
-
-/*
- * Linux x86_64 faccessat(2) — syscall 269.
- *
- * musl's faccessat() on x86_64 with AT_EACCESS unset does NOT go
- * straight to syscall 269; it calls access() (21).  But busybox
- * and glibc-built code may call faccessat directly, and glibc's
- * faccessat wrapper is __NR_faccessat (269).  Implement it as a
- * direct alias of sys_access; the dirfd / flags arguments are
- * ignored, which is correct for the only case we can support
- * (AT_FDCWD, no flags).
- */
-long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
-    (void)dirfd; (void)flags;
-    return sys_access(user_path, mode);
 }
 
 // ============================================================
