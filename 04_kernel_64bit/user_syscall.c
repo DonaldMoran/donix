@@ -2733,30 +2733,54 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
  * whole fallback chain (utimensat -> utimes -> futimesat) and
  * print "Function not implemented".
  *
- * AT_FDCWD is -100; dirfd is ignored.  The flags argument may
- * carry AT_SYMLINK_NOFOLLOW, which is meaningless on FAT (no
- * symlinks).  Both are accepted and ignored.
+ * PATH RESOLUTION.  utimensat is in the *at family, so it routes
+ * through resolve_at: an absolute path ignores dirfd, AT_FDCWD
+ * means the cwd, and any other dirfd is a directory slot whose
+ * stored path is the base.  This closes two gaps the previous
+ * body had -- it ignored dirfd entirely, and it never resolved
+ * against the cwd, so even a relative path was misresolved.
+ *
+ * FLAGS.  Unlike sys_faccessat, the flags mask here is safe:
+ * musl passes utimensat's flags in the fourth argument
+ * (third_party/musl-src/src/stat/utimensat.c line 35 -- the
+ * #else branch, which is what runs on x86_64 since there is no
+ * 32-bit time_t).  AT_SYMLINK_NOFOLLOW (0x100) is accepted and
+ * ignored (FAT has no symlinks).  AT_EMPTY_PATH (0x1000) is
+ * refused with -EINVAL: it selects the futimens(fd, NULL) form,
+ * which donix does not implement.  A NULL path is -EFAULT, the
+ * Linux errno for a bad pointer; -EINVAL is for bad flags.
  */
-long sys_utimensat(int dirfd, const char* path, const void* times, int flags) {
-    (void)times; (void)flags; (void)dirfd;
+long sys_utimensat(int dirfd, const char* path, const void* times,
+                   int flags) {
+    (void)times;
 
-    /* NULL path with a valid dirfd is the futimens(fd) form,
-     * which we do not support. */
-    if (!path) return -(long)EINVAL_;
+    if (!path) return -(long)EFAULT_;
+
+    /*
+     * Flags.  Linux's utimensat accepts AT_SYMLINK_NOFOLLOW (0x100)
+     * and AT_EMPTY_PATH (0x1000); anything else is -EINVAL.
+     * AT_SYMLINK_NOFOLLOW is a no-op on FAT (no symlinks).
+     * AT_EMPTY_PATH is the futimens(fd, NULL) form, which donix
+     * does not implement -- the flag requires path == "", and a
+     * non-empty path with the flag set is itself -EINVAL on Linux.
+     */
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_EMPTY_PATH_)) {
+        return -(long)EINVAL_;
+    }
+    if (flags & AT_EMPTY_PATH_) {
+        return -(long)EINVAL_;
+    }
 
     char local[USER_PATH_MAX];
     if (copy_user_string(local, sizeof(local), path) != 0) {
         return -(long)EFAULT_;
     }
-    strip_dot_prefix(local);
 
-    /* Root always "exists". */
-    if (path_is_root(local)) return 0;
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
 
-    FILINFO fno;
-    FRESULT r = f_stat_with_retry(local, &fno);
-    if (r != FR_OK) return fatfs_errno(r);
-    return 0;
+    return access_resolved(resolved);
 }
 
 /*
