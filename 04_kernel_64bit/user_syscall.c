@@ -44,8 +44,6 @@ typedef struct file_slot_s {
     char    *dir_path;
 } file_slot_t;
 
-/* Defined below, in the execve helpers section. */
-static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
 /* Defined below, in the stat section.  sys_open needs it for the
  * O_DIRECTORY-on-a-file check, which runs before the definition. */
 static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno);
@@ -2413,28 +2411,17 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
         for (const char* p = path; *p; p++) {
             if (*p == ':') { has_drive = 1; break; }
         }
-
-        char resolved[USER_PATH_MAX];
-        if (!has_drive &&
-            exec_resolve_bare_name(path, resolved, sizeof(resolved)) == 0) {
-#if DEBUG_STAT_TRACE
-            serial_print("f_stat retry: '");
-            serial_print(path);
-            serial_print("' -> '");
-            serial_print(resolved);
-            serial_print("' = ");
-            serial_print_dec((uint64_t)r);
-#endif
-            FRESULT r2 = f_stat(resolved, out_fno);
-#if DEBUG_STAT_TRACE
-            serial_print("/");
-            serial_print_dec((uint64_t)r2);
-            serial_print("\n");
-#endif
-            if (r2 == FR_OK) {
-                r = FR_OK;
-            }
-        }
+        /*
+         * No bare-name retry any more.  The binaries are staged
+         * bare and live under /usr/bin, and FatFs resolves
+         * multi-component paths (find traverses /usr/bin with
+         * f_opendir, so f_stat("/usr/bin/ls") works).  A PATH
+         * probe like ash's access("/usr/bin/ls", X_OK) therefore
+         * succeeds on its own, and the old retry -- which
+         * uppercased the name and appended ".ELF" -- could only
+         * fail.  See sys_execve's history comment.
+         */
+        (void)has_drive;
     }
     return r;
 }
@@ -2917,78 +2904,6 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
 }
 
 /*
- * Resolve a bare command name to a root-level path.
- *
- * This is sub-attempt (c1) of sys_execve's three-attempt open:
- * turn a bare name like "ls" into "0:/LS.ELF" — uppercased, with
- * ".ELF" appended, at the FAT root.  This is what makes ash's
- * execve("ls", ...) find the donix-native root binary, and what
- * makes `donix> hello` work from musl_sh without the shell doing
- * any rewriting of its own.
- *
- * Root is tried before /bin (see exec_resolve_bin_name) so a
- * donix-native binary shadows a same-named entry in /bin.
- *
- * The rule:
- *   - Take the base name: the substring after the last '/', or
- *     the whole string if there is no '/'.
- *   - If the base already ends in ".ELF" (case-insensitive), do
- *     not append it again.
- *   - Uppercase the base to match the FAT layout.
- *   - Prepend "0:/".
- *
- * Returns 0 on success, -1 if the resolved path would overflow
- * `out_cap` or if `in` has no base name (was "/" or "").
- */
-static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
-    /* Pick the base name: the substring after the last '/', or the
-     * whole string if there is no '/'. */
-    const char* base = in;
-    for (const char* p = in; *p; p++) {
-        if (*p == '/') base = p + 1;
-    }
-
-    if (*base == '\0') return -1;   /* path was just "/" or "" */
-
-    /* If the base already ends in ".ELF" (case-insensitive), don't
-     * append it again. */
-    size_t blen = 0;
-    while (base[blen]) blen++;
-    int have_suffix = 0;
-    if (blen >= 4) {
-        char c0 = base[blen - 4];
-        char c1 = base[blen - 3];
-        char c2 = base[blen - 2];
-        char c3 = base[blen - 1];
-        if ((c0 == '.' && (c1 == 'E' || c1 == 'e') &&
-             (c2 == 'L' || c2 == 'l') && (c3 == 'F' || c3 == 'f'))) {
-            have_suffix = 1;
-        }
-    }
-
-    size_t need = 3 /* "0:/" */ + blen + (have_suffix ? 0 : 4) + 1;
-    if (need > out_cap) return -1;
-
-    out[0] = '0';
-    out[1] = ':';
-    out[2] = '/';
-    size_t o = 3;
-    for (size_t i = 0; i < blen; i++) {
-        char c = base[i];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        out[o++] = c;
-    }
-    if (!have_suffix) {
-        out[o++] = '.';
-        out[o++] = 'E';
-        out[o++] = 'L';
-        out[o++] = 'F';
-    }
-    out[o] = '\0';
-    return 0;
-}
-
-/*
  * Resolve a bare command name to a path under /bin.
  *
  * `in` is a bare name like "busybox" (no '/').  Produces:
@@ -3116,41 +3031,33 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     
     /* ---- 2. Open and read the whole ELF file. ----
      *
-     * Three attempts, in order:
+     * TWO attempts, in order:
      *
      *   (a) the path exactly as the caller supplied it;
      *   (b) if the path starts with '/', "0:" + path, preserving
-     *       case and suffix -- the Unix-style absolute path form;
-     *   (c) if the path has no ':' at all, the bare-name form.
-     *       Attempt (c) itself has three sub-attempts: root
-     *       "0:/NAME.ELF", then "/bin/NAME", then "/bin/NAME.ELF".
+     *       case -- the Unix-style absolute path form.
      *
-     * (b) is what makes `/bin/busybox sh` work from the custom
-     * musl shell: the kernel was previously handing "/bin/busybox"
-     * straight to FatFs, which rejects any path with a leading
-     * slash.  The kernel is the layer that should translate a
-     * Unix-style path to the FatFs form, not the caller.
+     * A bare name does NOT resolve.  Every caller passes a path:
+     * musl_sh's run_external builds "/usr/bin/NAME" or "/bin/NAME"
+     * and passes it; ash's execvp walks $PATH itself and passes
+     * the full path it found.  There is no bare-name fallback
+     * because nothing calls one.
      *
-     * (c1) is what makes ash's bare `execve("ls", ...)` resolve to
-     * the donix-native root binary.  (c2) and (c3) are what make
-     * bare `busybox` resolve to /bin/busybox now that the busybox
-     * binary no longer sits at the FAT root.  Root is tried first
-     * so donix-native binaries shadow same-named /bin entries.
+     * HISTORY: a third attempt used to guess a bare name's
+     * location -- uppercase it, append ".ELF", try it at the root
+     * and in /bin.  It was removed in session 42: the binaries
+     * are staged bare (/usr/bin/HELLO, not HELLO.ELF) and live
+     * under /usr/bin, so all three sub-attempts could only fail.
+     * The helpers it called (exec_resolve_bare_name,
+     * exec_resolve_bin_name) are gone with it.
      */
     /*
-     * VFS SHIM.  The three attempts below stand in for a virtual
-     * filesystem layer that donix does not have yet.  On real
-     * Unix, execve hands the path to the VFS and the VFS resolves
-     * it; there is no guessing and no retry.  Here, FatFs has no
-     * notion of '/', no root directory in the POSIX sense, and no
-     * way to walk a multi-component path, so the kernel does the
-     * translation inline.
-     *
-     * When a VFS lands, DELETE this whole block and make execve
-     * call the VFS resolver once.  Do not add a fourth attempt;
-     * add the VFS instead.  Candidates that must then be removed:
-     * the "0:" + path prepend, exec_resolve_bare_name, and
-     * exec_resolve_bin_name.
+     * The remaining shim: attempt (b)'s "0:" + path translation.
+     * FatFs rejects a leading '/', so an absolute Unix path has to
+     * become "0:/...".  That is the one piece of path handling the
+     * kernel still does on execve's behalf; a VFS would subsume it.
+     * When a VFS lands, delete this and call the VFS resolver
+     * once.
      */
     FIL file;
     FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
@@ -3184,53 +3091,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                     fr = FR_OK;
                 }
             }
-            /* if too long, skip (b) and fall through to (c) */
-        }
-
-        /*
-         * Attempt (c): bare name.  Three sub-attempts, in order:
-         *
-         *   (c1) "0:/NAME.ELF"     -- root, uppercased, .ELF appended.
-         *                             Donix-native binaries win here.
-         *   (c2) "0:/BIN/NAME"     -- /bin, uppercased, no suffix.
-         *                             This is where busybox lives now.
-         *   (c3) "0:/BIN/NAME.ELF" -- /bin, uppercased, .ELF appended.
-         *                             Covers a future /bin/NAME.ELF.
-         */
-        if (fr != FR_OK && !has_drive) {
-            char resolved[USER_PATH_MAX];
-
-            /* (c1) root, uppercased, .ELF appended. */
-            if (exec_resolve_bare_name(exec_path, resolved,
-                                       sizeof(resolved)) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
-
-            /* (c2) /bin, uppercased, as-is (no .ELF). */
-            if (fr != FR_OK &&
-                exec_resolve_bin_name(exec_path, resolved,
-                                      sizeof(resolved), 0) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
-
-            /* (c3) /bin, uppercased, .ELF appended. */
-            if (fr != FR_OK &&
-                exec_resolve_bin_name(exec_path, resolved,
-                                      sizeof(resolved), 1) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
+            /* if too long, (b) is skipped; the open fails below */
         }
     }
 
