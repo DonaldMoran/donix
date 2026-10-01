@@ -73,6 +73,7 @@ needs; more of the family is expected before the bump.
 | Tag (kept, milestone open) | What |
 |---|---|
 | `20260930-at` | `resolve_at`, `file_slot_t.dir_path`, `newfstatat` (262), `openat` (257); stat family inverted to wrappers; `find` enabled with `-type` |
+| `20260930-cursor` | software block cursor on the framebuffer; PIT-rate comment correction |
 
 **What it means:** the `*at()` path-resolution rule now exists in
 one place.  `newfstatat(2)` and `openat(2)` are implemented; the
@@ -80,7 +81,15 @@ busybox `find` applet is enabled and works — `find /bin`,
 `find / -type d`, and `find / -type f -name busybox` all behave.
 `find` recurses with `openat` and stats entries with
 `newfstatat`, exactly as on Linux.
-
+- The cursor came back too.  `v0.6.7` moved the console to the
+  framebuffer and the cursor silently disappeared — the VGA text 
+  backend had a hardware cursor, the framebuffer has none, and
+  nothing drew a software replacement.  `20260930-cursor` adds a
+  software block cursor: inverse-video repaint of the cursor cell,
+  drawn and erased through the existing `paint_cell` chokepoint, so
+  it works on the framebuffer and the VGA text fallback is
+  unchanged.  Blink is driven from the PIT tick (100 Hz), 500 ms per
+  state.
 **Key facts for future work:**
 - **`resolve_at(dirfd, path, out, cap)` is the one resolver.**  An
   absolute path ignores `dirfd`; `AT_FDCWD` delegates to
@@ -276,6 +285,15 @@ stat family.
     vi test            # fills the screen; status line on the last row
     # edit, :wq
     ./test             # the saved script runs
+
+**Cursor (added `20260930-cursor`, not a canary row):**
+
+    # At any shell prompt on the framebuffer console, the block
+    # cursor at the current input position blinks at 500 ms per
+    # state.  Type a character: the cursor moves and does not leave
+    # an inverted cell behind (the "trail" bug fixed before the
+    # commit).  `vi test` puts the cursor at the edit position; it
+    # is hidden while the screen is redrawn and restored on exit.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.

@@ -3,6 +3,7 @@
 | Tag | What |
 |---|---|
 | `20260930-at` | `resolve_at`, `file_slot_t.dir_path`, `newfstatat` (262), `openat` (257); stat family inverted; `find` enabled with `-type` |
+| `20260930-cursor` | software block cursor on the framebuffer; no trail; 500 ms blink at 100 Hz; PIT-rate comment fix |
 
 **Commit 1** (`at: resolve_at, newfstatat(262), openat(257)`):
 implemented the `*at()` path-resolution rule in one place
@@ -52,6 +53,41 @@ test."
 **Scratch tag kept:** `20260930-at` is local, not pushed, and is
 part of the open `v0.6.8` milestone (not dropped until the
 milestone is pushed).
+
+**Cursor (`20260930-cursor`).**  The framebuffer console had lost
+its cursor because the VGA text backend had a hardware cursor and
+the framebuffer has none; nothing drew a software replacement.
+The fix is a software block cursor: an inverse-video repaint of
+the cursor cell, drawn and erased through the existing
+`paint_cell` chokepoint, so both backends share one draw path and
+the VGA text hardware-cursor path is untouched (`con_is_fb`
+early-outs).  Erase-then-redraw lives in
+`vga_update_hardware_cursor`, which every cursor move already
+calls, so no other call site changed.  The bulk-repaint functions
+(scroll, erase display, insert/delete chars, alt-screen) erase the
+cursor at the top and the trailing update call redraws it.
+
+The first version left an inverted trail: callers move
+`cursor_row`/`cursor_col` before calling
+`vga_update_hardware_cursor`, so the erase hit the new cell and the
+old paint stayed.  `cursor_painted_row`/`cursor_painted_col` now
+track the last painted position, which is the only position the
+erase can meaningfully hit.
+
+Blink is driven from the PIT tick via `vga_cursor_tick`, called
+from `timer_preempt_handler`.  No lock is taken: the tick runs
+from the ISR with interrupts off, so its one-cell repaint cannot
+interleave with a `vga_putc`, and `serial_lock` there would
+deadlock against a `vga_putc` the tick preempted.  Blink is 500 ms
+per state (`CURSOR_BLINK_TICKS 50` at the actual 100 Hz PIT
+rate).
+
+The PIT rate itself was corrected in a separate comment-only
+commit: `sys_poll`'s timeout comment claimed 500 Hz, and the same
+wrong figure had propagated into three comments in `vga.c`.  All
+now say 100 Hz, verified against `pit_init(100)` in `kmain.c`.
+See the gotchas entry "A wrong constant propagated because it was
+consistent with itself."
 
 ## Session 38 — framebuffer console, Terminus, `vi` fills the screen
 
