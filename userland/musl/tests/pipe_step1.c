@@ -1,36 +1,43 @@
-
 /*
- * pipe_step1.c -- Step 1 smoke test for donix pipe(2).
+ * pipe_step1.c -- pipe(2) smoke test: creation, round-trip, close.
  *
- * Verifies the non-blocking pipe created by sys_pipe:
+ * Verifies the basics of sys_pipe:
  *   1. pipe() returns two distinct, valid fds (>= 3, thanks to the
  *      console sentinels in fds 0/1/2).
  *   2. A small write-then-read round-trips bytes intact.
- *   3. A read on an empty pipe returns -1/EAGAIN.
- *   4. A write that exactly fills the pipe succeeds, and the next
- *      byte returns -1/EAGAIN.
- *   5. Closing both ends does not crash and does not leak (checked
- *      by the absence of kernel diagnostics on the serial log).
+ *   3. Closing both ends does not crash, and a re-close of a closed
+ *      fd is EBADF (proving the fd was released, not double-freed).
  *
- * Step 1 does NOT test blocking, EOF, or EPIPE -- those are Step
- * 2/3.  In particular, a read on an empty pipe returns EAGAIN, not
- * 0; the 0-on-EOF case requires a writer to have closed, which is
- * not yet distinguishable from a writer that is merely idle.
+ * WHAT THIS TEST DOES NOT COVER, AND WHY.
  *
- * Build: this file should be picked up by the same Makefile that
- * builds the other userland/musl/tests/*.c programs.  It links
- * statically against donix's musl.
+ * An earlier version of this file asserted that a read on an empty
+ * pipe returns -1/EAGAIN and that a write to a full pipe returns
+ * -1/EAGAIN.  That was Step-1 semantics, when pipes were
+ * non-blocking.  Steps 2 and 3 made read and write BLOCK: a reader
+ * with a live writer and an empty ring now sleeps in hlt until the
+ * writer produces, and a writer with a live reader and a full ring
+ * sleeps until the reader drains.  Those EAGAIN assertions are no
+ * longer true, and re-running them does not fail -- it HANGS,
+ * because nothing wakes the blocked process.
+ *
+ * The empty/full behavior is now tested where it can be tested
+ * safely:
+ *   - pipe_step2: blocking + directed wake (forks a peer).
+ *   - pipe_step3: EOF, -EPIPE, dup-aware closed-end counts.
+ *   - pipe_step3b: wake on the exit path.
+ *
+ * This file is the smoke test that needs no fork: create a pipe,
+ * move bytes through it, close it.  Keep it that way.
+ *
+ * Build: picked up by the same Makefile that builds the other
+ * userland/musl/tests/*.c programs.  Links statically against
+ * donix's musl.
  */
 
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-
-/* Must match PIPE_DEFAULT_CAPACITY in user_syscall.c.  If that
- * constant changes, change this too, or test_full will not
- * actually test the boundary it claims to. */
-#define PIPE_CAPACITY 4096
 
 static int failures = 0;
 
@@ -57,12 +64,13 @@ int main(void) {
     check(fds[1] >= 3, "write end is a low-but-not-stdio fd");
     check(fds[0] != fds[1], "read and write ends are distinct");
     if (r != 0) {
-        /* Without fds, the rest is meaningless. */
         printf("pipe_step1: cannot continue without a pipe\n");
         return 1;
     }
 
-    /* 2. Round-trip. */
+    /* 2. Round-trip.  A small write, then a read of exactly that
+     *    many bytes.  Both ends have live peers, so neither call
+     *    blocks: the write has room, the read has data. */
     const char* msg = "hello";
     errno = 0;
     ssize_t nw = write(fds[1], msg, 5);
@@ -75,56 +83,16 @@ int main(void) {
     check(nr == 5, "read() of 5 bytes returns 5");
     check(memcmp(buf, msg, 5) == 0, "read() returns the bytes written");
 
-    /* 3. Empty pipe -> EAGAIN.  This is the first real test of the
-     *    non-blocking path: the ring is empty, sys_read's pipe
-     *    branch must report EAGAIN rather than block or return 0. */
-    errno = 0;
-    nr = read(fds[0], buf, sizeof(buf));
-    check(nr == -1, "read() on empty pipe returns -1");
-    check(errno == EAGAIN, "read() on empty pipe sets errno=EAGAIN");
-
-    /* 4. Full pipe -> EAGAIN on the next byte.  Fill the ring with
-     *    exactly PIPE_CAPACITY bytes, then try one more.  The fill
-     *    must be a single write so it lands as one atomic append
-     *    into the empty ring; if sys_write's free-space math is
-     *    off by one, either the fill will short-write (and nw !=
-     *    PIPE_CAPACITY) or the extra byte will succeed (and the
-     *    next check fails). */
-    static char fill[PIPE_CAPACITY];
-    memset(fill, 'x', sizeof(fill));
-
-    errno = 0;
-    nw = write(fds[1], fill, sizeof(fill));
-    check(nw == PIPE_CAPACITY, "write() filling the pipe returns capacity");
-
-    errno = 0;
-    nw = write(fds[1], "z", 1);
-    check(nw == -1, "write() on full pipe returns -1");
-    check(errno == EAGAIN, "write() on full pipe sets errno=EAGAIN");
-
-    /* Drain the pipe, to leave it empty before the close test. */
-    {
-        static char drain[PIPE_CAPACITY];
-        size_t got = 0;
-        while (got < PIPE_CAPACITY) {
-            ssize_t g = read(fds[0], drain, sizeof(drain));
-            if (g <= 0) break;
-            got += (size_t)g;
-        }
-        check(got == PIPE_CAPACITY, "draining the pipe recovers every byte");
-    }
-
-    /* 5. Close.  After this, the kernel should have freed the two
-     *    slots, the pipe object, and the 4 KB ring buffer.  There
-     *    is no userspace-visible assertion for "freed"; the test
-     *    is that the serial log shows no diagnostic and that the
-     *    process exits cleanly. */
+    /*
+     * 3. Close.  No assertion for "the kernel freed the ring"; the
+     *    serial log is the check for leaks.  The re-close EBADF IS
+     *    an assertion, because it proves the fd was released and
+     *    not silently double-freed.
+     */
     errno = 0;
     check(close(fds[0]) == 0, "close(read end) returns 0");
     check(close(fds[1]) == 0, "close(write end) returns 0");
 
-    /* A second close must fail with EBADF, proving the fd really
-     * was released and not silently double-freed. */
     errno = 0;
     r = close(fds[1]);
     check(r == -1, "re-close of a closed fd returns -1");
