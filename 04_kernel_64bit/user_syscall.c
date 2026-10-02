@@ -170,6 +170,23 @@ static char g_write_bounce[WRITE_CHUNK];
  */
 #define FILE_KIND_PIPE 4
 
+/*
+ * A /dev/null slot.  obj is NULL; nothing to close or free.
+ *
+ * DELIBERATELY NOT THE DISPATCH SEAM.  open_resolved recognizes the
+ * exact path "dev/null" (after strip_dot_prefix) and returns this
+ * kind.  There is no /dev backend, no first-component dispatch, and
+ * no stat/access support -- only open().  That is enough for the
+ * acceptance test (`realpath /no/such/dir/file 2>/dev/null` exits
+ * non-zero, silently) and nothing more.
+ *
+ * When /proc forces the pathname dispatch seam into existence
+ * (see ROADMAP.md, "Make /proc possible"), this exact-path check
+ * becomes the seam's first /dev consumer and is deleted with it.
+ * Until then it is a recorded special case, not a pattern to copy.
+ */
+#define FILE_KIND_DEV_NULL 5
+
 /* Pipe end flags.  Stored in pipe_slot_t.end. */
 #define PIPE_END_READ  1
 #define PIPE_END_WRITE 2
@@ -363,6 +380,7 @@ typedef struct {
 #define KSTAT_IFMT   0170000
 #define KSTAT_IFREG  0100000
 #define KSTAT_IFDIR  0040000
+#define KSTAT_IFCHR  0020000   /* character device; /dev/null */
 
 /*
  * True if `p` names the FAT root directory.
@@ -1024,6 +1042,8 @@ static void put_file_slot(file_slot_t* slot) {
         if (slot->dir_path) kfree(slot->dir_path);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
+    } else if (slot->kind == FILE_KIND_DEV_NULL) {
+        /* obj is NULL; nothing to close or free. */
     } else if (slot->kind == FILE_KIND_PIPE) {
         /*
          * This is the last reference to this END (the slot refcount
@@ -1506,6 +1526,45 @@ static long open_resolved(const char* in_path, int flags) {
         return -(long)ENAMETOOLONG_;
     }
     strip_dot_prefix(local_path);
+
+    strip_dot_prefix(local_path);
+
+    /*
+     * /dev/null -- a recorded special case, not the dispatch seam.
+     *
+     * Matched on the STRIPPED form: strip_dot_prefix has already
+     * turned "/dev/null" into "dev/null".  Exact match only; there
+     * is no /dev directory and no other device.
+     *
+     * Read returns 0 (EOF), write returns the byte count and
+     * discards, close frees the slot, and fstat reports S_IFCHR.
+     * stat() and access() do NOT know about this path -- they still
+     * go to FatFs and fail with ENOENT.  That boundary is
+     * deliberate: open() is what the 2>/dev/null redirect needs,
+     * and nothing else is claimed.
+     *
+     * When the pathname dispatch seam lands for /proc, this check
+     * becomes the seam's first /dev consumer.  See ROADMAP.md,
+     * "Make /proc possible."
+     */
+    {
+        static const char devnull[] = "dev/null";
+        int is_devnull = 1;
+        for (int i = 0; devnull[i]; i++) {
+            if (local_path[i] != devnull[i]) { is_devnull = 0; break; }
+        }
+        if (is_devnull && local_path[sizeof(devnull) - 1] == '\0') {
+            file_slot_t* dslot = NULL;
+            int dfd = alloc_file_slot(&dslot);
+            if (dfd == -1) return -(long)EIO_;
+            dslot->kind = FILE_KIND_DEV_NULL;
+            /* obj stays NULL; refcount is 1 from alloc_file_slot. */
+            FDTRACE({ serial_print("open  dev/null -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" kind=DEV_NULL"); });
+            return dfd;
+        }
+    }
 
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
@@ -2356,6 +2415,22 @@ static long sys_fstat_body(int fd, void* user_stat) {
     kernel_stat_t st;
     FILINFO fno;
     for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+
+    if (slot->kind == FILE_KIND_DEV_NULL) {
+        /* Character device, like Linux's /dev/null.  Nothing calls
+         * fstat on an open devnull fd yet; this keeps the answer
+         * correct if something does. */
+        for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
+        st.st_nlink   = 1;
+        st.st_blksize = 512;
+        st.st_mode    = KSTAT_IFCHR | 0666;
+        st.st_size    = 0;
+        st.st_blocks  = 0;
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
 
     if (slot->kind == FILE_KIND_FILE) {
         FIL* f = (FIL*)slot->obj;
@@ -3693,6 +3768,15 @@ long sys_write(int fd, const void* buf, size_t count) {
      */
     file_slot_t* std_slot = get_file_slot_any(fd);
 
+    /* /dev/null: accept and discard.  Returns count, as Linux does
+     * for a successful write to /dev/null. */
+    {
+        file_slot_t* dn = get_file_slot_any(fd);
+        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
+            return (long)count;
+        }
+    }
+
     if ((fd == 1 || fd == 2) &&
         (!std_slot || std_slot->kind == FILE_KIND_CONSOLE)) {
         size_t remaining = count;
@@ -4084,6 +4168,15 @@ long sys_read(int fd, void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
     if (!self) return -(long)EBADF_;
+
+    /* /dev/null: always EOF.  Checked before the console and pipe
+     * paths so a devnull slot is never mistaken for either. */
+    {
+        file_slot_t* dn = get_file_slot_any(fd);
+        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
+            return 0;
+        }
+    }
 
     /*
      * fd 0 is the keyboard ONLY when it holds a console slot, or
