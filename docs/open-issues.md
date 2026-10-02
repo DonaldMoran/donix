@@ -31,18 +31,10 @@
    have no subshell form.  Real shells run the builtin in a
    subshell; adding that is its own change.  Deliberate limitation.
 
-4. **`sys_fcntl` refuses fd < 3 for subcommands other than
-   `F_DUPFD`/`F_DUPFD_CLOEXEC`.**  Deliberate: `F_GETFL`, `F_SETFL`,
-   `F_GETFD`, `F_SETFD` are not meaningful on a console sentinel.
-   Linux does allow e.g. `fcntl(0, F_GETFL, ...)` on a redirected fd;
-   donix returns `EBADF` there.  Not currently on any path, and
-   relaxing it is a small extension of the session-34 work rather
-   than a new problem.
-
-5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
+4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
    own syscalls.**  Deliberate FatFs-limitation first cuts.
 
-6. **`-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on a
+5. **`-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on a
    pipe with no reader returns `-EPIPE` (32), matching Linux's
    errno.  Real Linux *also* raises `SIGPIPE` first, which by default
    terminates the process before `write` returns.  donix's signal
@@ -68,7 +60,7 @@
    for `SIGBUS` on buffer overrun** — see `ROADMAP.md`.  Doing it
    once serves both.
 
-7. **`unlinkat` (263) has no consumer in busybox as configured.**
+6. **`unlinkat` (263) has no consumer in busybox as configured.**
    Implemented (session 40), correct, and tested by `at_step2.c`,
    but a tree-wide grep for `unlinkat` in `third_party/busybox`
    returns nothing.  busybox `rm -r` uses `lstat` + `unlink` +
@@ -80,7 +72,7 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
-8. **`vmm_map_page_in_cr3` and `vmm_map_page` silently abandon a
+7. **`vmm_map_page_in_cr3` and `vmm_map_page` silently abandon a
    mapping when a page-table allocation fails.**  Both functions
    walk the page tables and, at each level, call
    `pmm_alloc_page_for_tables()` if the next table does not exist.
@@ -97,11 +89,13 @@
    place where the caller asked for a **user** page, and the process
    later faults on a user instruction fetch of `0x400000` —
 
+   ```
        === PAGE FAULT (#PF) ===
          CR2 (Faulting Address) : 0x0000000000400000
          Raw Error Code         : 0x0000000000000015
          pde                    : 0x0000000000400083
          PDE IS 2 MB PAGE, phys base 0x400000
+   ```
 
    `0x400083` is present, write, PS, `PT_USER` clear; `0x15` is
    present + read + user + instruction-fetch.  The split path now
@@ -137,8 +131,7 @@
    *failure path* whose consumers do not check.  Both are
    "correct only for the cases known at the time."
 
-Also open: Ctrl- `[` not mapped to ESC; `sys_munmap` is a stub
-returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
+Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
 timestamp syscalls return 0 without storing); `prctl` is minimal
 (`PR_SET_NAME` accepted and dropped); busybox applet symlinks not
@@ -159,37 +152,21 @@ a `dup`'d chain stop waking the peer and the peer hangs until a
 keystroke — read the `put_file_slot` comment and this entry before
 touching either).
 
-**`vmm_map_page_in_cr3`/`vmm_map_page` still silently return
-without mapping when a page-table allocation fails** (the
-split-path instance is fixed; see item 8).
+**no `/dev` and no `/proc`** — `ttyname(3)` cannot name the
+console, so `tty` prints `not a tty`.  `readlink` (89) is
+implemented (session 42), so the `ttyname` fast path
+(`readlink("/proc/self/fd/N")`) no longer logs
+`Unknown syscall: 89` — but it returns `-EINVAL` because there
+are no symlinks, and the fallback walk of `/dev` still finds
+nothing, because `/dev` does not exist.  A device layer plus
+`/dev` entries would let `tty` print a path.  This is a
+prerequisite for anything wanting `/dev/null`, `/dev/tty`, or
+`/dev/urandom`.
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
 `FEATURE_VI_WIN_RESIZE` re-checking the size; it is `vi`'s behavior,
 harmless, and the reason `vi` fills the screen.  No action.
-
-**no `/dev` and no `/proc`** — `ttyname(3)` cannot name the
-console, so `tty` prints `not a tty`; musl's `ttyname` first tries
-`readlink("/proc/self/fd/N")` (syscall 89, unimplemented) and then
-walks `/dev`, which does not exist.  A device layer plus `/dev`
-entries plus `readlink` would let `tty` print a path.  The same
-gap blocks a `/dev/urandom` fallback for `mktemp` and is a
-prerequisite for anything wanting `/dev/null` or `/dev/tty`.
-
-**`mktemp` needs `clock_gettime` (228), not the `getpid`+`open`
-the busybox-enablement table names** — busybox `mktemp` calls
-musl's `mkstemp` → `__mkostemps` → `__randname`
-(`third_party/musl-src/src/temp/__randname.c`), which seeds its
-`XXXXXX` replacement from `__clock_gettime(CLOCK_REALTIME)`.  No
-`getrandom`, no `/dev/urandom` — just the clock, plus
-`__pthread_self()->tid` (no syscall).  donix has no
-`clock_gettime` (228); musl's `__clock_gettime` falls back to
-`gettimeofday` (96), also absent, so both fail and `__randname`
-reads an uninitialized `timespec`.  Implement `clock_gettime`
-(228) from `g_ticks` (100 Hz PIT: `tv_sec = g_ticks/100`,
-`tv_nsec = (g_ticks%100)*10000000`) and `mktemp` becomes
-enableable.  Corrects the enablement table, which lists `mktemp`
-under "Ready now" with `getpid` (39) + `open` (2).
 
 ### Test-design notes
 
