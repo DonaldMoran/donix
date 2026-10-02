@@ -206,10 +206,30 @@ it prevents the command from running.**  Session 43, testing
 The shell opens the redirect target *before* forking, the open
 fails, and the whole command is abandoned.  A script that relies
 on `2>/dev/null` to run something and silence its noise will find
-the *something* never ran.  **The first `/dev` consumer is
-`/dev/null`, and its acceptance test is this exact line:** after
-the device layer lands, `realpath /no/such/dir/file 2>/dev/null`
-exits non-zero, silently.
+the *something* never ran.
+
+**`/dev/null` now works, for open() only** (session 43,
+`20261002-dev-null`).  `open_resolved` recognizes the exact path
+`dev/null` and returns a `FILE_KIND_DEV_NULL` slot: read returns
+0, write returns count, close frees, fstat reports S_IFCHR.  The
+acceptance line passes:
+
+    $ realpath /no/such/dir/file 2>/dev/null
+    $ echo $?
+    1
+
+Silent, non-zero.  Before the change the same line printed
+`sh: can't create /dev/null: nonexistent directory` and the
+command did not run.
+
+**The boundary is deliberate.**  This is an exact-path check in
+`open_resolved`, not a `/dev` backend and not first-component
+dispatch.  `stat("/dev/null")`, `access("/dev/null", ...)`,
+`ls /dev/null`, and `test -e /dev/null` all still fail with
+ENOENT — only `open()` is covered, because `open()` is what the
+redirect needs.  The check is recorded as a special case and
+becomes the dispatch seam's first `/dev` consumer when `/proc`
+forces the seam; see `ROADMAP.md`, "Make `/proc` possible."
 
 The `sys_open` failure path shows `dev/null`, not `/dev/null` â€”
 the leading slash is stripped by the `0:` translation shim (item
