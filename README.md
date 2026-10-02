@@ -62,11 +62,12 @@ That's the point. That's the whole point.
   isn't Unix.
 - **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
   `pipe`, `dup`, `dup2`, `fork`, `execve`, `wait4`, `brk`, `mmap`,
-  `getdents64`, `stat`, `fstat`, `lstat`, `access`, `chdir`, `getcwd`,
-  `geteuid`, `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`,
-  `unlink`, `rmdir`, `uname`, `readv`, `writev` — the numbers and
-  semantics match Linux x86_64. musl's `printf`, `malloc`, and
-  `opendir` work unmodified.
+  `munmap`, `getdents64`, `stat`, `fstat`, `lstat`, `access`, `chdir`,
+  `getcwd`, `geteuid`, `prctl`, `ftruncate`, `lseek`, `rename`,
+  `utimensat`, `unlink`, `rmdir`, `uname`, `readv`, `writev`,
+  `readlink`, `clock_gettime`, `nanosleep` — the numbers and semantics
+  match Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
+  unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
   are real; `cd /bin; ls` lists `/bin`; `cd ..` walks back up; the
   change survives `fork` and `execve`. Relative paths (`.`, `..`,
@@ -83,7 +84,9 @@ That's the point. That's the whole point.
   `wc`, `head`, `tail`, `cp`, `mv`, `find`, `grep`, `sed`, `cut`,
   `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`,
   `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
-  `clear` — run
+  `clear`, `basename`, `dirname`, `unlink`, `ttysize`, `tty`,
+  `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
+  `printenv` — run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the
@@ -97,7 +100,8 @@ That's the point. That's the whole point.
   screen. Full-screen software gets what it expects: `vi don.txt`
   fills the screen, edit, `:wq`, then `cat don.txt` reads it back.
   The framebuffer was chosen over VGA text mode because VGA text is
-  hard to read in a half-screen window on a modern display; the  console grid is 102×42 instead of 80×25.
+  hard to read in a half-screen window on a modern display; the
+  console grid is 102×42 instead of 80×25.
 - **Has a second, real shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
@@ -109,8 +113,8 @@ That's the point. That's the whole point.
   file; `echo hi` prints `hi`; `ls` lists the FAT volume.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
-  tree is 20 short C files. There is no build system you can't read in
-  ten minutes. You can read it end to end in an evening.
+  tree is a few dozen short C files. There is no build system you
+  can't read in ten minutes. You can read it end to end in an evening.
 
 donix is a fork of [dons-os](https://github.com/DonaldMoran/dons-os-x86_64).
 The kernel infrastructure — boot chain, PMM, VMM, heap, scheduler, ATA
@@ -284,7 +288,9 @@ top-level `Makefile` for other modes.
 userland/musl/          musl userland source tree
   apps/                 userland programs (hello, echo, cat, ls,
                         memtest, musl_sh)
-  tests/                diagnostic binaries (musl_min, musl_fork, etc.)
+  tests/                regression and diagnostic binaries (canary,
+                        at_step1/2, pipe_step1-3b, envp_step1,
+                        fcntl_lowfd, musl_exec2, musl_min, ...)
   Makefile              builds every .c into build/*.elf; also builds
                         busybox from source
 configs/                tracked build configs (busybox.config)
