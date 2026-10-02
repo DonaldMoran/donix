@@ -28,6 +28,55 @@ canary during the migration)
 
 **One change at a time. Test. Commit. Revert on failure.**
 
+## When a feature may force architecture
+
+A feature is allowed to force architectural change only when the
+current architecture **cannot express it at all** -- not when a
+new architecture would merely be cleaner.  This is the rule that
+keeps the one-change-at-a-time discipline from collapsing into
+either of its two failure modes: speculative layers with no
+callers, and special cases scattered across syscalls.
+
+Worked examples from the current tree:
+
+- **`realpath` does not force anything.**  It is config-only; it
+  routes through musl's `realpath()`, which uses `lstat`,
+  `readlink`, and `getcwd` -- all present.
+- **A `readlink` errno fix does not force anything.**  It is a
+  correctness fix inside one function.
+- **Symlinks do not force anything yet**, because they are
+  deferrable.  They become a *consumer* of the pathname layer when
+  it exists; they are not the reason to build it.
+- **`/proc` forces the pathname dispatch seam.**  `resolve_against_cwd`
+  plus `fat_lookup` literally cannot express `/proc/self/status`:
+  there is no FAT entry and never will be.  This is the test --
+  the current machinery cannot produce the feature at all.
+
+When a feature does force change:
+
+- **Build exactly the seam that feature needs -- no more, no less.**
+  Not "a VFS"; the dispatch seam plus the smallest open-file
+  representation the feature's *smallest* case requires.  For
+  `/proc`, that is one `/proc` file's worth.
+- **Scope the seam against a named minimal customer**, then build
+  the customer to prove the sizing.  "Design the seam" in the
+  abstract is the speculative trap; "the seam `/proc/self/status`
+  needs" is designable.
+- **Let the customer prove the seam.**  If the customer does not
+  fit, the seam is wrong; the customer is not negotiable.
+- **Do not special-case in individual syscalls.**  The failure mode
+  donix is *most* at risk of is not over-abstraction -- it is
+  `strncmp(path, "/proc/", 6)` appearing first in `sys_open`, then
+  in `sys_stat`, then in `sys_access`.  `resolve_against_cwd` and
+  `sys_execve`'s shims are the existing instance of this pattern;
+  `/proc` is where it either gets generalized or gets three more
+  copies.
+
+The dispatch seam is the **VFS front door**, whatever it is called.
+Design it knowing `/proc` and `/dev` are coming, but do not build
+the VFS they are commonly assumed to need.  See `ROADMAP.md`,
+"Make `/proc` possible."
+
 ## Files that must not be touched
 
 Unless a specific tested problem requires it:
@@ -70,23 +119,32 @@ Full A1-A6 narrative: `docs/migration-history.md`.
 
 ## Tagging convention
 
-Tags through `20260926Z` used a single-letter suffix; that scheme
-is exhausted.  From the next commit onward:
+**Working tags** name a single commit and are local-only:
 
-    YYYYMMDD-NN
+    YYYYMMDD-<slug>
 
-`NN` is a two-digit sequence starting at `01`, incrementing per
-commit within a day; a new day restarts at `01`.  Zero-padding is
-required so lexical order matches chronological order.  Do not
-renumber or retag existing tags.
+The slug is a short lowercase description of the commit
+(`20261001-envp`, `20261002-handoff`).  **Working tags are annotated**
+-- the annotation is the fuller per-commit summary, and at a
+milestone bump the annotations seed the final milestone narrative.
+This is why each step gets a tag even when no `v*` tag is imminent.
 
-**Working tags** are local-only, one per commit, **kept in the
-local repo** -- do not delete them.  `git show 20260927-19` must
-always resolve; that is what makes the handoff's tag-only
-references work.
+**Working tags are dropped at the milestone bump.**  They exist
+while a milestone is being developed as local restore points; once
+the milestone is tagged `v*` and pushed, the scratch tags are
+deleted (`git tag -d <tag>...`).  A dropped scratch tag resolves to
+nothing; do not cite one as if it were a stable reference.  If a
+commit row needs a durable name after the bump, use its subject
+line, not its old scratch tag.
 
-**Milestone tags** (`v0.5.5`, `v0.6.0`, `v0.6.1`, `v0.6.2`, ...)
-are the only tags pushed to the remote.  Do not push working tags.
+**Milestone tags** (`v0.5.5`, `v0.6.0`, ... `v0.6.9`) are the only
+tags pushed to the remote and are permanent.  Do not push working
+tags.
+
+(Historical note: tags through `20260926Z` used a single-letter
+suffix, exhausted at `Z`; those were kept rather than dropped.
+The slug scheme above replaced the `YYYYMMDD-NN` sequence, which
+was never actually used and is superseded.)
 
 ## Git hygiene
 
@@ -103,6 +161,10 @@ are the only tags pushed to the remote.  Do not push working tags.
 - **Commits are recorded in `docs/session-log.md` before the
   session ends.**  An unrecorded commit on `dev` is worse than no
   entry.
+- **A commit message is a claim, not a fact.**  Read the diff.
+  `95c6337 handoff: rewrite fresh for the v0.6.9 bump` did not
+  rewrite the handoff body; the mismatch was found a session
+  later.
 
 ## Recovery
 

@@ -49,6 +49,12 @@ For the record, so this file does not re-plan finished work:
   all work on the framebuffer), and `vi` filling the screen. The
   VGA text console is the fallback; the VT100 parser is unchanged
   and drives either backend.
+- **v0.6.7 — a real shell, and a framebuffer console.**  The
+  milestone sessions 37 and 38 make up, tagged `11c2f16` and merged
+  to `main` (`3e6f00b`).  The shell became real (`musl_sh` tokenizer,
+  redirection, sequences, pipelines) and the console moved to the
+  1024×768 linear framebuffer with Terminus 10×18 text and `vi`
+  filling the screen.  Detail under sessions 37 and 38 below.
 - **v0.6.8 — the `*at()` family.** One path resolver (`resolve_at`)
   shared by every syscall that takes a dirfd.  `newfstatat` (262),
   `openat` (257), `unlinkat` (263), `faccessat` (269), and
@@ -119,6 +125,25 @@ and `printenv` — all config-only once the syscalls above existed.
 **Three small gaps.**  `munmap` (counted above), `fcntl` now accepts
 fd 0/1/2 for all subcommands, and Ctrl-`[` produces ESC (0x1B).
 
+**`realpath`, a post-ship tail (session 43).**  `CONFIG_REALPATH=y`,
+config-only — the trace showed it routes through musl's
+`realpath()` plus `libbb`'s `xmalloc_readlink` and `getcwd`, all
+present.  Two of the handoff's own test expectations were wrong:
+`realpath /nonexistent` succeeds (parent `/` exists); the failing
+case is a path whose parent does not exist.  The run also
+sharpened the `/dev` entry — `2>/dev/null` does not merely fail to
+discard, it stops the command from running.  Committed and
+scratch-tagged `20261002-realpath`, not yet pushed.
+
+**`readlink` errno, closed by test (session 43).**  `sys_readlink`
+already returned `-ENOENT` for a missing path and `-EINVAL` for an
+existing non-symlink; the fix had been in the tree, untested, and
+`open-issues.md` item 8 still described the defect as open.
+`tests/readlink_errno.c` calls `readlink(2)` directly, since no
+applet does, and asserts both answers.  3/3.  Item 8 is closed with
+a run behind it.  See `gotchas.md`, "A fix with no test is
+indistinguishable from an unfixed defect."
+
 The live state, the canary rows, and the NEXT SESSION list are in
 [`handoff.md`](handoff.md).
 
@@ -148,6 +173,97 @@ by reading busybox's source:
 See `open-issues.md` and `gotchas.md`, "A consumer inferred from
 behavior is not a consumer," for the `unlinkat` finding: it was
 added on the belief that `rm -r` needs it, and `rm -r` does not.
+
+---
+
+## Make `/proc` possible — the next major direction
+
+**This is the next major direction, not a scheduled milestone.**
+The `realpath` enable (session 43) is done and closed; the
+`readlink` errno fix is done too (`readlink_errno.c`, session 43).
+What `/proc` is: the shape the next real subsystem will take, and
+the thing that forces the pathname dispatch seam into existence.
+It is not scoped, sized, or scheduled.  When a session picks it up,
+it gets planned then.
+
+`/proc` is not a "VFS milestone."  It is the first feature that the
+current architecture **cannot express at all**, and building it is
+what forces the pathname dispatch seam into existence.
+
+### Why this, and not symlinks
+
+`resolve_against_cwd` plus `fat_lookup` cannot produce
+`/proc/self/status`.  There is no FAT entry and never will be.
+That is the test from `docs/strategy.md`, "When a feature may force
+architecture": a feature forces change when the current
+architecture cannot express it, not when a new architecture would
+be cleaner.
+
+Symlinks fail that test -- they are deferrable, and they can be
+added later as a *consumer* of the seam.  `/proc` passes it.
+`/proc` also delivers observability the kernel needs
+(`/proc/self/status`, `/proc/self/maps`), which makes kernel
+development itself easier.  It is the right first customer.
+
+### Scope — one deliverable, two parts, sized to one file
+
+The work is **"the minimal dispatch seam plus the smallest
+open-file representation that one `/proc` file requires."**  Both
+parts, together, sized to `/proc/self/status` and nothing larger.
+
+**The dispatch seam.**  Today path lookup is conceptually
+`path -> FAT -> result`.  `/proc` makes it
+`path -> first component -> procfs | fat | devfs`.  That is
+dispatch, and it is the VFS front door whether it is called that or
+not.  Design it knowing `/dev` and mounts are coming; do not build
+them now.
+
+**The minimal open-file representation.**  `open("/proc/self/status")`
+must return something `read`, `stat`, and `close` can act on, and
+that something is not a FAT file.  This is forced by the *first*
+`/proc` file -- it cannot be deferred past it.  The minimal form is
+a small `file_ops`-style struct with `read`/`stat`/`close`, with FAT
+and proc both implementing it.  **No inode layer, no vnode layer,
+no superblocks, no reference counts, no mount framework.**
+
+**Acceptance test:** one `/proc` file, probably `/proc/self/status`,
+opens, reads its contents, stats as a regular file, and closes --
+from `donix>` and from ash.  Add it to the canary.
+
+### What it subsumes
+
+`open-issues.md` item 1: `sys_execve`'s two remaining path attempts
+and `resolve_against_cwd` are shims the seam subsumes.  **Delete
+them as part of this work; do not extend them.**
+
+### The two failure modes to avoid
+
+- **Over-abstraction.**  Do not schedule "VFS."  Do not build an
+  inode/vnode/mount/superblock stack.  Build the seam `/proc`
+  needs and stop.
+- **Under-abstraction.**  Do not special-case `/proc` inside
+  `sys_open`, then `sys_stat`, then `sys_access`.  This is the
+  failure mode donix is *more* at risk of, because its history is
+  "implement the syscall when a feature needs it."
+  `resolve_against_cwd` and `sys_execve`'s shims are already the
+  existing instance of this pattern.
+
+### After it lands — consumers, in order
+
+Each of these is a consumer of the seam, ordered by what it
+unlocks.  None is scheduled yet.
+
+1. **`/dev`** — `/dev/null`, `/dev/tty`, `/dev/urandom`; lets
+   `tty` name its terminal.  `/dev/null` is first: its acceptance
+   test already exists (`realpath /no/such/dir/file 2>/dev/null`
+   must exit non-zero, silently; today the command does not run at
+   all).
+2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
+   ordinary file, hidden entirely inside the seam.  See
+   `open-issues.md` item 8.
+3. **`ln`, `link`, `readlink` with real targets**, and archive
+   symlink restoration (`tar`, `unzip`).
+4. **A mount framework**, if and when a second filesystem exists.
 
 ---
 
@@ -199,10 +315,6 @@ value.
 
 ### Longer term
 
-- **`/dev` and `/proc`.**  No device nodes, no `/proc`.  `tty`
-  cannot name its terminal (`ttyname(3)` finds neither), and there is
-  no `/dev/null`, `/dev/tty`, or `/dev/urandom`.  A device layer is
-  the prerequisite.  See `open-issues.md`.
 - **Per-process tty / console focus** — prerequisite for multiple
   concurrent shells.
 - **Serial console debug access** — kernel shell over COM1.
@@ -249,7 +361,7 @@ assumed:**
   future milestone (already listed under "Longer term" above).
 - **A VFS.**  Wayland does not require one.  A `wl_shm` client needs
   no device nodes at all; a DRM-backed compositor later can reach
-  `/dev/...` through the existing path layer.  The VFS is on the
+  `/dev/...` through the pathname dispatch seam.  The VFS is on the
   critical path for *donix generally*, not for Wayland.
 
 Revisit when `v0.6.10` opens.
