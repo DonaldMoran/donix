@@ -1,10 +1,12 @@
 ### Open
 
-1. **VFS layer (eventual).**  `sys_execve`'s three-attempt path
-   resolution and `resolve_against_cwd` are both shims.  When a VFS
-   lands, delete them; do not extend.  (A VFS is on the critical
-   path for donix generally, **not** for Wayland -- see
-   `ROADMAP.md`.)
+1. **VFS layer (eventual).**  `sys_execve`'s two remaining path
+   attempts — the path as given, and the `"0:"` prefix translation
+   for an absolute path — and `resolve_against_cwd` are all shims.
+   When a VFS lands, delete them; do not extend.  (The bare-name
+   attempt was removed in session 42; see `session-log.md`.  A VFS
+   is on the critical path for donix generally, **not** for
+   Wayland -- see `ROADMAP.md`.)
 
 2. **Redirection of a builtin is silently ignored.**  `musl_sh`'s
    builtins (`cd`, `pwd`) run in the parent, before any fork, so
@@ -29,18 +31,10 @@
    have no subshell form.  Real shells run the builtin in a
    subshell; adding that is its own change.  Deliberate limitation.
 
-4. **`sys_fcntl` refuses fd < 3 for subcommands other than
-   `F_DUPFD`/`F_DUPFD_CLOEXEC`.**  Deliberate: `F_GETFL`, `F_SETFL`,
-   `F_GETFD`, `F_SETFD` are not meaningful on a console sentinel.
-   Linux does allow e.g. `fcntl(0, F_GETFL, ...)` on a redirected fd;
-   donix returns `EBADF` there.  Not currently on any path, and
-   relaxing it is a small extension of the session-34 work rather
-   than a new problem.
-
-5. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
+4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
    own syscalls.**  Deliberate FatFs-limitation first cuts.
 
-6. **`-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on a
+5. **`-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on a
    pipe with no reader returns `-EPIPE` (32), matching Linux's
    errno.  Real Linux *also* raises `SIGPIPE` first, which by default
    terminates the process before `write` returns.  donix's signal
@@ -66,7 +60,7 @@
    for `SIGBUS` on buffer overrun** — see `ROADMAP.md`.  Doing it
    once serves both.
 
-7. **`unlinkat` (263) has no consumer in busybox as configured.**
+6. **`unlinkat` (263) has no consumer in busybox as configured.**
    Implemented (session 40), correct, and tested by `at_step2.c`,
    but a tree-wide grep for `unlinkat` in `third_party/busybox`
    returns nothing.  busybox `rm -r` uses `lstat` + `unlink` +
@@ -78,8 +72,66 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
-Also open: Ctrl- `[` not mapped to ESC; `sys_munmap` is a stub
-returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
+7. **`vmm_map_page_in_cr3` and `vmm_map_page` silently abandon a
+   mapping when a page-table allocation fails.**  Both functions
+   walk the page tables and, at each level, call
+   `pmm_alloc_page_for_tables()` if the next table does not exist.
+   Every one of those calls is followed by `if (!phys) return;` —
+   the function gives up without mapping anything, and **the caller
+   has no way to know.**  `elf_load_into_process`, `sys_brk`,
+   `sys_mmap`, and `sys_execve` all call these and treat a return
+   as "the mapping was made."
+
+   The huge-page-split path in `vmm_map_page_in_cr3` was the first
+   of these to be fixed (session 42, tag `20261001-splitfix`),
+   because it was the one with evidence: a silent return there
+   leaves the bootloader's 2 MB **supervisor** identity-map page in
+   place where the caller asked for a **user** page, and the process
+   later faults on a user instruction fetch of `0x400000` —
+
+   ```
+       === PAGE FAULT (#PF) ===
+         CR2 (Faulting Address) : 0x0000000000400000
+         Raw Error Code         : 0x0000000000000015
+         pde                    : 0x0000000000400083
+         PDE IS 2 MB PAGE, phys base 0x400000
+   ```
+
+   `0x400083` is present, write, PS, `PT_USER` clear; `0x15` is
+   present + read + user + instruction-fetch.  The split path now
+   halts with a `VMM: FATAL` message instead of returning.
+
+   **The remaining sites are still silent.**  In
+   `vmm_map_page_in_cr3`: the PDPT, PD, and PT allocation paths each
+   have their own `if (!phys) return;`.  In `vmm_map_page`: the same
+   three.  None of them has produced a visible bug yet — a failed
+   allocation there leaves a not-present page rather than a
+   supervisor one, and the caller faults on a *missing* page, which
+   is at least the right kind of fault — but the pattern is the
+   same defect: **a void function that cannot report failure, called
+   by code that assumes success.**
+
+   The fix is one of:
+   - **change the signature** to return an error, and check it at
+     every caller (the honest fix, and the larger one — it touches
+     every `vmm_map_page*` call site in the tree); or
+   - **halt on failure at each site**, as the split path now does
+     (matches the kernel idiom, smaller, but turns a recoverable
+     allocation failure into a dead machine).
+
+   Not urgent: allocation failure during page-table growth has not
+   been observed on a 128 MB machine with the current workload.  But
+   it is a real gap, it is the same shape as the bug we just fixed,
+   and it should be closed deliberately rather than one site at a
+   time as each produces its own confusing fault.
+
+   **Read `gotchas.md`, "A shim's dead code is only dead if you
+   watch it not run," together with this.**  That entry is about a
+   deletion whose consumers were not all found; this is about a
+   *failure path* whose consumers do not check.  Both are
+   "correct only for the cases known at the time."
+
+Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
 timestamp syscalls return 0 without storing); `prctl` is minimal
 (`PR_SET_NAME` accepted and dropped); busybox applet symlinks not
@@ -99,6 +151,17 @@ theory that `put_file_slot` covers everything, non-final closes in
 a `dup`'d chain stop waking the peer and the peer hangs until a
 keystroke — read the `put_file_slot` comment and this entry before
 touching either).
+
+**no `/dev` and no `/proc`** — `ttyname(3)` cannot name the
+console, so `tty` prints `not a tty`.  `readlink` (89) is
+implemented (session 42), so the `ttyname` fast path
+(`readlink("/proc/self/fd/N")`) no longer logs
+`Unknown syscall: 89` — but it returns `-EINVAL` because there
+are no symlinks, and the fallback walk of `/dev` still finds
+nothing, because `/dev` does not exist.  A device layer plus
+`/dev` entries would let `tty` print a path.  This is a
+prerequisite for anything wanting `/dev/null`, `/dev/tty`, or
+`/dev/urandom`.
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
@@ -138,3 +201,12 @@ harmless, and the reason `vi` fills the screen.  No action.
   resolution.  (There is no section 10; it was removed — it tested a
   kernel-side flag check that does not exist, because musl returns
   the `EINVAL` itself.  See `gotchas.md`, session 41.)
+
+- **The canary is now `canary`, a program.**  Session 42 replaced
+  the hand-typed list with `userland/musl/tests/canary.c`: it runs
+  every non-interactive canary row, checks exit status and output
+  substrings, and reports pass/fail.  `canary` (read-only) and
+  `canary --full` (also the mutating rows).  Run from `donix>` or
+  from ash; both search lists find `/usr/bin/CANARY`.  The rows it
+  does not cover (interactive `busybox ash`, `vi`) stay manual and
+  are printed at the end of a run.

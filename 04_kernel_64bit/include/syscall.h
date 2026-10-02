@@ -68,6 +68,7 @@
  *  22  pipe              sys_pipe          (Step 1: non-blocking; see note)
  *  32  dup               sys_dup           (alias of fcntl F_DUPFD)
  *  33  dup2              sys_dup2
+ *  35  nanosleep         sys_nanosleep (g_ticks deadline loop; 10 ms granularity)
  *  39  getpid            sys_getpid
  *  57  fork              sys_fork
  *  59  execve            sys_execve
@@ -82,6 +83,7 @@
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
+ *  89  readlink          sys_readlink      (honest -EINVAL: no symlinks)
  * 107  geteuid           sys_geteuid       (returns fixed uid 1000)
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
@@ -89,6 +91,7 @@
  * 158  arch_prctl        sys_arch_prctl
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
+ * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
  * 231  exit_group        sys_exit_group -> sys_exit
  * 235  utimes            sys_utimes        (session 31; no-op stub)
  * 257  openat            sys_openat        (resolve_at; find needs it)
@@ -143,6 +146,7 @@
 #define SYS_PIPE            22
 #define SYS_DUP             32
 #define SYS_DUP2            33
+#define SYS_NANOSLEEP       35
 #define SYS_GETPID          39
 #define SYS_FORK            57
 #define SYS_EXECVE          59
@@ -157,6 +161,7 @@
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
+#define SYS_READLINK        89
 #define SYS_GETEUID         107
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
@@ -164,6 +169,7 @@
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
 #define SYS_UTIMES          235
 #define SYS_OPENAT          257
@@ -185,11 +191,28 @@
  * arg0: const char* path        (user pointer, NUL-terminated)
  * arg1: char* const argv[]      (user pointer to array of user string
  *                                pointers; NULL if argc == 0)
- * arg2: char* const envp[]      (ignored for now)
+ * arg2: char* const envp[]      (user pointer to array of user string
+ *                                pointers; NULL if envc == 0)
  * returns: only on failure, as -errno
+ *
+ * envp is passed through VERBATIM, as Linux does: execve copies
+ * the caller's environment onto the new stack; it does not
+ * synthesize one.  The shell (busybox ash, musl_sh) is the layer
+ * that builds envp and hands it down.  Before session 42, arg2 was
+ * ignored and a single NULL was written as the envp terminator, so
+ * every program ran with an empty environment: getenv returned
+ * NULL, env/printenv printed nothing, and $VAR expansion in ash
+ * was always empty.
+ *
+ * EXEC_MAX_ENVC bounds the kernel-side snapshot.  The snapshot
+ * buffer is kmalloc'd, NOT a stack array: at EXEC_MAX_ENVC 64 and
+ * EXEC_MAX_ARG_LEN 256 a stack buffer would be 16 KB on its own,
+ * and PROC_STACK_SIZE is 16 KB.  See the comment at the snapshot
+ * site in user_syscall.c.
  */
 #define EXEC_MAX_ARGC 16
 #define EXEC_MAX_ARG_LEN 256
+#define EXEC_MAX_ENVC 64
 
 /*
  * SYS_WAIT4 (61) — wait for a child to exit.
@@ -228,7 +251,9 @@ long sys_close(int fd);
  */
 long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
+long sys_nanosleep(const void* req, void* rem);
 long sys_unlink(const char* path);
+long sys_readlink(const char* path, char* buf, size_t bufsiz);
 long sys_rmdir(const char* path);
 long sys_unlinkat(int dirfd, const char* path, int flags);
 long sys_ftruncate(int fd, long length);
@@ -250,6 +275,7 @@ long sys_setsid(void);
 long sys_geteuid(void);
 long sys_getppid(void);
 long sys_uname(void* user_buf);
+long sys_clock_gettime(int clk_id, void* user_ts);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
 long sys_rename(const char* oldpath, const char* newpath);

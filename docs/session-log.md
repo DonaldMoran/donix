@@ -1,3 +1,491 @@
+## Session 42 — envp, the `/usr/bin` layout, and the shim removal
+
+Six commits on `dev`, scratch-tagged, unpushed.  Opens `v0.6.9`
+with envp, and then — because envp exposed it — moves the binaries
+to `/usr/bin` and removes the kernel's bare-name resolution.  Two
+subjects, one session, in the order they happened.
+
+| Tag | What |
+|---|---|
+| `20261001-envp` | `sys_execve` copies `envp` onto the new stack; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
+| `20261001-env-applets` | config: enable busybox `env` and `printenv` |
+| `20261001-envdocs` | session-42 docs (the first pass) |
+| `20261001-usrbin` | executables to `/usr/bin`; `canary.c` the smoke test |
+| `20261001-nosuffix` | drop the `.ELF` suffix; binaries staged bare |
+| `20261001-noshim` | `execve`: remove the bare-name attempt; (a) and (b) remain |
+
+**`v0.6.8` was bumped and pushed mid-session** (tag `v0.6.8` at
+`b64a4fa`, merged to `main`), and the nine `2026*` scratch tags for
+that milestone were dropped at the bump.  The `v0.6.9` work begins
+with `20261001-envp`.
+
+---
+
+### Session 42, continued — the 19 commits after the shim removal
+
+The opening six commits were the milestone's original scope.  What
+followed was not planned: a test for envp that found a `%rax`-clobber
+bug, a rewrite of `musl_exec2`, a page-table bug the shim removal
+surfaced, four syscalls, ten busybox applets, three small gaps, and
+two doc cleanups.  `v0.6.9` grew from three subjects to a large
+milestone.  All 19 are tagged; the table below is the rest of the
+session.
+
+**The envp regression test and what it found**
+
+| Tag | What |
+|---|---|
+| `20261001-envtest` | `tests/envp_step1.c` + `envp_helper.c` — envp survives `execve`, 3 checks |
+| `20261001-lenfix` | `puts_raw` computes its own length; `musl_exec2` rewritten; two gotchas |
+
+The envp test was the handoff's own next-session item 1.  It forks
+three times and `execve`s a helper with one variable, two variables,
+and an empty envp, checking the child's **exit status** (not stdout —
+donix cannot capture a child's output).  It proved the session-42
+envp code by failing against pre-envp `execve`, and it surfaced two
+bugs, both in the test itself:
+
+- **The `%rax` clobber.**  `puts_raw`'s inline `syscall` asm declared
+  `%rax` only as an *input*, with no output and no `"rax"` clobber.
+  GCC believed `%rax` survived the block, so two `puts_raw` calls
+  back to back issued the second `syscall` **without reloading
+  `%rax`** — and it ran with the first syscall's return value as its
+  number.  The log:
+
+      Unknown syscall: 41
+      Unknown syscall: 18446744073709551578
+
+  `18446744073709551578` is `2^64 - 38`, the bit pattern of the
+  `-ENOSYS` that syscall 41 (`socket`) returned.  A syscall number
+  that is the previous syscall's *return value* is only possible if
+  `%rax` was never reloaded.  Fixed by giving every syscall asm an
+  `"=a"(ret)` output.  `musl_exec.c` and `musl_exec2.c` had the same
+  latent `puts_raw`; their callers always reset `%rax` after, so it
+  never showed.  See `gotchas.md`, "An input-only `syscall` asm
+  block does not tell GCC that `%rax` is overwritten."
+
+- **Hand-counted string lengths.**  Of `envp_step1.c`'s fourteen
+  `puts_raw` literals, **eight were wrong** — off by one or two.
+  A length one too long writes the string's NUL terminator as a
+  byte, invisible on the console but a one-byte over-read of
+  `.rodata` and a fault the day a string ends at a page boundary.
+  A length too short drops the trailing newline, which is how it
+  was noticed: `MUSL_EXEC2-ALL-PASS` ran together with the kernel's
+  `EXIT:` line.  Fixed by removing the length parameter entirely —
+  `puts_raw` computes it.  There is no compile-time check on a
+  hand-counted length, so recounting is not the fix.  See
+  `gotchas.md`, "A hand-counted string length in a syscall wrapper
+  will be wrong."
+
+**`musl_exec2` rewritten.**  It asserted `sys_execve`'s bare-name
+retry (removed by `20261001-noshim`) and the `.ELF` suffix form
+(removed by `20261001-nosuffix`), so all three of its checks were
+asserting removed behavior and failing.  Inverted: one positive
+(`execve("/usr/bin/HELLO")` resolves) and two negative
+(`execve("HELLO")` and `execve("/HELLO.ELF")` do not).  Kept rather
+than deleted, so a reintroduction of either form goes red.  The two
+negative checks are the record of the shim removal.
+
+**The page-table bug the shim removal surfaced**
+
+| Tag | What |
+|---|---|
+| `20261001-splitfix` | the huge-page split in `vmm_map_page_in_cr3` halts on allocation failure instead of returning |
+| `20261001-splitdiag-off` | removed the temporary `VMM: SPLIT` prints |
+| `20261001-vmm-issues` | recorded the six remaining silent `vmm_map_page*` returns as item 7 |
+
+An intermittent `#PF` appeared after the shim removal, on the first
+exec, sometimes:
+
+    === PAGE FAULT (#PF) ===
+      CR2 (Faulting Address) : 0x0000000000400000
+      Raw Error Code         : 0x0000000000000015
+      pde                    : 0x0000000000400083
+      PDE IS 2 MB PAGE, phys base 0x400000
+
+`0x400083` is present, write, PS, `PT_USER` clear; `0x15` is
+present + read + user + instruction-fetch.  The bootloader's low
+identity map is 2 MB **supervisor** huge pages; when
+`elf_load_into_process` maps the ELF entry page at `0x400000`,
+`vmm_map_page_in_cr3` must split that huge page into 4 KB PTEs
+before writing the user PTE.  The split allocates one page-table
+page — and on allocation failure the function **returned without
+splitting**, leaving the supervisor page in place.  The caller does
+not check; the process later faults on a user fetch of a supervisor
+page.  Intermittent because it depends on whether the allocator has
+a table page at that instant.
+
+**This is not the shim removal's fault.**  The shim removal changed
+`sys_execve`'s control flow and timing; the defect is the silent
+`return`.  Diagnostic confirmed the setup on ten clean boots
+(`split` fires for `0x400000`, `pde=0x400083`, `carry_user=0`, and
+succeeds); the failure path was **never reproduced**.  The fix is
+made because the silent return is wrong on its own terms — it
+leaves a supervisor page where the caller asked for a user page —
+not because the failure was caught.  A diagnostic patch first,
+then the fix (halting with `VMM: FATAL`), then the diagnostic
+removed.
+
+The six remaining `if (!phys) return;` sites in `vmm_map_page_in_cr3`
+and `vmm_map_page` are recorded as `open-issues.md` item 7 — the
+same defect, no evidence yet, a deliberate decision per site.
+
+**Dead code and four syscalls**
+
+| Tag | What |
+|---|---|
+| `20261001-deadname` | deleted `exec_resolve_bin_name`, dead since the shim removal |
+| `20261001-readlink` | `readlink` (89): honest `-EINVAL` (no symlinks), `-ENOENT` for missing |
+| `20261001-clock` | `clock_gettime` (228) from `g_ticks`; enables `mktemp` |
+| `20261001-nanosleep` | `nanosleep` (35) as a `g_ticks` deadline loop; enables `sleep`, `usleep` |
+| `20261001-munmap` | `munmap` (11) for real — the stub leaked; mallocng calls it |
+
+**`exec_resolve_bin_name`** was left behind by the shim removal —
+the callers were deleted, the function was not, and
+`-Wunused-function` caught it.  This is the deletion-shaped half of
+the gotcha the shim removal itself produced.  Deleting it also made
+true a comment `sys_execve` still carried ("the helpers it called
+are gone with it") — until this commit, one of them was not.
+
+**`readlink`** is the honest answer for a system with no symlinks:
+`-EINVAL` for a path that exists (Linux's answer for a non-symlink),
+`-ENOENT` for one that does not.  It exists because musl's
+`ttyname(3)` tries `readlink("/proc/self/fd/N")` before walking
+`/dev`, and without a handler that logged `Unknown syscall: 89` on
+every `tty` run.  It does **not** make `tty` print a path — after
+`-EINVAL`, `ttyname` walks `/dev`, which does not exist.  The
+number was confirmed against musl's `readlink.c` (`#ifdef
+SYS_readlink` → 89).  Exercised by `tty`: `not a tty`, no unknown
+syscall.
+
+**`clock_gettime`** reports `g_ticks` (100 Hz PIT) as both
+`CLOCK_REALTIME` and `CLOCK_MONOTONIC` — donix has no wall clock,
+so the two are the same number.  It was needed by `mktemp`: busybox
+`mktemp` → musl `mkstemp` → `__randname`, which seeds its `XXXXXX`
+replacement from `__clock_gettime(CLOCK_REALTIME)`.  **Not**
+`getrandom`, **not** `/dev/urandom` — just the clock, read from
+`__randname.c`.  This corrected the handoff's enablement table,
+which named `getpid`+`open`.  Exercised:
+
+    $ mktemp
+    /tmp/tmp.LimaPc
+    $ mktemp /tmp/testXXXXXX
+    /tmp/testABfoOf
+    $ ls /tmp
+    testABfoOf  tmp.LimaPc
+
+**`nanosleep`** is a `hlt` loop on a `g_ticks` deadline — the shape
+`sys_poll` and `sys_read` already use.  Duration rounds down to
+whole 10 ms ticks; `rem` is never written (no signals to interrupt
+a sleep).  musl's `nanosleep(3)` reaches this via
+`__clock_nanosleep(CLOCK_REALTIME, ...)`.  Timed with a stopwatch:
+`sleep 60` took one minute.
+
+**`munmap`** was a stub returning 0.  That was wrong — **musl's
+mallocng calls it** in `free()` (large-block release) and in
+`malloc`'s error path.  The stub told `free()` memory was released
+when it was not: a leak, not a no-op.  Now unmaps the rounded
+range, frees the frames, and removes them from `elf_page_list` so
+exit does not double-free.  Exercised by the kernel self-test's
+`heap_stress` (4096 malloc/free ops, "no leak, heap intact") and by
+`memtest` (`malloc(4096)` → `free()` → `malloc(8192)` at a nearby
+address).
+
+**Busybox applets — ten enabled**
+
+| Tag | What |
+|---|---|
+| `20261001-applets-free` | `basename`, `dirname`, `unlink` |
+| `20261001-applets-tty` | `ttysize`, `tty`, `arch` |
+| `20261001-truncate` | `truncate` |
+
+All config-only.  `basename`/`dirname` are string ops plus `write`;
+`unlink` calls `unlink(2)` (87), already present.  `ttysize` reads
+`ioctl(TIOCGWINSZ)`; `tty` prints `not a tty` (no `/dev`, no
+`/proc` — correct for donix); `arch` is the `uname` applet under
+another name (`applet_name[0] == 'a'`), already working.
+
+**`truncate` is config-only and the handoff's table was wrong.**
+The table listed it under "Needs one small syscall first" with
+`truncate` (76).  Reading `coreutils/truncate.c` settles it: the
+applet does `open()` then `ftruncate()` (77) — already implemented
+since session 31.  It never calls `truncate(2)`.  Same "consumer
+inferred from the name" error as `unlinkat`.  Exercised: a 6-byte
+file truncated to 0, no unknown syscall.
+
+**Three small gaps, the last of the NEXT-SESSION list**
+
+| Tag | What |
+|---|---|
+| `20261001-fcntl-lowfd` | `sys_fcntl` accepts fd 0/1/2 for all subcommands; new `fcntl_lowfd` test |
+| `20261001-ctrl-bracket` | Ctrl- `[` produces ESC (0x1B) |
+| (`20261001-munmap`) | `sys_munmap` — counted here; it was gap 1 |
+
+**`fcntl`** used `get_file_slot()` (refuses fd < 3) for everything
+but `F_DUPFD`, so `fcntl(0, F_GETFL)` on a redirected fd 0 returned
+`-EBADF`.  Now `get_file_slot_any()` throughout.  New test
+`fcntl_lowfd.c`: console fd 0 → 0, redirected fd 0 → 0 (the fix),
+closed fd 0 → `EBADF` (the control).  All three pass.
+
+**Ctrl-`[`** produced `[` because `scancode_to_ascii` had no Ctrl
+parameter.  Added `g_ctrl` (scancodes 0x1D/0x9D) alongside
+`g_shift`/`g_caps`, and a fourth `ctrl` parameter; Ctrl-`[` maps to
+`0x1B` before the table lookup.  Only Ctrl-`[` is mapped, not the
+full Ctrl+letter range — the others currently produce their base
+character and changing them would alter what the line editor sees.
+Exercised in `vi`.
+
+**Doc cleanups**
+
+| Tag | What |
+|---|---|
+| `20261001-dev-issue` | open-issues: no `/dev`, no `/proc`; `ttyname` cannot name the console |
+| `20261001-mktemp-issue` | open-issues: `mktemp` needs `clock_gettime`, not `getpid`+`open` |
+| `20261001-issues-cleanup` | removed the resolved entries from `open-issues.md` |
+
+The two "issue" commits recorded findings *while they were fresh*:
+the `/dev` gap found by enabling `tty`, and the `clock_gettime`
+dependency found by reading `__randname.c`.  The cleanup commit then
+removed the four entries that were no longer true (`fcntl`,
+Ctrl-`[`, `munmap`, `mktemp`) — an issues list that claims fixed
+things are broken is one you learn to ignore.
+
+**Gotchas added:** "An input-only `syscall` asm block does not tell
+GCC that `%rax` is overwritten"; "A hand-counted string length in a
+syscall wrapper will be wrong."  (The opening six commits added
+"The kernel stack is 16 KB" and "A shim's dead code is only dead if
+you watch it not run.")
+
+**Canary:** green from both shells.  `canary` 14/14, `canary
+--full` 27/27.  The kernel self-test runs at boot, 17/17.
+
+**New regression tests:** `envp_step1`, `musl_exec2` (rewritten),
+`fcntl_lowfd`.  The image stages 38 files.
+
+**Scratch tags kept:** all 24 `20261001-*` tags are local, not
+pushed, part of the open `v0.6.9` milestone — dropped at the bump.
+
+**The milestone, in one line:** `v0.6.9` shipped envp, the
+`/usr/bin` layout, the shim removal — and then a test, a rewrite, a
+page-table fix, four syscalls, ten applets, three gaps, and four
+gotchas, because each was the next thing the last one exposed.
+---
+
+### envp — `execve` passes the environment through
+
+`sys_execve` ignored its third argument and wrote a single NULL as
+the envp terminator, so every program ran with an empty
+environment: `getenv` returned NULL, `env`/`printenv` printed
+nothing, `$VAR` expansion in ash was always empty.
+
+**Commit 1** (`envp`): Linux semantics — `execve` passes the
+caller's `envp` through **verbatim**; it does not synthesize an
+environment.  The shell builds it, the kernel carries it.
+
+`sys_execve` section 3 snapshots `envp` from the OLD address space
+before the teardown in section 5, exactly as argv is snapshotted.
+Section 6 writes the SysV process-entry layout:
+
+    rsp_init  -> argc
+                 argv[0] ... argv[argc-1] NULL
+                 envp[0] ... envp[envc-1] NULL
+                 (argv strings, then envp strings, packed)
+
+The slot after the argv array, which held a single NULL (the whole
+envp), now holds the envp pointer array, NULL-terminated, with the
+strings following.
+
+**Two sizing decisions.**
+
+- **The argv region grew from 4 KB to 16 KB.**  A shell's
+  environment plus argv could approach 4 KB, and `MAINTENANCE.md`
+  item 3l (frozen) warned the gap between the region and the
+  child's downward-growing stack shrinks when envp is added.  The
+  user stack is 64 KB; 16 KB of region leaves 48 KB for frames.
+- **The envp snapshot is `kmalloc`'d, not a stack array.**
+  `EXEC_MAX_ENVC` × `EXEC_MAX_ARG_LEN` is 64 × 256 = 16 KB, and
+  `PROC_STACK_SIZE` is 16 KB (`process.h`).  A stack array that
+  size on top of `sys_execve`'s existing frame would overflow.
+  See `gotchas.md`, "The kernel stack is 16 KB; do not put a large
+  scratch buffer on it."
+
+**Commit 2** (`env-applets`): `CONFIG_ENV=y` and `CONFIG_PRINTENV=y`.
+Both read the environment, so both are only useful now that `execve`
+passes it.  Before this commit `busybox env` reported "applet not
+found" — disabled, not broken.
+
+**Tested — the `$FOO` round trip is the proof.**
+
+    $ export FOO=bar
+    $ echo $FOO
+    bar
+
+That is the whole feature: `export` puts `FOO` in ash's
+environment, `execve` carries it into the child, the child reads
+it.  `env` confirms it directly:
+
+    $ env
+    PWD=/
+    $ export FOO=bar
+    $ env
+    FOO=bar
+    PWD=/
+
+**The `PATH` finding.**  `echo $PATH` inside ash expands to
+`/sbin:/usr/sbin:/bin:/usr/bin`, and command lookup works — but
+`printenv PATH` prints nothing and `env` does not list `PATH`.
+That is because **busybox ash keeps `PATH` as a shell variable and
+does not export it.**  `export PATH` then `printenv PATH` prints
+the path, confirming the mechanism.  This is ash's behavior, not a
+donix bug, but it means every child applet runs with no `PATH` in
+its environment.
+
+---
+
+### The `/usr/bin` layout
+
+Moving the binaries was not part of the envp milestone.  It came
+from a question — "should the custom ELFs be somewhere other than
+the FAT root?" — and the answer was yes, for a reason the two
+shells make concrete:
+
+- **ash's applets never consult `PATH`.**  So busybox always wins
+  there, and `/bin` is where busybox lives.
+- **`musl_sh` does consult its search list**, so a bare name should
+  resolve to the donix-native tool.
+
+That is the same precedence a normal Unix gives `/usr/local/bin`
+over `/usr/bin`, and it *requires* the two tool sets to be in
+different directories.  The layout became:
+
+    /bin         busybox (the base toolset)
+    /usr/bin     the donix-native ELFs (apps + tests)
+    /tmp         empty
+    /            HELLO-WORLD.TXT and other data
+
+**`20261001-usrbin`**: `musl_sh`'s `run_external` searches
+`/usr/bin/NAME` then `/bin/NAME`; `kmain` boots the shell from
+`0:/usr/bin/MUSL_SH`; the Makefile stages every ELF to `::/usr/bin/`
+and creates the directories **before** the copies.
+
+**The mtools finding:** `mcopy` does not create intermediate
+directories, and the first version put the `mmd` calls after the
+copies.  Every copy failed with `no match for target`.  The mkdirs
+have to run right after `mkfs.vfat`, before anything is copied.
+
+**`20261001-canary`** (in the same commit): `tests/canary.c`, the
+post-change smoke test.  The canary used to be a list of lines in
+`handoff.md` a human read and retyped, and that drifts — the list
+said `find / -type d` prints `/` and `/bin`, and after the layout
+move it printed five directories, a change nobody noticed.  The
+program runs every non-interactive canary row, checks exit status
+and output substrings, and reports pass/fail.  `canary` is
+read-only; `canary --full` includes the mutating rows.
+
+**Two failures in the canary's own first run, both worth
+recording.**
+
+- **Every direct binary path was missing its `.ELF` suffix.**
+  `canary.c` calls `execve` directly and does not get `musl_sh`'s
+  suffix-adding search, so `/usr/bin/CAT` failed with 127 where
+  `/usr/bin/CAT.ELF` was the file.  Seven rows failed for this one
+  reason.
+- **`find / -type f -name busybox` is a seven-word command line.**
+  The `check4` and `check5` helpers cover four and five words; a
+  row that uses the wrong helper does not fail loudly, it silently
+  drops the trailing words and tests something else.  `check4` on
+  that row ran `find / -type` with no argument.  It needed a manual
+  `argv[]` build.
+
+---
+
+### The suffix removal
+
+**`20261001-nosuffix`**: drop `.ELF` from the staged names and from
+every search.
+
+The `.ELF` suffix was a convention from when binaries lived at the
+FAT root and the kernel guessed the name.  It became a problem the
+moment the layout moved: **ash's `execvp` walks `$PATH` looking for
+an exact filename and does not guess suffixes**, so `/usr/bin/HELLO.ELF`
+is invisible to `hello`.  The suffix had to go for bare-name
+lookup to work from ash at all.
+
+Staged names became `/usr/bin/HELLO`, `/usr/bin/LS`, ...; `musl_sh`'s
+`run_external` builds one form per directory; `kmain` loads
+`0:/usr/bin/MUSL_SH`; `canary.c` names the binaries as staged.
+
+**Verified from both shells, same result:**
+
+    donix> canary --full   27 passed, 0 failed
+    ash:   canary --full   27 passed, 0 failed
+    hello, musl_printf      run by bare name from both shells
+
+---
+
+### The shim removal
+
+**`20261001-noshim`**: remove `sys_execve`'s bare-name attempt.
+
+`sys_execve` tried three spellings of a path: (a) the path as given,
+(b) `"0:" + path` for an absolute path, (c) if the path was a bare
+name, uppercase it, append `.ELF`, try it at the root and in
+`/bin`.  **Attempt (c) could no longer succeed** — the binaries are
+staged bare and live under `/usr/bin`, so all three sub-attempts
+found nothing.
+
+**Removed:** the attempt-(c) block, `exec_resolve_bare_name`,
+`exec_resolve_bin_name`, their forward declaration, and **the retry
+call in `f_stat_with_retry`**.
+
+**The `f_stat_with_retry` call was the surprise.**  It was added in
+session 22 for ash's `find_execable`, which calls
+`access(candidate, X_OK)` on each `PATH` entry before exec'ing.
+Without the retry, `access("sbin/ls")` failed and ash concluded the
+command did not exist.  **But with the binaries in `/usr/bin`, the
+`PATH` probe reaches `access("/usr/bin/ls", X_OK)`, and FatFs
+resolves the multi-component path directly** — the retry never
+fires.  The canary's `ls` rows passing **from ash** is the proof:
+they go through `find_execable` → `access` → `f_stat_with_retry`,
+and they found every binary.
+
+**What remains** in `sys_execve` is (a) the path as given and
+(b) the `"0:"` prefix translation — the smallest the shim can be
+without a VFS.
+
+**The lesson, and it recurred three times.**  "This code has no
+consumer" was wrong three times this session:
+
+1. **The shim itself.**  I reasoned that attempt (c) was dead code
+   because the canary passed.  It passed because every row went
+   through `canary.c`'s full paths or ash's *applets*.  The
+   experiment — typing `hello` from ash with the binary only at the
+   root — showed ash reaching the kernel's bare-name code.  The
+   canary could not see the consumer.
+2. **The `f_stat_with_retry` retry.**  I told you to delete the
+   helper without checking its callers, and the compiler caught a
+   call site I had not seen.  The fix was to delete the call too,
+   but only after the canary proved the retry was dead.
+3. **The kernel-side record of session 42** (below).
+
+**The pattern:** a decision that was plausible, matched something
+nearby, and was never tested against the thing that defines truth.
+**The check is an experiment, not an inference** — run the thing and
+see, rather than reason about whether it can work.  See
+`gotchas.md`.
+
+---
+
+**Gotcha added:** "The kernel stack is 16 KB; do not put a large
+scratch buffer on it."
+
+**Canary:** green from both shells, `27 passed, 0 failed`, with
+`canary.c` now the executable form of what used to be a hand-typed
+list.
+
+**Scratch tags kept:** all six are local, not pushed, part of the
+open `v0.6.9` milestone.
+
 ## Session 41 — `faccessat` and `utimensat` close the `*at` family
 
 Two commits on `dev`, scratch-tagged, unpushed.  Continues the

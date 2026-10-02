@@ -19,7 +19,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, v0.6.6, sessions 37 and 38
+## Done — Phases A through B, v0.6.9
 
 For the record, so this file does not re-plan finished work:
 
@@ -49,20 +49,89 @@ For the record, so this file does not re-plan finished work:
   all work on the framebuffer), and `vi` filling the screen. The
   VGA text console is the fallback; the VT100 parser is unchanged
   and drives either backend.
+- **v0.6.8 — the `*at()` family.** One path resolver (`resolve_at`)
+  shared by every syscall that takes a dirfd.  `newfstatat` (262),
+  `openat` (257), `unlinkat` (263), `faccessat` (269), and
+  `utimensat` (280) all route through it.  The stat family is
+  inverted to wrappers as on Linux.  busybox `find` (with `-type`)
+  is enabled and works.
+- **v0.6.9 — envp, the `/usr/bin` layout, the shim removal — and
+  what grew from them.**  See below.
 
 The narratives are in the annotated scratch tags,
 `docs/session-log.md`, and `handoff.md`.
 
 ---
 
-## v0.6.8 — the `*at()` family (ready to close)
+## v0.6.9 — envp, `/usr/bin`, the shim removal (shipped)
 
-Opened in session 39 (`20260930-at`).  The theme is the `*at()`
-family: one path resolver shared by every syscall that takes a
-dirfd.  `resolve_at` is that resolver; `newfstatat` (262),
-`openat` (257), `unlinkat` (263), `faccessat` (269), and
-`utimensat` (280) all route through it.  The stat family is
-inverted to wrappers as on Linux.  busybox `find` (with `-type`)
+Opened in session 42 (`20261001-envp`) as three subjects and grew,
+in the same session, into a large milestone: a regression test, a
+rewrite, a page-table bug fix, four syscalls, ten busybox applets,
+three small gaps, and four gotchas.  The milestone's own scope
+followed each thing the last one exposed.
+
+**envp.**  `sys_execve` ignored its third argument, so every program
+ran with an empty environment.  It now passes the caller's `envp`
+through verbatim, Linux-style — the shell builds the environment,
+the kernel carries it.  `export FOO=bar` in ash, then `echo $FOO`,
+prints `bar`.  `env` and `printenv` are enabled and read it.
+Regression-tested by `tests/envp_step1.c`.
+
+**The `/usr/bin` layout.**  The donix-native ELFs moved from the FAT
+root to `/usr/bin`, `busybox` stays in `/bin`, `/tmp` was created.
+This is the split the two shells' search rules need: ash's applets
+never consult `PATH`, so busybox always wins there; `musl_sh`
+searches `/usr/bin` first, so a bare name resolves to the
+donix-native tool.  Every binary is staged **bare** — no `.ELF`
+suffix.
+
+**The shim removal.**  `sys_execve`'s bare-name attempt — uppercase
+the name, append `.ELF`, try the root and `/bin` — is gone, along
+with the helpers it called and a `f_stat` retry that used the same
+guesser.  What remains is (a) the path as given and (b) the `"0:"`
+prefix translation for an absolute path, which is the smallest the
+shim can be without a VFS.  `musl_exec2` now asserts that a bare
+name does *not* resolve.
+
+**The canary is a program.**  `tests/canary.c` runs every
+non-interactive canary row and reports pass/fail.  It replaces the
+hand-typed list, which had already drifted once.
+
+**The bugs and the syscalls.**  A `puts_raw` with an input-only
+`syscall` asm block let GCC issue a second syscall with the first's
+return value as its number; a set of hand-counted string lengths
+were wrong by one or two.  Both are gotchas now.  An intermittent
+`#PF` at `0x400000` — the huge-page split in `vmm_map_page_in_cr3`
+silently returning on allocation failure, leaving a supervisor page
+where a user page was asked for — was found, diagnosed, and fixed.
+Four syscalls landed: `readlink` (89, honest `-EINVAL` — no
+symlinks), `clock_gettime` (228, from `g_ticks`), `nanosleep` (35, a
+`g_ticks` deadline loop), and `munmap` (11, for real — the stub was
+a leak that musl's mallocng actually calls).
+
+**Ten busybox applets.**  `basename`, `dirname`, `unlink`, `ttysize`,
+`tty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, plus `env`
+and `printenv` — all config-only once the syscalls above existed.
+(`truncate` needed no new syscall: it uses `ftruncate` (77), not
+`truncate` (76), which the handoff's table had wrong.)
+
+**Three small gaps.**  `munmap` (counted above), `fcntl` now accepts
+fd 0/1/2 for all subcommands, and Ctrl-`[` produces ESC (0x1B).
+
+The live state, the canary rows, and the NEXT SESSION list are in
+[`handoff.md`](handoff.md).
+
+---
+
+## v0.6.8 — the `*at()` family (shipped)
+
+Opened in session 39 (`20260930-at`), shipped and pushed in session
+42.  The theme was the `*at()` family: one path resolver shared by
+every syscall that takes a dirfd.  `resolve_at` is that resolver;
+`newfstatat` (262), `openat` (257), `unlinkat` (263), `faccessat`
+(269), and `utimensat` (280) all route through it.  The stat family
+is inverted to wrappers as on Linux.  busybox `find` (with `-type`)
 is enabled and works.
 
 **Every `*at` syscall with a consumer is implemented.**  The
@@ -76,21 +145,9 @@ by reading busybox's source:
 - `linkat`/`symlinkat`/`readlinkat` (265/266/267) — FAT has no
   links; no consumer is possible.
 
-See `open-issues.md` item 7 and `gotchas.md`, "A consumer inferred
-from behavior is not a consumer," for the `unlinkat` finding: it
-was added on the belief that `rm -r` needs it, and `rm -r` does
-not.
-
-The milestone is **closeable**.  The next milestone is `v0.6.9`,
-`envp`: `sys_execve` currently ignores its third argument, so `env`
-and `printenv` run but show an empty environment and `$VAR`
-expansion is always empty.  Env passing has a real, readable
-consumer (every applet that reads the environment), is a
-self-contained change to `sys_execve`'s argv-layout code, and is
-what makes the environment-using half of busybox actually work.
-
-The live state, the canary rows, and the NEXT SESSION list are in
-[`handoff.md`](handoff.md).
+See `open-issues.md` and `gotchas.md`, "A consumer inferred from
+behavior is not a consumer," for the `unlinkat` finding: it was
+added on the belief that `rm -r` needs it, and `rm -r` does not.
 
 ---
 
@@ -107,12 +164,23 @@ value.
   `v0.6.6` and earlier.  Session 41 bisected a perceived slowdown
   in `musl_wait` and found the change was in the console (VGA text
   → framebuffer), not in `fork`; see `session-log.md`, session 41.
+- **The remaining silent `vmm_map_page*` returns.**  Six sites
+  (`vmm_map_page_in_cr3` and `vmm_map_page`, the PDPT/PD/PT
+  allocation paths) still `return` without mapping when a
+  page-table allocation fails, and the caller cannot tell.  The
+  huge-page-split instance was fixed in session 42 (`20261001-splitfix`).
+  The rest are a deliberate decision per site: change the signature
+  and check every caller, or halt on failure as the split path now
+  does.  See `open-issues.md` item 7.
 - **Page-table teardown on process exit.**
 - **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
   non-executable.
-- **`sys_munmap`.**  Currently a stub returning 0.
 - **`sys_brk` heap base and the mmap window.**  Fixed addresses;
   latent collisions.
+- **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `sys_rt_sigaction` is
+  a stub; `-EPIPE` is delivered without `SIGPIPE`.  A subsystem, and
+  the prerequisite for job control, `kill(2)`, and a Wayland
+  `wl_shm` client's `SIGBUS`.  See `open-issues.md`.
 - **Kernel log routing.**  Route diagnostics to serial only, or add
   a `SYS_KLOG(level)` syscall.
 - **Real FatFs timestamp storage.**  The timestamp syscalls return 0
@@ -122,12 +190,19 @@ value.
 
 ### Testing infrastructure
 
-- **Boot-time self-test mode** (`-DSELFTEST`).
+- **Boot-time self-test mode** (`-DSELFTEST`).  A self-test suite
+  already runs at boot (17 checks, GDT/TSS/PMM/VMM/heap/NX/ATA/
+  FatFs/exceptions); making it a build-flag mode would let a normal
+  boot skip it.
 - **`make test` target** — headless boot + serial grep.
 - **Scripted canary** — diff `capture.txt` against a known-good log.
 
 ### Longer term
 
+- **`/dev` and `/proc`.**  No device nodes, no `/proc`.  `tty`
+  cannot name its terminal (`ttyname(3)` finds neither), and there is
+  no `/dev/null`, `/dev/tty`, or `/dev/urandom`.  A device layer is
+  the prerequisite.  See `open-issues.md`.
 - **Per-process tty / console focus** — prerequisite for multiple
   concurrent shells.
 - **Serial console debug access** — kernel shell over COM1.
@@ -163,7 +238,7 @@ honest about what is and is not on that path.
 - **`memfd_create` + `ftruncate`** for `wl_shm` pools.
 - **`poll` (or `epoll`)** — the client's main loop.
 - **`SIGBUS` on buffer overrun** — needs real signal delivery, the
-  same subsystem `SIGPIPE` needs (see `open-issues.md` item 6).
+  same subsystem `SIGPIPE` needs (see `open-issues.md`).
 - **`futex`** — verify it exists; musl threads need it anyway.
 
 **Explicitly not Wayland prerequisites, despite being commonly
@@ -177,7 +252,7 @@ assumed:**
   `/dev/...` through the existing path layer.  The VFS is on the
   critical path for *donix generally*, not for Wayland.
 
-Revisit when `v0.6.8` closes.
+Revisit when `v0.6.10` opens.
 
 ---
 

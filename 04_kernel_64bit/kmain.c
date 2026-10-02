@@ -919,9 +919,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.8\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.9\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.8 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.9 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1155,7 +1155,7 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.8\n> ");
+    vga_print("donix v0.6.9\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
@@ -1389,7 +1389,7 @@ void kmain(BootInfo *info) {
 
     /*
      * Default boot shell: musl_sh, loaded from the FAT as
-     * 0:/MUSL_SH.ELF.
+     * 0:/usr/bin/MUSL_SH
      *
      * The embedded newlib shell fallback was removed at A5 step 6.
      * If the FAT read fails, the file is missing, or the ELF load
@@ -1399,9 +1399,9 @@ void kmain(BootInfo *info) {
      */
     {
         size_t fat_len = 0;
-        uint8_t* fat_buf = load_file_to_buffer("0:/MUSL_SH.ELF", &fat_len);
+        uint8_t* fat_buf = load_file_to_buffer("0:/usr/bin/MUSL_SH", &fat_len);
         if (!fat_buf) {
-            serial_print("PANIC: 0:/MUSL_SH.ELF not loadable; no shell available\n");
+            serial_print("PANIC: 0:/usr/bin/MUSL_SH; no shell available\n");
             while (1) asm volatile("hlt");
         }
 

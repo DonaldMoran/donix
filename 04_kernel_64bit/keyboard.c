@@ -241,6 +241,7 @@ void keyboard_buffer_flush(void) {
  *
  * shift: left or right shift held
  * caps:  caps lock toggled on
+ * ctrl:  left or right ctrl held
  *
  * Modifier-only scancodes (shift, ctrl, alt, caps, num, scroll) are
  * left unassigned in the tables, so they produce 0 and are dropped by
@@ -249,21 +250,42 @@ void keyboard_buffer_flush(void) {
  * break-code event when the corresponding make-code should be
  * suppressed.
  *
- * Ctrl+letter and Ctrl+symbol handling is NOT implemented here yet.
- * It requires a fourth parameter carrying Ctrl state from the IRQ
- * handler, which we are deliberately deferring until after the ESC
- * fix is confirmed. Until then, the literal ESC key (scancode 0x01)
- * is the only source of 0x1B. Ctrl+[ will not produce ESC. That is
- * fine for getting vi usable today; it is not fine for the long
- * term, and it is the first thing to add once the immediate work is
- * done.
+ * Ctrl+[ produces ESC (0x1B).  This is the terminal convention:
+ * Ctrl-[ and the ESC key are the same character, which is why
+ * Ctrl-[ is what you press when the ESC key is missing or awkward.
+ * Full-screen programs (vi, less, curses) and the shell's line
+ * editor all rely on it.  The literal ESC key (scancode 0x01)
+ * already produces 0x1B; this adds the second source.
+ *
+ * Only Ctrl+[ is mapped, not the full Ctrl+letter range (Ctrl+A
+ * = 0x01, Ctrl+C = 0x03, etc.).  Those are a separate change: the
+ * keys are already produced as their base character, and turning
+ * Ctrl+A into 0x01 would change what the shell's line editor
+ * sees for Ctrl+A (currently 'a').  Ctrl+[ is the one the
+ * terminal convention makes load-bearing, because ESC is the
+ * byte every escape parser keys on, and it is the one this
+ * change is for.  Add the rest when something needs them.
+ *
+ * Note on the 0x1B return: kbd_buffer_put drops NUL, not ESC.
+ * ESC is a real byte and is enqueued.  The table entry for the
+ * literal ESC key (scancode_ascii[0x01] = 0x1B) is why ESC
+ * already works; this makes Ctrl+[ produce the same byte.
  */
-char scancode_to_ascii(uint8_t sc, int shift, int caps) {
+char scancode_to_ascii(uint8_t sc, int shift, int caps, int ctrl) {
     /* Ignore break codes */
     if (sc & 0x80)
         return 0;
 
     uint8_t code = sc & 0x7F;
+
+    /* Ctrl+[ -> ESC.  Checked before the table lookup because the
+     * unshifted table entry for '[' (0x1A) is '[', and we want to
+     * override it only when ctrl is held.  Shift is not consulted:
+     * Ctrl+Shift+[ is still Ctrl+[ for this purpose, and there is
+     * no Ctrl+{ mapping to confuse it with. */
+    if (ctrl && code == 0x1A) {
+        return 0x1B;
+    }
 
     char ch = shift ? scancode_shift[code] : scancode_ascii[code];
     if (!ch)

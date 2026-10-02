@@ -371,3 +371,328 @@ derivation says nothing about the input; a feature working says
 nothing about *why*.  In each case the fix is to check the source
 of truth -- mtimes against the edit, the call site for the constant,
 the caller's source for the feature.
+
+## The kernel stack is 16 KB; do not put a large scratch buffer on it
+
+*Session 42 (envp).  A sizing decision that would have become a
+stack overflow.*
+
+`sys_execve` had to snapshot the caller's `envp` array and strings
+out of the old address space before tearing it down, the way it
+already snapshots `argv`.  The obvious shape — mirror the argv
+snapshot, a stack array `char envp_scratch[EXEC_MAX_ENVC]
+[EXEC_MAX_ARG_LEN]` — would have been:
+
+    EXEC_MAX_ENVC   = 64
+    EXEC_MAX_ARG_LEN = 256
+    sizeof(envp_scratch) = 64 * 256 = 16384 bytes
+
+**16 KB, on a kernel stack that is 16 KB.**  From `process.h`:
+
+    #define PROC_STACK_SIZE  16384   // 16KB: syscall entry +
+                                     // nested timer frame +
+                                     // sys_read blocking headroom
+
+That comment is not decoration; the 16 KB is already committed to
+three specific things, and `sys_execve` adds its own frame on top
+(`path`, `exec_path`, `argv_scratch[16][256]` = 4 KB, `proc_name`,
+the ELF-validation locals).  A 16 KB scratch array would put the
+frame well past the top of the stack.  The failure mode is not a
+clean fault — it corrupts whatever is below the stack, which is the
+syscall-entry frame or the adjacent kernel stack slot.
+
+**The fix, and the rule.**  The envp snapshot is `kmalloc`'d, like
+`elf_buf`, and freed on every exit path.  The argv snapshot stayed
+a stack array because 4 KB is affordable; the envp one did not,
+because 16 KB is not.
+
+> **Before adding a scratch buffer to a syscall, check
+> `PROC_STACK_SIZE` in `process.h` and count the bytes.**  Anything
+> over a couple of KB belongs in a `kmalloc`'d buffer, not on the
+> stack.  The kernel stack is 16 KB and is shared with the
+> syscall-entry frame and any nested interrupt frame.
+
+**How to size it.**  `PROC_STACK_SIZE` is one number in one place.
+Grep it:
+
+    grep -rn "PROC_STACK_SIZE" 04_kernel_64bit/
+
+and read the comment on it — the headroom it describes is for
+specific existing consumers, not slack for new ones.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39): a
+number that was plausible, matched something nearby (the argv
+snapshot's 4 KB), and was never checked against the limit that
+defines truth (the 16 KB stack).  Here the check was cheap — one
+grep for `PROC_STACK_SIZE` — and it was done before the code was
+written, not after a crash.  The rule is the same: go to the
+definition and read it; do not infer a limit from a neighboring
+example.
+
+## A shim's dead code is only dead if you watch it not run
+
+*Session 42 (the layout move and the shim removal).  Three times in
+one session, "this code has no consumer" was wrong.*
+
+The session removed a chunk of `sys_execve` that guessed where a
+bare command name lived: uppercase it, append `.ELF`, try it at the
+root and in `/bin`.  The reasoning for removing it was sound on its
+face — the binaries had moved to `/usr/bin`, the suffix was gone,
+so every sub-attempt of the guess would find nothing.  **The
+reasoning was right.  The way it was reached was wrong, three
+times, and each time the correction came from running the thing,
+not from thinking about it.**
+
+### One — the shim was not dead, and the canary could not see it
+
+The first claim was "the bare-name attempt is dead code, the canary
+passes without it."  The canary *did* pass.  But every canary row
+goes through `canary.c`'s own full-path `execve` calls or through
+ash's built-in applets — **neither of which uses the kernel's
+bare-name guess.**  The canary was passing without exercising the
+code the claim was about.
+
+The counter-evidence came from a single experiment: copy a binary to
+the root as `HELLO.ELF`, type `hello` at the ash prompt, and watch
+the serial log.
+
+    $ hello
+    sys_execve: pid=11 entry=0x400221 argc=1 ... (hello)
+    hello from donix (musl)
+
+The log shows `(hello)` — the **bare name**, not a resolved path.
+Ash's `execvp`, finding no `PATH` entry (ash does not export
+`PATH`), fell through to `execve("hello")`, and the kernel's
+bare-name guess is what found `/HELLO.ELF`.  **The guess had a
+consumer the canary could not reach.**
+
+### Two — the helper had a caller the deletion missed
+
+The removal deleted the two helper functions.  The build failed:
+
+    error: call to undeclared function 'exec_resolve_bare_name'
+
+Line 2417, in `f_stat_with_retry` — the **stat** path, not the exec
+path.  It used the same helper to retry a failed `f_stat` as
+`0:/NAME.ELF`, and it was added in session 22 for ash's
+`find_execable` probe.  The deletion was written against a
+remembered version of the file and missed the caller.
+
+The compiler caught it.  **That is the cheap case** — the failure
+was loud and immediate.  The expensive version of the same mistake
+is deleting code whose caller fails silently at runtime.
+
+### Three — the guess was dead this time, and one run proved it
+
+The retry *looked* load-bearing: ash probes `PATH` with
+`access(name, X_OK)` before exec'ing, and that probe goes through
+`f_stat_with_retry`.  If the retry were doing the work, deleting it
+would break every `PATH` lookup and no command would run from ash.
+
+The evidence it was dead: **ash's `PATH` includes `/usr/bin`, the
+binaries are in `/usr/bin`, and FatFs resolves a multi-component
+path.**  So `access("/usr/bin/ls", X_OK)` succeeds directly and the
+retry never fires.  The proof was the canary's `ls` rows passing
+**from ash** — they go through `find_execable` → `access` →
+`f_stat_with_retry`, and they found every binary.
+
+This time the reasoning was sound.  But it was the same shape as
+the two wrong calls before it, and the thing that made it different
+was that the run confirmed it.
+
+### The rule
+
+> **Before deleting code as "no consumer," make the consumer
+> attempt to use it and watch.**  Passing tests are not evidence
+> the code is unused — they are evidence the tests do not reach it.
+> A dead-code claim needs a run where the code *fails to be
+> needed*, not a run where it is simply not noticed.
+
+**The specific tell.**  Three claims, three times, the same error:
+the evidence was "it works without this" when the real question was
+"does the path that uses this still work."  A canary that passes
+tells you what *is* covered.  It says nothing about what is not.
+
+### Where this shape recurs
+
+Same family as "A consumer inferred from behavior is not a
+consumer" (session 40) and "A syscall argument the caller did not
+set holds the previous syscall's return value" (session 41).  Each
+was a plausible claim that matched something nearby and was never
+tested against the thing that defines truth.  The `unlinkat` case
+was a wrong *claim about busybox's source*; the `faccessat` case a
+wrong *assumption about the ABI*; this one a wrong *claim about
+reachability*.  In every case the fix was to go to the source —
+`grep` for the caller, `cat` for the wrapper, **run the path and
+watch the log** — and in every case the plausible story made the
+check feel unnecessary.
+
+**A related note.**  Deleting code is the one edit a test cannot
+guard.  An addition is caught by a test that exercises the new
+path.  A deletion is caught only by a test that exercises the
+*old* path — and if the old path is genuinely dead, no test
+exercises it, which is exactly when the deletion is safe and
+exactly when there is no test to say so.  That asymmetry is why
+deletion wants a run, not a review.
+
+
+## An input-only `syscall` asm block does not tell GCC that `%rax` is overwritten
+
+*Session 42 (the envp regression test), commit `20261001-envtest`.
+A bug in the test's own inline asm, found by a log line that made
+no sense.*
+
+`envp_step1.c` issues its syscalls as raw inline asm, matching
+`musl_exec.c` and `musl_exec2.c`.  The write helper was copied from
+those files verbatim:
+
+    static void puts_raw(const char* s, unsigned long n) {
+        __asm__ volatile("syscall"
+                         :
+                         : "a"(1L), "D"(1L), "S"(s), "d"(n)
+                         : "rcx", "r11", "memory");
+    }
+
+`"a"(1L)` is an **input**.  The asm has **no outputs** and does not
+list `"rax"` as clobbered.  It declares `rcx`, `r11`, `memory` —
+which is correct, those are what `syscall` destroys — and stops
+there.
+
+But `syscall` **always overwrites `%rax` with the return value.**
+The block never told the compiler so.  GCC was therefore free to
+believe `%rax` still held `1` after the call, and to reuse that
+belief for the next operation without reloading.
+
+With two `puts_raw` calls back to back at the end of `main`:
+
+    puts_raw("ENVP-ALL-PASS\n", 14);
+    puts_raw("ENVP-RAW-EXIT\n", 14);
+    raw_exit(0);
+
+the second `syscall` ran **without reloading `%rax`**.  It executed
+with `%rax` = the first syscall's return value.  The serial log
+showed:
+
+    ok 3: empty envp passes through as empty
+    Unknown syscall: 41
+    Unknown syscall: 18446744073709551578
+
+**The second line is the tell.**  `18446744073709551578` is
+`2^64 - 38`, the unsigned bit pattern of `-38` — which is
+`-ENOSYS`, the value syscall 41 (`socket`, unrelated) had just
+returned.  A syscall *number* that is the previous syscall's
+*return value* is only possible if `%rax` was never reloaded.
+
+**Why it hid in `musl_exec.c` and `musl_exec2.c`.**  They have the
+identical `puts_raw`.  It never bit there because their callers
+always followed a `puts_raw` with a `raw_fork`/`raw_wait4`/
+`raw_exec`/`raw_exit` that sets `"a"(NNL)` as an input — a fresh
+`%rax`, which masked the missing clobber.  The latent bug is still
+in those two files' `puts_raw` (both now fixed in
+`20261001-lenfix`).
+
+**The rule.**  An inline-asm block that executes `syscall` must
+declare `%rax` as an output (`"=a"(ret)`) or list `"rax"` as a
+clobber.  Naming it only as an input is a lie to the compiler.  The
+compiler does not know what the instruction does; it knows only
+what the constraints say.
+
+    static void puts_raw(const char* s) {
+        unsigned long n = 0;
+        while (s[n]) n++;
+
+        long ret;
+        __asm__ volatile("syscall"
+                         : "=a"(ret)
+                         : "a"(1L), "D"(1L), "S"(s), "d"(n)
+                         : "rcx", "r11", "memory");
+        (void)ret;
+    }
+
+**The tell.**  A syscall number in the kernel's "Unknown syscall:"
+diagnostic that is the *previous* syscall's return value, as an
+unsigned 64-bit number.  `18446744073709551578` for `-ENOSYS`,
+`18446744073709551614` for `-2` (`-ENOENT`), and so on.  Real
+syscall numbers are small and positive; a number near `2^64` is a
+return value in disguise.
+
+**Where this shape recurs.**  Same family as "A syscall argument the
+caller did not set holds the previous syscall's return value"
+(session 41).  That entry is about a *register the kernel reads*
+holding a stale value because the caller never set it.  This one is
+about a *register the compiler believes* holds a value because the
+asm block never said otherwise.  Both are stale `%rax`-adjacent
+state at a syscall boundary, both are deterministic rather than
+flaky, and both were found by reading a trace that showed a value
+that should not have been there.  The check is the same: when a
+syscall sees an argument or a number that no caller could have
+meant, suspect the boundary between the caller and the kernel, and
+read the asm constraints or the libc wrapper.
+
+## A hand-counted string length in a syscall wrapper will be wrong
+
+*Session 42 (the envp regression test), commit `20261001-lenfix`.
+A bug in the test's own string literals, invisible on the console.*
+
+`puts_raw` originally took `(const char* s, unsigned long n)` and
+wrote exactly `n` bytes.  Every call site hand-counted the length:
+
+    puts_raw("ok 1: single var survives execve\n", 34);
+    puts_raw("FAIL 1: getenv returned NULL (envp dropped)\n", 46);
+    puts_raw("FAIL 1: unexpected child exit\n", 30);
+    ...
+
+Of the **thirteen** such literals in `envp_step1.c`, **nine were
+wrong** — off by one or two.  The runs *looked* clean, because of
+which direction they were wrong:
+
+- A length one **too long** writes the string's NUL terminator as a
+  byte.  On the serial console a NUL prints as nothing, so the extra
+  byte was invisible.
+- A length two too long writes the NUL and the byte after it — also
+  invisible unless that byte happens to be printable, and in
+  `.rodata` it usually is not.
+- A length **too short** drops the trailing `\n`.  That one *was*
+  visible: the `MUSL_EXEC2-ALL-PASS` line ran together with the
+  kernel's `EXIT:` diagnostic on the same line, because the final
+  `puts_raw` was passed `19` for a `20`-byte string and never wrote
+  the newline.
+
+**Why "one too long" is not harmless.**  It is a one-byte read past
+the end of the literal.  In `.rodata` with other constants nearby it
+reads whatever is next, which is why the output still looked right.
+But a literal that ends exactly at a page boundary makes the extra
+byte a **fault** — and the day it faults is the day the test is
+being used to debug something else.
+
+**The rule.**  Do not pass a hand-counted length to a function that
+writes a string.  There is no compile-time check on a counted
+literal, and it *will* be wrong again.  The fix is to **remove the
+parameter**, not to recount:
+
+    static void puts_raw(const char* s) {
+        unsigned long n = 0;
+        while (s[n]) n++;
+        ... /* write(1, s, n) via the asm block above */
+    }
+
+C gives you `sizeof` for an array and nothing for a bare pointer, so
+the only reliable length for a string literal is one the callee
+computes.  `strlen` is available in a normal musl binary; in a raw-
+asm test, a two-line loop is enough and depends on nothing.
+
+**The tell.**  Two strings on the same output line that should be on
+separate lines.  That is a dropped `\n`, which means the length was
+too short.  The inverse — a `\0` byte appearing in a `write` of a
+literal — does not show on a console but shows in a hexdump of the
+output stream.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"The incremental kernel build can silently skip" (session 41): a
+derived value (`n = 34`) that was never checked against the thing it
+derives from (the literal's actual length), whose wrongness was
+masked because the wrong value was *close enough* to produce
+plausible output.  In every case the fix is to check the source of
+truth — here, to not have a derived value at all.

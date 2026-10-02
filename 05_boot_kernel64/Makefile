@@ -58,6 +58,10 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/pipe_step3b.elf \
 	$(USERLAND_BIN)/at_step1.elf \
 	$(USERLAND_BIN)/at_step2.elf \
+	$(USERLAND_BIN)/canary.elf \
+	$(USERLAND_BIN)/envp_step1.elf \
+	$(USERLAND_BIN)/envp_helper.elf \
+	$(USERLAND_BIN)/fcntl_lowfd.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -87,6 +91,11 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	dd if=../04_kernel_64bit/kernel.bin of=hdd-single.img bs=512 seek=128 conv=notrunc
 	mkfs.vfat -F 16 -h $(SINGLE_DRIVE_LBA) -n DONSOS \
 	    --offset=$(SINGLE_DRIVE_LBA) hdd-single.img
+	@echo "--- creating directories ---"
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp 2>/dev/null || true
 	@for f in ../test-files/*; do \
 	    if [ -f "$$f" ]; then \
 	        echo "mcopy $$f"; \
@@ -96,48 +105,52 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mcopy_one() { \
 	    local src="$$1"; local dst="$$2"; \
 	    if [ -f "$$src" ]; then \
-	        echo "mcopy $$src -> ::/$$dst"; \
-	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) "$$src" "::/$$dst" ; \
+	        echo "mcopy $$src -> ::/usr/bin/$$dst"; \
+	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	            "$$src" "::/usr/bin/$$dst" ; \
 	    else \
 	        echo "ERROR: $$src missing — did the musl userland build fail?"; \
 	        exit 1; \
 	    fi \
 	}; \
-	mcopy_one "$(USERLAND_BIN)/hello.elf"          HELLO.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/echo.elf"           ECHO.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/cat.elf"            CAT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/ls.elf"             LS.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/memtest.elf"        MEMTEST.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_stat.elf"      MUSL_STAT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_min.elf"       MUSL_MIN.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_printf.elf"    MUSL_PRINTF.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_malloc.elf"    MUSL_MALLOC.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_fork.elf"      MUSL_FORK.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_fork_raw.elf"  MUSL_FORK_RAW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/printnum.elf"       PRINTNUM.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brk_verify.elf"     BRK_VERIFY.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_exec2.elf"     MUSL_EXEC2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_dupfd.elf"     MUSL_DUPFD.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_ids.elf"       MUSL_IDS.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_getcwd.elf"    MUSL_GETCWD.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/fault_pf.elf"       FAULT_PF.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step1.elf"     PIPE_STEP1.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step2.elf"     PIPE_STEP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step3.elf"     PIPE_STEP3.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/at_step2.elf"       AT_STEP2.ELF ; \
-	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH.ELF
+	mcopy_one "$(USERLAND_BIN)/hello.elf"          HELLO ; \
+	mcopy_one "$(USERLAND_BIN)/echo.elf"           ECHO ; \
+	mcopy_one "$(USERLAND_BIN)/cat.elf"            CAT ; \
+	mcopy_one "$(USERLAND_BIN)/ls.elf"             LS ; \
+	mcopy_one "$(USERLAND_BIN)/memtest.elf"        MEMTEST ; \
+	mcopy_one "$(USERLAND_BIN)/musl_stat.elf"      MUSL_STAT ; \
+	mcopy_one "$(USERLAND_BIN)/musl_min.elf"       MUSL_MIN ; \
+	mcopy_one "$(USERLAND_BIN)/musl_printf.elf"    MUSL_PRINTF ; \
+	mcopy_one "$(USERLAND_BIN)/musl_malloc.elf"    MUSL_MALLOC ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork.elf"      MUSL_FORK ; \
+	mcopy_one "$(USERLAND_BIN)/musl_fork_raw.elf"  MUSL_FORK_RAW ; \
+	mcopy_one "$(USERLAND_BIN)/printnum.elf"       PRINTNUM ; \
+	mcopy_one "$(USERLAND_BIN)/brk_verify.elf"     BRK_VERIFY ; \
+	mcopy_one "$(USERLAND_BIN)/brkraw.elf"         BRKRAW ; \
+	mcopy_one "$(USERLAND_BIN)/brkgrow.elf"        BRKGROW ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec.elf"      MUSL_EXEC ; \
+	mcopy_one "$(USERLAND_BIN)/musl_exec2.elf"     MUSL_EXEC2 ; \
+	mcopy_one "$(USERLAND_BIN)/musl_wait.elf"      MUSL_WAIT ; \
+	mcopy_one "$(USERLAND_BIN)/musl_dup2.elf"      MUSL_DUP2 ; \
+	mcopy_one "$(USERLAND_BIN)/musl_dupfd.elf"     MUSL_DUPFD ; \
+	mcopy_one "$(USERLAND_BIN)/musl_ids.elf"       MUSL_IDS ; \
+	mcopy_one "$(USERLAND_BIN)/musl_getcwd.elf"    MUSL_GETCWD ; \
+	mcopy_one "$(USERLAND_BIN)/musl_readdir.elf"   MUSL_READDIR ; \
+	mcopy_one "$(USERLAND_BIN)/musl_r10probe.elf"  MUSL_R10PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/fault_pf.elf"       FAULT_PF ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step1.elf"     PIPE_STEP1 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step2.elf"     PIPE_STEP2 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step3.elf"     PIPE_STEP3 ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_step3b.elf"    PIPE_STEP3B ; \
+	mcopy_one "$(USERLAND_BIN)/at_step1.elf"       AT_STEP1 ; \
+	mcopy_one "$(USERLAND_BIN)/at_step2.elf"       AT_STEP2 ; \
+	mcopy_one "$(USERLAND_BIN)/canary.elf"         CANARY ; \
+	mcopy_one "$(USERLAND_BIN)/envp_step1.elf"    ENVP_STEP1 ; \
+	mcopy_one "$(USERLAND_BIN)/envp_helper.elf"   ENVP_HELPER ; \
+	mcopy_one "$(USERLAND_BIN)/fcntl_lowfd.elf"   FCNTL_LOWFD ; \
+	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
 	@echo "--- staging busybox at /bin/busybox ---"
-	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin 2>/dev/null || true
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
 	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
@@ -151,6 +164,10 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/ || true
 	@echo "--- /bin contents ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/bin || true
+	@echo "--- /usr/bin contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin || true
+	@echo "--- /tmp contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp || true
 	@echo "--- verifying FAT boot sector at LBA $(SINGLE_DRIVE_LBA) ---"
 	@dd if=hdd-single.img bs=512 skip=$(SINGLE_DRIVE_LBA) count=1 2>/dev/null | \
 	    xxd | head -2

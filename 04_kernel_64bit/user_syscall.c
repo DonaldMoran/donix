@@ -13,7 +13,7 @@
 #include "include/heap.h"
 #include "include/user_space.h"
 #include "ff.h"
-
+#include "interrupts.h"
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -44,8 +44,6 @@ typedef struct file_slot_s {
     char    *dir_path;
 } file_slot_t;
 
-/* Defined below, in the execve helpers section. */
-static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap);
 /* Defined below, in the stat section.  sys_open needs it for the
  * O_DIRECTORY-on-a-file check, which runs before the definition. */
 static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno);
@@ -1265,12 +1263,23 @@ static file_slot_t* get_file_slot_any(int fd) {
 #define F_DUPFD_CLOEXEC 1030
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
-    file_slot_t* slot;
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        slot = get_file_slot_any(fd);
-    } else {
-        slot = get_file_slot(fd, 0);
-    }
+    /*
+     * Every subcommand accepts fds 0, 1, and 2, not just F_DUPFD.
+     *
+     * get_file_slot() refuses fd < 3 by design -- most file
+     * syscalls must not treat stdin/stdout/stderr as ordinary open
+     * files.  But fcntl's flag operations are meaningful on a
+     * redirected stdio fd: after `dup2(file_fd, 0)`, fd 0 is a
+     * real file and F_GETFL/F_SETFL/F_GETFD/F_SETFD on it should
+     * work, as on Linux.
+     *
+     * get_file_slot_any does not weaken the guard anywhere else.
+     * A console sentinel (fd 0/1/2 with nothing dup2'd onto it) is
+     * a valid slot, so the flag cases return 0 for it -- what the
+     * old code did too, via the switch.  A genuinely closed fd
+     * returns NULL and gets EBADF.
+     */
+    file_slot_t* slot = get_file_slot_any(fd);
     if (!slot) {
         FDTRACE({ serial_print("fcntl fd="); serial_print_dec((uint64_t)fd);
                   serial_print(" cmd="); serial_print_dec((uint64_t)cmd);
@@ -2413,28 +2422,17 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
         for (const char* p = path; *p; p++) {
             if (*p == ':') { has_drive = 1; break; }
         }
-
-        char resolved[USER_PATH_MAX];
-        if (!has_drive &&
-            exec_resolve_bare_name(path, resolved, sizeof(resolved)) == 0) {
-#if DEBUG_STAT_TRACE
-            serial_print("f_stat retry: '");
-            serial_print(path);
-            serial_print("' -> '");
-            serial_print(resolved);
-            serial_print("' = ");
-            serial_print_dec((uint64_t)r);
-#endif
-            FRESULT r2 = f_stat(resolved, out_fno);
-#if DEBUG_STAT_TRACE
-            serial_print("/");
-            serial_print_dec((uint64_t)r2);
-            serial_print("\n");
-#endif
-            if (r2 == FR_OK) {
-                r = FR_OK;
-            }
-        }
+        /*
+         * No bare-name retry any more.  The binaries are staged
+         * bare and live under /usr/bin, and FatFs resolves
+         * multi-component paths (find traverses /usr/bin with
+         * f_opendir, so f_stat("/usr/bin/ls") works).  A PATH
+         * probe like ash's access("/usr/bin/ls", X_OK) therefore
+         * succeeds on its own, and the old retry -- which
+         * uppercased the name and appended ".ELF" -- could only
+         * fail.  See sys_execve's history comment.
+         */
+        (void)has_drive;
     }
     return r;
 }
@@ -2799,6 +2797,75 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
     return sys_utimensat(dirfd, path, times, 0);
 }
 
+/*
+ * Linux x86_64 readlink(2) — syscall 89.
+ *
+ * Read the target of a symbolic link into a user buffer.
+ *
+ * donix has no symlinks.  FAT has none, and there is no VFS to
+ * provide them.  So for any path that EXISTS, the honest answer is
+ * -EINVAL, which is exactly what Linux returns from readlink(2)
+ * when the path is not a symbolic link.  For a path that does not
+ * exist, -ENOENT, as Linux does.
+ *
+ * WHY THIS EXISTS AT ALL, GIVEN IT ALWAYS FAILS.  musl's
+ * ttyname(3) tries readlink("/proc/self/fd/N") as its fast path
+ * before falling back to walking /dev.  Without a handler here,
+ * that call hit "Unknown syscall: 89" and returned -ENOSYS, which
+ * is noise in every trace and hides real unknown-syscall lines.
+ * Returning -EINVAL is the truth ("there is no such symlink") and
+ * ttyname falls through to the /dev walk exactly as intended.
+ *
+ * THIS DOES NOT MAKE `tty` PRINT A PATH.  After readlink returns
+ * -EINVAL, ttyname walks /dev, which does not exist, returns NULL,
+ * and `tty` still prints "not a tty".  readlink removes the
+ * syscall noise, not the /dev gap.  See docs/open-issues.md, "no
+ * /dev and no /proc".
+ *
+ * ABI:
+ *   arg0  const char* path
+ *   arg1  char*       buf      (user pointer)
+ *   arg2  size_t      bufsiz
+ *   returns  the number of bytes placed in buf on success (never,
+ *            here), or -errno.  -EINVAL for a non-symlink,
+ *            -ENOENT for a missing path, -EFAULT for a bad user
+ *            pointer, -ENAMETOOLONG for an over-long path.
+ *
+ * The path is resolved with resolve_at(AT_FDCWD, ...) so it obeys
+ * the process cwd, exactly as sys_unlink and sys_access do.  No
+ * dirfd: readlink(2) has none (readlinkat(2), 267, is the dirfd
+ * form, and donix does not implement it).
+ */
+long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
+    if (!user_path || !buf) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    /* Validate the path exists, so a missing path is -ENOENT and a
+     * present one is -EINVAL (not a symlink).  access_resolved does
+     * exactly this check and returns 0 / -ENOENT; reuse its shape
+     * rather than duplicating the root-alias and stat logic. */
+    long exists = access_resolved(resolved);
+    if (exists != 0) return exists;   /* -ENOENT, or -ENAMETOOLONG */
+
+    /*
+     * The path exists and is not a symbolic link (nothing on FAT
+     * is).  -EINVAL is Linux's answer for readlink on a non-link,
+     * and it is the truthful one here.  bufsiz and buf are not
+     * touched: no bytes are copied, and a caller that passed a
+     * valid buffer gets no partial data.
+     */
+    (void)bufsiz;
+    return -(long)EINVAL_;
+}
+
 // ============================================================
 // execve helpers (used only by sys_execve below)
 // ============================================================
@@ -2916,132 +2983,6 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
     return top;
 }
 
-/*
- * Resolve a bare command name to a root-level path.
- *
- * This is sub-attempt (c1) of sys_execve's three-attempt open:
- * turn a bare name like "ls" into "0:/LS.ELF" — uppercased, with
- * ".ELF" appended, at the FAT root.  This is what makes ash's
- * execve("ls", ...) find the donix-native root binary, and what
- * makes `donix> hello` work from musl_sh without the shell doing
- * any rewriting of its own.
- *
- * Root is tried before /bin (see exec_resolve_bin_name) so a
- * donix-native binary shadows a same-named entry in /bin.
- *
- * The rule:
- *   - Take the base name: the substring after the last '/', or
- *     the whole string if there is no '/'.
- *   - If the base already ends in ".ELF" (case-insensitive), do
- *     not append it again.
- *   - Uppercase the base to match the FAT layout.
- *   - Prepend "0:/".
- *
- * Returns 0 on success, -1 if the resolved path would overflow
- * `out_cap` or if `in` has no base name (was "/" or "").
- */
-static int exec_resolve_bare_name(const char* in, char* out, size_t out_cap) {
-    /* Pick the base name: the substring after the last '/', or the
-     * whole string if there is no '/'. */
-    const char* base = in;
-    for (const char* p = in; *p; p++) {
-        if (*p == '/') base = p + 1;
-    }
-
-    if (*base == '\0') return -1;   /* path was just "/" or "" */
-
-    /* If the base already ends in ".ELF" (case-insensitive), don't
-     * append it again. */
-    size_t blen = 0;
-    while (base[blen]) blen++;
-    int have_suffix = 0;
-    if (blen >= 4) {
-        char c0 = base[blen - 4];
-        char c1 = base[blen - 3];
-        char c2 = base[blen - 2];
-        char c3 = base[blen - 1];
-        if ((c0 == '.' && (c1 == 'E' || c1 == 'e') &&
-             (c2 == 'L' || c2 == 'l') && (c3 == 'F' || c3 == 'f'))) {
-            have_suffix = 1;
-        }
-    }
-
-    size_t need = 3 /* "0:/" */ + blen + (have_suffix ? 0 : 4) + 1;
-    if (need > out_cap) return -1;
-
-    out[0] = '0';
-    out[1] = ':';
-    out[2] = '/';
-    size_t o = 3;
-    for (size_t i = 0; i < blen; i++) {
-        char c = base[i];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        out[o++] = c;
-    }
-    if (!have_suffix) {
-        out[o++] = '.';
-        out[o++] = 'E';
-        out[o++] = 'L';
-        out[o++] = 'F';
-    }
-    out[o] = '\0';
-    return 0;
-}
-
-/*
- * Resolve a bare command name to a path under /bin.
- *
- * `in` is a bare name like "busybox" (no '/').  Produces:
- *
- *   with_suffix == 0:  "0:/BIN/NAME"
- *   with_suffix == 1:  "0:/BIN/NAME.ELF"
- *
- * NAME is uppercased, matching the convention exec_resolve_bare_name
- * uses.  FatFs is case-insensitive on lookup, so the uppercase form
- * finds both "busybox" and "BUSYBOX.ELF" on disk.
- *
- * Returns 0 on success, -1 on overflow or if `in` is not a bare name.
- */
-static int exec_resolve_bin_name(const char* in, char* out,
-                                 size_t out_cap, int with_suffix) {
-    /* Callers pass bare names only; reject anything with a slash so
-     * a mistake here does not silently produce a doubled path. */
-    for (const char* p = in; *p; p++) {
-        if (*p == '/') return -1;
-    }
-    if (*in == '\0') return -1;
-
-    size_t blen = 0;
-    while (in[blen]) blen++;
-
-    /* "0:/BIN/" is 7 chars, plus name, plus optional ".ELF", plus NUL. */
-    size_t need = 7 + blen + (with_suffix ? 4 : 0) + 1;
-    if (need > out_cap) return -1;
-
-    out[0] = '0';
-    out[1] = ':';
-    out[2] = '/';
-    out[3] = 'B';
-    out[4] = 'I';
-    out[5] = 'N';
-    out[6] = '/';
-
-    size_t o = 7;
-    for (size_t i = 0; i < blen; i++) {
-        char c = in[i];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        out[o++] = c;
-    }
-    if (with_suffix) {
-        out[o++] = '.';
-        out[o++] = 'E';
-        out[o++] = 'L';
-        out[o++] = 'F';
-    }
-    out[o] = '\0';
-    return 0;
-}
-
 // ============================================================
 // SYS_EXECVE (59) — Linux execve, in-place
 //
@@ -3116,41 +3057,33 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     
     /* ---- 2. Open and read the whole ELF file. ----
      *
-     * Three attempts, in order:
+     * TWO attempts, in order:
      *
      *   (a) the path exactly as the caller supplied it;
      *   (b) if the path starts with '/', "0:" + path, preserving
-     *       case and suffix -- the Unix-style absolute path form;
-     *   (c) if the path has no ':' at all, the bare-name form.
-     *       Attempt (c) itself has three sub-attempts: root
-     *       "0:/NAME.ELF", then "/bin/NAME", then "/bin/NAME.ELF".
+     *       case -- the Unix-style absolute path form.
      *
-     * (b) is what makes `/bin/busybox sh` work from the custom
-     * musl shell: the kernel was previously handing "/bin/busybox"
-     * straight to FatFs, which rejects any path with a leading
-     * slash.  The kernel is the layer that should translate a
-     * Unix-style path to the FatFs form, not the caller.
+     * A bare name does NOT resolve.  Every caller passes a path:
+     * musl_sh's run_external builds "/usr/bin/NAME" or "/bin/NAME"
+     * and passes it; ash's execvp walks $PATH itself and passes
+     * the full path it found.  There is no bare-name fallback
+     * because nothing calls one.
      *
-     * (c1) is what makes ash's bare `execve("ls", ...)` resolve to
-     * the donix-native root binary.  (c2) and (c3) are what make
-     * bare `busybox` resolve to /bin/busybox now that the busybox
-     * binary no longer sits at the FAT root.  Root is tried first
-     * so donix-native binaries shadow same-named /bin entries.
+     * HISTORY: a third attempt used to guess a bare name's
+     * location -- uppercase it, append ".ELF", try it at the root
+     * and in /bin.  It was removed in session 42: the binaries
+     * are staged bare (/usr/bin/HELLO, not HELLO.ELF) and live
+     * under /usr/bin, so all three sub-attempts could only fail.
+     * The helpers it called (exec_resolve_bare_name,
+     * exec_resolve_bin_name) are gone with it.
      */
     /*
-     * VFS SHIM.  The three attempts below stand in for a virtual
-     * filesystem layer that donix does not have yet.  On real
-     * Unix, execve hands the path to the VFS and the VFS resolves
-     * it; there is no guessing and no retry.  Here, FatFs has no
-     * notion of '/', no root directory in the POSIX sense, and no
-     * way to walk a multi-component path, so the kernel does the
-     * translation inline.
-     *
-     * When a VFS lands, DELETE this whole block and make execve
-     * call the VFS resolver once.  Do not add a fourth attempt;
-     * add the VFS instead.  Candidates that must then be removed:
-     * the "0:" + path prepend, exec_resolve_bare_name, and
-     * exec_resolve_bin_name.
+     * The remaining shim: attempt (b)'s "0:" + path translation.
+     * FatFs rejects a leading '/', so an absolute Unix path has to
+     * become "0:/...".  That is the one piece of path handling the
+     * kernel still does on execve's behalf; a VFS would subsume it.
+     * When a VFS lands, delete this and call the VFS resolver
+     * once.
      */
     FIL file;
     FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
@@ -3184,53 +3117,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                     fr = FR_OK;
                 }
             }
-            /* if too long, skip (b) and fall through to (c) */
-        }
-
-        /*
-         * Attempt (c): bare name.  Three sub-attempts, in order:
-         *
-         *   (c1) "0:/NAME.ELF"     -- root, uppercased, .ELF appended.
-         *                             Donix-native binaries win here.
-         *   (c2) "0:/BIN/NAME"     -- /bin, uppercased, no suffix.
-         *                             This is where busybox lives now.
-         *   (c3) "0:/BIN/NAME.ELF" -- /bin, uppercased, .ELF appended.
-         *                             Covers a future /bin/NAME.ELF.
-         */
-        if (fr != FR_OK && !has_drive) {
-            char resolved[USER_PATH_MAX];
-
-            /* (c1) root, uppercased, .ELF appended. */
-            if (exec_resolve_bare_name(exec_path, resolved,
-                                       sizeof(resolved)) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
-
-            /* (c2) /bin, uppercased, as-is (no .ELF). */
-            if (fr != FR_OK &&
-                exec_resolve_bin_name(exec_path, resolved,
-                                      sizeof(resolved), 0) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
-
-            /* (c3) /bin, uppercased, .ELF appended. */
-            if (fr != FR_OK &&
-                exec_resolve_bin_name(exec_path, resolved,
-                                      sizeof(resolved), 1) == 0) {
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
+            /* if too long, (b) is skipped; the open fails below */
         }
     }
 
@@ -3352,7 +3239,18 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -(long)EIO_;
     }
 
-    /* ---- 3. Snapshot argv from the OLD address space. ---- */
+    /* ---- 3. Snapshot argv and envp from the OLD address space. ----
+     *
+     * argv is snapshotted into a stack array, as before.  envp is
+     * snapshotted into a KMALLOC'D array, not a stack array:
+     * EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN is 16 KB at the current
+     * values, and PROC_STACK_SIZE (process.h) is 16 KB.  A stack
+     * array that size, on top of argv_scratch (4 KB) and the rest
+     * of sys_execve's locals, would overflow the kernel stack.
+     *
+     * envp_scratch is NULL when there is no environment, and is
+     * freed on every exit path below.  envc is 0 in that case.
+     */
     int argc = 0;
     char argv_scratch[EXEC_MAX_ARGC][EXEC_MAX_ARG_LEN];
 
@@ -3376,6 +3274,54 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] string\n");
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -(long)EFAULT_;
+            }
+        }
+    }
+
+    /*
+     * envp.  Passed through verbatim, as Linux does.
+     *
+     * We copy each pointer and each string out of the OLD address
+     * space now, before the teardown in section 5, exactly as argv
+     * is copied.  After section 5 the old address space is gone.
+     */
+    int envc = 0;
+    char (*envp_scratch)[EXEC_MAX_ARG_LEN] = NULL;
+
+    if (user_envp) {
+        envp_scratch = (char (*)[EXEC_MAX_ARG_LEN])
+            kmalloc((size_t)EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN);
+        if (!envp_scratch) {
+            serial_print("sys_execve: kmalloc failed for envp snapshot\n");
+            kfree(elf_buf);
+            __asm__ volatile("sti");
+            return -(long)ENOMEM_;
+        }
+
+        for (envc = 0; envc < EXEC_MAX_ENVC; envc++) {
+            uint64_t user_str_va = 0;
+            if (safe_copy_from_user(&user_str_va,
+                                    (const char**)user_envp + envc,
+                                    sizeof(user_str_va)) != 0) {
+                serial_print("sys_execve: bad envp[");
+                serial_print_dec(envc);
+                serial_print("] pointer\n");
+                kfree(envp_scratch);
+                kfree(elf_buf);
+                __asm__ volatile("sti");
+                return -(long)EFAULT_;
+            }
+            if (user_str_va == 0) break;
+
+            if (copy_user_string(envp_scratch[envc], EXEC_MAX_ARG_LEN,
+                                 (const char*)user_str_va) != 0) {
+                serial_print("sys_execve: bad envp[");
+                serial_print_dec(envc);
+                serial_print("] string\n");
+                kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -3428,20 +3374,52 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -1;  /* unreachable */
     }
 
-    /* ---- 6. Lay out argv on the new stack. ---- */
+    /* ---- 6. Lay out argc, argv, and envp on the new stack. ----
+     *
+     * SysV process-entry layout, growing down from the top of the
+     * stack:
+     *
+     *     rsp_init  -> argc
+     *                  argv[0] ... argv[argc-1] NULL
+     *                  envp[0] ... envp[envc-1] NULL
+     *                  (argv strings, then envp strings, packed)
+     *
+     * REGION SIZE.  The region is 16 KB, up from 4 KB.  The 4 KB
+     * figure was sized when only argv was written; with envp added,
+     * a shell's environment (PATH, HOME, TERM, PWD, OLDPWD, IFS,
+     * USER, SHELL, HOSTNAME, PS1, ...) plus argv could approach it.
+     * MAINTENANCE.md item 3l (frozen) warned that the gap between
+     * argv and the child's downward-growing stack shrinks when envp
+     * is added.  16 KB of the 64 KB user stack leaves 48 KB for
+     * stack frames, which is ample, and retires that landmine.
+     *
+     * The region sits at the TOP of the user stack; rsp_init is one
+     * slot below its bottom, so the child's own stack frames grow
+     * down from argv_region_bottom - 8 and do not touch the region
+     * until they have consumed the whole 48 KB below it.
+     */
     uint64_t rsp_init = 0;
     uint64_t argv_array_base = 0;   /* for %rsi below; 0 when argc == 0 */
 
-    if (argc > 0) {
+    {
         uint64_t argv_region_top    = new_user_stack_top;
-        uint64_t argv_region_bottom = argv_region_top - 4096;
+        uint64_t argv_region_bottom = argv_region_top - (16 * 1024);
 
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
-        uint64_t array_base    = argv_region_bottom;
-        uint64_t strings_start = argv_region_bottom + array_bytes + 8;
+        size_t envp_bytes  = ((size_t)envc + 1) * sizeof(uint64_t);
 
+        uint64_t array_base    = argv_region_bottom;
+        uint64_t envp_array_base = argv_region_bottom + array_bytes;
+        uint64_t strings_start = argv_region_bottom + array_bytes + envp_bytes;
+
+        /*
+         * Pack argv strings, then envp strings, growing up from
+         * strings_start.  A single cursor so the two pools cannot
+         * overlap.
+         */
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
+        uint64_t env_vaddrs[EXEC_MAX_ENVC];
 
         for (int i = 0; i < argc; i++) {
             size_t slen = 0;
@@ -3450,6 +3428,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (cursor + slen > argv_region_top) {
                 serial_print("sys_execve: argv region overflow\n");
+                kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
                 return -1;  /* unreachable */
@@ -3461,6 +3440,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
                 serial_print("sys_execve: failed to write argv[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
                 return -1;  /* unreachable */
@@ -3469,6 +3449,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             cursor += slen;
         }
 
+        for (int i = 0; i < envc; i++) {
+            size_t slen = 0;
+            while (slen < EXEC_MAX_ARG_LEN && envp_scratch[i][slen] != '\0') slen++;
+            slen++;
+
+            if (cursor + slen > argv_region_top) {
+                serial_print("sys_execve: envp region overflow\n");
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t dst = cursor;
+
+            if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
+                                      envp_scratch[i], slen) != 0) {
+                serial_print("sys_execve: failed to write envp[");
+                serial_print_dec(i);
+                serial_print("]\n");
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            env_vaddrs[i] = dst;
+            cursor += slen;
+        }
+
+        /*
+         * argv pointer array, NULL-terminated, then envp pointer
+         * array, NULL-terminated.  Both live in the region; the
+         * envp array is at argv_array_base + array_bytes, which is
+         * exactly where the old single envp NULL used to be.
+         *
+         * Write the arrays even when argc or envc is 0: the terminator
+         * is what the child's libc walks.
+         */
         uint64_t array_data[EXEC_MAX_ARGC + 1];
         for (int i = 0; i < argc; i++) array_data[i] = arg_vaddrs[i];
         array_data[argc] = 0;
@@ -3476,6 +3493,25 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         if (safe_copy_to_user_cr3(self->cr3, (void*)array_base,
                                   array_data, array_bytes) != 0) {
             serial_print("sys_execve: failed to write argv array\n");
+            kfree(envp_scratch);
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+
+        /*
+         * envp array: envc pointers followed by NULL.  Built in a
+         * bounded stack buffer; EXEC_MAX_ENVC is 64, so this is
+         * 520 bytes, not 16 KB.
+         */
+        uint64_t envp_data[EXEC_MAX_ENVC + 1];
+        for (int i = 0; i < envc; i++) envp_data[i] = env_vaddrs[i];
+        envp_data[envc] = 0;
+
+        if (safe_copy_to_user_cr3(self->cr3, (void*)envp_array_base,
+                                  envp_data, envp_bytes) != 0) {
+            serial_print("sys_execve: failed to write envp array\n");
+            kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
             return -1;  /* unreachable */
@@ -3483,35 +3519,28 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         argv_array_base = array_base;
 
+        /*
+         * argc sits one slot below the region, so the child's RSP
+         * on entry points at it.  The whole region is above.
+         */
         rsp_init = argv_region_bottom - 8;
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
                                   &argc_slot, sizeof(argc_slot)) != 0) {
             serial_print("sys_execve: failed to write argc\n");
+            kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
             return -1;  /* unreachable */
         }
+    }
 
-        uint64_t envp_null = 0;
-        if (safe_copy_to_user_cr3(self->cr3,
-                                  (void*)(argv_region_bottom + array_bytes),
-                                  &envp_null, sizeof(envp_null)) != 0) {
-            serial_print("sys_execve: failed to write envp terminator\n");
-            __asm__ volatile("sti");
-            sys_exit(-1);
-            return -1;  /* unreachable */
-        }
-    } else {
-        rsp_init = new_user_stack_top - 16;
-        uint64_t zero = 0;
-        if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
-                                  &zero, sizeof(zero)) != 0) {
-            serial_print("sys_execve: failed to write argc=0\n");
-            __asm__ volatile("sti");
-            sys_exit(-1);
-            return -1;  /* unreachable */
-        }
+    /* The envp snapshot is no longer needed: it has been copied into
+     * the new address space.  Free it before returning to the new
+     * program. */
+    if (envp_scratch) {
+        kfree(envp_scratch);
+        envp_scratch = NULL;
     }
 
     /* ---- 7. Rewrite the syscall-entry frame. ---- */
@@ -4483,6 +4512,176 @@ long sys_uname(void* user_buf) {
 }
 
 /*
+ * Linux x86_64 clock_gettime(2) — syscall 228.
+ *
+ * Fill a struct timespec with the time for `clk_id`.
+ *
+ * donix has no wall clock -- no RTC is read, and there is no
+ * epoch to be relative to.  What it does have is g_ticks, the
+ * 100 Hz PIT counter (pit_init(100) in kmain.c, confirmed at the
+ * call site; 1 tick == 10 ms).  This reports that counter as
+ * both CLOCK_REALTIME and CLOCK_MONOTONIC.  The two differ on
+ * Linux (realtime is wall-clock, monotonic is since-boot); on
+ * donix they are the same number because there is nothing to
+ * distinguish them.  That is wrong for realtime in the sense
+ * that the time will not match any wall clock, and correct in
+ * the sense that it is monotonic and advances at the right rate.
+ *
+ * WHO CALLS THIS AND WHY IT MATTERS.  musl's __randname
+ * (third_party/musl-src/src/temp/__randname.c), the XXXXXX
+ * generator behind mkstemp/mkdtemp/mktemp, seeds itself from
+ * __clock_gettime(CLOCK_REALTIME).  Without a handler for 228,
+ * that call returned -ENOSYS, musl fell back to
+ * __syscall(SYS_gettimeofday) -- also absent -- and __randname
+ * read an uninitialized timespec.  busybox mktemp needs a
+ * working clock to generate a name; this provides one.  See
+ * docs/open-issues.md, "mktemp needs clock_gettime".
+ *
+ * ABI:
+ *   arg0  int             clk_id   (CLOCK_REALTIME = 0,
+ *                                   CLOCK_MONOTONIC = 1)
+ *   arg1  struct timespec* ts      (user pointer)
+ *   returns  0 on success, -errno on failure.
+ *
+ * struct timespec on x86_64 is two int64s, 16 bytes, no padding:
+ *
+ *     offset  size  field
+ *       0      8    tv_sec
+ *       8      8    tv_nsec
+ *
+ * CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1, and
+ * CLOCK_MONOTONIC_RAW = 4 are all accepted and reported the
+ * same way.  Any other clk_id is -EINVAL, matching Linux for an
+ * unknown clock.
+ *
+ * tv_nsec is (g_ticks % 100) * 10,000,000, so it is always a
+ * multiple of 10 ms and always in [0, 999999999].  tv_sec is
+ * g_ticks / 100.  The pair is exact for a 100 Hz tick: no
+ * rounding, no drift, every tick advances tv_nsec by exactly
+ * 10,000,000 except once per second where tv_sec takes the carry.
+ *
+ * g_ticks is volatile and read here without a lock.  A read that
+ * races the timer IRQ gets a value one tick off either way,
+ * which is fine for a clock read -- it is not a synchronization
+ * point.  Reading it twice would be worse; this reads it once
+ * into a local.
+ */
+long sys_clock_gettime(int clk_id, void* user_ts) {
+    if (!user_ts) return -(long)EFAULT_;
+
+    /* Accept the clocks musl and busybox actually ask for.
+     * Anything else is -EINVAL, as Linux does. */
+    switch (clk_id) {
+        case 0:   /* CLOCK_REALTIME */
+        case 1:   /* CLOCK_MONOTONIC */
+        case 4:   /* CLOCK_MONOTONIC_RAW */
+            break;
+        default:
+            return -(long)EINVAL_;
+    }
+
+    uint64_t ticks = g_ticks;   /* one read; see the header comment */
+
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } ts;
+
+    ts.tv_sec  = (int64_t)(ticks / 100);
+    ts.tv_nsec = (int64_t)((ticks % 100) * 10000000);
+
+    if (safe_copy_to_user(user_ts, &ts, sizeof(ts)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
+/*
+ * Linux x86_64 nanosleep(2) — syscall 35.
+ *
+ * Sleep for the duration in *req.
+ *
+ * WHO CALLS THIS.  musl's nanosleep(3)
+ * (src/time/nanosleep.c) is a wrapper over __clock_nanosleep,
+ * which for CLOCK_REALTIME (0) with no flags issues exactly this
+ * syscall with the caller's req and rem.  musl's sleep(3) and
+ * usleep(3) both call nanosleep, so busybox `sleep` and `usleep`
+ * reach here.  See docs, "Busybox enablement".
+ *
+ * GRANULARITY.  donix's only clock is g_ticks, the 100 Hz PIT
+ * counter (10 ms per tick).  A requested duration is rounded
+ * DOWN to whole ticks: tv_sec*100 + tv_nsec/10000000.  So a
+ * 5 ms sleep takes 0 ticks and returns immediately; a 15 ms
+ * sleep takes 1 tick (10 ms).  That is the resolution donix has.
+ *
+ * WAITING.  The loop is `hlt`, the same shape sys_poll's blocking
+ * path and sys_read's fd-0 path use.  hlt stops the CPU until the
+ * next interrupt; the 100 Hz timer wakes it, g_ticks advances,
+ * and the loop re-checks.  No scheduler block is involved --
+ * there is no BLOCK_KIND_SLEEP and nothing would wake one.  On a
+ * single-process system that is correct; if multiple processes
+ * ever need to sleep concurrently, this becomes a scheduler
+ * concern and the loop becomes a block/wake pair.
+ *
+ * sti before hlt matches sys_poll: harmless when interrupts are
+ * already on (the normal case), protective if a caller somehow
+ * has them off.
+ *
+ * rem IS NEVER WRITTEN.  Linux writes rem only when the sleep is
+ * interrupted by a signal; donix does not deliver signals, so
+ * every sleep here runs to completion and returns 0.  musl's
+ * sleep(3) and usleep(3) pass the SAME pointer for req and rem,
+ * so writing rem on success would clobber the caller's req --
+ * another reason not to touch it.  When signal delivery lands,
+ * this is where the leftover time goes.
+ *
+ * ABI:
+ *   arg0  const struct timespec* req   (user pointer)
+ *   arg1  struct timespec*       rem   (user pointer; unused)
+ *   returns  0 on success, -errno on failure.
+ *
+ * struct timespec on x86_64 is two int64s, 16 bytes, no padding:
+ *     offset 0: tv_sec   (int64)
+ *     offset 8: tv_nsec  (int64)
+ *
+ * Validation, matching Linux: tv_sec < 0 is -EINVAL; tv_nsec
+ * must be in [0, 999999999] or -EINVAL.  NULL req is -EFAULT.
+ */
+long sys_nanosleep(const void* user_req, void* user_rem) {
+    (void)user_rem;   /* never written; see the header comment */
+
+    if (!user_req) return -(long)EFAULT_;
+
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } req;
+
+    if (safe_copy_from_user(&req, user_req, sizeof(req)) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    if (req.tv_sec < 0) return -(long)EINVAL_;
+    if (req.tv_nsec < 0 || req.tv_nsec > 999999999LL) return -(long)EINVAL_;
+
+    /* Round down to whole 10 ms ticks.  A sub-tick request waits
+     * zero ticks and returns immediately, which is the honest
+     * answer for a system whose clock is 100 Hz. */
+    uint64_t ticks = (uint64_t)req.tv_sec * 100ULL
+                   + (uint64_t)req.tv_nsec / 10000000ULL;
+
+    if (ticks == 0) return 0;
+
+    uint64_t deadline = g_ticks + ticks;
+    while (g_ticks < deadline) {
+        __asm__ volatile("sti");
+        __asm__ volatile("hlt");
+    }
+
+    return 0;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
  * Return the current working directory: the path stored by
@@ -5238,10 +5437,83 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
 }
 
 /*
- * Linux x86_64 munmap(2) — stub.  Return 0 (nothing to unmap yet).
+ * Linux x86_64 munmap(2) — syscall 11.
+ *
+ * Unmap a range of pages and free their physical frames.
+ *
+ * WHY THIS IS NOT A STUB.  It was one until now, on the theory that
+ * nothing called it.  That was wrong: musl's mallocng allocator
+ * calls munmap in two places --
+ *
+ *   mallocng/free.c:  free() of a block large enough that mallocng
+ *                     gave it a dedicated mapping unmaps that
+ *                     mapping when the group is released.
+ *   mallocng/malloc.c: on alloc_meta() failure, mmap()'s result is
+ *                     unmapped to avoid leaking it.
+ *
+ * Both describe WHOLE mappings that mmap returned, page-aligned.
+ * A stub returning 0 told free() the memory was released when it
+ * was not -- a leak, not a no-op.  Nothing has tripped over it
+ * yet because the arena is reused, but the call is real.
+ *
+ * WHAT IT DOES.  For each page in [addr, addr+length):
+ *   - resolve the physical frame via vmm_get_phys_from_cr3;
+ *   - skip it if not present (Linux tolerates unmapping holes);
+ *   - unmap it in the calling process's address space;
+ *   - remove the frame from pcb->elf_page_list so process exit does
+ *     not free it a second time;
+ *   - pmm_free_page it.
+ *
+ * The elf_page_list removal is a swap with the last element plus a
+ * decrement -- the list is an unordered array of physical addresses
+ * and nothing depends on its order (see exec_free_and_unmap_user_pages,
+ * which only iterates it).  O(1), no shift.
+ *
+ * SCOPE.  donix's sys_mmap only ever maps anonymous pages into the
+ * 4 MB window at MMAP_BASE (0x8010000000).  This unmaps whatever
+ * range it is given, but the only real caller's ranges are inside
+ * that window.  If a future mmap ever maps elsewhere, this still
+ * works: it unmaps by address, not by window.  It does NOT split
+ * huge pages, so unmapping a range covered by a 2 MB page would be
+ * wrong -- but the mmap window is above the bootloader's identity
+ * map and has no huge pages.  If mmap ever reaches a huge-page
+ * region, this needs the same split logic vmm_map_page_in_cr3 has.
+ *
+ * ABI:
+ *   arg0  void*   addr    (need not be page-aligned; Linux rounds down)
+ *   arg1  size_t  length  (rounded up to a page)
+ *   returns  0 on success, -EINVAL on length == 0 or no current process.
  */
 long sys_munmap(void* addr, size_t length) {
-    (void)addr; (void)length;
+    if (length == 0) return -(long)EINVAL_;
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    uint64_t start = (uint64_t)addr & ~0xFFFULL;
+    uint64_t end   = ((uint64_t)addr + length + 0xFFFULL) & ~0xFFFULL;
+    if (end <= start) return 0;
+
+    for (uint64_t va = start; va < end; va += 0x1000) {
+        uint64_t phys = vmm_get_phys_from_cr3(self->cr3, va);
+        if (!phys) continue;      /* hole: Linux tolerates it */
+        phys &= ~0xFFFULL;
+
+        vmm_unmap_page_in_cr3(self->cr3, va);
+
+        /* Drop the frame from elf_page_list so exit does not free it
+         * twice.  Swap-with-last; the list is unordered. */
+        for (uint64_t i = 0; i < self->elf_num_pages; i++) {
+            if (self->elf_page_list[i] == phys) {
+                self->elf_page_list[i] =
+                    self->elf_page_list[self->elf_num_pages - 1];
+                self->elf_num_pages--;
+                break;
+            }
+        }
+
+        pmm_free_page(phys);
+    }
     return 0;
 }
 
@@ -5668,6 +5940,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
         case SYS_DUP:             return (uint64_t)sys_dup((int)arg0);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
+        case SYS_NANOSLEEP:       return (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
@@ -5682,6 +5955,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();
@@ -5689,6 +5963,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
+        case SYS_CLOCK_GETTIME:   return (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1);
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
