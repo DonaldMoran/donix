@@ -3,30 +3,30 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-01 (session 42)
-**Current HEAD:** branch `dev`, six commits past `origin/dev`;
-scratch tags `20261001-envp`, `20261001-env-applets`,
-`20261001-envdocs`, `20261001-usrbin`, `20261001-nosuffix`,
-`20261001-noshim` (all local)
+**Last updated:** 2026-10-02 (session 42, cont.)
+**Current HEAD:** branch `dev`, 25 commits past `origin/dev`;
+24 scratch tags, all `20261001-*` (local; see the tag list below)
 **Last milestone:** `v0.6.8` (published) — the `*at()` family;
 `resolve_at`, `newfstatat` (262), `openat` (257), `unlinkat` (263),
 `faccessat` (269), `utimensat` (280), all through one resolver
-**Milestone status:** **`v0.6.9` open — envp, the `/usr/bin`
-layout, and the shim removal.**  Six commits; two subjects; one
-session.  Not bumping yet.
+**Milestone status:** **`v0.6.9` complete, at the bump.**  Session
+42 grew it far past its opening scope (envp, layout, shim) — see
+"Where we are."  Next step is the milestone bump: drop the scratch
+tags, write the `v0.6.9` narrative, rewrite this file, push.
 
 Commits are named by tag only, never by SHA.  **Working tags
-(`2026*`) are local scratch restore points** — they exist while a
-milestone is being developed and are **dropped before the milestone
-is pushed**.  Only `v*` tags go to the remote and are permanent.
-The commit record is `docs/session-log.md`; the commit message
-carries the narrative.  Once a scratch tag is dropped it resolves
-to nothing; do not cite one as if it were a stable reference.
+(`20261001-*`) are local scratch restore points** — they exist while
+a milestone is being developed and are **dropped before the
+milestone is pushed**.  Only `v*` tags go to the remote and are
+permanent.  The commit record is `docs/session-log.md`; the commit
+message carries the narrative.  Once a scratch tag is dropped it
+resolves to nothing; do not cite one as if it were a stable
+reference.
 
-**Scratch tags are annotated** (session 37 onward).  The annotation
-is the fuller per-commit summary; at a milestone bump the
-annotations seed the final milestone narrative.  This is the reason
-to keep tagging each step even when no `v*` tag is imminent.
+**Scratch tags are annotated.**  The annotation is the fuller
+per-commit summary; at a milestone bump the annotations seed the
+final milestone narrative.  This is why each step gets a tag even
+when no `v*` tag is imminent.
 
 ---
 
@@ -63,15 +63,21 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Where we are — `v0.6.9` (envp, layout, shim) in progress
+## Where we are — `v0.6.9` complete, at the bump
 
 `v0.6.8` shipped the `*at()` family and is pushed.  `v0.6.9` opened
-as **envp** and grew, in the same session, into the **`/usr/bin`
-layout** and the **removal of `execve`'s bare-name guess**.
+as **envp** and grew, in session 42, into the **`/usr/bin` layout**,
+the **removal of `execve`'s bare-name guess**, a **page-table bug
+fix**, **four new syscalls**, **ten busybox applets**, **three
+small gaps**, and **four new gotchas**.  It is no longer a
+three-subject milestone; it is a large one.  See "Session 42, in
+full" below.
 
-### Session 42 — three themes, six commits
+### Session 42, in full
 
-| Tag (kept, milestone open) | What |
+**The opening themes (envp, layout, shim):**
+
+| Tag | What |
 |---|---|
 | `20261001-envp` | `sys_execve` copies `envp` onto the new stack; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
 | `20261001-env-applets` | config: enable busybox `env` and `printenv` |
@@ -79,46 +85,91 @@ layout** and the **removal of `execve`'s bare-name guess**.
 | `20261001-usrbin` | executables to `/usr/bin`; `canary.c` the smoke test |
 | `20261001-nosuffix` | drop the `.ELF` suffix; binaries staged bare |
 | `20261001-noshim` | `execve`: bare-name attempt and the `.ELF` helpers removed |
+| `20261001-session42-docs` | session-42 docs (second pass) |
+
+**The envp regression test and the bugs it surfaced:**
+
+| Tag | What |
+|---|---|
+| `20261001-envtest` | `tests/envp_step1.c` + `envp_helper.c`; proved envp survives `execve`.  Found the `%rax`-clobber bug in `puts_raw` |
+| `20261001-lenfix` | `puts_raw` computes its own length; `musl_exec2` rewritten to assert the shim is gone; two gotchas added |
+
+**The page-table bug:**
+
+| Tag | What |
+|---|---|
+| `20261001-splitfix` | the huge-page split in `vmm_map_page_in_cr3` no longer silently returns on allocation failure; it halts with `VMM: FATAL`.  The intermittent `#PF` at `0x400000` |
+| `20261001-splitdiag-off` | removed the temporary `VMM: SPLIT` diagnostic prints |
+| `20261001-vmm-issues` | recorded the six remaining silent `vmm_map_page*` returns as item 7 |
+
+**The dead code and the syscalls:**
+
+| Tag | What |
+|---|---|
+| `20261001-deadname` | deleted `exec_resolve_bin_name`, dead since the shim removal |
+| `20261001-readlink` | `readlink` (89) as an honest `-EINVAL` (no symlinks); removes `ttyname`'s `Unknown syscall: 89` noise |
+| `20261001-clock` | `clock_gettime` (228) from `g_ticks`; enables `mktemp` |
+| `20261001-nanosleep` | `nanosleep` (35) as a `g_ticks` deadline loop; enables `sleep`, `usleep` |
+| `20261001-munmap` | `munmap` (11) for real — the stub leaked; mallocng calls it |
+
+**The applets:**
+
+| Tag | What |
+|---|---|
+| `20261001-applets-free` | `basename`, `dirname`, `unlink` |
+| `20261001-applets-tty` | `ttysize`, `tty`, `arch` |
+| `20261001-truncate` | `truncate` (config-only — it uses `ftruncate`, not `truncate(2)`) |
+
+**The doc cleanups and the last gaps:**
+
+| Tag | What |
+|---|---|
+| `20261001-dev-issue` | open-issues: no `/dev`, no `/proc`; `ttyname` cannot name the console |
+| `20261001-mktemp-issue` | open-issues: `mktemp` needs `clock_gettime`, not `getpid`+`open` |
+| `20261001-fcntl-lowfd` | `sys_fcntl` accepts fd 0/1/2 for all subcommands; new `fcntl_lowfd` test |
+| `20261001-ctrl-bracket` | Ctrl-`[` produces ESC (0x1B) |
+| `20261001-issues-cleanup` | removed the resolved entries from `open-issues.md` |
 
 **What it means:**
 
 - **envp:** `execve` passes the caller's environment through
   verbatim.  `export FOO=bar` then `echo $FOO` prints `bar`;
-  `busybox env` lists variables.
+  `busybox env` lists variables.  Regression-tested by
+  `tests/envp_step1.c`.
 - **The layout:** `/bin` holds busybox, `/usr/bin` holds the
   donix-native ELFs, `/tmp` is empty, `/` holds data.  **This is
   the split the two shells' search rules need** — ash's applets
   never consult `PATH` so busybox wins there; `musl_sh` searches
   `/usr/bin` first so a bare name resolves to the donix-native tool.
-- **The shim:** `sys_execve`'s bare-name attempt is gone.  It tried
-  three spellings of a path; the third (bare name → uppercase →
-  append `.ELF` → try the root and `/bin`) could not succeed once
-  the binaries moved to `/usr/bin` and lost the suffix.  What
+- **The shim:** `sys_execve`'s bare-name attempt is gone.  What
   remains is (a) the path as given and (b) the `"0:"` prefix
   translation — the smallest the shim can be without a VFS.
+  `musl_exec2` now asserts that a bare name does *not* resolve.
 
 **Key facts for future work:**
 
 - **Every donix-native binary is staged BARE.**  `/usr/bin/HELLO`,
-  not `HELLO.ELF`; `/bin/busybox`, no suffix.  The `.ELF` suffix is
-  gone from the Makefile, from `musl_sh`'s search, from `kmain`'s
-  boot path, and from `canary.c`'s paths.  **A file named with
+  not `HELLO.ELF`; `/bin/busybox`, no suffix.  **A file named with
   `.ELF` will not be found by anything.**
 - **`execve` now takes a path.**  No bare-name resolution.  Callers
-  pass `/usr/bin/NAME` or `/bin/NAME`.  `musl_sh`'s `run_external`
-  builds those; ash's `execvp` walks `$PATH` and passes the resolved
-  path.
+  pass `/usr/bin/NAME` or `/bin/NAME`.
 - **ash does not export `PATH`.**  It keeps `PATH` as a shell
   variable, so `$PATH` expands and command lookup works, but a child
-  does not see `PATH` in its environment.  A difference from a
-  distro Linux where `PATH` is exported at login.
+  does not see `PATH` in its environment.
 - **The envp snapshot is `kmalloc`'d, not a stack array.**
   `EXEC_MAX_ENVC` × `EXEC_MAX_ARG_LEN` = 16 KB, and
   `PROC_STACK_SIZE` is 16 KB.  See `docs/gotchas.md`, "The kernel
   stack is 16 KB."
-- **The canary is now `canary`, a program.**  `tests/canary.c`
-  replaces the hand-typed list.  Run from `donix>` or ash, both find
-  `/usr/bin/CANARY` via their search rules.
+- **The canary is now `canary`, a program.**  `tests/canary.c`.
+  Run from `donix>` or ash, both find `/usr/bin/CANARY`.
+- **`clock_gettime` (228) is the clock.**  It reports `g_ticks`
+  (100 Hz PIT) as both `CLOCK_REALTIME` and `CLOCK_MONOTONIC`.  No
+  wall clock exists.
+- **`nanosleep` (35) is a `hlt` loop** on a `g_ticks` deadline, 10 ms
+  granularity.  Not a scheduler block; correct for a single-process
+  system.
+- **`munmap` (11) is real** and frees frames, removing them from
+  `elf_page_list`.  The old stub was a leak.
 
 ### What `v0.6.8` contributed (prior milestone, pushed)
 
@@ -146,95 +197,75 @@ The findings that milestone recorded, still load-bearing:
   `sh: builtin in pipeline not supported`.
 - **`diff`, `chmod`, `ln`, `mount` are off** — the last three need
   their own syscalls.
-- **`musl_wait`'s WNOHANG loop spins.**  Pre-existing (present at
-  `v0.6.6`); the spin's wall-clock duration increased between
-  `v0.6.6` (VGA text) and `v0.6.7` (framebuffer).  Not a
-  regression.  See `docs/session-log.md`, session 41.
+- **`tty` prints `not a tty`.**  Correct for donix: no `/dev`, no
+  `/proc`.  `readlink` (89) is implemented, so no `Unknown syscall`
+  noise, but `ttyname` still cannot name the console.  See
+  `open-issues.md`.
+- **`musl_wait`'s WNOHANG loop spins.**  Pre-existing.  See
+  `docs/session-log.md`, session 41.
 
 ---
 
-## NEXT SESSION — pick one
+## NEXT SESSION — the bump, then what follows
 
-`v0.6.9` has six commits and is closeable once the layout and the
-shim work have settled.  Candidates:
+**The immediate task is the `v0.6.9` bump**, which is a session-end
+operation:
 
-### Finishing `v0.6.9`
+1. Harvest the 24 scratch-tag annotations into `docs/session-log.md`
+   as the session-42 commit table.
+2. Write the `v0.6.9` tag annotation from them — the milestone
+   narrative.
+3. Rewrite this file fresh.
+4. Drop the scratch tags:
+   ```
+   git tag -d 20261001-envp 20261001-env-applets ... (all 24)
+   ```
+5. `git tag -a v0.6.9` on HEAD.
+6. Push `dev` and `v0.6.9` to `origin`.
 
-1. **A dedicated envp regression test.**  The `$FOO` round trip is
-   proven by hand; a `userland/musl/tests/` app that forks, sets a
-   variable, `execve`s a helper that prints `getenv`, and checks the
-   value would make it a one-command check.
-2. **The free busybox applets.**  `basename`, `dirname`, `readlink`,
-   `realpath`, `truncate`, `sleep`, `usleep`, `unlink`.  Each is
-   gated on a syscall donix has or a small one; each is pure
-   userland or a thin wrapper.  Add one at a time, exercising the
-   applet before the commit.  **`env`/`printenv` are done.**
+### After the bump — candidates
 
-### Small, close gaps (non-theme)
-
-1. **Ctrl-`[` as ESC** — `scancode_to_ascii` has no Ctrl parameter
-   yet; touches the keyboard layer.  Low urgency.
-2. **`sys_fcntl` fd < 3 for the other subcommands** — `F_GETFL`,
-   `F_SETFL`, `F_GETFD`, `F_SETFD` still refuse `fd < 3`.  Not on
-   any current path.
-3. **`sys_munmap`** — a stub returning 0.
-
-### Deliberately later — larger
-
-- **Signal delivery (`SIGPIPE`, `SIGBUS`).**  See `open-issues.md`
-  item 6.  A subsystem (real `sys_rt_sigaction`, per-process
-  handlers, a `SIGPIPE` raise on the `-EPIPE` write path).  Also
-  the prerequisite for job control and `kill(2)`, and for a Wayland
-  `wl_shm` client's `SIGBUS`.
+- **The remaining busybox applets.**  `realpath` (needs `readlink`,
+  done — config-only now).  Then the "needs a subsystem" set stays
+  off for the reasons listed below.
+- **The `/dev` and `/proc` device layer.**  Unblocks `tty` naming
+  its terminal, `/dev/null`, `/dev/urandom`.  A subsystem.
+- **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `open-issues.md`
+  item 5.  Also the prerequisite for job control, `kill(2)`, and a
+  Wayland `wl_shm` client's `SIGBUS`.
+- **The six remaining silent `vmm_map_page*` returns.**
+  `open-issues.md` item 7.  A deliberate decision per site.
 - **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
-  remaining shims when it lands, do not extend them.  Note: the VFS
-  is **not** a Wayland prerequisite; see `ROADMAP.md`.
-- **Wayland (long horizon).**  See `ROADMAP.md`.  Not a `v0.6.x`
-  target; the one concrete kernel gap it shares with existing work
-  is non-anonymous `mmap`.
-- **PS/2 mouse driver + framebuffer cursor.**  Not on the roadmap
-  yet, but the natural first step toward any interactive GUI.
-- **Font size / resolution.**  The console is 10×18 at 1024×768.
-  A bigger glyph (`ter-u24n.psf`, 12×24) or a bigger mode is a
-  data change, but **see the `v0.6.7` "changing the VBE mode" note
-  in `docs/session-log.md`** — it also needs the grid constants and
-  possibly `fb.c`.
+  remaining shims when it lands, do not extend them.
+- **Wayland (long horizon).**  See `ROADMAP.md`.
+- **PS/2 mouse driver + framebuffer cursor.**  The natural first
+  step toward any interactive GUI.
+- **Font size / resolution.**  See the `v0.6.7` "changing the VBE
+  mode" note in `docs/session-log.md`.
 
 ---
 
 ## Busybox enablement
 
-Every applet and feature in `configs/busybox.config` that is off,
-with whether donix can support it today.  **Rule: enable an applet
-only when the syscalls it actually calls are implemented — read the
-applet's source, do not guess from its name.**
+**All the applets in the handoff's original "Ready now" and "Needs
+one small syscall" tables are now ENABLED.**  The tables below are
+kept for the record and for the still-off ones.
 
-### Ready now (syscalls all present)
+### Enabled in session 42
 
-| Config | Applet | Needs | Notes |
-|---|---|---|---|
-| `CONFIG_BASENAME` | `basename` | none (string op) | off; pure userland |
-| `CONFIG_DIRNAME` | `dirname` | none (string op) | off; pure userland |
-| `CONFIG_UNLINK` | `unlink` | `unlink` (87) | done — applet just off |
-| `CONFIG_MKTEMP` | `mktemp` | `getpid` (39) + `open` (2) | both present; check source |
-| `CONFIG_TTY` | `tty` | `ioctl` (16) | present; check source |
-| `CONFIG_TTYSIZE` | `ttysize` | `ioctl` (16) | present; check source |
-| `CONFIG_UNAME`-adjacent | `arch`, `bb_arch` | `uname` (63) | present; check source |
+`basename`, `dirname`, `unlink`, `ttysize`, `tty`, `arch`,
+`mktemp`, `sleep`, `usleep`, `truncate`, plus `env`/`printenv`
+(earlier in the session).
 
-### Needs one small syscall first
+Syscalls added to unblock them: `readlink` (89), `clock_gettime`
+(228), `nanosleep` (35).  `truncate` needed none — it uses
+`ftruncate` (77), which was already there.
 
-| Config | Applet | Missing syscall | Size |
-|---|---|---|---|
-| `CONFIG_READLINK` | `readlink` | `readlink` (89) | small — FAT has no symlinks, so an honest `-EINVAL`/`-ENOENT` may be all it needs |
-| `CONFIG_REALPATH` | `realpath` | `readlink` (89) | follows from `readlink` |
-| `CONFIG_SLEEP` | `sleep` | `nanosleep` (35) | small — a `g_ticks` deadline loop |
-| `CONFIG_USLEEP` | `usleep` | `nanosleep` (35) | same |
-| `CONFIG_TRUNCATE` | `truncate` | `truncate` (76) | small — mirrors `ftruncate` by path |
-
-### Needs a subsystem (do not enable yet)
+### Still off — needs a subsystem (do not enable yet)
 
 | Config | Applet | Blocked by |
 |---|---|---|
+| `CONFIG_REALPATH` | `realpath` | config-only now (`readlink` done); not yet enabled |
 | `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous `mmap`); deliberate |
 | `CONFIG_CHMOD` | `chmod` | `chmod`/`fchmodat`; FAT has no permissions |
 | `CONFIG_CHOWN` | `chown` | `chown`/`fchownat`; FAT has no ownership |
@@ -242,64 +273,54 @@ applet's source, do not guess from its name.**
 | `CONFIG_LINK` | `link` | same |
 | `CONFIG_MOUNT`/`UMOUNT` | `mount`/`umount` | `mount` (165); no VFS |
 | `CONFIG_TAR`/`UNZIP`/`CPIO`/`GZIP`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
-| `CONFIG_AWK` | `awk` | `fork`/`execve` work, but `awk` is large and needs `FEATURE_AWK_LIBM`; its `system()`/`getline` paths need signal delivery |
-| `CONFIG_LESS`/`MORE` | pagers | `ioctl` works, but they need raw-mode terminal control donix's line-discipline stubs do not model |
+| `CONFIG_AWK` | `awk` | large; needs `FEATURE_AWK_LIBM`; `system()`/`getline` need signal delivery |
+| `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control donix's line-discipline stubs do not model |
 | `CONFIG_TOP`/`PS`/`KILL`/`PIDOF` | process tools | `/proc`; donix has none |
 | `CONFIG_NETWORKING` (all) | `ping`, `wget`, etc. | no network stack |
-| `CONFIG_FEATURE_FIND_DELETE` | `find -delete` | works today via `unlink`/`rmdir`; needs `FEATURE_FIND_DEPTH` (post-order walk), also off |
+| `CONFIG_FEATURE_FIND_DELETE` | `find -delete` | works via `unlink`/`rmdir`; needs `FEATURE_FIND_DEPTH`, also off |
 | `CONFIG_ASH_JOB_CONTROL` | ash job control | signal delivery |
-| `CONFIG_FEATURE_EDITING_HISTORY`-adjacent (`FEATURE_TAB_COMPLETION`) | ash completion | needs `stat` on many paths; probably works, test it |
+| `CONFIG_FEATURE_TAB_COMPLETION` | ash completion | needs `stat` on many paths; probably works, test it |
 
-### Suggested order (one per commit)
+### The rule
 
-1. **`basename`, `dirname`, `unlink`** — free, no new syscall.
-2. **`mktemp`, `tty`, `ttysize`, `arch`** — check each source for
-   the syscalls it actually calls; enable the ones that only use
-   what exists.
-3. **`sleep`, `usleep`** — add `nanosleep` (35) as a `g_ticks`
-   deadline loop, then enable both.
-4. **`truncate`** — add `truncate` (76) by path (mirror
-   `ftruncate`), then enable.
-5. **`readlink`, `realpath`** — add `readlink` (89) as an honest
-   `-EINVAL` on FAT (no symlinks), then enable.
-
-Each step: read the applet's source, enable, exercise from ash,
-commit.  Do not batch-enable without exercising.
+**Enable an applet only when the syscalls it actually calls are
+implemented — read the applet's source, do not guess from its
+name.**  Two applets were mis-classified by name this session:
+`truncate` (uses `ftruncate`, not `truncate(2)`) and `mktemp`
+(needs `clock_gettime` through musl's `__randname`, not the
+`getpid`+`open` the table said).  Read the source.
 
 ---
 
 ## Canary state
 
-**The focused canary is green as of `20261001-noshim`.**  Full
-table in `docs/session-log.md`.
+**Green as of `20261001-fcntl-lowfd`** — `canary` and `canary
+--full` from both shells, 14/14 and 27/27.  The kernel self-test
+runs at boot and reports 17/17.
 
-**The canary is now a program: `canary`.**  `tests/canary.c` runs
-every non-interactive canary row, checks exit status and output
+**The canary is a program: `canary`.**  `tests/canary.c` runs every
+non-interactive canary row, checks exit status and output
 substrings, and reports pass/fail.  Run from `donix>` or ash; both
-find `/usr/bin/CANARY` via their search rules.
+find `/usr/bin/CANARY`.
 
     canary          # read-only rows
     canary --full   # also the mutating rows (create/remove under /)
-
-**What `canary` covers** — file reads, listing, the shell spine,
-`find` (including the two-level `/usr/bin` walk), the applets
-through busybox, and the `printenv PATH` empty-output check.
 
 **What stays manual**, printed at the end of a `canary` run:
 
     busybox ash      # interactive; then pwd, cd /bin, ls, exit
     vi test          # fills screen; :wq; ./test
 
-**The old hand-typed rows** remain in `docs/session-log.md` for
-history.  The rows `canary` runs are those, minus the interactive
-ones, plus the checks that changed with the `/usr/bin` layout and
-the suffix removal.
+**Regression tests (`userland/musl/tests/`, not canary rows):**
 
-**`*at` regression tests (`userland/musl/tests/`, not canary rows):**
-
-    at_step1    # resolve_at via dirfd; fstatat flags; AT_EMPTY_PATH;
-                # faccessat dirfd; utimensat dirfd  (read-only, 10/10)
-    at_step2    # unlinkat + the unlink/rmdir type check (mutates the disk)
+    at_step1       # resolve_at via dirfd; fstatat flags;
+                   # AT_EMPTY_PATH; faccessat dirfd; utimensat dirfd
+                   # (read-only)
+    at_step2       # unlinkat + the unlink/rmdir type check
+                   # (mutates the disk)
+    envp_step1     # envp survives execve, 3 checks (forks)
+    musl_exec2     # the bare-name shim is gone, 3 checks (forks)
+    fcntl_lowfd    # fcntl on fd 0/1/2, 3 checks (redirects fd 0)
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
@@ -310,21 +331,21 @@ the suffix removal.
 
 Run these when changing `sys_read`/`sys_write`/`sys_close`/
 `put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
-Not canary rows (they fork), but they are the only pipe regression
-suite.
+
+**New tests this session must be added to both `USERLAND_ELFS` and
+the `mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image
+now stages 38 files.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
 
 **Expected noise:** no `Unknown syscall:` lines; no `[fd]` lines
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
-trace line (session-41 diagnostic, removed).  The `FB: mapped N
-pages ...` line is expected.  The `sys_open: f_open FAIL path=...`
-lines from `vi` on a new file, and from `busybox stat` on
-nonexistent paths, are expected diagnostics.  **`sys_execve: f_open
-FAIL` lines no longer appear** — the exec path tries two attempts
-and, since callers pass resolved paths, the first or second
-succeeds.
+trace line (removed).  The `FB: mapped N pages ...` line is
+expected.  The `sys_open: f_open FAIL path=...` lines from `vi` on
+a new file and from `busybox stat` on nonexistent paths are
+expected diagnostics.  `sys_execve: f_open FAIL` lines no longer
+appear.
 
 ---
 
@@ -335,21 +356,20 @@ succeeds.
    subsume.  When a VFS lands, delete them; do not extend.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
-4. **`sys_fcntl` refuses fd < 3** for subcommands other than
-   `F_DUPFD`/`F_DUPFD_CLOEXEC`.  Deliberate; not on any path.
+4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
+   own syscalls.**  Deliberate FatFs-limitation first cuts.
 5. **`-EPIPE` is delivered without `SIGPIPE`.**  Narrower than the
    old docs claimed: `busybox yes | busybox head -n 1` does *not*
    hang.  Fixing it means signal delivery.
 
-Also open: `unlinkat` has no consumer; Ctrl- `[` not mapped to ESC;
-`sys_munmap` is a stub returning 0; `sys_brk`'s fixed `heap_base`
-and the 4 MB mmap window are latent collisions; real FatFs
-timestamp storage; `prctl` is minimal; busybox applet symlinks not
-installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
-spins (pre-existing; duration increased at the console swap);
+Also open: `unlinkat` has no consumer; the six remaining silent
+`vmm_map_page*` returns; `sys_brk`'s fixed `heap_base` and the
+4 MB mmap window are latent collisions; real FatFs timestamp
+storage; `prctl` is minimal; busybox applet symlinks not installed;
+syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake.
+wake is coupled to `sys_close`'s wake; no `/dev`, no `/proc`.
 
 ---
 
@@ -357,7 +377,7 @@ wake is coupled to `sys_close`'s wake.
 
 **Real project root:** `/home/noneya/code/donix/`.
 
-**The FAT layout (as of `20261001-usrbin`):**
+**The FAT layout:**
 
     /            HELLO-WORLD.TXT and other data
     /bin         busybox
@@ -369,18 +389,18 @@ wake is coupled to `sys_close`'s wake.
   `find`, `head`, `ls`, `mkdir`, `mv`, `od`, `printenv`, `pwd`,
   `rm`, `rmdir`, `seq`, `sort`, `stat`, `tail`, `tee`, `test`,
   `touch`, `tr`, `true`, `uname`, `uniq`, `wc`, `yes`, `cmp`,
-  `grep`, `sed`, `vi`, `clear`, plus `ash`.
+  `grep`, `sed`, `vi`, `clear`, `basename`, `dirname`, `unlink`,
+  `ttysize`, `tty`, `arch`, `mktemp`, `sleep`, `usleep`,
+  `truncate`, plus `ash`.
   `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  `CONFIG_FIND=y` and
-  `CONFIG_FEATURE_FIND_TYPE=y`.  `CONFIG_ENV=y`,
-  `CONFIG_PRINTENV=y`.  The other `FEATURE_FIND_*` predicates are
-  off deliberately.  Off (with reasons): `diff` (deliberate),
-  `chmod`/`ln`/`mount` (need kernel work).  See "Busybox
-  enablement" above.
+  `CONFIG_FEATURE_FIND_TYPE=y`.  Other `FEATURE_FIND_*` predicates
+  off deliberately.  Off with reasons: `diff`, `chmod`, `ln`,
+  `mount`, and the archive/network/process tools — see "Busybox
+  enablement."
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
-  `05_boot_kernel64/Makefile`.  `tests/canary.c` is the smoke test;
-  `tests/at_step1.c`/`at_step2.c` are the `*at` regression suites.
+  `05_boot_kernel64/Makefile`.
 - `04_kernel_64bit/fonts/ter-u18n.psf` — tracked font source.  The
   `.psf` is tracked; the generated `ter_u18n_data.c` is gitignored.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
@@ -401,20 +421,15 @@ needs it.  Paths relative to the tree root
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  A growing
-  family of "a decision correct only for the cases known at the
-  time": the low-fd and fd-kind entries (sessions 34, 36), the
-  multi-write-interleave entry (session 37), the byte-order
-  entries (session 38), the naming/bookkeeping/PIT entries
-  (session 39), "A consumer inferred from behavior is not a
-  consumer" (session 40), "A syscall argument the caller did not
-  set holds the previous syscall's return value" and "The
-  incremental kernel build can silently skip" (session 41), "The
-  kernel stack is 16 KB" and "A shim's dead code is only dead if
-  you watch it not run" (session 42).  Read them together; expect
-  more.
+- `docs/gotchas.md` — every bug writeup, by subsystem.  Session 42
+  added: "The kernel stack is 16 KB" and "A shim's dead code is
+  only dead if you watch it not run" (the first pass), plus
+  "An input-only `syscall` asm block does not tell GCC that `%rax`
+  is overwritten" and "A hand-counted string length in a syscall
+  wrapper will be wrong."  Read them together; expect more.
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Rows named by scratch tag.
+  Rows named by scratch tag.  **Session 42's rows are not yet
+  written** — that is part of the bump.
 - `docs/open-issues.md` — full open-issues list.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
@@ -430,13 +445,14 @@ needs it.  Paths relative to the tree root
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` shipped the shell and the framebuffer;
-`v0.6.8` shipped the `*at()` family.  `v0.6.9` is in progress and
-covers three things: `execve` now passes the environment through,
-the donix-native binaries live in `/usr/bin` (busybox in `/bin`,
-bare names, no `.ELF` suffix), and `sys_execve`'s bare-name guess
-is gone — it takes a path.  The canary is now the `canary` program,
-green from both shells.  Six scratch tags, not bumped.  One change
-at a time.**
+`v0.6.8` shipped the `*at()` family.  `v0.6.9` — session 42 — is
+complete and at the bump: envp passes through `execve`, the
+donix-native binaries live in `/usr/bin` (busybox in `/bin`, bare
+names, no `.ELF` suffix), `sys_execve`'s bare-name guess is gone,
+the huge-page-split `#PF` is fixed, and four syscalls (`readlink`,
+`clock_gettime`, `nanosleep`, `munmap`) plus ten busybox applets
+landed.  Twenty-five commits, 24 scratch tags.  Next: the bump.
+One change at a time.**
 
 ---
 
