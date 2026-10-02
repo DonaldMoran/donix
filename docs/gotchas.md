@@ -1,3 +1,85 @@
+## A test can encode an earlier version's behavior, and it will hang rather than fail
+
+*Session 43 (`pipe_step1`), commit `20261002-pipe-step1`.  Not a
+kernel bug -- a test that had been correct six sessions earlier,
+and went stale when the behavior it asserted changed.*
+
+`pipe_step1` asserted that a read on an empty pipe returns
+`-EAGAIN` and that a write to a full pipe returns `-EAGAIN`.  That
+was Step-1 semantics, from session 36, when pipes were
+non-blocking.  Steps 2 and 3 made read and write **block**: a
+reader with a live writer sleeps in `hlt` until data arrives, and
+a writer with a live reader sleeps until space frees.
+
+**Re-running the old assertions did not fail.  It hung.**  The
+test wrote 5 bytes, read 5 bytes, then read again expecting
+`-EAGAIN` -- but `writers_open` was still 1, so the kernel
+blocked the reader, and nothing in a non-interactive test would
+ever wake it.  A test that hangs names nothing: no assertion is
+reported, no exit code is produced, and the suite stops at the
+point of the hang with no indication of which check was wrong.
+
+A stale test that *fails* is a message.  A stale test that *hangs*
+is a dead end.
+
+**How the staleness was found.**  `open-issues.md`'s test-design
+notes carry the rule:
+
+> **Pipe regression suite is not a canary.**  `pipe_step1` …
+> `pipe_step3b` fork and take seconds; run them when changing
+> `sys_read`/`sys_write`/`sys_close`/`put_file_slot`/`sys_fork`/
+> `sys_pipe` or adding a `FILE_KIND_*`, but not as part of the boot
+> canary.
+
+Session 43 added a `FILE_KIND_*` (`FILE_KIND_DEV_NULL`) and
+touched `sys_read` and `sys_write`, so the rule applied.  The
+suite was run for the first time since session 36, and
+`pipe_step1` hung on the third check.  **The rule was right; it
+had simply not been executed for six sessions.**  A rule in a doc
+that is not run is the same as no rule.
+
+**The fix.**  The EAGAIN assertions are removed.  The empty/full
+behavior is tested where it can be tested safely -- by tests that
+fork a peer, so a blocked process has something to wake it:
+
+- `pipe_step2` -- blocking + directed wake, forks a peer.
+- `pipe_step3` -- EOF, `-EPIPE`, dup-aware closed-end counts.
+- `pipe_step3b` -- wake on the exit path.
+
+`pipe_step1` is now the fork-free smoke test: create a pipe, move
+bytes through it, close it, re-close for `EBADF`.  Checks that
+cannot block.
+
+**The rule.**  When a syscall's behavior changes from non-blocking
+to blocking, every test asserting the old non-blocking behavior
+becomes a hang, not a failure.  A behavioral change that turns a
+return value into a wait is the one kind of change a test suite
+cannot report: the test does not disagree, it stops.  So:
+
+> **A test suite that has not been run since a semantic change is
+> an unknown, and a hang is how the unknown presents.**  Run the
+> suite the change's own rule names, or the staleness is invisible
+> until it blocks a session.
+
+**Where this shape recurs.**  Same family as "A fix with no test
+is indistinguishable from an unfixed defect" (session 43, the
+`readlink` entry): a test or a doc asserting a state the code no
+longer has.  The `readlink` case was a *fix* believed absent when
+it was present; this is a *behavior* believed present when it had
+changed.  Both produced wasted motion -- rounds spent looking for
+a defect that was fixed, a suite run that deadlocked on an
+assertion that no longer described the kernel.  The check is the
+same: read the code before trusting the test or the doc.
+
+**A related tell.**  A test file's header comment that says "Step
+1" or "non-blocking" is describing the state at the time it was
+written.  When the behavior the header describes has changed, the
+header is a claim, and re-running the file is the check.  In this
+case the header still said "This implementation ... does NOT
+block: read on an empty pipe and write on a full pipe return
+-EAGAIN" -- a sentence that was true when written and false six
+sessions later, and was the exact reason the test hung.
+
 ## A fix with no test is indistinguishable from an unfixed defect
 
 *Session 43 (`readlink` errno), commit `20261002-readlink-test`.
