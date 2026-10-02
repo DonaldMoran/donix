@@ -1,12 +1,15 @@
 ### Open
 
-1. **VFS layer (eventual).**  `sys_execve`'s two remaining path
-   attempts — the path as given, and the `"0:"` prefix translation
-   for an absolute path — and `resolve_against_cwd` are all shims.
-   When a VFS lands, delete them; do not extend.  (The bare-name
-   attempt was removed in session 42; see `session-log.md`.  A VFS
-   is on the critical path for donix generally, **not** for
-   Wayland -- see `ROADMAP.md`.)
+1. **The path shims are what the dispatch seam subsumes.**  Not a
+   scheduled "VFS" -- see `ROADMAP.md`, "Make `/proc` possible."
+   `sys_execve`'s two remaining path attempts (the path as given,
+   and the `"0:"` prefix translation for an absolute path) and
+   `resolve_against_cwd` are all shims.  When the dispatch seam
+   lands for `/proc`, these are its first migration: delete them,
+   do not extend them.  (The bare-name attempt was removed in
+   session 42; see `session-log.md`.  A VFS is on the critical
+   path for donix generally, **not** for Wayland -- see
+   `ROADMAP.md`.)
 
 2. **Redirection of a builtin is silently ignored.**  `musl_sh`'s
    builtins (`cd`, `pwd`) run in the parent, before any fork, so
@@ -131,6 +134,53 @@
    *failure path* whose consumers do not check.  Both are
    "correct only for the cases known at the time."
 
+8. **`sys_readlink` returns `-EINVAL` for every input, including
+   nonexistent paths.**  Linux distinguishes `-ENOENT` (the path
+   does not exist) from `-EINVAL` (the path exists but is not a
+   symlink).  donix has no symlinks, so every existing path is
+   correctly `-EINVAL` — but a *missing* path should be `-ENOENT`,
+   and currently is not.
+
+   This became observable in session 43: `realpath` routes through
+   musl's `realpath()`, which calls `readlink` and treats the two
+   errnos differently.  `realpath /nonexistent` gets `-EINVAL` and
+   takes the wrong branch (the diagnostic is wrong; the canonicalize-
+   an-existing-path case is unaffected, because every component of
+   an existing path correctly returns `-EINVAL`).  `ttyname(3)`
+   walks the same path.
+
+   Small fix: in `sys_readlink`, resolve the path first; return
+   `-ENOENT` if it does not resolve, `-EINVAL` if it does.  New
+   regression test.  This is a correctness fix, not a feature, and
+   it is wanted **regardless of whether symlinks ever land**.
+
+9. **Symlinks: recorded design, not scheduled.**  FAT16 has no
+   native symlink storage, and donix is committed to FAT.  The
+   correct frame is therefore **Unix semantics, not FAT storage**:
+   the question is not "how does FAT store a symlink" but "what
+   should POSIX userspace observe."  If `ln -s`, `readlink`,
+   `realpath`, and archive restoration all behave correctly,
+   the kernel is semantically correct; the on-disk encoding is an
+   implementation detail.
+
+   The encoding is a magic marker in an ordinary file — e.g.
+   `DONIX_LINK:/usr/bin/busybox` — hidden **entirely inside the
+   pathname dispatch seam**.  This is "contained ugly": the same
+   category as ext4's inline symlinks or btrfs's extent-based ones,
+   and Linux likewise hides filesystem-specific ugliness behind
+   its VFS.
+
+   **Do not implement standalone symlink handling in individual
+   syscalls** (`open`, `stat`, `lstat`, `execve`, `chdir`,
+   `access`).  That is the technical debt the dispatch seam exists
+   to prevent.  Symlinks are a **consumer** of the seam, scheduled
+   after it exists -- see `ROADMAP.md`.
+
+   Payoff when it lands: `ln`, `link`, `readlink` with real
+   targets, `realpath` correctness, `tar`/`unzip` link restoration,
+   and the quiet assumptions (`/bin/sh -> busybox`) that many
+   configure scripts and build systems make.
+
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
 timestamp syscalls return 0 without storing); `prctl` is minimal
@@ -156,12 +206,14 @@ touching either).
 console, so `tty` prints `not a tty`.  `readlink` (89) is
 implemented (session 42), so the `ttyname` fast path
 (`readlink("/proc/self/fd/N")`) no longer logs
-`Unknown syscall: 89` — but it returns `-EINVAL` because there
-are no symlinks, and the fallback walk of `/dev` still finds
-nothing, because `/dev` does not exist.  A device layer plus
-`/dev` entries would let `tty` print a path.  This is a
-prerequisite for anything wanting `/dev/null`, `/dev/tty`, or
-`/dev/urandom`.
+`Unknown syscall: 89` — but it returns `-EINVAL` (item 8 above
+sharpens this to `-ENOENT` for a missing path) because there are
+no symlinks, and the fallback walk of `/dev` still finds nothing,
+because `/dev` does not exist.  **This is item 1's customer and
+the reason the dispatch seam gets built** — see `ROADMAP.md`,
+"Make `/proc` possible."  A device layer plus `/dev` entries
+would let `tty` print a path, and is the prerequisite for anything
+wanting `/dev/null`, `/dev/tty`, or `/dev/urandom`.
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is

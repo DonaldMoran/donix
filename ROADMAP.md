@@ -151,6 +151,88 @@ added on the belief that `rm -r` needs it, and `rm -r` does not.
 
 ---
 
+## Make `/proc` possible — the next milestone
+
+**This is the next major milestone after the immediate `realpath`
+enable and `readlink` errno fix** (see `handoff.md`).  It is not a
+"VFS milestone."  It is the first feature that the current
+architecture **cannot express at all**, and building it is what
+forces the pathname dispatch seam into existence.
+
+### Why this, and not symlinks
+
+`resolve_against_cwd` plus `fat_lookup` cannot produce
+`/proc/self/status`.  There is no FAT entry and never will be.
+That is the test from `docs/strategy.md`, "When a feature may force
+architecture": a feature forces change when the current
+architecture cannot express it, not when a new architecture would
+be cleaner.
+
+Symlinks fail that test -- they are deferrable, and they can be
+added later as a *consumer* of the seam.  `/proc` passes it.
+`/proc` also delivers observability the kernel needs
+(`/proc/self/status`, `/proc/self/maps`), which makes kernel
+development itself easier.  It is the right first customer.
+
+### Scope — one deliverable, two parts, sized to one file
+
+The milestone is **"the minimal dispatch seam plus the smallest
+open-file representation that one `/proc` file requires."**  Both
+parts, together, sized to `/proc/self/status` and nothing larger.
+
+**The dispatch seam.**  Today path lookup is conceptually
+`path -> FAT -> result`.  `/proc` makes it
+`path -> first component -> procfs | fat | devfs`.  That is
+dispatch, and it is the VFS front door whether it is called that or
+not.  Design it knowing `/dev` and mounts are coming; do not build
+them now.
+
+**The minimal open-file representation.**  `open("/proc/self/status")`
+must return something `read`, `stat`, and `close` can act on, and
+that something is not a FAT file.  This is forced by the *first*
+`/proc` file -- it cannot be deferred past it.  The minimal form is
+a small `file_ops`-style struct with `read`/`stat`/`close`, with FAT
+and proc both implementing it.  **No inode layer, no vnode layer,
+no superblocks, no reference counts, no mount framework.**
+
+**Acceptance test:** one `/proc` file, probably `/proc/self/status`,
+opens, reads its contents, stats as a regular file, and closes --
+from `donix>` and from ash.  Add it to the canary.
+
+### What it subsumes
+
+`open-issues.md` item 1: `sys_execve`'s two remaining path attempts
+and `resolve_against_cwd` are shims the seam subsumes.  **Delete
+them as part of this milestone; do not extend them.**
+
+### The two failure modes to avoid
+
+- **Over-abstraction.**  Do not schedule "VFS."  Do not build an
+  inode/vnode/mount/superblock stack.  Build the seam `/proc`
+  needs and stop.
+- **Under-abstraction.**  Do not special-case `/proc` inside
+  `sys_open`, then `sys_stat`, then `sys_access`.  This is the
+  failure mode donix is *more* at risk of, because its history is
+  "implement the syscall when a feature needs it."
+  `resolve_against_cwd` and `sys_execve`'s shims are already the
+  existing instance of this pattern.
+
+### After it lands — consumers, in order
+
+Each of these is a consumer of the seam, ordered by what it
+unlocks.  None is scheduled yet.
+
+1. **`/dev`** — `/dev/null`, `/dev/tty`, `/dev/urandom`; lets
+   `tty` name its terminal.
+2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
+   ordinary file, hidden entirely inside the seam.  See
+   `open-issues.md` item 9.
+3. **`ln`, `link`, `readlink` with real targets**, and archive
+   symlink restoration (`tar`, `unzip`).
+4. **A mount framework**, if and when a second filesystem exists.
+
+---
+
 ## Kernel hardening and infrastructure
 
 Independent of the shell/framebuffer work.  Roughly in order of
@@ -199,10 +281,6 @@ value.
 
 ### Longer term
 
-- **`/dev` and `/proc`.**  No device nodes, no `/proc`.  `tty`
-  cannot name its terminal (`ttyname(3)` finds neither), and there is
-  no `/dev/null`, `/dev/tty`, or `/dev/urandom`.  A device layer is
-  the prerequisite.  See `open-issues.md`.
 - **Per-process tty / console focus** — prerequisite for multiple
   concurrent shells.
 - **Serial console debug access** — kernel shell over COM1.
@@ -249,7 +327,7 @@ assumed:**
   future milestone (already listed under "Longer term" above).
 - **A VFS.**  Wayland does not require one.  A `wl_shm` client needs
   no device nodes at all; a DRM-backed compositor later can reach
-  `/dev/...` through the existing path layer.  The VFS is on the
+  `/dev/...` through the pathname dispatch seam.  The VFS is on the
   critical path for *donix generally*, not for Wayland.
 
 Revisit when `v0.6.10` opens.
