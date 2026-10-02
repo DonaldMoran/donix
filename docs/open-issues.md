@@ -159,14 +159,22 @@ a `dup`'d chain stop waking the peer and the peer hangs until a
 keystroke — read the `put_file_slot` comment and this entry before
 touching either).
 
-  **`vmm_map_page_in_cr3`/`vmm_map_page` still silently return
-  without mapping when a page-table allocation fails** (the
-  split-path instance is fixed; see item 8).
+**`vmm_map_page_in_cr3`/`vmm_map_page` still silently return
+without mapping when a page-table allocation fails** (the
+split-path instance is fixed; see item 8).
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
 `FEATURE_VI_WIN_RESIZE` re-checking the size; it is `vi`'s behavior,
 harmless, and the reason `vi` fills the screen.  No action.
+
+**no `/dev` and no `/proc`** — `ttyname(3)` cannot name the
+console, so `tty` prints `not a tty`; musl's `ttyname` first tries
+`readlink("/proc/self/fd/N")` (syscall 89, unimplemented) and then
+walks `/dev`, which does not exist.  A device layer plus `/dev`
+entries plus `readlink` would let `tty` print a path.  The same
+gap blocks a `/dev/urandom` fallback for `mktemp` and is a
+prerequisite for anything wanting `/dev/null` or `/dev/tty`.
 
 ### Test-design notes
 
