@@ -4,7 +4,7 @@ Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
 **Last updated:** 2026-10-02 (session 43, closing)
-**Current HEAD:** branch `dev`, **10 commits ahead of `origin/dev`**
+**Current HEAD:** branch `dev`, **13 commits ahead of `origin/dev`**
 (`origin/dev` is at `v0.6.9`, `441229e`).  Nothing pushed since
 `v0.6.9`.
 **Last milestone:** `v0.6.9` (published) — envp, the `/usr/bin`
@@ -13,9 +13,9 @@ four syscalls (`readlink`, `clock_gettime`, `nanosleep`, `munmap`),
 ten busybox applets
 **Milestone status:** **`v0.6.9` shipped and pushed.**  Session 43
 is a tail on it: `realpath` enabled (config-only), the `readlink`
-errno closed by a regression test, and `/dev/null` working for
-`open()` only.  All committed and scratch-tagged; none pushed.
-No milestone has been opened for the post-ship work.
+errno closed by a regression test, and `/dev/null` working across
+`open`/`stat`/`access`.  All committed and scratch-tagged; none
+pushed.  No milestone has been opened for the post-ship work.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -277,7 +277,7 @@ noneya@fedora:~/code/donix$ tree -L 3
 
 ---
 
-## Where we are — `v0.6.9` shipped, three post-ship changes
+## Where we are — `v0.6.9` shipped, four post-ship changes
 
 `v0.6.8` shipped the `*at()` family.  `v0.6.9` opened as **envp**
 and grew, in session 42, into the **`/usr/bin` layout**, the
@@ -286,15 +286,18 @@ and grew, in session 42, into the **`/usr/bin` layout**, the
 gaps**, and **four new gotchas**.  Tagged `v0.6.9`, pushed,
 scratch tags dropped.
 
-Session 43 added three things on top, all committed and
+Session 43 added four things on top, all committed and
 scratch-tagged, none pushed:
 
 - **`realpath` enabled**, config-only (`20261002-realpath`).
 - **`readlink` errno closed by test** (`20261002-readlink-test`).
-- **`/dev/null` works for `open()` only** (`20261002-dev-null`).
+- **`/dev/null` works for `open()`** (`20261002-dev-null`).
+- **`/dev/null` works for `stat` and `access` too**
+  (`20261002-dev-null-stat`) — the match extracted into
+  `path_is_devnull`, one predicate, three call sites.
 
-It also corrected two stale artifacts found along the way:
-`pipe_step1` (`20261002-pipe-step1`) and the gotcha it produced
+It also corrected a stale test found along the way: `pipe_step1`
+(`20261002-pipe-step1`), and the gotcha it produced
 (`20261002-pipe-gotcha`).
 
 ### Session 43, in full
@@ -304,8 +307,9 @@ It also corrected two stale artifacts found along the way:
 | `20261002-realpath` | `CONFIG_REALPATH=y` — enables busybox `realpath`; config-only |
 | `20261002-readlink-test` | `readlink_errno.c` — readlink(2) errno split, 3 checks; closes item 8 |
 | `20261002-dev-null` | `open()` recognizes `/dev/null`; `FILE_KIND_DEV_NULL` |
+| `20261002-dev-null-stat` | `path_is_devnull` shared by open/stat/access; `ls`, `stat`, `test -e` work |
 | `20261002-pipe-step1` | `pipe_step1` EAGAIN assertions removed; they block now, not fail |
-| `20261002-dev-null-docs`, `-readlink-docs`, `-readlink-gotcha`, `-pipe-gotcha`, `-arch-rule`, `-handoff`, `-handoff-repath` | docs |
+| `20261002-dev-null-docs`, `-dev-null-stat-docs`, `-readlink-docs`, `-readlink-gotcha`, `-pipe-gotcha`, `-arch-rule`, `-handoff`, `-handoff-repath`, `-handoff-close` | docs |
 
 **`realpath` — the trace, and two wrong test expectations.**
 `realpath_main` → `xmalloc_realpath_coreutils` → `xmalloc_realpath`
@@ -328,20 +332,32 @@ asserts both answers — 3/3.  Item 8 is closed with a run behind it.
 See `gotchas.md`, "A fix with no test is indistinguishable from an
 unfixed defect."
 
-**`/dev/null` — open() only.**  `open_resolved` recognizes the
-exact path `dev/null` (the `strip_dot_prefix`'d form) and returns
-a `FILE_KIND_DEV_NULL` slot: read returns 0, write returns count,
-close frees, `fstat` reports `S_IFCHR`.  The acceptance line passes:
+**`/dev/null` — from open-only to stat and access.**
+`20261002-dev-null` made `open_resolved` recognize the exact path
+`dev/null` (the `strip_dot_prefix`'d form) and return a
+`FILE_KIND_DEV_NULL` slot: read returns 0, write returns count,
+close frees, `fstat` reports `S_IFCHR`.  `2>/dev/null` became
+silent-and-non-zero.
 
-    $ realpath /no/such/dir/file 2>/dev/null
-    $ echo $?
-    1
+`20261002-dev-null-stat` then found that only `open` knew the path:
+`ls /dev/null`, `test -e /dev/null`, and `stat /dev/null` all still
+failed with ENOENT.  It extracted the inline match into
+`path_is_devnull` and called it from `stat_resolved` and
+`access_resolved` as well — one predicate, three call sites:
 
-Silent, non-zero.  Before the change the same line printed
-`sh: can't create /dev/null: nonexistent directory` and the
-command did not run.  **Deliberately not the dispatch seam**: an
-exact-path check, `open()` only.  `stat`, `access`, `ls`, and
-`test -e` on `/dev/null` all still fail with `ENOENT`.
+    $ ls -l /dev/null
+    crw-rw-rw-    1    0,   0 /dev/null
+    $ test -e /dev/null && echo yes
+    yes
+    $ stat /dev/null
+      File: '/dev/null'
+      ...    character special file
+
+`readlink("/dev/null")` gets `-EINVAL` for free, via
+`access_resolved`.  Still an exact-path predicate, not the dispatch
+seam.  **Boundary:** `readdir("/dev")` fails (no `/dev` directory
+to list), and `/dev/tty` and `/dev/urandom` do not exist, so `tty`
+still prints `not a tty`.
 
 **`pipe_step1` — a test that went stale and hung.**  It asserted
 Step-1 non-blocking semantics (empty read → `-EAGAIN`, full write
@@ -473,10 +489,12 @@ not have — and all three were caught by going to the source.
 - **`readlink` (89) returns `-ENOENT` for a missing path and
   `-EINVAL` for an existing non-symlink**, verified by
   `readlink_errno.c`.  Item 8 closed.
-- **`/dev/null` works for `open()` only.**  `2>/dev/null` is
-  silent and exits non-zero.  `stat`/`access`/`ls` on it still
-  fail with `ENOENT`; an exact-path check in `open_resolved`, not
-  the dispatch seam.
+- **`/dev/null` works for `open`, `stat`, and `access`**, one
+  predicate (`path_is_devnull`) shared by `open_resolved`,
+  `stat_resolved`, and `access_resolved`.  `ls -l /dev/null`
+  shows `crw-rw-rw-`; `readlink` returns `-EINVAL` for free.
+  `readdir("/dev")` fails; no other device exists.  An exact-path
+  predicate, not the dispatch seam.
 
 ### What `v0.6.8` contributed (prior milestone, pushed)
 
@@ -502,10 +520,10 @@ The findings that milestone recorded, still load-bearing:
   runs `cd`, creates no file, prints no error.
 - **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
   `sh: builtin in pipeline not supported`.
-- **`2>/dev/null` works** (session 43), but only for `open()`:
-  `ls /dev/null`, `stat /dev/null`, and `test -e /dev/null` still
-  fail with `ENOENT`.  The full `/dev` layer is a direction, not
-  scheduled.
+- **`/dev/null` works for `open`/`stat`/`access`** (session 43),
+  but `readdir("/dev")` fails (no directory), and no other device
+  exists — so `tty` still prints `not a tty`.  The full `/dev`
+  layer is a direction, not scheduled.
 - **`diff`, `chmod`, `ln`, `mount` are off** — the last three need
   their own syscalls.
 - **`tty` prints `not a tty`.**  Correct for donix: no `/dev`, no
@@ -519,17 +537,17 @@ The findings that milestone recorded, still load-bearing:
 
 ## NEXT SESSION — the `/dev` + `/proc` direction
 
-`realpath`, the `readlink` errno, and `/dev/null`-for-open are all
-done.  The next real work is the **`/dev` and `/proc` device
-layer**.  It is not a scheduled milestone; it is a direction, and
-the session that picks it up plans it then.  What follows is the
-shape, not the schedule.
+`realpath`, the `readlink` errno, and `/dev/null` across
+open/stat/access are all done.  The next real work is the **`/dev`
+and `/proc` device layer**.  It is not a scheduled milestone; it is
+a direction, and the session that picks it up plans it then.  What
+follows is the shape, not the schedule.
 
-What `/dev/null`-for-open did **not** do, and what the direction
+What the `/dev/null` work did **not** do, and what the direction
 still needs:
 
-- **A `/dev` that `stat` and `access` can see.**  Today `/dev/null`
-  is an exact-path special case in `open_resolved`.  `ls /dev/null`
+- **A real `/dev` that `readdir` can list.**  Today `/dev/null` is
+  an exact-path predicate, one name, not a directory.  `ls /dev`
   fails.  A device layer that appears in the path namespace is the
   thing that fixes this, and it is the dispatch seam's job.
 - **`tty` naming its terminal.**  `ttyname(3)` walks
@@ -542,8 +560,9 @@ built.  See `ROADMAP.md`, "Make `/proc` possible."  **/proc is the
 first feature the current architecture cannot express, so it forces
 the seam.**  Symlinks and `/dev` are consumers of it.  Do not
 implement standalone `/dev` handling in individual syscalls — the
-`/dev/null`-for-open check is the one deliberate exception, and it
-is recorded as such, to be deleted when the seam lands.
+`path_is_devnull` predicate and its three call sites are the one
+deliberate exception, and they are recorded as such, to be deleted
+when the seam lands.
 
 ### After that — candidates
 
@@ -672,9 +691,10 @@ stages 39 files.
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
 trace line (removed).  The `FB: mapped N pages ...` line is
 expected.  The `sys_open: f_open FAIL path=...` lines from `vi` on
-a new file and from `busybox stat` on nonexistent paths are
-expected diagnostics.  `sys_execve: f_open FAIL` lines no longer
-appear, and neither do the `f_open FAIL path=dev/null` lines from
+a new file and from `busybox stat` on nonexistent paths (it probes
+`/etc/group`, `/etc/passwd`, `/etc/localtime`) are expected
+diagnostics.  `sys_execve: f_open FAIL` lines no longer appear, and
+neither do the `f_open FAIL path=dev/null` lines from
 `2>/dev/null` — that redirect now succeeds (session 43).
 
 ---
@@ -699,9 +719,9 @@ storage; `prctl` is minimal; busybox applet symlinks not installed;
 syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake; **no `/dev` and no `/proc`
-as path-namespace entries** — `/dev/null` works for `open()` only,
-via a recorded exact-path special case.
+wake is coupled to `sys_close`'s wake; **no `/dev` directory and no
+`/proc`** — `/dev/null` is one name recognized by a predicate in
+`open`/`stat`/`access`, not a listable directory.
 
 ---
 
@@ -765,9 +785,10 @@ needs it.  Paths relative to the tree root
   **Session 42's rows are written, and session 43's rows are folded
   in as a tail on session 42.**
 - `docs/open-issues.md` — full open-issues list.  Session 43
-  sharpened the `/dev` entry with the `2>/dev/null` finding, then
-  recorded `/dev/null` working for open(), and **removed item 8**
-  (the `readlink` errno defect), closed by `readlink_errno.c`.
+  sharpened the `/dev` entry with the `2>/dev/null` finding,
+  recorded `/dev/null` working across open/stat/access, and
+  **removed item 8** (the `readlink` errno defect), closed by
+  `readlink_errno.c`.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
@@ -787,8 +808,9 @@ Newlib is gone.  The userland is a tracked source tree at
 `#PF` fix, four syscalls, and ten busybox applets — tagged and
 pushed.  Session 43 added `realpath` (config-only), closed
 `readlink`'s errno defect with a regression test, and made
-`/dev/null` work for `open()`.  Next: the `/dev`+`/proc` direction,
-which forces the pathname dispatch seam.  One change at a time.**
+`/dev/null` work across open, stat, and access.  Next: the
+`/dev`+`/proc` direction, which forces the pathname dispatch seam.
+One change at a time.**
 
 ---
 
