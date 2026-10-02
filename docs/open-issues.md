@@ -80,6 +80,63 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
+8. **`vmm_map_page_in_cr3` and `vmm_map_page` silently abandon a
+   mapping when a page-table allocation fails.**  Both functions
+   walk the page tables and, at each level, call
+   `pmm_alloc_page_for_tables()` if the next table does not exist.
+   Every one of those calls is followed by `if (!phys) return;` —
+   the function gives up without mapping anything, and **the caller
+   has no way to know.**  `elf_load_into_process`, `sys_brk`,
+   `sys_mmap`, and `sys_execve` all call these and treat a return
+   as "the mapping was made."
+
+   The huge-page-split path in `vmm_map_page_in_cr3` was the first
+   of these to be fixed (session 42, tag `20261001-splitfix`),
+   because it was the one with evidence: a silent return there
+   leaves the bootloader's 2 MB **supervisor** identity-map page in
+   place where the caller asked for a **user** page, and the process
+   later faults on a user instruction fetch of `0x400000` —
+
+       === PAGE FAULT (#PF) ===
+         CR2 (Faulting Address) : 0x0000000000400000
+         Raw Error Code         : 0x0000000000000015
+         pde                    : 0x0000000000400083
+         PDE IS 2 MB PAGE, phys base 0x400000
+
+   `0x400083` is present, write, PS, `PT_USER` clear; `0x15` is
+   present + read + user + instruction-fetch.  The split path now
+   halts with a `VMM: FATAL` message instead of returning.
+
+   **The remaining sites are still silent.**  In
+   `vmm_map_page_in_cr3`: the PDPT, PD, and PT allocation paths each
+   have their own `if (!phys) return;`.  In `vmm_map_page`: the same
+   three.  None of them has produced a visible bug yet — a failed
+   allocation there leaves a not-present page rather than a
+   supervisor one, and the caller faults on a *missing* page, which
+   is at least the right kind of fault — but the pattern is the
+   same defect: **a void function that cannot report failure, called
+   by code that assumes success.**
+
+   The fix is one of:
+   - **change the signature** to return an error, and check it at
+     every caller (the honest fix, and the larger one — it touches
+     every `vmm_map_page*` call site in the tree); or
+   - **halt on failure at each site**, as the split path now does
+     (matches the kernel idiom, smaller, but turns a recoverable
+     allocation failure into a dead machine).
+
+   Not urgent: allocation failure during page-table growth has not
+   been observed on a 128 MB machine with the current workload.  But
+   it is a real gap, it is the same shape as the bug we just fixed,
+   and it should be closed deliberately rather than one site at a
+   time as each produces its own confusing fault.
+
+   **Read `gotchas.md`, "A shim's dead code is only dead if you
+   watch it not run," together with this.**  That entry is about a
+   deletion whose consumers were not all found; this is about a
+   *failure path* whose consumers do not check.  Both are
+   "correct only for the cases known at the time."
+
 Also open: Ctrl- `[` not mapped to ESC; `sys_munmap` is a stub
 returning 0; `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
@@ -101,6 +158,10 @@ theory that `put_file_slot` covers everything, non-final closes in
 a `dup`'d chain stop waking the peer and the peer hangs until a
 keystroke — read the `put_file_slot` comment and this entry before
 touching either).
+
+  **`vmm_map_page_in_cr3`/`vmm_map_page` still silently return
+  without mapping when a page-table allocation fails** (the
+  split-path instance is fixed; see item 8).
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
