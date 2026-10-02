@@ -3,20 +3,19 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-02 (session 43, open)
-**Current HEAD:** branch `dev` at `v0.6.9` (tag `v0.6.9` on
-`441229e`), **pushed** — `origin/dev` is at the same commit
+**Last updated:** 2026-10-02 (session 43, closing)
+**Current HEAD:** branch `dev`, **10 commits ahead of `origin/dev`**
+(`origin/dev` is at `v0.6.9`, `441229e`).  Nothing pushed since
+`v0.6.9`.
 **Last milestone:** `v0.6.9` (published) — envp, the `/usr/bin`
 layout, the `execve` shim removal, the huge-page-split `#PF` fix,
 four syscalls (`readlink`, `clock_gettime`, `nanosleep`, `munmap`),
 ten busybox applets
-**Milestone status:** **`v0.6.9` shipped and pushed.**  The bump is
-complete: scratch tags dropped, session-42 rows in
-`docs/session-log.md`, README/ROADMAP/banner refreshed.  Session 43
-is a tail on the shipped milestone: `realpath` enabled (config-only)
-and the `readlink` errno closed by a new regression test.  Both
-committed and scratch-tagged (`20261002-realpath`,
-`20261002-readlink-test`), not yet pushed.
+**Milestone status:** **`v0.6.9` shipped and pushed.**  Session 43
+is a tail on it: `realpath` enabled (config-only), the `readlink`
+errno closed by a regression test, and `/dev/null` working for
+`open()` only.  All committed and scratch-tagged; none pushed.
+No milestone has been opened for the post-ship work.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -278,20 +277,25 @@ noneya@fedora:~/code/donix$ tree -L 3
 
 ---
 
-## Where we are — `v0.6.9` shipped, two post-ship fixes
+## Where we are — `v0.6.9` shipped, three post-ship changes
 
 `v0.6.8` shipped the `*at()` family.  `v0.6.9` opened as **envp**
 and grew, in session 42, into the **`/usr/bin` layout**, the
 **removal of `execve`'s bare-name guess**, a **page-table bug fix**,
 **four new syscalls**, **ten busybox applets**, **three small
-gaps**, and **four new gotchas**.  It is a large milestone, and it
-is done: tagged `v0.6.9`, pushed, scratch tags dropped.
+gaps**, and **four new gotchas**.  Tagged `v0.6.9`, pushed,
+scratch tags dropped.
 
-Session 43 added two things on top, both committed and
-scratch-tagged, neither pushed:
+Session 43 added three things on top, all committed and
+scratch-tagged, none pushed:
 
 - **`realpath` enabled**, config-only (`20261002-realpath`).
 - **`readlink` errno closed by test** (`20261002-readlink-test`).
+- **`/dev/null` works for `open()` only** (`20261002-dev-null`).
+
+It also corrected two stale artifacts found along the way:
+`pipe_step1` (`20261002-pipe-step1`) and the gotcha it produced
+(`20261002-pipe-gotcha`).
 
 ### Session 43, in full
 
@@ -299,6 +303,9 @@ scratch-tagged, neither pushed:
 |---|---|
 | `20261002-realpath` | `CONFIG_REALPATH=y` — enables busybox `realpath`; config-only |
 | `20261002-readlink-test` | `readlink_errno.c` — readlink(2) errno split, 3 checks; closes item 8 |
+| `20261002-dev-null` | `open()` recognizes `/dev/null`; `FILE_KIND_DEV_NULL` |
+| `20261002-pipe-step1` | `pipe_step1` EAGAIN assertions removed; they block now, not fail |
+| `20261002-dev-null-docs`, `-readlink-docs`, `-readlink-gotcha`, `-pipe-gotcha`, `-arch-rule`, `-handoff`, `-handoff-repath` | docs |
 
 **`realpath` — the trace, and two wrong test expectations.**
 `realpath_main` → `xmalloc_realpath_coreutils` → `xmalloc_realpath`
@@ -309,12 +316,6 @@ scratch-tagged, neither pushed:
 exists, so `xmalloc_realpath_coreutils`'s `ENOENT` fallback
 succeeds.  The failing case is a path whose parent does not exist.
 The diagnostic goes to stderr.
-
-**The `/dev` finding.**  `2>/dev/null` does not merely fail to
-discard stderr — it stops the command from running.  The shell
-opens the redirect target before forking; the open fails; the whole
-command is abandoned.  Recorded in `open-issues.md`, with the
-acceptance test for the device layer.
 
 **`readlink` errno — the fix was already in.**  `sys_readlink`
 returned `-ENOENT` for a missing path and `-EINVAL` for an existing
@@ -327,12 +328,37 @@ asserts both answers — 3/3.  Item 8 is closed with a run behind it.
 See `gotchas.md`, "A fix with no test is indistinguishable from an
 unfixed defect."
 
-**The lesson of the session.**  Reading the source before enabling
-caught a stale assertion in the instructions (`realpath`), and the
-same habit — reading the code rather than the doc — would have
-caught the second stale assertion (`readlink` item 8) before the
-session spent rounds on it.  Both are the same shape: a document
-asserting a state the repository does not have.
+**`/dev/null` — open() only.**  `open_resolved` recognizes the
+exact path `dev/null` (the `strip_dot_prefix`'d form) and returns
+a `FILE_KIND_DEV_NULL` slot: read returns 0, write returns count,
+close frees, `fstat` reports `S_IFCHR`.  The acceptance line passes:
+
+    $ realpath /no/such/dir/file 2>/dev/null
+    $ echo $?
+    1
+
+Silent, non-zero.  Before the change the same line printed
+`sh: can't create /dev/null: nonexistent directory` and the
+command did not run.  **Deliberately not the dispatch seam**: an
+exact-path check, `open()` only.  `stat`, `access`, `ls`, and
+`test -e` on `/dev/null` all still fail with `ENOENT`.
+
+**`pipe_step1` — a test that went stale and hung.**  It asserted
+Step-1 non-blocking semantics (empty read → `-EAGAIN`, full write
+→ `-EAGAIN`).  Steps 2/3 made read and write block, so re-running
+the assertions hangs rather than fails: the blocked reader has
+nothing to wake it.  Found by running the pipe suite per the
+`open-issues.md` rule; the suite had not been run since session 36.
+Removed the EAGAIN checks; the empty/full behavior is covered by
+`pipe_step2`/`pipe_step3`/`pipe_step3b`, which fork a peer.  See
+`gotchas.md`, "A test can encode an earlier version's behavior."
+
+**The lesson of the session.**  Three stale artifacts were found by
+reading the source rather than the doc: the handoff's `realpath`
+expectation, `open-issues.md` item 8 (a fix that was already in),
+and `pipe_step1` (a test from six sessions earlier).  All three are
+the same shape — an artifact asserting a state the repository does
+not have — and all three were caught by going to the source.
 
 ### Session 42, in full
 
@@ -447,6 +473,10 @@ asserting a state the repository does not have.
 - **`readlink` (89) returns `-ENOENT` for a missing path and
   `-EINVAL` for an existing non-symlink**, verified by
   `readlink_errno.c`.  Item 8 closed.
+- **`/dev/null` works for `open()` only.**  `2>/dev/null` is
+  silent and exits non-zero.  `stat`/`access`/`ls` on it still
+  fail with `ENOENT`; an exact-path check in `open_resolved`, not
+  the dispatch seam.
 
 ### What `v0.6.8` contributed (prior milestone, pushed)
 
@@ -472,12 +502,10 @@ The findings that milestone recorded, still load-bearing:
   runs `cd`, creates no file, prints no error.
 - **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
   `sh: builtin in pipeline not supported`.
-- **`2>/dev/null` does not work, and worse, it stops the command
-  from running.**  The redirect target cannot be opened, so the
-  shell abandons the whole command.  See `open-issues.md`, the
-  `/dev` entry; the acceptance test for the device layer is
-  `realpath /no/such/dir/file 2>/dev/null` exiting non-zero,
-  silently.
+- **`2>/dev/null` works** (session 43), but only for `open()`:
+  `ls /dev/null`, `stat /dev/null`, and `test -e /dev/null` still
+  fail with `ENOENT`.  The full `/dev` layer is a direction, not
+  scheduled.
 - **`diff`, `chmod`, `ln`, `mount` are off** — the last three need
   their own syscalls.
 - **`tty` prints `not a tty`.**  Correct for donix: no `/dev`, no
@@ -489,18 +517,21 @@ The findings that milestone recorded, still load-bearing:
 
 ---
 
-## NEXT SESSION — open the `/dev` + `/proc` direction
+## NEXT SESSION — the `/dev` + `/proc` direction
 
-`realpath` and the `readlink` errno fix are done.  The next real
-work is the **`/dev` and `/proc` device layer**.  It is not a
-scheduled milestone; it is a direction, and the session that picks
-it up plans it then.  What follows is the shape, not the schedule.
+`realpath`, the `readlink` errno, and `/dev/null`-for-open are all
+done.  The next real work is the **`/dev` and `/proc` device
+layer**.  It is not a scheduled milestone; it is a direction, and
+the session that picks it up plans it then.  What follows is the
+shape, not the schedule.
 
-What it unblocks, concretely:
+What `/dev/null`-for-open did **not** do, and what the direction
+still needs:
 
-- **`/dev/null` first.**  Its acceptance test already exists:
-  `realpath /no/such/dir/file 2>/dev/null` must exit non-zero,
-  silently.  Today the command does not run at all.
+- **A `/dev` that `stat` and `access` can see.**  Today `/dev/null`
+  is an exact-path special case in `open_resolved`.  `ls /dev/null`
+  fails.  A device layer that appears in the path namespace is the
+  thing that fixes this, and it is the dispatch seam's job.
 - **`tty` naming its terminal.**  `ttyname(3)` walks
   `/proc/self/fd/N` then `/dev`.  Both fail today; with either one
   present, `tty` can print a path instead of `not a tty`.
@@ -510,8 +541,9 @@ This is item 1's customer and the reason the dispatch seam gets
 built.  See `ROADMAP.md`, "Make `/proc` possible."  **/proc is the
 first feature the current architecture cannot express, so it forces
 the seam.**  Symlinks and `/dev` are consumers of it.  Do not
-implement standalone `/dev` handling in individual syscalls — that
-is the technical debt the seam exists to prevent.
+implement standalone `/dev` handling in individual syscalls — the
+`/dev/null`-for-open check is the one deliberate exception, and it
+is recorded as such, to be deleted when the seam lands.
 
 ### After that — candidates
 
@@ -616,13 +648,18 @@ find `/usr/bin/CANARY`.
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
-    pipe_step1    # object + non-blocking I/O
+    pipe_step1    # create, round-trip, close, re-close EBADF
+                  # (no blocking assertions; see below)
     pipe_step2    # blocking + directed wake
     pipe_step3    # EOF, EPIPE, dup-aware counts
     pipe_step3b   # exit-path wake
 
 Run these when changing `sys_read`/`sys_write`/`sys_close`/
 `put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
+**Run them, do not just read the rule** — the suite went six
+sessions without being run after a `sys_read`/`sys_write` change,
+and `pipe_step1` went stale and hung.  See `docs/gotchas.md`, "A
+test can encode an earlier version's behavior."
 
 **New tests must be added to both `USERLAND_ELFS` and the
 `mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image now
@@ -635,9 +672,10 @@ stages 39 files.
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
 trace line (removed).  The `FB: mapped N pages ...` line is
 expected.  The `sys_open: f_open FAIL path=...` lines from `vi` on
-a new file, from `busybox stat` on nonexistent paths, and from
-`2>/dev/null` (the `/dev` gap) are expected diagnostics.
-`sys_execve: f_open FAIL` lines no longer appear.
+a new file and from `busybox stat` on nonexistent paths are
+expected diagnostics.  `sys_execve: f_open FAIL` lines no longer
+appear, and neither do the `f_open FAIL path=dev/null` lines from
+`2>/dev/null` — that redirect now succeeds (session 43).
 
 ---
 
@@ -661,8 +699,9 @@ storage; `prctl` is minimal; busybox applet symlinks not installed;
 syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake; **no `/dev`, no `/proc` —
-and `2>/dev/null` stops the command from running.**
+wake is coupled to `sys_close`'s wake; **no `/dev` and no `/proc`
+as path-namespace entries** — `/dev/null` works for `open()` only,
+via a recorded exact-path special case.
 
 ---
 
@@ -715,9 +754,10 @@ needs it.  Paths relative to the tree root
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
 - `docs/gotchas.md` — every bug writeup, by subsystem.  Session 43
-  added "A fix with no test is indistinguishable from an unfixed
-  defect."  Session 42 added "The kernel stack is 16 KB," "A shim's
-  dead code is only dead if you watch it not run," "An input-only
+  added "A test can encode an earlier version's behavior" and "A
+  fix with no test is indistinguishable from an unfixed defect."
+  Session 42 added "The kernel stack is 16 KB," "A shim's dead
+  code is only dead if you watch it not run," "An input-only
   `syscall` asm block does not tell GCC that `%rax` is
   overwritten," and "A hand-counted string length in a syscall
   wrapper will be wrong."
@@ -725,9 +765,9 @@ needs it.  Paths relative to the tree root
   **Session 42's rows are written, and session 43's rows are folded
   in as a tail on session 42.**
 - `docs/open-issues.md` — full open-issues list.  Session 43
-  sharpened the `/dev` entry with the `2>/dev/null` finding and
-  **removed item 8** (the `readlink` errno defect), closed by
-  `readlink_errno.c`.
+  sharpened the `/dev` entry with the `2>/dev/null` finding, then
+  recorded `/dev/null` working for open(), and **removed item 8**
+  (the `readlink` errno defect), closed by `readlink_errno.c`.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
@@ -745,10 +785,10 @@ Newlib is gone.  The userland is a tracked source tree at
 `v0.6.8` shipped the `*at()` family; `v0.6.9` shipped envp, the
 `/usr/bin` layout, the `execve` shim removal, the huge-page-split
 `#PF` fix, four syscalls, and ten busybox applets — tagged and
-pushed.  Session 43 enabled `realpath` (config-only) and closed
-`readlink`'s errno defect with a regression test.  Next: open the
-`/dev`+`/proc` direction, starting with `/dev/null` and the
-`2>/dev/null` acceptance test.  One change at a time.**
+pushed.  Session 43 added `realpath` (config-only), closed
+`readlink`'s errno defect with a regression test, and made
+`/dev/null` work for `open()`.  Next: the `/dev`+`/proc` direction,
+which forces the pathname dispatch seam.  One change at a time.**
 
 ---
 
@@ -774,8 +814,12 @@ A document assembled from parts carries the state of each part,
 not the state of the whole.  This is the same lesson as "read the
 diff, not the subject."
 
-**A fix with no test is a fix nobody can confirm.**  Session 43
-found `sys_readlink` returning the right errnos while three docs
-said it did not; the fix had been in the tree, untested, since
-session 42.  See `docs/gotchas.md`.  When a doc entry names its
-own fix, `grep` for the fix before scheduling the work.
+**Two session-43 gotchas worth reading before the next change.**
+"A fix with no test is indistinguishable from an unfixed defect":
+`sys_readlink` was correct while three docs said it was not; when
+a doc entry names its own fix, `grep` before scheduling the work.
+"A test can encode an earlier version's behavior": `pipe_step1`'s
+EAGAIN assertions were Step-1 semantics, and after read/write
+began blocking they hung instead of failing.  Run the suite a
+change's own rule names, or the staleness is invisible.  See
+`docs/gotchas.md`.
