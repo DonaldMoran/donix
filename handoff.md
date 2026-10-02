@@ -431,9 +431,11 @@ The findings that milestone recorded, still load-bearing:
 
 ## NEXT SESSION — `realpath`, then the `/dev` layer
 
-**This session's task: enable busybox `realpath`.**  It is
-config-only now — `readlink` (89) landed in session 42, which was
-its only blocker.  One config line, one rebuild, one canary run.
+This session's task: enable busybox realpath. It is config-only: it 
+routes through musl's realpath(), which uses lstat + readlink + getcwd, 
+all present. (readlink alone was never the blocker — see open-issues.md 
+item 8 for the errno defect this surfaced.) One config line, one 
+rebuild, one canary run.
 This closes out the session-42 applet work with no kernel change.
 
 Do it in this order:
@@ -467,6 +469,10 @@ mid-`realpath`.
 
 ### After that — candidates
 
+- /proc + the pathname dispatch seam — the next major milestone; see 
+  ROADMAP.md, "Make /proc possible." /proc is the first feature the 
+  current architecture cannot express, so it forces the seam. 
+  Symlinks and /dev are consumers of it.
 - **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `open-issues.md`
   item 5.  Also the prerequisite for job control, `kill(2)`, and a
   Wayland `wl_shm` client's `SIGBUS`.
@@ -486,8 +492,9 @@ mid-`realpath`.
 
 **All the applets in the handoff's original "Ready now" and "Needs
 one small syscall" tables are now ENABLED, except `realpath`.**
-`realpath` is this session's task (config-only now).  The tables
-below are kept for the record and for the still-off ones.
+`realpath` is this session's task (config-only — routes through musl's 
+realpath()).  The tables below are kept for the record and for the 
+still-off ones.
 
 ### Enabled in session 42
 
@@ -503,7 +510,7 @@ Syscalls added to unblock them: `readlink` (89), `clock_gettime`
 
 | Config | Applet | Blocked by |
 |---|---|---|
-| `CONFIG_REALPATH` | `realpath` | **this session's task**; config-only now (`readlink` done) |
+| `CONFIG_REALPATH` | `realpath` | **this session's task**; config-only — routes through musl's realpath(); not yet enabled |
 | `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous `mmap`); deliberate |
 | `CONFIG_CHMOD` | `chmod` | `chmod`/`fchmodat`; FAT has no permissions |
 | `CONFIG_CHOWN` | `chown` | `chown`/`fchownat`; FAT has no ownership |
