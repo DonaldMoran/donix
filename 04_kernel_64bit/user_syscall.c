@@ -5426,10 +5426,83 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
 }
 
 /*
- * Linux x86_64 munmap(2) — stub.  Return 0 (nothing to unmap yet).
+ * Linux x86_64 munmap(2) — syscall 11.
+ *
+ * Unmap a range of pages and free their physical frames.
+ *
+ * WHY THIS IS NOT A STUB.  It was one until now, on the theory that
+ * nothing called it.  That was wrong: musl's mallocng allocator
+ * calls munmap in two places --
+ *
+ *   mallocng/free.c:  free() of a block large enough that mallocng
+ *                     gave it a dedicated mapping unmaps that
+ *                     mapping when the group is released.
+ *   mallocng/malloc.c: on alloc_meta() failure, mmap()'s result is
+ *                     unmapped to avoid leaking it.
+ *
+ * Both describe WHOLE mappings that mmap returned, page-aligned.
+ * A stub returning 0 told free() the memory was released when it
+ * was not -- a leak, not a no-op.  Nothing has tripped over it
+ * yet because the arena is reused, but the call is real.
+ *
+ * WHAT IT DOES.  For each page in [addr, addr+length):
+ *   - resolve the physical frame via vmm_get_phys_from_cr3;
+ *   - skip it if not present (Linux tolerates unmapping holes);
+ *   - unmap it in the calling process's address space;
+ *   - remove the frame from pcb->elf_page_list so process exit does
+ *     not free it a second time;
+ *   - pmm_free_page it.
+ *
+ * The elf_page_list removal is a swap with the last element plus a
+ * decrement -- the list is an unordered array of physical addresses
+ * and nothing depends on its order (see exec_free_and_unmap_user_pages,
+ * which only iterates it).  O(1), no shift.
+ *
+ * SCOPE.  donix's sys_mmap only ever maps anonymous pages into the
+ * 4 MB window at MMAP_BASE (0x8010000000).  This unmaps whatever
+ * range it is given, but the only real caller's ranges are inside
+ * that window.  If a future mmap ever maps elsewhere, this still
+ * works: it unmaps by address, not by window.  It does NOT split
+ * huge pages, so unmapping a range covered by a 2 MB page would be
+ * wrong -- but the mmap window is above the bootloader's identity
+ * map and has no huge pages.  If mmap ever reaches a huge-page
+ * region, this needs the same split logic vmm_map_page_in_cr3 has.
+ *
+ * ABI:
+ *   arg0  void*   addr    (need not be page-aligned; Linux rounds down)
+ *   arg1  size_t  length  (rounded up to a page)
+ *   returns  0 on success, -EINVAL on length == 0 or no current process.
  */
 long sys_munmap(void* addr, size_t length) {
-    (void)addr; (void)length;
+    if (length == 0) return -(long)EINVAL_;
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    uint64_t start = (uint64_t)addr & ~0xFFFULL;
+    uint64_t end   = ((uint64_t)addr + length + 0xFFFULL) & ~0xFFFULL;
+    if (end <= start) return 0;
+
+    for (uint64_t va = start; va < end; va += 0x1000) {
+        uint64_t phys = vmm_get_phys_from_cr3(self->cr3, va);
+        if (!phys) continue;      /* hole: Linux tolerates it */
+        phys &= ~0xFFFULL;
+
+        vmm_unmap_page_in_cr3(self->cr3, va);
+
+        /* Drop the frame from elf_page_list so exit does not free it
+         * twice.  Swap-with-last; the list is unordered. */
+        for (uint64_t i = 0; i < self->elf_num_pages; i++) {
+            if (self->elf_page_list[i] == phys) {
+                self->elf_page_list[i] =
+                    self->elf_page_list[self->elf_num_pages - 1];
+                self->elf_num_pages--;
+                break;
+            }
+        }
+
+        pmm_free_page(phys);
+    }
     return 0;
 }
 
