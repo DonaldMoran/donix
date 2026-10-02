@@ -408,6 +408,31 @@ static int path_is_root(const char* p) {
 }
 
 /*
+ * True if `p` names /dev/null.
+ *
+ * `p` must be the STRIPPED form: strip_dot_prefix has already
+ * turned "/dev/null" into "dev/null".  Exact match only -- there
+ * is no /dev directory and no other device.
+ *
+ * This is the ONE definition of the /dev/null match, shared by
+ * open_resolved, stat_resolved, and access_resolved.  A recorded
+ * special case, not the dispatch seam: when the pathname dispatch
+ * seam lands for /proc (see ROADMAP.md), this predicate and its
+ * three call sites are deleted together, as the seam's first /dev
+ * consumer.
+ *
+ * No libc string functions are used anywhere in this file, so the
+ * compare is a manual loop.
+ */
+static int path_is_devnull(const char* p) {
+    static const char devnull[] = "dev/null";
+    for (int i = 0; devnull[i]; i++) {
+        if (p[i] != devnull[i]) return 0;
+    }
+    return p[sizeof(devnull) - 1] == '\0';
+}
+
+/*
  * Strip leading "./" and "/" components from a FatFs path, in place.
  *
  * FatFs accepts "0:/NAME", "0:NAME", and bare "NAME", but rejects
@@ -1532,40 +1557,27 @@ static long open_resolved(const char* in_path, int flags) {
     /*
      * /dev/null -- a recorded special case, not the dispatch seam.
      *
-     * Matched on the STRIPPED form: strip_dot_prefix has already
-     * turned "/dev/null" into "dev/null".  Exact match only; there
-     * is no /dev directory and no other device.
+     * The match lives in path_is_devnull, shared with stat_resolved
+     * and access_resolved so the exception is one definition rather
+     * than three copies.  Read returns 0 (EOF), write returns the
+     * byte count and discards, close frees the slot, and stat/fstat
+     * report S_IFCHR.
      *
-     * Read returns 0 (EOF), write returns the byte count and
-     * discards, close frees the slot, and fstat reports S_IFCHR.
-     * stat() and access() do NOT know about this path -- they still
-     * go to FatFs and fail with ENOENT.  That boundary is
-     * deliberate: open() is what the 2>/dev/null redirect needs,
-     * and nothing else is claimed.
-     *
-     * When the pathname dispatch seam lands for /proc, this check
-     * becomes the seam's first /dev consumer.  See ROADMAP.md,
+     * When the pathname dispatch seam lands for /proc, path_is_devnull
+     * and its three call sites are deleted together.  See ROADMAP.md,
      * "Make /proc possible."
      */
-    {
-        static const char devnull[] = "dev/null";
-        int is_devnull = 1;
-        for (int i = 0; devnull[i]; i++) {
-            if (local_path[i] != devnull[i]) { is_devnull = 0; break; }
-        }
-        if (is_devnull && local_path[sizeof(devnull) - 1] == '\0') {
-            file_slot_t* dslot = NULL;
-            int dfd = alloc_file_slot(&dslot);
-            if (dfd == -1) return -(long)EIO_;
-            dslot->kind = FILE_KIND_DEV_NULL;
-            /* obj stays NULL; refcount is 1 from alloc_file_slot. */
-            FDTRACE({ serial_print("open  dev/null -> fd=");
-                      serial_print_dec((uint64_t)dfd);
-                      serial_print(" kind=DEV_NULL"); });
-            return dfd;
-        }
+    if (path_is_devnull(local_path)) {
+        file_slot_t* dslot = NULL;
+        int dfd = alloc_file_slot(&dslot);
+        if (dfd == -1) return -(long)EIO_;
+        dslot->kind = FILE_KIND_DEV_NULL;
+        /* obj stays NULL; refcount is 1 from alloc_file_slot. */
+        FDTRACE({ serial_print("open  dev/null -> fd=");
+                  serial_print_dec((uint64_t)dfd);
+                  serial_print(" kind=DEV_NULL"); });
+        return dfd;
     }
-
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
     if (fd == -1) return -(long)EIO_;
@@ -2545,7 +2557,24 @@ static long stat_resolved(const char* abs_path, void* user_stat) {
         }
         return 0;
     }
-
+    /*
+     * /dev/null -- report a character device, matching what
+     * sys_fstat_body already returns for an open devnull fd, so
+     * stat() and fstat() agree.  See path_is_devnull.
+     */
+    if (path_is_devnull(path)) {
+        kernel_stat_t st;
+        for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
+        st.st_nlink   = 1;
+        st.st_blksize = 512;
+        st.st_mode    = KSTAT_IFCHR | 0666;
+        st.st_size    = 0;
+        st.st_blocks  = 0;
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
     FILINFO fno;
     FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
@@ -2682,7 +2711,10 @@ static long access_resolved(const char* abs_path) {
     if (path_is_root(path)) {
         return 0;
     }
-
+    /* /dev/null exists.  See path_is_devnull. */
+    if (path_is_devnull(path)) {
+        return 0;
+    }
     FILINFO fno;
     FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
