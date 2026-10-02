@@ -1,3 +1,93 @@
+## A fix with no test is indistinguishable from an unfixed defect
+
+*Session 43 (`readlink` errno), commit `20261002-readlink-test`.
+Not a kernel bug -- a stale claim in three docs, and a fix that
+had been in the tree, untested, since session 42.*
+
+`open-issues.md` item 8 described a defect: `sys_readlink` returns
+`-EINVAL` for every input, including paths that do not exist.
+Linux distinguishes `-ENOENT` (the path does not exist) from
+`-EINVAL` (the path exists but is not a symlink).  The item
+carried a described fix -- "resolve the path first; return
+`-ENOENT` if it does not resolve, `-EINVAL` if it does" -- and a
+required new regression test.
+
+**The fix was already in the tree.**  `sys_readlink` had been
+resolving the path since the session-42 readlink commit:
+
+    long exists = access_resolved(resolved);
+    if (exists != 0) return exists;   /* -ENOENT */
+    ...
+    return -(long)EINVAL_;
+
+That is exactly the described fix, written and compiled.  The
+item, the handoff, and the ROADMAP all still said it was open.
+
+**Why nothing noticed.**  No applet in the current set calls
+`readlink(2)`.  The only consumer is musl's `ttyname(3)`, which
+tries `readlink("/proc/self/fd/N")` then walks `/dev` -- and
+neither `/proc` nor `/dev` exists, so `ttyname` returns NULL
+either way.  It can never distinguish the two errnos, so it could
+never tell whether the kernel's answer was right.  A fix with no
+consumer has no test, and a fix with no test is a fix nobody can
+confirm.
+
+**The session that found it went looking for the fix.**  Session
+43 opened `open-issues.md`, read item 8, and started scheduling a
+kernel change that had already been made.  The rounds spent
+"verifying state" were spent looking for the source of a defect
+that was not present.
+
+**How the evidence was actually in hand, and read past.**  The
+session-43 `realpath` trace had shown that libbb's
+`xmalloc_readlink` collapses every `readlink` error to NULL before
+any branch can distinguish `ENOENT` from `EINVAL`.  That collapse
+is only *observable* if the kernel is returning the two errnos
+differently -- if the kernel returned `-EINVAL` for everything, as
+item 8 claimed, the collapse would have been a no-op and the
+`/nonexistent` fallback branch in `xmalloc_realpath_coreutils`
+would have taken the same path either way.  The trace was
+evidence the fix was in.  It was written up as "item 8 does not
+affect realpath's output," which is true, and stopped there.
+
+**The rule.**  A doc entry that describes a defect and its fix is
+a claim that the defect is *currently present*.  Before acting on
+it, check the code.  If the fix is there, the entry is stale, and
+the work is to write the test that proves it and delete the entry
+-- not to write the fix again.
+
+    grep -n "sys_readlink" 04_kernel_64bit/user_syscall.c
+
+One command.  The function body answers whether the fix is in.
+
+**The test that closed it.**  `readlink_errno.c` calls
+`readlink(2)` directly, since no applet does, and asserts both
+answers:
+
+    readlink("/nonexistent")     -> -1, errno == ENOENT
+    readlink("/usr/bin/HELLO")   -> -1, errno == EINVAL
+    readlink("/")                -> -1, errno == EINVAL
+
+All three pass.  Item 8 is closed with a run behind the claim,
+not a reading.
+
+**Where this shape recurs.**  Same family as "A consumer inferred
+from behavior is not a consumer" (session 40), in the opposite
+direction.  That entry is about a *feature* believed to have a
+consumer it did not have.  This one is about a *defect* believed
+to be present when the fix had already landed.  Both are claims
+about the state of the source that were never checked against the
+source, and both produced wasted motion -- a syscall written for a
+caller that never made it, a fix looked for that was already
+there.  The check is the same in both: read the source before
+writing the sentence.
+
+**A related tell.**  An open-issues entry that names its own fix
+is one step away from being stale.  If the entry says "the fix is
+X," someone may already have done X, and the entry may be the only
+thing still saying otherwise.  Items that name a fix are worth a
+`grep` before they are worth a work session.
+
 ## A consumer inferred from behavior is not a consumer
 
 *Session 40 (`unlinkat`), commit `20261001-unlinkat`. Not a kernel
