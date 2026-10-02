@@ -115,6 +115,7 @@ void pic_remap(void) {
 volatile uint64_t g_ticks = 0;
 static int g_shift = 0;
 static int g_caps  = 0;
+static int g_ctrl  = 0;
 
 /*
  * Expected-fault protocol for the kernel self-test.  See interrupts.h
@@ -351,9 +352,14 @@ void irq1_handler(void) {
         case 0x2A: case 0x36: g_shift = 1; outb(PIC1_CMD, PIC_EOI); return;
         case 0xAA: case 0xB6: g_shift = 0; outb(PIC1_CMD, PIC_EOI); return;
         case 0x3A: g_caps ^= 1; outb(PIC1_CMD, PIC_EOI); return;
+        /* Ctrl: 0x1D make, 0x9D break (left; the right-Ctrl codes
+         * 0xE0 0x1D are not handled -- the E0 prefix is a separate
+         * concern and left Ctrl is enough for Ctrl-[). */
+        case 0x1D: g_ctrl = 1; outb(PIC1_CMD, PIC_EOI); return;
+        case 0x9D: g_ctrl = 0; outb(PIC1_CMD, PIC_EOI); return;
     }
 
-    char c = scancode_to_ascii(sc, g_shift, g_caps);
+    char c = scancode_to_ascii(sc, g_shift, g_caps, g_ctrl);
     if (c) {
         kbd_buffer_put(c);
         /* Wake any process blocked in sys_read. Currently a no-op:

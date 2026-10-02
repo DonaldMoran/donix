@@ -23,6 +23,6 @@ int  kbd_buffer_has_data(void);
 // Expose our new flush primitive tool to your kernel loader files
 void keyboard_buffer_flush(void);
 
-char scancode_to_ascii(uint8_t sc, int shift, int caps);
+char scancode_to_ascii(uint8_t sc, int shift, int caps, int ctrl);
 
 #endif
