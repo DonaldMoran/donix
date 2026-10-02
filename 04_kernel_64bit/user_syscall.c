@@ -2903,60 +2903,6 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
     return top;
 }
 
-/*
- * Resolve a bare command name to a path under /bin.
- *
- * `in` is a bare name like "busybox" (no '/').  Produces:
- *
- *   with_suffix == 0:  "0:/BIN/NAME"
- *   with_suffix == 1:  "0:/BIN/NAME.ELF"
- *
- * NAME is uppercased, matching the convention exec_resolve_bare_name
- * uses.  FatFs is case-insensitive on lookup, so the uppercase form
- * finds both "busybox" and "BUSYBOX.ELF" on disk.
- *
- * Returns 0 on success, -1 on overflow or if `in` is not a bare name.
- */
-static int exec_resolve_bin_name(const char* in, char* out,
-                                 size_t out_cap, int with_suffix) {
-    /* Callers pass bare names only; reject anything with a slash so
-     * a mistake here does not silently produce a doubled path. */
-    for (const char* p = in; *p; p++) {
-        if (*p == '/') return -1;
-    }
-    if (*in == '\0') return -1;
-
-    size_t blen = 0;
-    while (in[blen]) blen++;
-
-    /* "0:/BIN/" is 7 chars, plus name, plus optional ".ELF", plus NUL. */
-    size_t need = 7 + blen + (with_suffix ? 4 : 0) + 1;
-    if (need > out_cap) return -1;
-
-    out[0] = '0';
-    out[1] = ':';
-    out[2] = '/';
-    out[3] = 'B';
-    out[4] = 'I';
-    out[5] = 'N';
-    out[6] = '/';
-
-    size_t o = 7;
-    for (size_t i = 0; i < blen; i++) {
-        char c = in[i];
-        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-        out[o++] = c;
-    }
-    if (with_suffix) {
-        out[o++] = '.';
-        out[o++] = 'E';
-        out[o++] = 'L';
-        out[o++] = 'F';
-    }
-    out[o] = '\0';
-    return 0;
-}
-
 // ============================================================
 // SYS_EXECVE (59) — Linux execve, in-place
 //
