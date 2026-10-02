@@ -1263,12 +1263,23 @@ static file_slot_t* get_file_slot_any(int fd) {
 #define F_DUPFD_CLOEXEC 1030
 
 long sys_fcntl(int fd, int cmd, unsigned long arg) {
-    file_slot_t* slot;
-    if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
-        slot = get_file_slot_any(fd);
-    } else {
-        slot = get_file_slot(fd, 0);
-    }
+    /*
+     * Every subcommand accepts fds 0, 1, and 2, not just F_DUPFD.
+     *
+     * get_file_slot() refuses fd < 3 by design -- most file
+     * syscalls must not treat stdin/stdout/stderr as ordinary open
+     * files.  But fcntl's flag operations are meaningful on a
+     * redirected stdio fd: after `dup2(file_fd, 0)`, fd 0 is a
+     * real file and F_GETFL/F_SETFL/F_GETFD/F_SETFD on it should
+     * work, as on Linux.
+     *
+     * get_file_slot_any does not weaken the guard anywhere else.
+     * A console sentinel (fd 0/1/2 with nothing dup2'd onto it) is
+     * a valid slot, so the flag cases return 0 for it -- what the
+     * old code did too, via the switch.  A genuinely closed fd
+     * returns NULL and gets EBADF.
+     */
+    file_slot_t* slot = get_file_slot_any(fd);
     if (!slot) {
         FDTRACE({ serial_print("fcntl fd="); serial_print_dec((uint64_t)fd);
                   serial_print(" cmd="); serial_print_dec((uint64_t)cmd);

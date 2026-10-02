@@ -61,6 +61,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/canary.elf \
 	$(USERLAND_BIN)/envp_step1.elf \
 	$(USERLAND_BIN)/envp_helper.elf \
+	$(USERLAND_BIN)/fcntl_lowfd.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -146,6 +147,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/canary.elf"         CANARY ; \
 	mcopy_one "$(USERLAND_BIN)/envp_step1.elf"    ENVP_STEP1 ; \
 	mcopy_one "$(USERLAND_BIN)/envp_helper.elf"   ENVP_HELPER ; \
+	mcopy_one "$(USERLAND_BIN)/fcntl_lowfd.elf"   FCNTL_LOWFD ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
 	@echo "--- staging busybox at /bin/busybox ---"
