@@ -2786,6 +2786,75 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
     return sys_utimensat(dirfd, path, times, 0);
 }
 
+/*
+ * Linux x86_64 readlink(2) — syscall 89.
+ *
+ * Read the target of a symbolic link into a user buffer.
+ *
+ * donix has no symlinks.  FAT has none, and there is no VFS to
+ * provide them.  So for any path that EXISTS, the honest answer is
+ * -EINVAL, which is exactly what Linux returns from readlink(2)
+ * when the path is not a symbolic link.  For a path that does not
+ * exist, -ENOENT, as Linux does.
+ *
+ * WHY THIS EXISTS AT ALL, GIVEN IT ALWAYS FAILS.  musl's
+ * ttyname(3) tries readlink("/proc/self/fd/N") as its fast path
+ * before falling back to walking /dev.  Without a handler here,
+ * that call hit "Unknown syscall: 89" and returned -ENOSYS, which
+ * is noise in every trace and hides real unknown-syscall lines.
+ * Returning -EINVAL is the truth ("there is no such symlink") and
+ * ttyname falls through to the /dev walk exactly as intended.
+ *
+ * THIS DOES NOT MAKE `tty` PRINT A PATH.  After readlink returns
+ * -EINVAL, ttyname walks /dev, which does not exist, returns NULL,
+ * and `tty` still prints "not a tty".  readlink removes the
+ * syscall noise, not the /dev gap.  See docs/open-issues.md, "no
+ * /dev and no /proc".
+ *
+ * ABI:
+ *   arg0  const char* path
+ *   arg1  char*       buf      (user pointer)
+ *   arg2  size_t      bufsiz
+ *   returns  the number of bytes placed in buf on success (never,
+ *            here), or -errno.  -EINVAL for a non-symlink,
+ *            -ENOENT for a missing path, -EFAULT for a bad user
+ *            pointer, -ENAMETOOLONG for an over-long path.
+ *
+ * The path is resolved with resolve_at(AT_FDCWD, ...) so it obeys
+ * the process cwd, exactly as sys_unlink and sys_access do.  No
+ * dirfd: readlink(2) has none (readlinkat(2), 267, is the dirfd
+ * form, and donix does not implement it).
+ */
+long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
+    if (!user_path || !buf) return -(long)EFAULT_;
+
+    char local[USER_PATH_MAX];
+    if (copy_user_string(local, sizeof(local), user_path) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    char resolved[USER_PATH_MAX];
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    if (rr != 0) return rr;
+
+    /* Validate the path exists, so a missing path is -ENOENT and a
+     * present one is -EINVAL (not a symlink).  access_resolved does
+     * exactly this check and returns 0 / -ENOENT; reuse its shape
+     * rather than duplicating the root-alias and stat logic. */
+    long exists = access_resolved(resolved);
+    if (exists != 0) return exists;   /* -ENOENT, or -ENAMETOOLONG */
+
+    /*
+     * The path exists and is not a symbolic link (nothing on FAT
+     * is).  -EINVAL is Linux's answer for readlink on a non-link,
+     * and it is the truthful one here.  bufsiz and buf are not
+     * touched: no bytes are copied, and a caller that passed a
+     * valid buffer gets no partial data.
+     */
+    (void)bufsiz;
+    return -(long)EINVAL_;
+}
+
 // ============================================================
 // execve helpers (used only by sys_execve below)
 // ============================================================
@@ -5631,6 +5700,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();

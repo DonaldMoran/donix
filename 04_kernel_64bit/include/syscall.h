@@ -82,6 +82,7 @@
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
+ *  89  readlink          sys_readlink      (honest -EINVAL: no symlinks)
  * 107  geteuid           sys_geteuid       (returns fixed uid 1000)
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
@@ -157,6 +158,7 @@
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
+#define SYS_READLINK        89
 #define SYS_GETEUID         107
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
@@ -246,6 +248,7 @@ long sys_close(int fd);
 long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_unlink(const char* path);
+long sys_readlink(const char* path, char* buf, size_t bufsiz);
 long sys_rmdir(const char* path);
 long sys_unlinkat(int dirfd, const char* path, int flags);
 long sys_ftruncate(int fd, long length);
