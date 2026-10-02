@@ -55,7 +55,7 @@ static long sys_fstat_body(int fd, void* user_stat);
 static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
-static long access_resolved(const char* abs_path);
+static long access_resolved(const char* abs_path, int backend);
 
 /* ENOTDIR (20) on Linux x86_64.  Guarded, so the block in the
  * sys_chdir section further down is a no-op once this one is seen
@@ -173,17 +173,19 @@ static char g_write_bounce[WRITE_CHUNK];
 /*
  * A /dev/null slot.  obj is NULL; nothing to close or free.
  *
- * DELIBERATELY NOT THE DISPATCH SEAM.  open_resolved recognizes the
- * exact path "dev/null" (after strip_dot_prefix) and returns this
- * kind.  There is no /dev backend, no first-component dispatch, and
- * no stat/access support -- only open().  That is enough for the
- * acceptance test (`realpath /no/such/dir/file 2>/dev/null` exits
- * non-zero, silently) and nothing more.
+ * In this commit, the decision to produce this kind is made by
+ * the DEV backend: dev_lookup() maps "/dev/null" to this kind,
+ * and open_resolved returns it.  Before commit 2, the decision
+ * was made by path_is_devnull(), an exact-path predicate called
+ * from open_resolved, stat_resolved, and access_resolved; that
+ * predicate is deleted now, and its three call sites consult
+ * dev_lookup instead.
  *
- * When /proc forces the pathname dispatch seam into existence
- * (see ROADMAP.md, "Make /proc possible"), this exact-path check
- * becomes the seam's first /dev consumer and is deleted with it.
- * Until then it is a recorded special case, not a pattern to copy.
+ * The name is still the specific kind, not a generic FILE_KIND_DEV:
+ * there is one device, and a generic shape would be designed from
+ * a single example.  Commit 4 (/dev/console) is where a second
+ * device arrives and where a generic FILE_KIND_DEV, if it is
+ * warranted, gets designed against two devices instead of one.
  */
 #define FILE_KIND_DEV_NULL 5
 
@@ -197,13 +199,10 @@ static char g_write_bounce[WRITE_CHUNK];
  *     /proc/...   -> BACKEND_PROC
  *     anything    -> BACKEND_FAT
  *
- * IN THIS COMMIT EVERY CALLER IGNORES THE VALUE.  FAT is the only
- * backend with a handler, and the FAT handler is what the code
- * already did.  A path tagged DEV or PROC still goes to the FAT
- * handler, which is exactly today's behavior: f_open("dev/null")
- * fails with FR_NO_PATH -> -ENOENT, f_open("proc/self/status")
- * fails the same way.  Commits 2 and 3 give DEV and PROC handlers
- * respectively; until then the tag is computed and discarded.
+ * FAT is the only backend with a *handler* today: DEV is a table
+ * of known device names (dev_lookup, below) whose matches produce
+ * FILE_KIND_DEV_NULL slots, and everything else still goes to the
+ * FAT path.  PROC has no handler until commit 3.
  *
  * This is the VFS front door, whether or not it is called that.
  * It is deliberately NOT a VFS: no inode, no vnode, no mount
@@ -443,28 +442,81 @@ static int path_is_root(const char* p) {
 }
 
 /*
- * True if `p` names /dev/null.
+ * The DEV backend's device table.
  *
- * `p` must be the STRIPPED form: strip_dot_prefix has already
- * turned "/dev/null" into "dev/null".  Exact match only -- there
- * is no /dev directory and no other device.
+ * ONE entry today: "null".  /dev/console and /dev/tty are commit
+ * 4's work; each is a row here, and nothing else changes -- that
+ * is the point of the table shape.  The `kind` is the FILE_KIND_*
+ * a matching open() produces.
  *
- * This is the ONE definition of the /dev/null match, shared by
- * open_resolved, stat_resolved, and access_resolved.  A recorded
- * special case, not the dispatch seam: when the pathname dispatch
- * seam lands for /proc (see ROADMAP.md), this predicate and its
- * three call sites are deleted together, as the seam's first /dev
- * consumer.
+ * The name is the component AFTER "/dev/" in the resolved path:
+ * "/dev/null" matches "null", "/dev/console" would match
+ * "console".  The match is by full component, so "/dev/nullx" does
+ * not match "null"; see dev_lookup.
  *
- * No libc string functions are used anywhere in this file, so the
- * compare is a manual loop.
+ * This table is the seam's first consumer.  Before commit 2, the
+ * same decision was made by path_is_devnull(), a single exact-path
+ * predicate called from open_resolved, stat_resolved, and
+ * access_resolved.  That predicate is gone; those three call
+ * dev_lookup instead.  The change is one definition and one
+ * lookup replacing one definition and three call sites -- the
+ * shape docs/strategy.md asks for ("build exactly the seam the
+ * feature needs"), not a VFS.
  */
-static int path_is_devnull(const char* p) {
-    static const char devnull[] = "dev/null";
-    for (int i = 0; devnull[i]; i++) {
-        if (p[i] != devnull[i]) return 0;
+static const struct {
+    const char* name;
+    uint32_t    kind;
+} g_dev_table[] = {
+    { "null", FILE_KIND_DEV_NULL },
+};
+#define G_DEV_TABLE_LEN (sizeof(g_dev_table) / sizeof(g_dev_table[0]))
+
+/*
+ * Look up a resolved absolute path in the DEV backend's table.
+ *
+ * `abs_path` is a path that came from resolve_at and whose backend
+ * is BACKEND_DEV.  It has a leading '/' -- this is the *unstripped*
+ * resolved form, because resolve_at computes the backend BEFORE
+ * strip_dot_prefix runs, and the three callers strip at different
+ * points.  So this function does its own leading-'/' skip and does
+ * NOT assume strip_dot_prefix has or has not run.
+ *
+ * Returns the FILE_KIND_* for a known device, or 0 if the path is
+ * not a DEV entry the table knows (e.g. "/dev/tty" before commit
+ * 4, or "/dev" alone, or "/dev/null/x").  A return of 0 is "DEV
+ * backend, but no such device" and the caller treats it the way it
+ * treats any other unresolved path.
+ *
+ * The match is by FULL COMPONENT: "/dev/null" matches "null";
+ * "/dev/nullx" does not; "/dev/null/x" does not (a file under a
+ * device is not the device).  No libc string functions, matching
+ * this file's convention.
+ */
+static uint32_t dev_lookup(const char* abs_path) {
+    if (abs_path[0] != '/') return 0;
+
+    /* Skip "/dev/". */
+    const char* p = abs_path + 1;
+    if (!(p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == '/')) {
+        return 0;
     }
-    return p[sizeof(devnull) - 1] == '\0';
+    const char* name = p + 4;   /* after "dev/" */
+
+    /* Empty component: "/dev/" alone is not a device. */
+    if (name[0] == '\0') return 0;
+
+    for (size_t i = 0; i < G_DEV_TABLE_LEN; i++) {
+        const char* entry = g_dev_table[i].name;
+        size_t j = 0;
+        while (entry[j] && name[j] == entry[j]) j++;
+        /* Full match: the entry ended AND the path component ended
+         * (either at the string end or at a '/' -- but a '/' means
+         * there is more path, so only '\0' counts). */
+        if (entry[j] == '\0' && name[j] == '\0') {
+            return g_dev_table[i].kind;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -785,7 +837,7 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * path is treated as FAT, which is the pre-seam behavior.
  *
  * No libc string functions, matching this file's convention (see
- * the comment on path_is_devnull).  Manual compare.
+ * the comment on dev_lookup).  Manual compare.
  */
 static int path_backend(const char* abs_path) {
     if (abs_path[0] != '/') return BACKEND_FAT;
@@ -861,8 +913,8 @@ static int resolve_at(int dirfd, const char* path,
              * resolve_against_cwd returns -1 on overflow (its only
              * failure).  Map that to ENAMETOOLONG, not EINVAL: an
              * over-long path is a path-length error, and Linux
-             * returns ENAMETOOLONG for it.  The four callers this
-             * commit moves off resolve_against_cwd (sys_access,
+             * returns ENAMETOOLONG for it.  The four callers
+             * commit 1 moved off resolve_against_cwd (sys_access,
              * sys_chdir, sys_mkdir, sys_rename) already mapped it
              * to ENAMETOOLONG themselves; this makes resolve_at
              * agree with them.  sys_open / sys_openat /
@@ -967,6 +1019,18 @@ static void fill_kstat_as_root(kernel_stat_t* st) {
     st->st_nlink   = 1;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFDIR | 0755;
+    st->st_size    = 0;
+    st->st_blocks  = 0;
+}
+
+/* Fill a kernel_stat_t describing a DEV backend character device.
+ * This is what /dev/null reports, and what commit 4's
+ * /dev/console would report (with different st_dev/st_ino). */
+static void fill_kstat_as_chardev(kernel_stat_t* st) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFCHR | 0666;
     st->st_size    = 0;
     st->st_blocks  = 0;
 }
@@ -1390,8 +1454,7 @@ static file_slot_t* get_file_slot_any(int fd) {
  *
  * musl's opendir() calls
  *     fcntl(fd, F_SETFD, FD_CLOEXEC)
- * after opening the directory, and treats a failure as fatal: it
- * closes the fd, frees the DIR, and returns NULL.  busybox's `ls`
+ * after opening the directory, and treats a failure as fatal: it * closes the fd, frees the DIR, and returns NULL.  busybox's `ls`
  * then unwinds through its own error path and, in the build we
  * have, hits a musl a_crash() (an `hlt` in user mode -> #GP).
  *
@@ -1637,16 +1700,50 @@ long sys_pipe(int* user_pipefd) {
  * absolute Unix-form path (from resolve_at or a direct caller).
  *
  * sys_open and sys_openat both funnel into this; it is where the
- * FatFs translation, the DIR-vs-FILE decision, and the fd
- * allocation live.  It does NOT resolve a cwd or a dirfd -- the
- * caller has done that with resolve_at.
+ * FatFs translation, the DIR-vs-FILE decision, the DEV backend
+ * dispatch, and the fd allocation live.  It does NOT resolve a cwd
+ * or a dirfd -- the caller has done that with resolve_at.
  *
  * `in_path` must be absolute (leading '/') or a FatFs-form path
  * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
+ *
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
+ * the path goes to the DEV backend: dev_lookup is consulted and a
+ * match produces the corresponding device slot without touching
+ * FatFs.  A path with BACKEND_DEV and no matching table entry
+ * falls through to the FAT path, which is what produced -ENOENT
+ * for unknown /dev paths before commit 2 as well.
  */
-static long open_resolved(const char* in_path, int flags) {
+static long open_resolved(const char* in_path, int flags, int backend) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EFAULT_;
+
+    /*
+     * DEV backend.  The match is against the UNSTRIPPED resolved
+     * path (in_path), because dev_lookup expects the leading '/'
+     * form and the strip below has not run yet.
+     *
+     * If the path is a known device, return its slot and be done.
+     * If not -- "/dev/tty" before commit 4, "/dev" alone, or
+     * anything else under /dev -- fall through to the FAT path,
+     * exactly as the pre-commit-2 predicate did when it failed to
+     * match.
+     */
+    if (backend == BACKEND_DEV) {
+        uint32_t kind = dev_lookup(in_path);
+        if (kind != 0) {
+            file_slot_t* dslot = NULL;
+            int dfd = alloc_file_slot(&dslot);
+            if (dfd == -1) return -(long)EIO_;
+            dslot->kind = kind;
+            /* obj stays NULL; refcount is 1 from alloc_file_slot. */
+            FDTRACE({ serial_print("open  dev -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" kind=");
+                      serial_print_dec((uint64_t)kind); });
+            return dfd;
+        }
+    }
 
     char local_path[USER_PATH_MAX];
     if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
@@ -1654,32 +1751,6 @@ static long open_resolved(const char* in_path, int flags) {
     }
     strip_dot_prefix(local_path);
 
-    strip_dot_prefix(local_path);
-
-    /*
-     * /dev/null -- a recorded special case, not the dispatch seam.
-     *
-     * The match lives in path_is_devnull, shared with stat_resolved
-     * and access_resolved so the exception is one definition rather
-     * than three copies.  Read returns 0 (EOF), write returns the
-     * byte count and discards, close frees the slot, and stat/fstat
-     * report S_IFCHR.
-     *
-     * When the pathname dispatch seam lands for /proc, path_is_devnull
-     * and its three call sites are deleted together.  See ROADMAP.md,
-     * "Make /proc possible."
-     */
-    if (path_is_devnull(local_path)) {
-        file_slot_t* dslot = NULL;
-        int dfd = alloc_file_slot(&dslot);
-        if (dfd == -1) return -(long)EIO_;
-        dslot->kind = FILE_KIND_DEV_NULL;
-        /* obj stays NULL; refcount is 1 from alloc_file_slot. */
-        FDTRACE({ serial_print("open  dev/null -> fd=");
-                  serial_print_dec((uint64_t)dfd);
-                  serial_print(" kind=DEV_NULL"); });
-        return dfd;
-    }
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
     if (fd == -1) return -(long)EIO_;
@@ -1894,7 +1965,8 @@ static long open_resolved(const char* in_path, int flags) {
  * open implementation.
  *
  * The path is copied from user space, resolved against the cwd
- * (absolute paths pass through), and handed to open_resolved.
+ * (absolute paths pass through), and handed to open_resolved with
+ * the backend tag from resolve_at.
  */
 long sys_open(const char* path, int flags) {
     if (!path) return -(long)EFAULT_;
@@ -1908,9 +1980,8 @@ long sys_open(const char* path, int flags) {
     int backend;
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return open_resolved(resolved, flags);
+    return open_resolved(resolved, flags, backend);
 }
 
 /*
@@ -1937,9 +2008,8 @@ long sys_openat(int dirfd, const char* path, int flags) {
     int backend;
     int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return open_resolved(resolved, flags);
+    return open_resolved(resolved, flags, backend);
 }
 
 long sys_close(int fd) {
@@ -2549,12 +2619,7 @@ static long sys_fstat_body(int fd, void* user_stat) {
         /* Character device, like Linux's /dev/null.  Nothing calls
          * fstat on an open devnull fd yet; this keeps the answer
          * correct if something does. */
-        for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
-        st.st_nlink   = 1;
-        st.st_blksize = 512;
-        st.st_mode    = KSTAT_IFCHR | 0666;
-        st.st_size    = 0;
-        st.st_blocks  = 0;
+        fill_kstat_as_chardev(&st);
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
@@ -2645,11 +2710,17 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * The shared stat body, given an absolute Unix-form path.  This is
  * what sys_newfstatat (and therefore stat/lstat/fstat) all use.
  *
- * Handles the root aliases, the bare-name retry, and the
+ * Handles the root aliases, the DEV backend, and the
  * kernel_stat_t fill.  Does NOT resolve against a cwd or a dirfd;
  * the caller has done that with resolve_at.
+ *
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
+ * the path goes to the DEV backend: dev_lookup is consulted and a
+ * match produces the character-device stat without touching FatFs.
+ * Before commit 2, the same decision was made by path_is_devnull().
  */
-static long stat_resolved(const char* abs_path, void* user_stat) {
+static long stat_resolved(const char* abs_path, void* user_stat,
+                          int backend) {
     if (!user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
@@ -2674,24 +2745,27 @@ static long stat_resolved(const char* abs_path, void* user_stat) {
         }
         return 0;
     }
+
     /*
-     * /dev/null -- report a character device, matching what
-     * sys_fstat_body already returns for an open devnull fd, so
-     * stat() and fstat() agree.  See path_is_devnull.
+     * DEV backend.  The match is against the UNSTRIPPED resolved
+     * path (abs_path), because dev_lookup expects the leading '/'
+     * form.  A path with BACKEND_DEV and no matching table entry
+     * falls through to the FAT path below, which is what produced
+     * -ENOENT for unknown /dev paths before commit 2 as well.
      */
-    if (path_is_devnull(path)) {
-        kernel_stat_t st;
-        for (size_t i = 0; i < sizeof(st); i++) ((uint8_t*)&st)[i] = 0;
-        st.st_nlink   = 1;
-        st.st_blksize = 512;
-        st.st_mode    = KSTAT_IFCHR | 0666;
-        st.st_size    = 0;
-        st.st_blocks  = 0;
-        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-            return -(long)EFAULT_;
+    if (backend == BACKEND_DEV) {
+        uint32_t kind = dev_lookup(abs_path);
+        if (kind == FILE_KIND_DEV_NULL) {
+            kernel_stat_t st;
+            fill_kstat_as_chardev(&st);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
         }
-        return 0;
+        /* Unknown /dev entry: fall through to FAT, as before. */
     }
+
     FILINFO fno;
     FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
@@ -2769,9 +2843,8 @@ long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
     int backend;
     int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return stat_resolved(resolved, user_stat);
+    return stat_resolved(resolved, user_stat, backend);
 }
 
 /*
@@ -2799,21 +2872,26 @@ long sys_lstat(const char* user_path, void* user_stat) {
 
 /*
  * The shared existence-check body, given a path that is already an
- * absolute Unix-form path (from resolve_at or resolve_against_cwd).
+ * absolute Unix-form path (from resolve_at).
  *
  * sys_access and sys_faccessat both funnel into this.  It does NOT
  * resolve a cwd or a dirfd -- the caller has done that.
  *
  * donix does not track UNIX permissions (FAT has none), so every
  * mode -- F_OK (0), R_OK (4), W_OK (2), X_OK (1) -- reduces to
- * "does this path resolve to something on the FAT".  The mode
- * argument is not passed in for that reason.
+ * "does this path resolve to something".  The mode argument is not
+ * passed in for that reason.
  *
  * `abs_path` must be absolute (leading '/') or a FatFs-form path
  * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
  * The root aliases (".", "/", "0:/") always "exist".
+ *
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
+ * dev_lookup is consulted: a known device "exists" and returns 0
+ * without touching FatFs; an unknown /dev path falls through, as
+ * before.
  */
-static long access_resolved(const char* abs_path) {
+static long access_resolved(const char* abs_path, int backend) {
     char path[USER_PATH_MAX];
     if (path_copy(path, sizeof(path), abs_path) != 0) {
         return -(long)ENAMETOOLONG_;
@@ -2830,10 +2908,15 @@ static long access_resolved(const char* abs_path) {
     if (path_is_root(path)) {
         return 0;
     }
-    /* /dev/null exists.  See path_is_devnull. */
-    if (path_is_devnull(path)) {
-        return 0;
+
+    /* DEV backend: a known device exists. */
+    if (backend == BACKEND_DEV) {
+        if (dev_lookup(abs_path) != 0) {
+            return 0;
+        }
+        /* Unknown /dev entry: fall through to FAT, as before. */
     }
+
     FILINFO fno;
     FRESULT r = f_stat_with_retry(path, &fno);
     if (r != FR_OK) {
@@ -2852,16 +2935,7 @@ static long access_resolved(const char* abs_path) {
  *
  * access(2) has no dirfd: it resolves against the process cwd.
  * The path goes through resolve_at with AT_FDCWD, the same
- * resolver every other path syscall now uses; the tag is
- * unused here and discarded.
- *
- * WHY THIS USES resolve_at AND NOT resolve_against_cwd: before
- * this commit, sys_access called resolve_against_cwd directly,
- * which meant it did not go through the seam.  Every path syscall
- * now asks resolve_at.  The result is identical -- resolve_at's
- * AT_FDCWD case delegates to resolve_against_cwd -- and the
- * errno on overflow is the same ENAMETOOLONG the old code
- * returned by hand.
+ * resolver every other path syscall now uses.
  *
  * Why this exists: busybox's find_execable() (libbb/find_execable.c)
  * calls access(path, X_OK) for each PATH candidate before deciding
@@ -2885,8 +2959,7 @@ long sys_access(const char* user_path, int mode) {
     int rr = resolve_at(AT_FDCWD_, local, resolved,
                         sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
-    return access_resolved(resolved);
+    return access_resolved(resolved, backend);
 }
 
 /*
@@ -2939,9 +3012,8 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
     int backend;
     int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return access_resolved(resolved);
+    return access_resolved(resolved, backend);
 }
 
 /*
@@ -3005,9 +3077,8 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
     int backend;
     int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return access_resolved(resolved);
+    return access_resolved(resolved, backend);
 }
 
 /*
@@ -3077,13 +3148,12 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     int backend;
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
     /* Validate the path exists, so a missing path is -ENOENT and a
      * present one is -EINVAL (not a symlink).  access_resolved does
      * exactly this check and returns 0 / -ENOENT; reuse its shape
      * rather than duplicating the root-alias and stat logic. */
-    long exists = access_resolved(resolved);
+    long exists = access_resolved(resolved, backend);
     if (exists != 0) return exists;   /* -ENOENT, or -ENAMETOOLONG */
 
     /*
