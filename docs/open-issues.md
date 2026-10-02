@@ -208,28 +208,48 @@ fails, and the whole command is abandoned.  A script that relies
 on `2>/dev/null` to run something and silence its noise will find
 the *something* never ran.
 
-**`/dev/null` now works, for open() only** (session 43,
-`20261002-dev-null`).  `open_resolved` recognizes the exact path
-`dev/null` and returns a `FILE_KIND_DEV_NULL` slot: read returns
-0, write returns count, close frees, fstat reports S_IFCHR.  The
-acceptance line passes:
+**`/dev/null` is handled on every path syscall that matters**
+(session 43, `20261002-dev-null` and `20261002-dev-null-stat`).
+`path_is_devnull` -- one predicate, three call sites -- is
+consulted by `open_resolved`, `stat_resolved`, and
+`access_resolved`:
 
     $ realpath /no/such/dir/file 2>/dev/null
     $ echo $?
     1
 
-Silent, non-zero.  Before the change the same line printed
-`sh: can't create /dev/null: nonexistent directory` and the
-command did not run.
+Silent, non-zero.  And the path is now visible to the rest of the
+system:
 
-**The boundary is deliberate.**  This is an exact-path check in
-`open_resolved`, not a `/dev` backend and not first-component
-dispatch.  `stat("/dev/null")`, `access("/dev/null", ...)`,
-`ls /dev/null`, and `test -e /dev/null` all still fail with
-ENOENT — only `open()` is covered, because `open()` is what the
-redirect needs.  The check is recorded as a special case and
-becomes the dispatch seam's first `/dev` consumer when `/proc`
-forces the seam; see `ROADMAP.md`, "Make `/proc` possible."
+    $ ls /dev/null
+    /dev/null
+    $ ls -l /dev/null
+    crw-rw-rw-    1    0,   0 /dev/null
+    $ test -e /dev/null && echo yes
+    yes
+    $ stat /dev/null
+      File: '/dev/null'
+      Size: 0    ...    character special file
+    Access: (0666/crw-rw-rw-)
+
+`open` returns a `FILE_KIND_DEV_NULL` slot: read returns 0, write
+returns count, close frees.  `stat` and `fstat` agree, both
+reporting `S_IFCHR | 0666`.  `readlink("/dev/null")` returns
+`-EINVAL` (not a symlink) for free, via `access_resolved`.
+
+**The boundary is deliberate.**  This is an exact-path predicate,
+not a `/dev` backend and not first-component dispatch.  What it
+does NOT cover:
+
+- **`readdir` on `/dev`.**  There is no `/dev` directory to list;
+  `readdir("/dev")` fails with `ENOENT`.
+- **Any other device.**  `/dev/tty` and `/dev/urandom` do not
+  exist, so `ttyname(3)`'s fallback walk of `/dev` still finds
+  nothing and `tty` still prints `not a tty`.
+
+The predicate and its three call sites become the dispatch seam's
+first `/dev` consumer when `/proc` forces the seam; they are
+deleted with it.  See `ROADMAP.md`, "Make `/proc` possible."
 
 The `sys_open` failure path shows `dev/null`, not `/dev/null` â€”
 the leading slash is stripped by the `0:` translation shim (item
