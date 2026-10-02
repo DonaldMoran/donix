@@ -90,6 +90,7 @@
  * 158  arch_prctl        sys_arch_prctl
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
+ * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
  * 231  exit_group        sys_exit_group -> sys_exit
  * 235  utimes            sys_utimes        (session 31; no-op stub)
  * 257  openat            sys_openat        (resolve_at; find needs it)
@@ -166,6 +167,7 @@
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
 #define SYS_UTIMES          235
 #define SYS_OPENAT          257
@@ -270,6 +272,7 @@ long sys_setsid(void);
 long sys_geteuid(void);
 long sys_getppid(void);
 long sys_uname(void* user_buf);
+long sys_clock_gettime(int clk_id, void* user_ts);
 long sys_getcwd(char* buf, unsigned long size);
 long sys_chdir(const char* path);
 long sys_rename(const char* oldpath, const char* newpath);

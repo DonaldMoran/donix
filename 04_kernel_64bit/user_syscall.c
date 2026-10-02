@@ -13,7 +13,7 @@
 #include "include/heap.h"
 #include "include/user_space.h"
 #include "ff.h"
-
+#include "interrupts.h"
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -4501,6 +4501,91 @@ long sys_uname(void* user_buf) {
 }
 
 /*
+ * Linux x86_64 clock_gettime(2) — syscall 228.
+ *
+ * Fill a struct timespec with the time for `clk_id`.
+ *
+ * donix has no wall clock -- no RTC is read, and there is no
+ * epoch to be relative to.  What it does have is g_ticks, the
+ * 100 Hz PIT counter (pit_init(100) in kmain.c, confirmed at the
+ * call site; 1 tick == 10 ms).  This reports that counter as
+ * both CLOCK_REALTIME and CLOCK_MONOTONIC.  The two differ on
+ * Linux (realtime is wall-clock, monotonic is since-boot); on
+ * donix they are the same number because there is nothing to
+ * distinguish them.  That is wrong for realtime in the sense
+ * that the time will not match any wall clock, and correct in
+ * the sense that it is monotonic and advances at the right rate.
+ *
+ * WHO CALLS THIS AND WHY IT MATTERS.  musl's __randname
+ * (third_party/musl-src/src/temp/__randname.c), the XXXXXX
+ * generator behind mkstemp/mkdtemp/mktemp, seeds itself from
+ * __clock_gettime(CLOCK_REALTIME).  Without a handler for 228,
+ * that call returned -ENOSYS, musl fell back to
+ * __syscall(SYS_gettimeofday) -- also absent -- and __randname
+ * read an uninitialized timespec.  busybox mktemp needs a
+ * working clock to generate a name; this provides one.  See
+ * docs/open-issues.md, "mktemp needs clock_gettime".
+ *
+ * ABI:
+ *   arg0  int             clk_id   (CLOCK_REALTIME = 0,
+ *                                   CLOCK_MONOTONIC = 1)
+ *   arg1  struct timespec* ts      (user pointer)
+ *   returns  0 on success, -errno on failure.
+ *
+ * struct timespec on x86_64 is two int64s, 16 bytes, no padding:
+ *
+ *     offset  size  field
+ *       0      8    tv_sec
+ *       8      8    tv_nsec
+ *
+ * CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1, and
+ * CLOCK_MONOTONIC_RAW = 4 are all accepted and reported the
+ * same way.  Any other clk_id is -EINVAL, matching Linux for an
+ * unknown clock.
+ *
+ * tv_nsec is (g_ticks % 100) * 10,000,000, so it is always a
+ * multiple of 10 ms and always in [0, 999999999].  tv_sec is
+ * g_ticks / 100.  The pair is exact for a 100 Hz tick: no
+ * rounding, no drift, every tick advances tv_nsec by exactly
+ * 10,000,000 except once per second where tv_sec takes the carry.
+ *
+ * g_ticks is volatile and read here without a lock.  A read that
+ * races the timer IRQ gets a value one tick off either way,
+ * which is fine for a clock read -- it is not a synchronization
+ * point.  Reading it twice would be worse; this reads it once
+ * into a local.
+ */
+long sys_clock_gettime(int clk_id, void* user_ts) {
+    if (!user_ts) return -(long)EFAULT_;
+
+    /* Accept the clocks musl and busybox actually ask for.
+     * Anything else is -EINVAL, as Linux does. */
+    switch (clk_id) {
+        case 0:   /* CLOCK_REALTIME */
+        case 1:   /* CLOCK_MONOTONIC */
+        case 4:   /* CLOCK_MONOTONIC_RAW */
+            break;
+        default:
+            return -(long)EINVAL_;
+    }
+
+    uint64_t ticks = g_ticks;   /* one read; see the header comment */
+
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } ts;
+
+    ts.tv_sec  = (int64_t)(ticks / 100);
+    ts.tv_nsec = (int64_t)((ticks % 100) * 10000000);
+
+    if (safe_copy_to_user(user_ts, &ts, sizeof(ts)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
  * Return the current working directory: the path stored by
@@ -5708,6 +5793,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
         case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
+        case SYS_CLOCK_GETTIME:   return (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1);
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
