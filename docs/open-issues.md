@@ -176,6 +176,21 @@ entries plus `readlink` would let `tty` print a path.  The same
 gap blocks a `/dev/urandom` fallback for `mktemp` and is a
 prerequisite for anything wanting `/dev/null` or `/dev/tty`.
 
+**`mktemp` needs `clock_gettime` (228), not the `getpid`+`open`
+the busybox-enablement table names** — busybox `mktemp` calls
+musl's `mkstemp` → `__mkostemps` → `__randname`
+(`third_party/musl-src/src/temp/__randname.c`), which seeds its
+`XXXXXX` replacement from `__clock_gettime(CLOCK_REALTIME)`.  No
+`getrandom`, no `/dev/urandom` — just the clock, plus
+`__pthread_self()->tid` (no syscall).  donix has no
+`clock_gettime` (228); musl's `__clock_gettime` falls back to
+`gettimeofday` (96), also absent, so both fail and `__randname`
+reads an uninitialized `timespec`.  Implement `clock_gettime`
+(228) from `g_ticks` (100 Hz PIT: `tv_sec = g_ticks/100`,
+`tv_nsec = (g_ticks%100)*10000000`) and `mktemp` becomes
+enableable.  Corrects the enablement table, which lists `mktemp`
+under "Ready now" with `getpid` (39) + `open` (2).
+
 ### Test-design notes
 
 - **The old `musl_sh` ash-only caveats are gone.**  Through
