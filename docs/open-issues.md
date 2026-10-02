@@ -19,8 +19,8 @@
    `<` and `>>`.
 
    Verified (session 37):
-   - `cd / > log` — no output, no error, no file; `cd` succeeded.
-   - `pwd > log` — prints `/` to the screen, not into `log`.
+   - `cd / > log` â€” no output, no error, no file; `cd` succeeded.
+   - `pwd > log` â€” prints `/` to the screen, not into `log`.
    - `ls` shows no `log`; `cat log` fails with `cannot open`.
 
    A loud failure would be better than silence; so would actually
@@ -48,19 +48,19 @@
    `SIGPIPE` does not.
 
    This gap is narrower than `v0.6.6`'s docs suggested.  Session 37
-   ran the case the old docs named as the poster child —
-   `busybox yes | busybox head -n 1` — and it does **not** hang:
+   ran the case the old docs named as the poster child â€”
+   `busybox yes | busybox head -n 1` â€” and it does **not** hang:
    `head` prints `y` and exits, `yes` gets `-EPIPE`, handles it,
    prints `yes: Broken pipe`, and exits.  busybox apps generally
    check `write`'s return value, so the common pipelines are fine.
    The remaining exposure is a program that expects to be *killed*
-   by `SIGPIPE` and does not check `write` — none has been found.
+   by `SIGPIPE` and does not check `write` â€” none has been found.
 
    Fixing this means implementing signal delivery: a real
    `sys_rt_sigaction`, per-process signal handlers, and a `SIGPIPE`
    raise on the `-EPIPE` write path.  That is a subsystem, not a
    small change.  **Same subsystem a Wayland `wl_shm` client needs
-   for `SIGBUS` on buffer overrun** — see `ROADMAP.md`.  Doing it
+   for `SIGBUS` on buffer overrun** â€” see `ROADMAP.md`.  Doing it
    once serves both.
 
 6. **`unlinkat` (263) has no consumer in busybox as configured.**
@@ -70,8 +70,8 @@
    `rmdir` with constructed path strings (`libbb/remove_file.c`);
    `find` recurses with `openat` + `newfstatat` but removes
    nothing.  `unlinkat` is part of the `*at` family and is correct
-   to have — it will serve the first tool that walks a directory and
-   removes entries relative to a dirfd — but nothing in the current
+   to have â€” it will serve the first tool that walks a directory and
+   removes entries relative to a dirfd â€” but nothing in the current
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
@@ -79,7 +79,7 @@
    mapping when a page-table allocation fails.**  Both functions
    walk the page tables and, at each level, call
    `pmm_alloc_page_for_tables()` if the next table does not exist.
-   Every one of those calls is followed by `if (!phys) return;` —
+   Every one of those calls is followed by `if (!phys) return;` â€”
    the function gives up without mapping anything, and **the caller
    has no way to know.**  `elf_load_into_process`, `sys_brk`,
    `sys_mmap`, and `sys_execve` all call these and treat a return
@@ -90,7 +90,7 @@
    because it was the one with evidence: a silent return there
    leaves the bootloader's 2 MB **supervisor** identity-map page in
    place where the caller asked for a **user** page, and the process
-   later faults on a user instruction fetch of `0x400000` —
+   later faults on a user instruction fetch of `0x400000` â€”
 
    ```
        === PAGE FAULT (#PF) ===
@@ -107,16 +107,16 @@
    **The remaining sites are still silent.**  In
    `vmm_map_page_in_cr3`: the PDPT, PD, and PT allocation paths each
    have their own `if (!phys) return;`.  In `vmm_map_page`: the same
-   three.  None of them has produced a visible bug yet — a failed
+   three.  None of them has produced a visible bug yet â€” a failed
    allocation there leaves a not-present page rather than a
    supervisor one, and the caller faults on a *missing* page, which
-   is at least the right kind of fault — but the pattern is the
+   is at least the right kind of fault â€” but the pattern is the
    same defect: **a void function that cannot report failure, called
    by code that assumes success.**
 
    The fix is one of:
    - **change the signature** to return an error, and check it at
-     every caller (the honest fix, and the larger one — it touches
+     every caller (the honest fix, and the larger one â€” it touches
      every `vmm_map_page*` call site in the tree); or
    - **halt on failure at each site**, as the split path now does
      (matches the kernel idiom, smaller, but turns a recoverable
@@ -134,27 +134,7 @@
    *failure path* whose consumers do not check.  Both are
    "correct only for the cases known at the time."
 
-8. **`sys_readlink` returns `-EINVAL` for every input, including
-   nonexistent paths.**  Linux distinguishes `-ENOENT` (the path
-   does not exist) from `-EINVAL` (the path exists but is not a
-   symlink).  donix has no symlinks, so every existing path is
-   correctly `-EINVAL` — but a *missing* path should be `-ENOENT`,
-   and currently is not.
-
-   This became observable in session 43: `realpath` routes through
-   musl's `realpath()`, which calls `readlink` and treats the two
-   errnos differently.  `realpath /nonexistent` gets `-EINVAL` and
-   takes the wrong branch (the diagnostic is wrong; the canonicalize-
-   an-existing-path case is unaffected, because every component of
-   an existing path correctly returns `-EINVAL`).  `ttyname(3)`
-   walks the same path.
-
-   Small fix: in `sys_readlink`, resolve the path first; return
-   `-ENOENT` if it does not resolve, `-EINVAL` if it does.  New
-   regression test.  This is a correctness fix, not a feature, and
-   it is wanted **regardless of whether symlinks ever land**.
-
-9. **Symlinks: recorded design, not scheduled.**  FAT16 has no
+8. **Symlinks: recorded design, not scheduled.**  FAT16 has no
    native symlink storage, and donix is committed to FAT.  The
    correct frame is therefore **Unix semantics, not FAT storage**:
    the question is not "how does FAT store a symlink" but "what
@@ -163,8 +143,8 @@
    the kernel is semantically correct; the on-disk encoding is an
    implementation detail.
 
-   The encoding is a magic marker in an ordinary file — e.g.
-   `DONIX_LINK:/usr/bin/busybox` — hidden **entirely inside the
+   The encoding is a magic marker in an ordinary file â€” e.g.
+   `DONIX_LINK:/usr/bin/busybox` â€” hidden **entirely inside the
    pathname dispatch seam**.  This is "contained ugly": the same
    category as ext4's inline symlinks or btrfs's extent-based ones,
    and Linux likewise hides filesystem-specific ugliness behind
@@ -188,32 +168,58 @@ timestamp syscalls return 0 without storing); `prctl` is minimal
 installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
 spins (pre-existing; the spin's wall-clock duration increased
 between `v0.6.6` and `v0.6.7`, when the console changed from VGA
-text to framebuffer — see `session-log.md`, session 41, for the
+text to framebuffer â€” see `session-log.md`, session 41, for the
 bisect); `sys_mmap` rejects all non-anonymous mappings (a
 file-backed `mmap` caller will get `-ENOMEM` and must fall back to
 `read`; **a Wayland prerequisite -- see `ROADMAP.md`**); **pipes
 support one concurrent reader and one concurrent writer** (see
-`pipe_t`'s comment in `user_syscall.c` — a second blocked reader on
+`pipe_t`'s comment in `user_syscall.c` â€” a second blocked reader on
 the same pipe end has nowhere to record itself and will only wake
 on a keyboard IRQ); **`put_file_slot`'s pipe wake is coupled to
 `sys_close`'s wake** (if `sys_close`'s wake is ever removed on the
 theory that `put_file_slot` covers everything, non-final closes in
 a `dup`'d chain stop waking the peer and the peer hangs until a
-keystroke — read the `put_file_slot` comment and this entry before
+keystroke â€” read the `put_file_slot` comment and this entry before
 touching either).
 
-**no `/dev` and no `/proc`** — `ttyname(3)` cannot name the
+**no `/dev` and no `/proc`** â€” `ttyname(3)` cannot name the
 console, so `tty` prints `not a tty`.  `readlink` (89) is
 implemented (session 42), so the `ttyname` fast path
 (`readlink("/proc/self/fd/N")`) no longer logs
-`Unknown syscall: 89` — but it returns `-EINVAL` (item 8 above
-sharpens this to `-ENOENT` for a missing path) because there are
-no symlinks, and the fallback walk of `/dev` still finds nothing,
-because `/dev` does not exist.  **This is item 1's customer and
-the reason the dispatch seam gets built** — see `ROADMAP.md`,
-"Make `/proc` possible."  A device layer plus `/dev` entries
-would let `tty` print a path, and is the prerequisite for anything
-wanting `/dev/null`, `/dev/tty`, or `/dev/urandom`.
+`Unknown syscall: 89` â€” and it now returns `-ENOENT` for a
+missing path and `-EINVAL` for one that exists, verified by
+`readlink_errno.c` (session 43) â€” but the fallback walk of `/dev`
+still finds nothing, because `/dev` does not exist.
+
+**The user-visible consequence is sharper than "no device
+files."  `2>/dev/null` does not merely fail to discard stderr â€”
+it prevents the command from running.**  Session 43, testing
+`realpath`:
+
+    $ realpath /no/such/dir/file 2>/dev/null
+    sys_open: f_open FAIL path=dev/null flags=0x0000000000008241 ...
+    sh: can't create /dev/null: nonexistent directory
+
+    (realpath's own diagnostic never appears â€” the command did
+     not execute)
+
+The shell opens the redirect target *before* forking, the open
+fails, and the whole command is abandoned.  A script that relies
+on `2>/dev/null` to run something and silence its noise will find
+the *something* never ran.  **The first `/dev` consumer is
+`/dev/null`, and its acceptance test is this exact line:** after
+the device layer lands, `realpath /no/such/dir/file 2>/dev/null`
+exits non-zero, silently.
+
+The `sys_open` failure path shows `dev/null`, not `/dev/null` â€”
+the leading slash is stripped by the `0:` translation shim (item
+1) before FatFs sees it.
+
+**This is item 1's customer and the reason the dispatch seam gets
+built** â€” see `ROADMAP.md`, "Make `/proc` possible."  A device
+layer plus `/dev` entries would let `tty` print a path, and is the
+prerequisite for anything wanting `/dev/null`, `/dev/tty`, or
+`/dev/urandom`.
 
 **Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
 keystroke (visible as a syscall per key in a trace).  This is
@@ -233,7 +239,7 @@ harmless, and the reason `vi` fills the screen.  No action.
   after framebuffer or console changes, not as part of the boot
   canary.
 
-- **Pipe regression suite is not a canary.**  `pipe_step1` …
+- **Pipe regression suite is not a canary.**  `pipe_step1` â€¦
   `pipe_step3b` fork and take seconds; run them when changing
   `sys_read`/`sys_write`/`sys_close`/`put_file_slot`/`sys_fork`/
   `sys_pipe` or adding a `FILE_KIND_*`, but not as part of the boot
@@ -246,11 +252,16 @@ harmless, and the reason `vi` fills the screen.  No action.
   extended in session 41) is read-only and is the analogous suite
   for `resolve_at`, the stat family, `faccessat`, and `utimensat`.
 
-- **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
+- **`readlink_errno` is read-only and fast** but is run by hand,
+  not as a canary row, like `at_step1` and `fcntl_lowfd`.  Run it
+  when changing `sys_readlink`, the `resolve_at` family, or
+  `access_resolved`.  Session 43.
+
+- **`at_step1` sections, as of session 41.**  Sections 1â€“7 exercise
   `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.
-  Section 8–9 exercise `faccessat` dirfd resolution and the
+  Section 8â€“9 exercise `faccessat` dirfd resolution and the
   `AT_FDCWD` control.  Section 11 exercises `utimensat` dirfd
-  resolution.  (There is no section 10; it was removed — it tested a
+  resolution.  (There is no section 10; it was removed â€” it tested a
   kernel-side flag check that does not exist, because musl returns
   the `EINVAL` itself.  See `gotchas.md`, session 41.)
 

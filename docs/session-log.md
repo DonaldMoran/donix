@@ -265,10 +265,106 @@ you watch it not run.")
 **Scratch tags kept:** all 24 `20261001-*` tags are local, not
 pushed, part of the open `v0.6.9` milestone — dropped at the bump.
 
+---
+
+### Session 43 — `realpath`, and the `readlink` errno closed by test
+
+Two commits on `dev`, after `v0.6.9` was tagged and pushed.  Not a
+new milestone — a tail on `v0.6.9` that closes out its applet work
+and one of its open issues.
+
+| Tag | What |
+|---|---|
+| `20261002-realpath` | `CONFIG_REALPATH=y` — enables busybox `realpath`; config-only |
+| `20261002-readlink-test` | `readlink_errno.c` — readlink(2) errno split, 3 checks; closes item 8 |
+
+**`realpath` — the trace, done before the edit.**  `realpath_main`
+→ `xmalloc_realpath_coreutils` → `xmalloc_realpath` → musl
+`realpath()`, plus `xmalloc_readlink` (readlink 89, present) and
+`xrealloc_getcwd_or_warn` (getcwd, present).  No
+`//config:depends on` for `CONFIG_REALPATH` — the applet does not
+require the `readlink` applet, it uses `libbb`'s
+`xmalloc_readlink`.  That is why the change is config-only.
+
+**Two of the handoff's own step-4 test expectations were wrong,
+and the run showed which.**  The handoff said `realpath
+/nonexistent` should fail with a diagnostic.  It does not:
+
+    $ realpath /nonexistent
+    /nonexistent
+
+Exit 0.  `xmalloc_realpath_coreutils` has an `ENOENT` fallback:
+when musl's `realpath()` fails `ENOENT`, busybox strips trailing
+slashes, splits at the last slash, canonicalizes the parent, and
+re-appends the basename.  `/nonexistent`'s parent is `/`, which
+exists, so the fallback succeeds.  **The failing case is a path
+whose parent does not exist:**
+
+    $ realpath /no/such/dir/file
+    realpath: /no/such/dir/file: No such file or directory
+
+**The diagnostic is on stderr.**  `realpath /no/such/dir/file >
+log.txt` left `log.txt` **empty** while the message appeared on
+the console — so the message did not go to stdout, and busybox's
+`bb_simple_perror_msg` writes to stderr.
+
+**A new finding, and it sharpens the `/dev` entry.**
+`2>/dev/null` does not merely fail to discard stderr — it
+**prevents the command from running**:
+
+    $ realpath /no/such/dir/file 2>/dev/null
+    sys_open: f_open FAIL path=dev/null flags=0x0000000000008241 ...
+    sh: can't create /dev/null: nonexistent directory
+
+    (realpath's own diagnostic never appears — the command did
+     not execute)
+
+The shell opens the redirect target before forking, the open
+fails, and the whole command is abandoned.  Recorded in
+`open-issues.md` under the `/dev` entry, with the acceptance test:
+after the device layer lands, `realpath /no/such/dir/file
+2>/dev/null` exits non-zero, silently.
+
+**`readlink` errno — the fix was already in the tree.**
+`sys_readlink` returned `-ENOENT` for a missing path and `-EINVAL`
+for an existing non-symlink; it had since the session-42 readlink
+commit.  `open-issues.md` item 8 still described the defect as
+open, and so did the handoff and the ROADMAP.  **No applet calls
+`readlink(2)`** — the only consumer is musl's `ttyname(3)`, which
+cannot distinguish the errnos with no `/proc` and no `/dev`, so
+nothing exercised the fix and nothing noticed it was done.
+
+The evidence had been in hand and read past: the `realpath` trace
+showed `xmalloc_readlink` collapses every `readlink` error to
+NULL, which is only observable if the kernel returns the two
+errnos differently — i.e. the fix was in.  That was written up as
+"item 8 does not affect realpath's output" and stopped there.
+
+`readlink_errno.c` calls `readlink(2)` directly, since no applet
+does, and asserts both answers:
+
+    readlink("/nonexistent")     -> -1, errno == ENOENT
+    readlink("/usr/bin/HELLO")   -> -1, errno == EINVAL
+    readlink("/")                -> -1, errno == EINVAL
+
+All three pass.  Item 8 is closed with a run behind the claim, not
+a reading.  See `gotchas.md`, "A fix with no test is
+indistinguishable from an unfixed defect."
+
+**The headline of the session is not "realpath works."**  It is
+that reading the source before enabling caught a stale assertion
+in the instructions, and the same habit would have caught the
+second stale assertion (`readlink` item 8) before the session
+spent rounds on it.  Both are the same shape: a document asserting
+a state the repository does not have.
+
 **The milestone, in one line:** `v0.6.9` shipped envp, the
 `/usr/bin` layout, the shim removal — and then a test, a rewrite, a
 page-table fix, four syscalls, ten applets, three gaps, and four
-gotchas, because each was the next thing the last one exposed.
+gotchas, because each was the next thing the last one exposed — and
+session 43 followed it with `realpath` and the `readlink` errno,
+both closed with a run.
+
 ---
 
 ### envp — `execve` passes the environment through

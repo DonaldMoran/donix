@@ -49,6 +49,12 @@ For the record, so this file does not re-plan finished work:
   all work on the framebuffer), and `vi` filling the screen. The
   VGA text console is the fallback; the VT100 parser is unchanged
   and drives either backend.
+- **v0.6.7 — a real shell, and a framebuffer console.**  The
+  milestone sessions 37 and 38 make up, tagged `11c2f16` and merged
+  to `main` (`3e6f00b`).  The shell became real (`musl_sh` tokenizer,
+  redirection, sequences, pipelines) and the console moved to the
+  1024×768 linear framebuffer with Terminus 10×18 text and `vi`
+  filling the screen.  Detail under sessions 37 and 38 below.
 - **v0.6.8 — the `*at()` family.** One path resolver (`resolve_at`)
   shared by every syscall that takes a dirfd.  `newfstatat` (262),
   `openat` (257), `unlinkat` (263), `faccessat` (269), and
@@ -119,6 +125,25 @@ and `printenv` — all config-only once the syscalls above existed.
 **Three small gaps.**  `munmap` (counted above), `fcntl` now accepts
 fd 0/1/2 for all subcommands, and Ctrl-`[` produces ESC (0x1B).
 
+**`realpath`, a post-ship tail (session 43).**  `CONFIG_REALPATH=y`,
+config-only — the trace showed it routes through musl's
+`realpath()` plus `libbb`'s `xmalloc_readlink` and `getcwd`, all
+present.  Two of the handoff's own test expectations were wrong:
+`realpath /nonexistent` succeeds (parent `/` exists); the failing
+case is a path whose parent does not exist.  The run also
+sharpened the `/dev` entry — `2>/dev/null` does not merely fail to
+discard, it stops the command from running.  Committed and
+scratch-tagged `20261002-realpath`, not yet pushed.
+
+**`readlink` errno, closed by test (session 43).**  `sys_readlink`
+already returned `-ENOENT` for a missing path and `-EINVAL` for an
+existing non-symlink; the fix had been in the tree, untested, and
+`open-issues.md` item 8 still described the defect as open.
+`tests/readlink_errno.c` calls `readlink(2)` directly, since no
+applet does, and asserts both answers.  3/3.  Item 8 is closed with
+a run behind it.  See `gotchas.md`, "A fix with no test is
+indistinguishable from an unfixed defect."
+
 The live state, the canary rows, and the NEXT SESSION list are in
 [`handoff.md`](handoff.md).
 
@@ -151,13 +176,19 @@ added on the belief that `rm -r` needs it, and `rm -r` does not.
 
 ---
 
-## Make `/proc` possible — the next milestone
+## Make `/proc` possible — the next major direction
 
-**This is the next major milestone after the immediate `realpath`
-enable and `readlink` errno fix** (see `handoff.md`).  It is not a
-"VFS milestone."  It is the first feature that the current
-architecture **cannot express at all**, and building it is what
-forces the pathname dispatch seam into existence.
+**This is the next major direction, not a scheduled milestone.**
+The `realpath` enable (session 43) is done and closed; the
+`readlink` errno fix is done too (`readlink_errno.c`, session 43).
+What `/proc` is: the shape the next real subsystem will take, and
+the thing that forces the pathname dispatch seam into existence.
+It is not scoped, sized, or scheduled.  When a session picks it up,
+it gets planned then.
+
+`/proc` is not a "VFS milestone."  It is the first feature that the
+current architecture **cannot express at all**, and building it is
+what forces the pathname dispatch seam into existence.
 
 ### Why this, and not symlinks
 
@@ -176,7 +207,7 @@ development itself easier.  It is the right first customer.
 
 ### Scope — one deliverable, two parts, sized to one file
 
-The milestone is **"the minimal dispatch seam plus the smallest
+The work is **"the minimal dispatch seam plus the smallest
 open-file representation that one `/proc` file requires."**  Both
 parts, together, sized to `/proc/self/status` and nothing larger.
 
@@ -203,7 +234,7 @@ from `donix>` and from ash.  Add it to the canary.
 
 `open-issues.md` item 1: `sys_execve`'s two remaining path attempts
 and `resolve_against_cwd` are shims the seam subsumes.  **Delete
-them as part of this milestone; do not extend them.**
+them as part of this work; do not extend them.**
 
 ### The two failure modes to avoid
 
@@ -223,10 +254,13 @@ Each of these is a consumer of the seam, ordered by what it
 unlocks.  None is scheduled yet.
 
 1. **`/dev`** — `/dev/null`, `/dev/tty`, `/dev/urandom`; lets
-   `tty` name its terminal.
+   `tty` name its terminal.  `/dev/null` is first: its acceptance
+   test already exists (`realpath /no/such/dir/file 2>/dev/null`
+   must exit non-zero, silently; today the command does not run at
+   all).
 2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
    ordinary file, hidden entirely inside the seam.  See
-   `open-issues.md` item 9.
+   `open-issues.md` item 8.
 3. **`ln`, `link`, `readlink` with real targets**, and archive
    symlink restoration (`tar`, `unzip`).
 4. **A mount framework**, if and when a second filesystem exists.

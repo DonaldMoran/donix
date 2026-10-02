@@ -12,10 +12,11 @@ four syscalls (`readlink`, `clock_gettime`, `nanosleep`, `munmap`),
 ten busybox applets
 **Milestone status:** **`v0.6.9` shipped and pushed.**  The bump is
 complete: scratch tags dropped, session-42 rows in
-`docs/session-log.md`, README/ROADMAP/banner refreshed.  This file
-was not actually rewritten at the bump (commit `95c6337` says it
-was; it wasn't) — this is that rewrite, done now as a docs-only
-change on top of `v0.6.9`.
+`docs/session-log.md`, README/ROADMAP/banner refreshed.  Session 43
+is a tail on the shipped milestone: `realpath` enabled (config-only)
+and the `readlink` errno closed by a new regression test.  Both
+committed and scratch-tagged (`20261002-realpath`,
+`20261002-readlink-test`), not yet pushed.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -277,7 +278,7 @@ noneya@fedora:~/code/donix$ tree -L 3
 
 ---
 
-## Where we are — `v0.6.9` shipped
+## Where we are — `v0.6.9` shipped, two post-ship fixes
 
 `v0.6.8` shipped the `*at()` family.  `v0.6.9` opened as **envp**
 and grew, in session 42, into the **`/usr/bin` layout**, the
@@ -285,6 +286,53 @@ and grew, in session 42, into the **`/usr/bin` layout**, the
 **four new syscalls**, **ten busybox applets**, **three small
 gaps**, and **four new gotchas**.  It is a large milestone, and it
 is done: tagged `v0.6.9`, pushed, scratch tags dropped.
+
+Session 43 added two things on top, both committed and
+scratch-tagged, neither pushed:
+
+- **`realpath` enabled**, config-only (`20261002-realpath`).
+- **`readlink` errno closed by test** (`20261002-readlink-test`).
+
+### Session 43, in full
+
+| Tag | What |
+|---|---|
+| `20261002-realpath` | `CONFIG_REALPATH=y` — enables busybox `realpath`; config-only |
+| `20261002-readlink-test` | `readlink_errno.c` — readlink(2) errno split, 3 checks; closes item 8 |
+
+**`realpath` — the trace, and two wrong test expectations.**
+`realpath_main` → `xmalloc_realpath_coreutils` → `xmalloc_realpath`
+→ musl `realpath()`, plus `libbb`'s `xmalloc_readlink` (readlink
+89, present) and `xrealloc_getcwd_or_warn` (getcwd, present).  No
+`//config:depends on` for `CONFIG_REALPATH`.  The handoff said
+`realpath /nonexistent` should fail; it does not — its parent `/`
+exists, so `xmalloc_realpath_coreutils`'s `ENOENT` fallback
+succeeds.  The failing case is a path whose parent does not exist.
+The diagnostic goes to stderr.
+
+**The `/dev` finding.**  `2>/dev/null` does not merely fail to
+discard stderr — it stops the command from running.  The shell
+opens the redirect target before forking; the open fails; the whole
+command is abandoned.  Recorded in `open-issues.md`, with the
+acceptance test for the device layer.
+
+**`readlink` errno — the fix was already in.**  `sys_readlink`
+returned `-ENOENT` for a missing path and `-EINVAL` for an existing
+non-symlink; the fix had been in the tree since session 42,
+untested, and `open-issues.md` item 8 still described the defect as
+open.  No applet calls `readlink(2)`; the only consumer is musl's
+`ttyname(3)`, which cannot distinguish the errnos with no `/proc`
+and no `/dev`.  `readlink_errno.c` calls `readlink(2)` directly and
+asserts both answers — 3/3.  Item 8 is closed with a run behind it.
+See `gotchas.md`, "A fix with no test is indistinguishable from an
+unfixed defect."
+
+**The lesson of the session.**  Reading the source before enabling
+caught a stale assertion in the instructions (`realpath`), and the
+same habit — reading the code rather than the doc — would have
+caught the second stale assertion (`readlink` item 8) before the
+session spent rounds on it.  Both are the same shape: a document
+asserting a state the repository does not have.
 
 ### Session 42, in full
 
@@ -393,6 +441,12 @@ is done: tagged `v0.6.9`, pushed, scratch tags dropped.
   system.
 - **`munmap` (11) is real** and frees frames, removing them from
   `elf_page_list`.  The old stub was a leak.
+- **`realpath` is enabled** and config-only.  `realpath
+  /nonexistent` succeeds (parent `/` exists); `realpath
+  /no/such/dir/file` fails on stderr.
+- **`readlink` (89) returns `-ENOENT` for a missing path and
+  `-EINVAL` for an existing non-symlink**, verified by
+  `readlink_errno.c`.  Item 8 closed.
 
 ### What `v0.6.8` contributed (prior milestone, pushed)
 
@@ -418,61 +472,49 @@ The findings that milestone recorded, still load-bearing:
   runs `cd`, creates no file, prints no error.
 - **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
   `sh: builtin in pipeline not supported`.
+- **`2>/dev/null` does not work, and worse, it stops the command
+  from running.**  The redirect target cannot be opened, so the
+  shell abandons the whole command.  See `open-issues.md`, the
+  `/dev` entry; the acceptance test for the device layer is
+  `realpath /no/such/dir/file 2>/dev/null` exiting non-zero,
+  silently.
 - **`diff`, `chmod`, `ln`, `mount` are off** — the last three need
   their own syscalls.
 - **`tty` prints `not a tty`.**  Correct for donix: no `/dev`, no
-  `/proc`.  `readlink` (89) is implemented, so no `Unknown syscall`
-  noise, but `ttyname` still cannot name the console.  See
+  `/proc`.  `readlink` (89) is implemented and now returns the
+  correct errnos, but `ttyname` still cannot name the console.  See
   `open-issues.md`.
 - **`musl_wait`'s WNOHANG loop spins.**  Pre-existing.  See
   `docs/session-log.md`, session 41.
 
 ---
 
-## NEXT SESSION — `realpath`, then the `/dev` layer
+## NEXT SESSION — open the `/dev` + `/proc` direction
 
-This session's task: enable busybox realpath. It is config-only: it 
-routes through musl's realpath(), which uses lstat + readlink + getcwd, 
-all present. (readlink alone was never the blocker — see open-issues.md 
-item 8 for the errno defect this surfaced.) One config line, one 
-rebuild, one canary run.
-This closes out the session-42 applet work with no kernel change.
+`realpath` and the `readlink` errno fix are done.  The next real
+work is the **`/dev` and `/proc` device layer**.  It is not a
+scheduled milestone; it is a direction, and the session that picks
+it up plans it then.  What follows is the shape, not the schedule.
 
-Do it in this order:
+What it unblocks, concretely:
 
-1. Add `CONFIG_REALPATH=y` to `configs/busybox.config` (match the
-   file's canonical form; check how the neighbours are written).
-2. Rebuild busybox via `./toolchain/install_musl.sh`.
-3. Rebuild the image and boot.  Run `canary` and `canary --full`.
-4. Test `realpath` by hand: `realpath /usr/bin/CANARY`,
-   `realpath /bin/busybox`, `realpath .`, `realpath ..`,
-   `realpath /nonexistent` (expect a diagnostic and non-zero exit).
-   Note what it does with a path that has no symlink component —
-   donix has no symlinks, so the result should be the canonicalized
-   path.
-5. **Read the applet's source before trusting the name.**  This is
-   the rule that caught `truncate` and `mktemp`.  `realpath` may
-   reach for syscalls beyond `readlink`; verify against
-   `third_party/busybox/coreutils/realpath.c` and
-   `libbb/` helpers.  If it needs something not implemented, stop
-   and record it in `open-issues.md` rather than enabling it.
-6. Commit, tag it as a scratch tag (`YYYYMMDD-realpath`), write the
-   session-log row and the annotation.
+- **`/dev/null` first.**  Its acceptance test already exists:
+  `realpath /no/such/dir/file 2>/dev/null` must exit non-zero,
+  silently.  Today the command does not run at all.
+- **`tty` naming its terminal.**  `ttyname(3)` walks
+  `/proc/self/fd/N` then `/dev`.  Both fail today; with either one
+  present, `tty` can print a path instead of `not a tty`.
+- **`/dev/tty`, `/dev/urandom`.**
 
-**After `realpath`: the `/dev` and `/proc` device layer.**  This is
-the next real subsystem and the natural follow-on.  It unblocks
-`tty` naming its terminal (currently `not a tty`), `/dev/null`,
-`/dev/urandom`, and the `ttyname` path.  It is a milestone-sized
-piece of work, so it should open its own milestone, not extend
-`v0.6.9`.  Plan it at the start of that session; do not start it
-mid-`realpath`.
+This is item 1's customer and the reason the dispatch seam gets
+built.  See `ROADMAP.md`, "Make `/proc` possible."  **/proc is the
+first feature the current architecture cannot express, so it forces
+the seam.**  Symlinks and `/dev` are consumers of it.  Do not
+implement standalone `/dev` handling in individual syscalls — that
+is the technical debt the seam exists to prevent.
 
 ### After that — candidates
 
-- /proc + the pathname dispatch seam — the next major milestone; see 
-  ROADMAP.md, "Make /proc possible." /proc is the first feature the 
-  current architecture cannot express, so it forces the seam. 
-  Symlinks and /dev are consumers of it.
 - **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `open-issues.md`
   item 5.  Also the prerequisite for job control, `kill(2)`, and a
   Wayland `wl_shm` client's `SIGBUS`.
@@ -491,10 +533,13 @@ mid-`realpath`.
 ## Busybox enablement
 
 **All the applets in the handoff's original "Ready now" and "Needs
-one small syscall" tables are now ENABLED, except `realpath`.**
-`realpath` is this session's task (config-only — routes through musl's 
-realpath()).  The tables below are kept for the record and for the 
-still-off ones.
+one small syscall" tables are now ENABLED, including `realpath`.**
+The tables below are kept for the record and for the still-off ones.
+
+### Enabled in session 43
+
+`realpath` — config-only.  See session 43 above for the trace and
+the test expectations.
 
 ### Enabled in session 42
 
@@ -510,7 +555,6 @@ Syscalls added to unblock them: `readlink` (89), `clock_gettime`
 
 | Config | Applet | Blocked by |
 |---|---|---|
-| `CONFIG_REALPATH` | `realpath` | **this session's task**; config-only — routes through musl's realpath(); not yet enabled |
 | `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous `mmap`); deliberate |
 | `CONFIG_CHMOD` | `chmod` | `chmod`/`fchmodat`; FAT has no permissions |
 | `CONFIG_CHOWN` | `chown` | `chown`/`fchownat`; FAT has no ownership |
@@ -539,9 +583,9 @@ name.**  Two applets were mis-classified by name in session 42:
 
 ## Canary state
 
-**Green as of the `v0.6.9` bump** — `canary` and `canary --full`
-from both shells, 14/14 and 27/27.  The kernel self-test runs at
-boot and reports 17/17.
+**Green as of session 43** — `canary` and `canary --full` from
+both shells, 14/14 and 27/27, unchanged from the `v0.6.9` baseline.
+The kernel self-test runs at boot and reports 17/17.
 
 **The canary is a program: `canary`.**  `tests/canary.c` runs every
 non-interactive canary row, checks exit status and output
@@ -566,6 +610,9 @@ find `/usr/bin/CANARY`.
     envp_step1     # envp survives execve, 3 checks (forks)
     musl_exec2     # the bare-name shim is gone, 3 checks (forks)
     fcntl_lowfd    # fcntl on fd 0/1/2, 3 checks (redirects fd 0)
+    readlink_errno # readlink(2) errno split: ENOENT for a missing
+                   # path, EINVAL for an existing non-symlink, 3
+                   # checks (read-only); closes item 8
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
@@ -577,9 +624,9 @@ find `/usr/bin/CANARY`.
 Run these when changing `sys_read`/`sys_write`/`sys_close`/
 `put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
 
-**New tests this session must be added to both `USERLAND_ELFS` and
-the `mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image
-now stages 38 files.
+**New tests must be added to both `USERLAND_ELFS` and the
+`mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image now
+stages 39 files.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
@@ -588,9 +635,9 @@ now stages 38 files.
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
 trace line (removed).  The `FB: mapped N pages ...` line is
 expected.  The `sys_open: f_open FAIL path=...` lines from `vi` on
-a new file and from `busybox stat` on nonexistent paths are
-expected diagnostics.  `sys_execve: f_open FAIL` lines no longer
-appear.
+a new file, from `busybox stat` on nonexistent paths, and from
+`2>/dev/null` (the `/dev` gap) are expected diagnostics.
+`sys_execve: f_open FAIL` lines no longer appear.
 
 ---
 
@@ -614,7 +661,8 @@ storage; `prctl` is minimal; busybox applet symlinks not installed;
 syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake; no `/dev`, no `/proc`.
+wake is coupled to `sys_close`'s wake; **no `/dev`, no `/proc` —
+and `2>/dev/null` stops the command from running.**
 
 ---
 
@@ -636,12 +684,12 @@ wake is coupled to `sys_close`'s wake; no `/dev`, no `/proc`.
   `touch`, `tr`, `true`, `uname`, `uniq`, `wc`, `yes`, `cmp`,
   `grep`, `sed`, `vi`, `clear`, `basename`, `dirname`, `unlink`,
   `ttysize`, `tty`, `arch`, `mktemp`, `sleep`, `usleep`,
-  `truncate`, plus `ash`.
+  `truncate`, `realpath`, plus `ash`.
   `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  `CONFIG_FIND=y` and
   `CONFIG_FEATURE_FIND_TYPE=y`.  Other `FEATURE_FIND_*` predicates
   off deliberately.  Off with reasons: `diff`, `chmod`, `ln`,
   `mount`, and the archive/network/process tools — see "Busybox
-  enablement."  **This session adds `realpath`.**
+  enablement."
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
@@ -666,15 +714,20 @@ needs it.  Paths relative to the tree root
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  Session 42
-  added: "The kernel stack is 16 KB" and "A shim's dead code is
-  only dead if you watch it not run" (the first pass), plus
-  "An input-only `syscall` asm block does not tell GCC that `%rax`
-  is overwritten" and "A hand-counted string length in a syscall
-  wrapper will be wrong."  Read them together; expect more.
+- `docs/gotchas.md` — every bug writeup, by subsystem.  Session 43
+  added "A fix with no test is indistinguishable from an unfixed
+  defect."  Session 42 added "The kernel stack is 16 KB," "A shim's
+  dead code is only dead if you watch it not run," "An input-only
+  `syscall` asm block does not tell GCC that `%rax` is
+  overwritten," and "A hand-counted string length in a syscall
+  wrapper will be wrong."
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  **Session 42's rows are written** (commit `965c19a`).
-- `docs/open-issues.md` — full open-issues list.
+  **Session 42's rows are written, and session 43's rows are folded
+  in as a tail on session 42.**
+- `docs/open-issues.md` — full open-issues list.  Session 43
+  sharpened the `/dev` entry with the `2>/dev/null` finding and
+  **removed item 8** (the `readlink` errno defect), closed by
+  `readlink_errno.c`.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
@@ -692,9 +745,10 @@ Newlib is gone.  The userland is a tracked source tree at
 `v0.6.8` shipped the `*at()` family; `v0.6.9` shipped envp, the
 `/usr/bin` layout, the `execve` shim removal, the huge-page-split
 `#PF` fix, four syscalls, and ten busybox applets — tagged and
-pushed.  Next: enable `realpath` (config-only), then open the
-`/dev`+`/proc` device layer as its own milestone.  One change at a
-time.**
+pushed.  Session 43 enabled `realpath` (config-only) and closed
+`readlink`'s errno defect with a regression test.  Next: open the
+`/dev`+`/proc` direction, starting with `/dev/null` and the
+`2>/dev/null` acceptance test.  One change at a time.**
 
 ---
 
@@ -708,3 +762,20 @@ canary state, and next step.  Do not append.  New gotchas go to
 `docs/gotchas.md`; new commit rows go to `docs/session-log.md`;
 new open issues go to `docs/open-issues.md`.  This file never
 grows.  Name commits by tag only, never by SHA.
+
+**When a session's findings change an earlier numbered step, edit
+the step in place — do not just add a paragraph above it.**  The
+session-43 handoff carried a "NEXT SESSION" paragraph that stated
+the `realpath` conclusion and a numbered step 5 that still said
+"read the source, it may need more" — both live, both current-
+looking, contradicting.  The fix, now applied: the step carries
+the finding, and the rule moves to "apply to the next candidate."
+A document assembled from parts carries the state of each part,
+not the state of the whole.  This is the same lesson as "read the
+diff, not the subject."
+
+**A fix with no test is a fix nobody can confirm.**  Session 43
+found `sys_readlink` returning the right errnos while three docs
+said it did not; the fix had been in the tree, untested, since
+session 42.  See `docs/gotchas.md`.  When a doc entry names its
+own fix, `grep` for the fix before scheduling the work.
