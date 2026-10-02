@@ -4586,6 +4586,91 @@ long sys_clock_gettime(int clk_id, void* user_ts) {
 }
 
 /*
+ * Linux x86_64 nanosleep(2) — syscall 35.
+ *
+ * Sleep for the duration in *req.
+ *
+ * WHO CALLS THIS.  musl's nanosleep(3)
+ * (src/time/nanosleep.c) is a wrapper over __clock_nanosleep,
+ * which for CLOCK_REALTIME (0) with no flags issues exactly this
+ * syscall with the caller's req and rem.  musl's sleep(3) and
+ * usleep(3) both call nanosleep, so busybox `sleep` and `usleep`
+ * reach here.  See docs, "Busybox enablement".
+ *
+ * GRANULARITY.  donix's only clock is g_ticks, the 100 Hz PIT
+ * counter (10 ms per tick).  A requested duration is rounded
+ * DOWN to whole ticks: tv_sec*100 + tv_nsec/10000000.  So a
+ * 5 ms sleep takes 0 ticks and returns immediately; a 15 ms
+ * sleep takes 1 tick (10 ms).  That is the resolution donix has.
+ *
+ * WAITING.  The loop is `hlt`, the same shape sys_poll's blocking
+ * path and sys_read's fd-0 path use.  hlt stops the CPU until the
+ * next interrupt; the 100 Hz timer wakes it, g_ticks advances,
+ * and the loop re-checks.  No scheduler block is involved --
+ * there is no BLOCK_KIND_SLEEP and nothing would wake one.  On a
+ * single-process system that is correct; if multiple processes
+ * ever need to sleep concurrently, this becomes a scheduler
+ * concern and the loop becomes a block/wake pair.
+ *
+ * sti before hlt matches sys_poll: harmless when interrupts are
+ * already on (the normal case), protective if a caller somehow
+ * has them off.
+ *
+ * rem IS NEVER WRITTEN.  Linux writes rem only when the sleep is
+ * interrupted by a signal; donix does not deliver signals, so
+ * every sleep here runs to completion and returns 0.  musl's
+ * sleep(3) and usleep(3) pass the SAME pointer for req and rem,
+ * so writing rem on success would clobber the caller's req --
+ * another reason not to touch it.  When signal delivery lands,
+ * this is where the leftover time goes.
+ *
+ * ABI:
+ *   arg0  const struct timespec* req   (user pointer)
+ *   arg1  struct timespec*       rem   (user pointer; unused)
+ *   returns  0 on success, -errno on failure.
+ *
+ * struct timespec on x86_64 is two int64s, 16 bytes, no padding:
+ *     offset 0: tv_sec   (int64)
+ *     offset 8: tv_nsec  (int64)
+ *
+ * Validation, matching Linux: tv_sec < 0 is -EINVAL; tv_nsec
+ * must be in [0, 999999999] or -EINVAL.  NULL req is -EFAULT.
+ */
+long sys_nanosleep(const void* user_req, void* user_rem) {
+    (void)user_rem;   /* never written; see the header comment */
+
+    if (!user_req) return -(long)EFAULT_;
+
+    struct {
+        int64_t tv_sec;
+        int64_t tv_nsec;
+    } req;
+
+    if (safe_copy_from_user(&req, user_req, sizeof(req)) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    if (req.tv_sec < 0) return -(long)EINVAL_;
+    if (req.tv_nsec < 0 || req.tv_nsec > 999999999LL) return -(long)EINVAL_;
+
+    /* Round down to whole 10 ms ticks.  A sub-tick request waits
+     * zero ticks and returns immediately, which is the honest
+     * answer for a system whose clock is 100 Hz. */
+    uint64_t ticks = (uint64_t)req.tv_sec * 100ULL
+                   + (uint64_t)req.tv_nsec / 10000000ULL;
+
+    if (ticks == 0) return 0;
+
+    uint64_t deadline = g_ticks + ticks;
+    while (g_ticks < deadline) {
+        __asm__ volatile("sti");
+        __asm__ volatile("hlt");
+    }
+
+    return 0;
+}
+
+/*
  * Linux x86_64 getcwd(2) — syscall 79.
  *
  * Return the current working directory: the path stored by
@@ -5771,6 +5856,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
         case SYS_DUP:             return (uint64_t)sys_dup((int)arg0);
         case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
+        case SYS_NANOSLEEP:       return (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1);
         case SYS_GETPID:          return (uint64_t)sys_getpid();
         case SYS_FORK:            return (uint64_t)sys_fork();
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
