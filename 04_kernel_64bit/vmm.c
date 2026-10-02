@@ -404,26 +404,6 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
         uint64_t huge_phys  = pd[pd_idx] & ~0x1FFFFFULL;
         uint64_t huge_flags = pd[pd_idx] & 0xFFF;
 
-        /*
-         * DIAGNOSTIC (temporary).  Log every huge-page split so a
-         * boot that faults can be compared against one that does
-         * not.  If the split's allocation fails, the function
-         * returns without mapping, and the huge page -- which is
-         * SUPERVISOR (PT_USER clear) -- stays in place.  The
-         * caller, elf_load_into_process, does not check, and the
-         * process later faults on a user fetch of a supervisor
-         * page.  Remove these prints once the fault is fixed.
-         */
-        serial_print("VMM: SPLIT huge virt=0x");
-        serial_print_hex(virt);
-        serial_print(" cr3=0x");
-        serial_print_hex(cr3);
-        serial_print(" pde=0x");
-        serial_print_hex(pd[pd_idx]);
-        serial_print(" carry_user=");
-        serial_print_dec((huge_flags & PT_USER) ? 1 : 0);
-        serial_print("\n");
-
         uint64_t new_pt_phys = pmm_alloc_page_for_tables();
         if (!new_pt_phys) {
             /*
@@ -431,11 +411,10 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
              *
              * The caller asked for a mapping.  The page at `virt`
              * is currently covered by a 2 MB HUGE page, and that
-             * huge page is SUPERVISOR (PT_USER clear) -- see the
-             * SPLIT diagnostic above, which prints carry_user=0
-             * for the bootloader's identity map.  The ONLY thing
-             * that converts it to a user page is this split,
-             * followed by the caller writing its own PTE.
+             * huge page is SUPERVISOR (PT_USER clear) -- the
+             * bootloader's identity map.  The ONLY thing that
+             * converts it to a user page is this split, followed
+             * by the caller writing its own PTE.
              *
              * If we `return` here -- as this code used to -- the
              * split does not happen, the huge supervisor page
@@ -483,12 +462,6 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
             split_pt[m] = (huge_phys + (uint64_t)m * 0x1000) | carry;
         }
         pd[pd_idx] = new_pt_phys | carry;
-
-        serial_print("VMM: SPLIT-OK new_pt_phys=0x");
-        serial_print_hex(new_pt_phys);
-        serial_print(" new_pde=0x");
-        serial_print_hex(pd[pd_idx]);
-        serial_print("\n");
 
         uint64_t active_cr3_split;
         asm volatile("mov %%cr3, %0" : "=r"(active_cr3_split));
