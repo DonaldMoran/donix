@@ -3,19 +3,25 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-02 (session 43, closing)
-**Current HEAD:** branch `dev`, **13 commits ahead of `origin/dev`**
-(`origin/dev` is at `v0.6.9`, `441229e`).  Nothing pushed since
-`v0.6.9`.
-**Last milestone:** `v0.6.9` (published) — envp, the `/usr/bin`
-layout, the `execve` shim removal, the huge-page-split `#PF` fix,
-four syscalls (`readlink`, `clock_gettime`, `nanosleep`, `munmap`),
-ten busybox applets
-**Milestone status:** **`v0.6.9` shipped and pushed.**  Session 43
-is a tail on it: `realpath` enabled (config-only), the `readlink`
-errno closed by a regression test, and `/dev/null` working across
-`open`/`stat`/`access`.  All committed and scratch-tagged; none
-pushed.  No milestone has been opened for the post-ship work.
+**Last updated:** 2026-10-02 (session 43 closed; `v0.6.10` shipped)
+**Current HEAD:** branch `dev` at `v0.6.10` (tag `v0.6.10` on
+`70c85c6`), **pushed** — `origin/dev` is at the same commit.
+`main` is at the merge commit `cc38646`.  Working tree clean.
+**Last milestone:** `v0.6.10` (published) — a tail on `v0.6.9`,
+not a new subsystem.  `realpath` enabled (config-only); the
+`readlink` errno defect closed by a regression test; `/dev/null`
+working across `open`, `stat`, and `access`.
+**Milestone status:** **`v0.6.10` shipped and pushed.**  Session 43
+is closed: five code commits, ten docs commits, all merged to
+`main`, all scratch tags dropped, `v0.6.10` tagged and pushed.
+`main` was merged with `--no-ff` (`cc38646`).  No milestone has
+been opened for the next work.
+
+**The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
+a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
+`v0.6.9` envp, the `/usr/bin` layout, the `execve` shim removal;
+`v0.6.10` a tail on `v0.6.9` — `realpath`, the `readlink` errno,
+and `/dev/null`.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -34,6 +40,84 @@ when no `v*` tag is imminent.
 **Note on commit messages:** a commit message is a claim, not a
 fact.  `95c6337 handoff: rewrite fresh for the v0.6.9 bump` did not
 rewrite the handoff body.  Read the diff, not the subject.
+
+---
+
+## Working style — how this project gets changed
+
+Read this before proposing any command block.  It is how the
+project has been run for many sessions, and it is what the next
+session should preserve.
+
+**One change at a time.**  A "change" is a commit.  The handoff's
+work, the docs' rules, and the session-log's pattern all assume a
+single coherent change per commit, verified before the next one
+starts.
+
+**The state check comes before the command block.**  Every commit
+block starts with `git status` (or `git log`) so the working tree
+is known *before* a command runs.  This is a rule because it was
+learned: a `git commit` was once written against an assumed state
+and landed wrong.  Ask for the status, then give the block.
+
+**A command block is one paste.**  `git add`, `git status`,
+`git commit`, and `git tag` belong in **one** block, with the
+commit message inline via heredoc (`git commit -F - <<'EOF' … EOF`),
+not spread across several turns.  The same for the push/merge
+sequence below.  Do not split a single operation across messages;
+that is how a commit and its tag get separated.
+
+**Two file-return styles.**
+
+- **Small files:** return the complete file, four-backtick fenced.
+- **Large files:** return unified-diff hunks, each located by
+  enough surrounding context to be unambiguous, preceded by a bold
+  **`WORK BEGINS HERE.`** marker on its own line so it is never
+  confused with thinking-out-loud.
+
+  The marker is load-bearing: before it, the assistant is
+  discussing; after it, the content is applyable.  Never mix the
+  two — do not post file parts while reasoning.
+
+**Ask for source you do not have.**  The assistant does not have
+direct file access.  Before patching a file whose current contents
+it has not seen in this session, it must **ask for that file**.
+Never guess at a file's contents, never patch from memory of an
+earlier version, never assume a file is unchanged.  This is how
+stale patches and reverted work have been avoided.
+
+**The push / merge / tag sequence** (the project's own order,
+used for every `v*` bump):
+
+    git tag -a vX.Y.Z -F - <<'EOF'
+    <annotation>
+    EOF
+
+    git push origin dev && \
+    git push origin vX.Y.Z && \
+    git checkout main && \
+    git merge --no-ff dev -m "Merge dev into main for vX.Y.Z
+
+    <merge narrative>" && \
+    git push origin main && \
+    git checkout dev && \
+    git status && \
+    git log --oneline -3
+
+Before this: the banner bump is the **last** code commit of the
+version; the session's `YYYYMMDD-*` scratch tags are **dropped**
+(`git tag -d`); and the session-log and handoff are written.  The
+banner commit is named `kmain: bump the shell banner to vX.Y.Z`.
+
+The tag is **annotated** (`-a -F -`) — the annotation is the
+milestone narrative, and it is what a future reader sees first.
+The merge is `--no-ff`, so `main` keeps a real merge commit for
+each version (`Merge dev into main for v0.6.10`, etc.).
+
+**A version is not necessarily a milestone.**  `v0.6.10` is a tail
+on `v0.6.9` with no new subsystem.  When that happens, the tag
+annotation and the session-log row should *say so*, so a future
+reader does not hunt for a milestone narrative that is not there.
 
 ---
 
@@ -277,39 +361,30 @@ noneya@fedora:~/code/donix$ tree -L 3
 
 ---
 
-## Where we are — `v0.6.9` shipped, four post-ship changes
+## Where we are — `v0.6.10` shipped
 
 `v0.6.8` shipped the `*at()` family.  `v0.6.9` opened as **envp**
 and grew, in session 42, into the **`/usr/bin` layout**, the
 **removal of `execve`'s bare-name guess**, a **page-table bug fix**,
 **four new syscalls**, **ten busybox applets**, **three small
-gaps**, and **four new gotchas**.  Tagged `v0.6.9`, pushed,
-scratch tags dropped.
+gaps**, and **four new gotchas**.  Tagged, pushed, scratch tags
+dropped.
 
-Session 43 added four things on top, all committed and
-scratch-tagged, none pushed:
-
-- **`realpath` enabled**, config-only (`20261002-realpath`).
-- **`readlink` errno closed by test** (`20261002-readlink-test`).
-- **`/dev/null` works for `open()`** (`20261002-dev-null`).
-- **`/dev/null` works for `stat` and `access` too**
-  (`20261002-dev-null-stat`) — the match extracted into
-  `path_is_devnull`, one predicate, three call sites.
-
-It also corrected a stale test found along the way: `pipe_step1`
-(`20261002-pipe-step1`), and the gotcha it produced
-(`20261002-pipe-gotcha`).
+`v0.6.10` is a **tail on `v0.6.9`** — session 43's four post-ship
+changes, merged and pushed.  It is not a milestone in the docs'
+sense; there is no new subsystem.  The tag annotation says so.
 
 ### Session 43, in full
 
-| Tag | What |
+| Commit | What |
 |---|---|
-| `20261002-realpath` | `CONFIG_REALPATH=y` — enables busybox `realpath`; config-only |
-| `20261002-readlink-test` | `readlink_errno.c` — readlink(2) errno split, 3 checks; closes item 8 |
-| `20261002-dev-null` | `open()` recognizes `/dev/null`; `FILE_KIND_DEV_NULL` |
-| `20261002-dev-null-stat` | `path_is_devnull` shared by open/stat/access; `ls`, `stat`, `test -e` work |
-| `20261002-pipe-step1` | `pipe_step1` EAGAIN assertions removed; they block now, not fail |
-| `20261002-dev-null-docs`, `-dev-null-stat-docs`, `-readlink-docs`, `-readlink-gotcha`, `-pipe-gotcha`, `-arch-rule`, `-handoff`, `-handoff-repath`, `-handoff-close` | docs |
+| `busybox: enable realpath (config-only)` | `CONFIG_REALPATH=y`; the trace showed no new syscalls needed |
+| `readlink: regression test for the errno split (item 8)` | `readlink_errno.c`, 3/3; item 8 closed |
+| `dev/null: open() recognizes the exact path` | `FILE_KIND_DEV_NULL`; `2>/dev/null` works |
+| `dev/null: stat and access know the path` | `path_is_devnull`, one predicate, three call sites |
+| `pipe_step1: drop the Step-1 EAGAIN checks` | stale since session 36; hung rather than failed |
+
+Plus the docs that record them, and two gotchas.
 
 **`realpath` — the trace, and two wrong test expectations.**
 `realpath_main` → `xmalloc_realpath_coreutils` → `xmalloc_realpath`
@@ -332,18 +407,9 @@ asserts both answers — 3/3.  Item 8 is closed with a run behind it.
 See `gotchas.md`, "A fix with no test is indistinguishable from an
 unfixed defect."
 
-**`/dev/null` — from open-only to stat and access.**
-`20261002-dev-null` made `open_resolved` recognize the exact path
-`dev/null` (the `strip_dot_prefix`'d form) and return a
-`FILE_KIND_DEV_NULL` slot: read returns 0, write returns count,
-close frees, `fstat` reports `S_IFCHR`.  `2>/dev/null` became
-silent-and-non-zero.
-
-`20261002-dev-null-stat` then found that only `open` knew the path:
-`ls /dev/null`, `test -e /dev/null`, and `stat /dev/null` all still
-failed with ENOENT.  It extracted the inline match into
-`path_is_devnull` and called it from `stat_resolved` and
-`access_resolved` as well — one predicate, three call sites:
+**`/dev/null` — open, stat, access.**  `path_is_devnull` — one
+predicate, three call sites — is consulted by `open_resolved`,
+`stat_resolved`, and `access_resolved`:
 
     $ ls -l /dev/null
     crw-rw-rw-    1    0,   0 /dev/null
@@ -353,11 +419,13 @@ failed with ENOENT.  It extracted the inline match into
       File: '/dev/null'
       ...    character special file
 
-`readlink("/dev/null")` gets `-EINVAL` for free, via
-`access_resolved`.  Still an exact-path predicate, not the dispatch
-seam.  **Boundary:** `readdir("/dev")` fails (no `/dev` directory
-to list), and `/dev/tty` and `/dev/urandom` do not exist, so `tty`
-still prints `not a tty`.
+`open` returns a `FILE_KIND_DEV_NULL` slot: read returns 0, write
+returns count, close frees.  `stat`/`fstat` report `S_IFCHR | 0666`.
+`readlink("/dev/null")` returns `-EINVAL` for free, via
+`access_resolved`.  **Still an exact-path predicate, not the
+dispatch seam.**  **Boundary:** `readdir("/dev")` fails (there is
+no `/dev` directory), and `/dev/tty` and `/dev/urandom` do not
+exist, so `tty` still prints `not a tty`.
 
 **`pipe_step1` — a test that went stale and hung.**  It asserted
 Step-1 non-blocking semantics (empty read → `-EAGAIN`, full write
@@ -530,6 +598,16 @@ The findings that milestone recorded, still load-bearing:
   `/proc`.  `readlink` (89) is implemented and now returns the
   correct errnos, but `ttyname` still cannot name the console.  See
   `open-issues.md`.
+- **`reboot` / `halt` / `poweroff` cannot be enabled yet.**  They
+  need signal delivery.  `reboot` with no `-f` calls
+  `kill(1, SIGTERM)` — it signals init, and donix has no init and
+  no signal delivery, so it would be a silent no-op.  `reboot -f`
+  would reach `reboot(2)` (169), but it is the *force* path; and
+  `halt`/`poweroff` collapse to the same action as `reboot` on
+  donix (reset), because there is no ACPI and no halt state — so
+  shipping them would be a lie in the applet's behavior.  The
+  blocking dependency is `open-issues.md` item 5, signal delivery,
+  the same subsystem `SIGPIPE` and a Wayland `SIGBUS` need.
 - **`musl_wait`'s WNOHANG loop spins.**  Pre-existing.  See
   `docs/session-log.md`, session 41.
 
@@ -538,37 +616,82 @@ The findings that milestone recorded, still load-bearing:
 ## NEXT SESSION — the `/dev` + `/proc` direction
 
 `realpath`, the `readlink` errno, and `/dev/null` across
-open/stat/access are all done.  The next real work is the **`/dev`
-and `/proc` device layer**.  It is not a scheduled milestone; it is
-a direction, and the session that picks it up plans it then.  What
-follows is the shape, not the schedule.
+open/stat/access are all done and shipped as `v0.6.10`.  The next
+real work is the **`/dev` and `/proc` device layer**.  It is not a
+scheduled milestone; it is a **direction**, and the session that
+picks it up **plans it then**, as the docs' own rule says.
 
-What the `/dev/null` work did **not** do, and what the direction
-still needs:
+**Plan first, build second.**  Do not start with a patch.  The
+first task is to read the relevant source and decide the scope, as
+`ROADMAP.md`, "Make `/proc` possible," lays out:
+
+> The work is **"the minimal dispatch seam plus the smallest
+> open-file representation that one `/proc` file requires."**
+> Both parts, together, sized to `/proc/self/status` and nothing
+> larger.
+
+`/proc` is the first feature the current architecture **cannot
+express at all**, so it is what forces the pathname dispatch seam
+into existence.  Symlinks and `/dev` are **consumers** of the
+seam, built after it.
+
+### What the direction still needs
 
 - **A real `/dev` that `readdir` can list.**  Today `/dev/null` is
   an exact-path predicate, one name, not a directory.  `ls /dev`
-  fails.  A device layer that appears in the path namespace is the
-  thing that fixes this, and it is the dispatch seam's job.
+  fails.
 - **`tty` naming its terminal.**  `ttyname(3)` walks
   `/proc/self/fd/N` then `/dev`.  Both fail today; with either one
   present, `tty` can print a path instead of `not a tty`.
 - **`/dev/tty`, `/dev/urandom`.**
 
-This is item 1's customer and the reason the dispatch seam gets
-built.  See `ROADMAP.md`, "Make `/proc` possible."  **/proc is the
-first feature the current architecture cannot express, so it forces
-the seam.**  Symlinks and `/dev` are consumers of it.  Do not
-implement standalone `/dev` handling in individual syscalls — the
-`path_is_devnull` predicate and its three call sites are the one
-deliberate exception, and they are recorded as such, to be deleted
-when the seam lands.
+### The two failure modes to avoid
 
-### After that — candidates
+From `ROADMAP.md`, and they are the reason to plan before building:
+
+- **Over-abstraction.**  Do not schedule "VFS."  No inode layer, no
+  vnode layer, no superblocks, no mount framework.  Build the seam
+  `/proc` needs and stop.
+- **Under-abstraction.**  Do not special-case `/proc` inside
+  `sys_open`, then `sys_stat`, then `sys_access`.  The
+  `path_is_devnull` predicate is the *one* recorded exception, and
+  it is to be deleted when the seam lands — do not add a second.
+
+### What the seam subsumes
+
+`open-issues.md` item 1: `sys_execve`'s two remaining path attempts
+and `resolve_against_cwd` are shims the seam subsumes.  **Delete
+them as part of this work; do not extend them.**  The
+`path_is_devnull` predicate and its three call sites go with them.
+
+### Source the next session will need
+
+The assistant does not have file access; ask for what the task
+needs.  For the seam, at minimum:
+
+- `04_kernel_64bit/include/syscall.h` — the `SYS_*` numbers and
+  the `SYS_REBOOT` (500) define; the seam may add to this file.
+- `04_kernel_64bit/include/process.h` — `pcb_t`,
+  `MAX_PROCESS_FILES`, `PROC_STACK_SIZE`, the `file_table[]`
+  shape.
+- `04_kernel_64bit/user_syscall.c` — the whole file, since the
+  seam lives in its path functions (`resolve_at`,
+  `resolve_against_cwd`, `open_resolved`, `stat_resolved`,
+  `access_resolved`, and the `file_slot_t` definition).
+- `04_kernel_64bit/include/user_syscall.h` — if the seam changes
+  the `file_slot_t` shape, the header is where the contract lives.
+- `docs/strategy.md` — the "When a feature may force architecture"
+  test the seam must pass.
+
+Read `ROADMAP.md`, "Make `/proc` possible," **before** deciding
+anything, and read `docs/strategy.md` for the one-change-at-a-time
+discipline.
+
+### After the seam — candidates
 
 - **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `open-issues.md`
-  item 5.  Also the prerequisite for job control, `kill(2)`, and a
-  Wayland `wl_shm` client's `SIGBUS`.
+  item 5.  Unblocks `reboot`/`halt`/`poweroff`, job control,
+  `kill(2)`, and a Wayland `wl_shm` client's `SIGBUS`.
 - **The six remaining silent `vmm_map_page*` returns.**
   `open-issues.md` item 7.  A deliberate decision per site.
 - **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
@@ -612,6 +735,7 @@ Syscalls added to unblock them: `readlink` (89), `clock_gettime`
 | `CONFIG_LN` | `ln` | `link`/`symlink`; FAT has no links |
 | `CONFIG_LINK` | `link` | same |
 | `CONFIG_MOUNT`/`UMOUNT` | `mount`/`umount` | `mount` (165); no VFS |
+| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | `halt`/`poweroff`/`reboot` | signal delivery (item 5); no init to signal, no ACPI |
 | `CONFIG_TAR`/`UNZIP`/`CPIO`/`GZIP`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
 | `CONFIG_AWK` | `awk` | large; needs `FEATURE_AWK_LIBM`; `system()`/`getline` need signal delivery |
 | `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control donix's line-discipline stubs do not model |
@@ -710,7 +834,8 @@ neither do the `f_open FAIL path=dev/null` lines from
    own syscalls.**  Deliberate FatFs-limitation first cuts.
 5. **`-EPIPE` is delivered without `SIGPIPE`.**  Narrower than the
    old docs claimed: `busybox yes | busybox head -n 1` does *not*
-   hang.  Fixing it means signal delivery.
+   hang.  Fixing it means signal delivery — the same subsystem
+   `reboot`/`halt`/`poweroff` need.
 
 Also open: `unlinkat` has no consumer; the six remaining silent
 `vmm_map_page*` returns; `sys_brk`'s fixed `heap_base` and the
@@ -747,8 +872,8 @@ wake is coupled to `sys_close`'s wake; **no `/dev` directory and no
   `CONFIG_FEATURE_VI_WIN_RESIZE=y`.  `CONFIG_FIND=y` and
   `CONFIG_FEATURE_FIND_TYPE=y`.  Other `FEATURE_FIND_*` predicates
   off deliberately.  Off with reasons: `diff`, `chmod`, `ln`,
-  `mount`, and the archive/network/process tools — see "Busybox
-  enablement."
+  `mount`, `halt`/`poweroff`/`reboot`, and the archive/network/
+  process tools — see "Busybox enablement."
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
@@ -782,8 +907,7 @@ needs it.  Paths relative to the tree root
   overwritten," and "A hand-counted string length in a syscall
   wrapper will be wrong."
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  **Session 42's rows are written, and session 43's rows are folded
-  in as a tail on session 42.**
+  Session 43's commits are recorded.
 - `docs/open-issues.md` — full open-issues list.  Session 43
   sharpened the `/dev` entry with the `2>/dev/null` finding,
   recorded `/dev/null` working across open/stat/access, and
@@ -805,11 +929,10 @@ Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` shipped the shell and the framebuffer;
 `v0.6.8` shipped the `*at()` family; `v0.6.9` shipped envp, the
 `/usr/bin` layout, the `execve` shim removal, the huge-page-split
-`#PF` fix, four syscalls, and ten busybox applets — tagged and
-pushed.  Session 43 added `realpath` (config-only), closed
-`readlink`'s errno defect with a regression test, and made
-`/dev/null` work across open, stat, and access.  Next: the
-`/dev`+`/proc` direction, which forces the pathname dispatch seam.
+`#PF` fix, four syscalls, and ten busybox applets; `v0.6.10`
+shipped `realpath`, the `readlink` errno, and `/dev/null` across
+open/stat/access — all tagged and pushed.  Next: the `/dev`+`/proc`
+direction, which forces the pathname dispatch seam; plan it first.
 One change at a time.**
 
 ---
@@ -826,22 +949,20 @@ new open issues go to `docs/open-issues.md`.  This file never
 grows.  Name commits by tag only, never by SHA.
 
 **When a session's findings change an earlier numbered step, edit
-the step in place — do not just add a paragraph above it.**  The
-session-43 handoff carried a "NEXT SESSION" paragraph that stated
-the `realpath` conclusion and a numbered step 5 that still said
-"read the source, it may need more" — both live, both current-
-looking, contradicting.  The fix, now applied: the step carries
-the finding, and the rule moves to "apply to the next candidate."
-A document assembled from parts carries the state of each part,
-not the state of the whole.  This is the same lesson as "read the
-diff, not the subject."
+the step in place — do not just add a paragraph above it.**  A
+document assembled from parts carries the state of each part, not
+the state of the whole.  This is the same lesson as "read the diff,
+not the subject" — and the session-43 handoff had exactly this
+problem until it was rewritten.
 
-**Two session-43 gotchas worth reading before the next change.**
-"A fix with no test is indistinguishable from an unfixed defect":
-`sys_readlink` was correct while three docs said it was not; when
-a doc entry names its own fix, `grep` before scheduling the work.
-"A test can encode an earlier version's behavior": `pipe_step1`'s
-EAGAIN assertions were Step-1 semantics, and after read/write
-began blocking they hung instead of failing.  Run the suite a
-change's own rule names, or the staleness is invisible.  See
-`docs/gotchas.md`.
+**Before proposing any command block, read the "Working style"
+section at the top.**  It is the project's git and file-return
+convention, and it is what every prior session has used.
+
+**Three gotchas worth reading before the next change.**  "A fix
+with no test is indistinguishable from an unfixed defect" (item 8
+was already fixed while three docs said otherwise — `grep` before
+scheduling).  "A test can encode an earlier version's behavior"
+(`pipe_step1` hung instead of failing — run the suite a change's own
+rule names).  "A consumer inferred from behavior is not a consumer"
+(read the caller's source).  See `docs/gotchas.md`.
