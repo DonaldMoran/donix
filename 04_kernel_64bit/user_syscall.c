@@ -187,6 +187,41 @@ static char g_write_bounce[WRITE_CHUNK];
  */
 #define FILE_KIND_DEV_NULL 5
 
+/*
+ * Which backend owns a resolved path.  THE SEAM.
+ *
+ * resolve_at produces an absolute Unix-form path AND one of these,
+ * computed from the first path component of that resolved path:
+ *
+ *     /dev/...    -> BACKEND_DEV
+ *     /proc/...   -> BACKEND_PROC
+ *     anything    -> BACKEND_FAT
+ *
+ * IN THIS COMMIT EVERY CALLER IGNORES THE VALUE.  FAT is the only
+ * backend with a handler, and the FAT handler is what the code
+ * already did.  A path tagged DEV or PROC still goes to the FAT
+ * handler, which is exactly today's behavior: f_open("dev/null")
+ * fails with FR_NO_PATH -> -ENOENT, f_open("proc/self/status")
+ * fails the same way.  Commits 2 and 3 give DEV and PROC handlers
+ * respectively; until then the tag is computed and discarded.
+ *
+ * This is the VFS front door, whether or not it is called that.
+ * It is deliberately NOT a VFS: no inode, no vnode, no mount
+ * table.  It is "which of three things does this path name."
+ * See docs/strategy.md, "When a feature may force architecture."
+ *
+ * Values are 0/1/2 so a zero-initialized local is BACKEND_FAT,
+ * the safe default: an unset tag falls through to the FAT handler
+ * and behaves as today.
+ *
+ * Private to this file.  The enum is the seam's vocabulary; no
+ * other translation unit needs to name these.  If one ever does,
+ * that is the signal to move them to a header.
+ */
+#define BACKEND_FAT  0
+#define BACKEND_DEV  1
+#define BACKEND_PROC 2
+
 /* Pipe end flags.  Stored in pipe_slot_t.end. */
 #define PIPE_END_READ  1
 #define PIPE_END_WRITE 2
@@ -730,6 +765,47 @@ static int path_copy(char* out, size_t cap, const char* src) {
 }
 
 /*
+ * The seam's decision.  Given an absolute Unix-form path, return
+ * which backend owns it, by FIRST COMPONENT.
+ *
+ * This is the ONLY place the mapping lives.  A second copy of
+ * "does this path start with /dev or /proc" is the failure mode
+ * docs/strategy.md names -- do not add one.  When a later session
+ * wants a new backend, it adds a clause here and a handler; it does
+ * not touch the syscalls.
+ *
+ * The comparison is by COMPONENT, not by prefix.  "/dev" and
+ * "/dev/null" match; "/devices/x" does not, because after "dev"
+ * comes 'i', not '/' or end-of-string.  A plain prefix compare of
+ * "dev" would wrongly match "devices".
+ *
+ * Called only on paths that came from resolve_at, which are
+ * absolute, so abs_path[0] == '/' is guaranteed by the caller.
+ * The guard below is defensive, not load-bearing: a non-absolute
+ * path is treated as FAT, which is the pre-seam behavior.
+ *
+ * No libc string functions, matching this file's convention (see
+ * the comment on path_is_devnull).  Manual compare.
+ */
+static int path_backend(const char* abs_path) {
+    if (abs_path[0] != '/') return BACKEND_FAT;
+
+    const char* p = abs_path + 1;
+
+    /* "dev" followed by '/' or end-of-string. */
+    if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' &&
+        (p[3] == '/' || p[3] == '\0')) {
+        return BACKEND_DEV;
+    }
+    /* "proc" followed by '/' or end-of-string. */
+    if (p[0] == 'p' && p[1] == 'r' && p[2] == 'o' && p[3] == 'c' &&
+        (p[4] == '/' || p[4] == '\0')) {
+        return BACKEND_PROC;
+    }
+    return BACKEND_FAT;
+}
+
+/*
  * Resolve `path` against `dirfd` the way Unix does.
  *
  *   out, cap        the destination; cap must be >= USER_PATH_MAX
@@ -738,11 +814,16 @@ static int path_copy(char* out, size_t cap, const char* src) {
  *                   caller's own AT_EMPTY_PATH handling; resolve_at
  *                   itself treats "" as a path that resolves to the
  *                   directory itself)
+ *   backend_out     if non-NULL, receives BACKEND_FAT / _DEV / _PROC
+ *                   computed from the first component of the
+ *                   resolved path.  Untouched on failure; callers
+ *                   must not read it after a nonzero return.
  *
  * Returns 0 and writes an absolute Unix-form path to `out`, or a
  * negative errno:
  *
- *   -EINVAL   path would overflow out
+ *   -ENAMETOOLONG  the path would overflow out (from path_copy, or
+ *                  from resolve_against_cwd's overflow)
  *   -EBADF    dirfd is negative and not AT_FDCWD, or out of range
  *   -ENOTDIR  dirfd names a slot that is not a directory
  *   -ENOENT   dirfd is a directory slot with no recorded path
@@ -761,10 +842,13 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * cases 4 and 5 produce an absolute result directly.
  */
 static int resolve_at(int dirfd, const char* path,
-                      char* out, size_t cap) {
+                      char* out, size_t cap,
+                      int* backend_out) {
     /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
     if (path_is_absolute(path)) {
-        return path_copy(out, cap, path) == 0 ? 0 : -(long)EINVAL_;
+        if (path_copy(out, cap, path) != 0) return -(long)ENAMETOOLONG_;
+        if (backend_out) *backend_out = path_backend(out);
+        return 0;
     }
 
     /* 2 and 3. AT_FDCWD: cwd-relative, which is what every existing
@@ -773,8 +857,21 @@ static int resolve_at(int dirfd, const char* path,
     if (dirfd == AT_FDCWD_) {
         pcb_t* self = process_get_current();
         if (resolve_against_cwd(self, path, out, cap) != 0) {
-            return -(long)EINVAL_;
+            /*
+             * resolve_against_cwd returns -1 on overflow (its only
+             * failure).  Map that to ENAMETOOLONG, not EINVAL: an
+             * over-long path is a path-length error, and Linux
+             * returns ENAMETOOLONG for it.  The four callers this
+             * commit moves off resolve_against_cwd (sys_access,
+             * sys_chdir, sys_mkdir, sys_rename) already mapped it
+             * to ENAMETOOLONG themselves; this makes resolve_at
+             * agree with them.  sys_open / sys_openat /
+             * sys_newfstatat, which already used resolve_at,
+             * change from EINVAL to ENAMETOOLONG on this one path.
+             */
+            return -(long)ENAMETOOLONG_;
         }
+        if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -792,7 +889,11 @@ static int resolve_at(int dirfd, const char* path,
      * want this (newfstatat without AT_EMPTY_PATH) reject before
      * reaching here. */
     if (path[0] == '\0') {
-        return path_copy(out, cap, slot->dir_path) == 0 ? 0 : -(long)EINVAL_;
+        if (path_copy(out, cap, slot->dir_path) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
+        if (backend_out) *backend_out = path_backend(out);
+        return 0;
     }
 
     /* 5. dir_path + "/" + path, avoiding a doubled slash when
@@ -802,18 +903,19 @@ static int resolve_at(int dirfd, const char* path,
     while (slot->dir_path[dlen]) dlen++;
 
     for (size_t i = 0; i < dlen; i++) {
-        if (o + 1 >= cap) return -(long)EINVAL_;
+        if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
         out[o++] = slot->dir_path[i];
     }
     if (o == 0 || out[o - 1] != '/') {
-        if (o + 1 >= cap) return -(long)EINVAL_;
+        if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
         out[o++] = '/';
     }
     for (size_t i = 0; path[i]; i++) {
-        if (o + 1 >= cap) return -(long)EINVAL_;
+        if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
         out[o++] = path[i];
     }
     out[o] = '\0';
+    if (backend_out) *backend_out = path_backend(out);
     return 0;
 }
 
@@ -1803,8 +1905,10 @@ long sys_open(const char* path, int flags) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return open_resolved(resolved, flags);
 }
@@ -1830,8 +1934,10 @@ long sys_openat(int dirfd, const char* path, int flags) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return open_resolved(resolved, flags);
 }
@@ -2133,8 +2239,10 @@ long sys_unlink(const char* path) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return unlink_body(resolved, 0, "sys_unlink");
 }
@@ -2162,8 +2270,10 @@ long sys_rmdir(const char* path) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return unlink_body(resolved, 1, "sys_rmdir");
 }
@@ -2204,8 +2314,10 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     int want_dir = (flags & AT_REMOVEDIR_) != 0;
     return unlink_body(resolved, want_dir, "sys_unlinkat");
@@ -2264,15 +2376,19 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
         return -(long)EFAULT_;
     }
 
-    /* Resolve both against the process cwd. */
-    if (resolve_against_cwd(self, old_path, old_resolved,
-                            sizeof(old_resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
-    if (resolve_against_cwd(self, new_path, new_resolved,
-                            sizeof(new_resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
+    /* Resolve both against the process cwd.  Both now go through
+     * resolve_at with AT_FDCWD, so this syscall uses the same
+     * resolver as every other path syscall; the tag is unused
+     * here and discarded. */
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, old_path, old_resolved,
+                        sizeof(old_resolved), &backend);
+    if (rr != 0) return rr;
+    (void)backend;
+    rr = resolve_at(AT_FDCWD_, new_path, new_resolved,
+                    sizeof(new_resolved), &backend);
+    if (rr != 0) return rr;
+    (void)backend;
 
     /* Copy the resolved forms back into the working buffers. */
     {
@@ -2356,10 +2472,11 @@ long sys_mkdir(const char* path, int mode) {
     if (copy_user_string(local_path, sizeof(local_path), path) != 0) {
         return -(long)EFAULT_;
     }
-    if (resolve_against_cwd(self, local_path, resolved,
-                            sizeof(resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local_path, resolved,
+                        sizeof(resolved), &backend);
+    if (rr != 0) return rr;
+    (void)backend;
     {
         size_t i = 0;
         while (resolved[i] && i < sizeof(local_path) - 1) {
@@ -2649,8 +2766,10 @@ long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return stat_resolved(resolved, user_stat);
 }
@@ -2732,19 +2851,17 @@ static long access_resolved(const char* abs_path) {
  * access_resolved.
  *
  * access(2) has no dirfd: it resolves against the process cwd.
- * The path is resolved with resolve_against_cwd, then handed to
- * access_resolved.  sys_faccessat is the dirfd-taking form and
- * shares access_resolved with this.
+ * The path goes through resolve_at with AT_FDCWD, the same
+ * resolver every other path syscall now uses; the tag is
+ * unused here and discarded.
  *
- * The copy-back dance below (resolve into `resolved`, then copy
- * `resolved` back into `local`) is how the pre-resolve_at
- * callers drive resolve_against_cwd: it resolves into a separate
- * buffer, and the caller then wants the resolved string in the
- * buffer it goes on to strip.  sys_faccessat does not need it,
- * because resolve_at already returns an absolute Unix-form path
- * and access_resolved does its own path_copy + strip_dot_prefix.
- * The asymmetry is deliberate; see the open(2)/openat(2) pair for
- * the same shape.
+ * WHY THIS USES resolve_at AND NOT resolve_against_cwd: before
+ * this commit, sys_access called resolve_against_cwd directly,
+ * which meant it did not go through the seam.  Every path syscall
+ * now asks resolve_at.  The result is identical -- resolve_at's
+ * AT_FDCWD case delegates to resolve_against_cwd -- and the
+ * errno on overflow is the same ENAMETOOLONG the old code
+ * returned by hand.
  *
  * Why this exists: busybox's find_execable() (libbb/find_execable.c)
  * calls access(path, X_OK) for each PATH candidate before deciding
@@ -2764,10 +2881,11 @@ long sys_access(const char* user_path, int mode) {
     if (copy_user_string(local, sizeof(local), user_path) != 0) {
         return -(long)EFAULT_;
     }
-    if (resolve_against_cwd(process_get_current(), local, resolved,
-                            sizeof(resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local, resolved,
+                        sizeof(resolved), &backend);
+    if (rr != 0) return rr;
+    (void)backend;
     return access_resolved(resolved);
 }
 
@@ -2818,8 +2936,10 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return access_resolved(resolved);
 }
@@ -2882,8 +3002,10 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     return access_resolved(resolved);
 }
@@ -2952,8 +3074,10 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     }
 
     char resolved[USER_PATH_MAX];
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved));
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+    (void)backend;
 
     /* Validate the path exists, so a missing path is -ENOENT and a
      * present one is -EINVAL (not a symlink).  access_resolved does
@@ -4932,12 +5056,18 @@ long sys_chdir(const char* user_path) {
      * directly -- no separate "Unix form" step is needed.  It may
      * still carry a leading '/' or "./" that FatFs rejects, so a
      * copy is stripped for validation.
+     *
+     * This now routes through resolve_at with AT_FDCWD, the same
+     * resolver every other path syscall uses; the tag is unused
+     * here and discarded.  The errno on overflow is the same
+     * ENAMETOOLONG the old direct call returned.
      */
     char resolved[USER_PATH_MAX];
-    if (resolve_against_cwd(self, path, resolved,
-                            sizeof(resolved)) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
+    int backend;
+    int rr = resolve_at(AT_FDCWD_, path, resolved,
+                        sizeof(resolved), &backend);
+    if (rr != 0) return rr;
+    (void)backend;
 
     /*
      * FAT form: strip the leading '/' and "./" components that
