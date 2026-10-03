@@ -6,6 +6,7 @@
 #include "include/process.h"
 #include "include/scheduler.h"
 #include "include/user_msr.h"
+#include "include/pmm.h"
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -617,6 +618,15 @@ void isr14_handler(exception_frame_t *frame) {
             } else {
                 serial_print("  PTE NOT PRESENT\n");
             }
+            serial_print("  pmm: pml4=");
+            serial_print_dec((uint64_t)pmm_get_page_type(pml4e & ~0xFFFULL));
+            serial_print(" pdpt=");
+            serial_print_dec((uint64_t)pmm_get_page_type(pdpte & ~0xFFFULL));
+            serial_print(" pd=");
+            serial_print_dec((uint64_t)pmm_get_page_type(pde & ~0xFFFULL));
+            serial_print(" pt=");
+            serial_print_dec((uint64_t)pmm_get_page_type(pte & ~0xFFFULL));
+            serial_print("\n");
             serial_unlock();
         }
     }

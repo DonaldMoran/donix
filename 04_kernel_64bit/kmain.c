@@ -473,8 +473,8 @@ static int test_map(void) {
     uint64_t active_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
 
-    extern void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
-    vmm_map_page_in_cr3(active_cr3, test_virt, phys, 0x01ULL | 0x02ULL);
+    extern int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
+    (void)vmm_map_page_in_cr3(active_cr3, test_virt, phys, 0x01ULL | 0x02ULL);
     __asm__ volatile("invlpg (%0)" : : "r"(test_virt) : "memory");
 
     uint64_t res = *(uint64_t*)test_virt;
@@ -630,8 +630,8 @@ static int test_nx(void) {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
 
-    extern void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
-    vmm_map_page_in_cr3(cr3, virt, phys, 0x01ULL | 0x02ULL | 0x8000000000000000ULL);
+    extern int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
+    (void)vmm_map_page_in_cr3(cr3, virt, phys, 0x01ULL | 0x02ULL | 0x8000000000000000ULL);
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 
     /* Walk the page tables via HHDM to read the PTE back. */

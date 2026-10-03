@@ -73,7 +73,7 @@ void vmm_init(BootInfo* info) {
     serial_unlock();
 }
 
-void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
+int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     phys &= ~0xFFFULL;
 
     uint64_t user_flag    = (flags & PT_USER) ? PT_USER : 0;
@@ -94,7 +94,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     uint64_t* pdpt;
     if (!(pml4[pml4_idx] & PT_PRESENT)) {
         uint64_t new_pdpt_phys = pmm_alloc_page_for_tables();
-        if (!new_pdpt_phys) return;
+        if (!new_pdpt_phys) return -1;
         memset(phys_to_virt(new_pdpt_phys), 0, PAGE_SIZE);
         pml4[pml4_idx] = new_pdpt_phys | dir_flags;
         pdpt = phys_to_virt(new_pdpt_phys);
@@ -106,7 +106,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     uint64_t* pd;
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) {
         uint64_t new_pd_phys = pmm_alloc_page_for_tables();
-        if (!new_pd_phys) return;
+        if (!new_pd_phys) return -1;
         memset(phys_to_virt(new_pd_phys), 0, PAGE_SIZE);
         pdpt[pdpt_idx] = new_pd_phys | dir_flags;
         pd = phys_to_virt(new_pd_phys);
@@ -118,7 +118,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     uint64_t* pt;
     if (!(pd[pd_idx] & PT_PRESENT)) {
         uint64_t new_pt_phys = pmm_alloc_page_for_tables();
-        if (!new_pt_phys) return;
+        if (!new_pt_phys) return -1;
         memset(phys_to_virt(new_pt_phys), 0, PAGE_SIZE);
         pd[pd_idx] = new_pt_phys | dir_flags;
         pt = phys_to_virt(new_pt_phys);
@@ -132,6 +132,7 @@ void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
 
     pt[pt_idx] = pte;
     asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+    return 0;
 }
 
 void vmm_unmap_page(uint64_t virt) {
@@ -352,7 +353,7 @@ uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
     return (pt[pt_idx] & ~0xFFFULL) | (virt & 0xFFFULL);
 }
 
-void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags) {
+int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags) {
     phys &= ~0xFFFULL;
 
     uint64_t user_flag    = (flags & PT_USER) ? PT_USER : 0;
@@ -373,7 +374,7 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     uint64_t* pdpt;
     if (!(pml4[pml4_idx] & PT_PRESENT)) {
         uint64_t new_pdpt_phys = pmm_alloc_page_for_tables();
-        if (!new_pdpt_phys) return;
+        if (!new_pdpt_phys) return -1;
         memset(phys_to_virt(new_pdpt_phys), 0, PAGE_SIZE);
         pml4[pml4_idx] = new_pdpt_phys | dir_flags;
         pdpt = (uint64_t*)phys_to_virt(new_pdpt_phys);
@@ -385,7 +386,7 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     uint64_t* pd;
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) {
         uint64_t new_pd_phys = pmm_alloc_page_for_tables();
-        if (!new_pd_phys) return;
+        if (!new_pd_phys) return -1;
         memset(phys_to_virt(new_pd_phys), 0, PAGE_SIZE);
         pdpt[pdpt_idx] = new_pd_phys | dir_flags;
         pd = (uint64_t*)phys_to_virt(new_pd_phys);
@@ -476,7 +477,7 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     uint64_t* pt;
     if (!(pd[pd_idx] & PT_PRESENT)) {
         uint64_t new_pt_phys = pmm_alloc_page_for_tables();
-        if (!new_pt_phys) return;
+        if (!new_pt_phys) return -1;
         memset(phys_to_virt(new_pt_phys), 0, PAGE_SIZE);
         pd[pd_idx] = new_pt_phys | dir_flags;
         pt = (uint64_t*)phys_to_virt(new_pt_phys);
@@ -495,6 +496,7 @@ void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fl
     if ((active_cr3 & ~0xFFFULL) == (cr3 & ~0xFFFULL)) {
         asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
     }
+    return 0;
 }
 
 void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt) {

@@ -15,7 +15,7 @@
 
 void vmm_init(BootInfo* info);
 void* ensure_hhdm_mapped(uint64_t phys);
-void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 void vmm_unmap_page(uint64_t virt);
 uint64_t vmm_get_phys(uint64_t virt);
 int vmm_is_mapped(uint64_t virt);
@@ -23,5 +23,5 @@ void vmm_dump_page_table(uint64_t virt);
 
 uint64_t vmm_clone_page_table(uint64_t src_cr3);
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt);
-void vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
+int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
 void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);
