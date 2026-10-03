@@ -1005,6 +1005,69 @@ syscall sees an argument or a number that no caller could have
 meant, suspect the boundary between the caller and the kernel, and
 read the asm constraints or the libc wrapper.
 
+## A redirection binds to the last command in an `&&` chain
+
+*Session 45 (the `run` script's build-capture fix), commit
+`6cfb0e6`.  Not a kernel bug -- a shell redirection that scoped to
+one command instead of the whole chain, so every capture was
+missing the front of the build.*
+
+The `run` script's active line was:
+
+    make clean && make FAT_CONFIG=single && \
+        make -C 05_boot_kernel64 hdd-single.img && \
+        make -C 05_boot_kernel64 run-single > capture.txt
+
+The intent was "build everything and capture the whole build."
+What it actually did was `> capture.txt` **binds to the last
+command in the `&&` chain** -- `make -C 05_boot_kernel64
+run-single`.  The `clean`, the kernel build, and the image build
+wrote to the **terminal**, not to `capture.txt`.  So every capture
+produced this way was missing the front of the build, including
+the one line that says whether the kernel was even rebuilt.
+
+**Why it cost half a session.**  Session 45 spent it comparing
+`kernel.bin` binaries and reasoning about allocator state, when
+the log it was reading did not contain the kernel build at all.
+The evidence needed to answer "was the kernel rebuilt?" was never
+in the file, and nothing about the command line said so.
+
+**The fix.**  Wrap the whole chain in a brace group so the pipe
+and the redirection apply to all of it:
+
+    { make -C 04_kernel_64bit clean && \
+      make -C 04_kernel_64bit FAT_CONFIG=single && \
+      make -C 05_boot_kernel64 hdd-single.img && \
+      make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
+
+The brace group makes `2>&1 | tee capture.txt` apply to the whole
+chain.  `tee` writes to the terminal **and** to the file, so the
+terminal is not silenced.  The explicit `make -C 04_kernel_64bit`
+stages make the kernel build appear in the log.  Committed as
+`6cfb0e6`.
+
+**The rule.**  A redirection at the end of an `&&` chain binds to
+the **last** command, not the chain.  `a && b && c && d > file`
+sends only `d`'s output to `file`; `a`, `b`, and `c` write to the
+terminal.  This is easy to miss because the command line *reads*
+as if the redirection covers everything, and because the file it
+produces is non-empty -- it just does not contain what you think.
+
+**The tell.**  A capture file whose first line is not the first
+command you expected.  Or: you are comparing two artifacts whose
+build logs you believe you have, and one of them does not contain
+the build at all.  When the whole chain's output matters, wrap it
+in `{ ... ; }` and pipe the group.
+
+**Where this shape recurs.**  Same family as "The incremental
+kernel build can silently skip" (session 41): a build step whose
+output was believed captured and was not, which presents as a
+mystery about the artifact rather than about the command.  In both
+cases the fix is to make the command do what it reads as doing --
+`make clean` first, or wrap the chain -- and the lesson is that a
+command line is a claim about what ran, checked against the log,
+not against the intent.
+
 ## A hand-counted string length in a syscall wrapper will be wrong
 
 *Session 42 (the envp regression test), commit `20261001-lenfix`.

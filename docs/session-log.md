@@ -1,3 +1,51 @@
+## Session 46 — the boot-time `#PF` is tabled; the next session is busybox enablement
+
+One commit on `dev`, untagged, unpushed.  **Not a milestone** — a
+docs change that tables the boot-time `#PF` and re-points the next
+session.  No kernel change.
+
+| Tag | What |
+|---|---|
+| (none — docs commit) | `handoff: table the boot-time #PF; point the next session at busybox enablement` |
+
+**What it does.**  The boot-time `#PF` at `0x400000` is
+**intermittent and allocator-state dependent**, and is not
+currently observed.  Rather than being the next session's work, it
+is now **TABLED** in `open-issues.md` item 7.  The handoff is
+rewritten so a fresh session starts on feature work, and the next
+session is pointed at **busybox enablement**.
+
+- `open-issues.md` item 7: marked TABLED; the "do not tag a `v*`"
+  gate is lifted; session 45's findings (the virtual-1 fault, the
+  `pmm_get_page_type` result, the `vmm_clone_page_table` lessons)
+  are folded into the item so they are not lost when a session
+  reopens it.
+- `handoff.md`: the warning block, the "NEXT SESSION — item 7"
+  section, and "Session 45, and what it reverted" are removed or
+  replaced; the busybox-enablement table is reframed as a **cost
+  estimate** ("what each applet needs"), not a prohibition.  The
+  stale `BOOT_PF.TXT` reference is corrected — that file is not on
+  disk; `PFcapture.txt` holds presentation 2.  The stale HEAD line
+  and the stale "item 1 must be rewritten" paragraph are removed.
+- `gotchas.md`: a new entry, "A redirection binds to the last
+  command in an `&&` chain" (session 45's `run` build-capture
+  finding).
+
+**Session 45, in one line, for the record.**  Session 45 attempted
+the item-7 kernel fix three ways and reverted all three; **no
+kernel change was committed.**  Its one kept commit is `6cfb0e6`
+(the `run` script's build-and-capture fix), which rides on `dev`
+untagged.  Its findings live in `open-issues.md` item 7.  There is
+no session-45 section in this log; the tabled item is the record.
+
+**Known issue with this file.**  Session 44's section is at the
+**bottom** of the file, after session 34, instead of at the top
+where the newest-first convention puts it.  That misordering is
+noted here and **not** fixed in this change — reordering a file
+this size from a paste is the edit the working-style rules say to
+avoid.  Fix it in a separate change when the file is next
+rewritten.
+
 ## Session 42 — envp, the `/usr/bin` layout, and the shim removal
 
 Six commits on `dev`, scratch-tagged, unpushed.  Opens `v0.6.9`
