@@ -243,6 +243,19 @@ static char g_write_bounce[WRITE_CHUNK];
 #define PROC_ENTRY_SELF_STATUS 1
 
 /*
+ * The obj value of a synthesized PROC directory slot.
+ *
+ * open_resolved gives a FILE_KIND_DIR slot this value instead of a
+ * DIR* when the path is /proc or /proc/self, because there is no
+ * FatFs directory behind it -- readdir synthesizes the entries.
+ * put_file_slot checks for it before f_closedir/kfree, and
+ * sys_getdents64 checks for it before f_readdir.
+ *
+ * It is a non-NULL sentinel that no real DIR* can be.
+ */
+#define PROC_DIR_SENTINEL ((void*)(uintptr_t)0xFFFFFFFFFFFFFF01ULL)
+
+/*
  * Which backend owns a resolved path.  THE SEAM.
  *
  * resolve_at produces an absolute Unix-form path AND one of these,
@@ -1345,6 +1358,21 @@ static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
     st->st_blocks  = (st->st_size + 511) / 512;
 }
 
+/* Fill a kernel_stat_t describing a synthesized PROC directory.
+ * /proc and /proc/self report as directories: mode 0555, nlink 2,
+ * size 0.  KSTAT_IFDIR is the same mode constant
+ * fill_kstat_from_filinfo uses for a real FAT directory; this
+ * helper exists separately because a PROC directory has no
+ * FILINFO. */
+static void fill_kstat_as_dir(kernel_stat_t* st) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 2;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFDIR | 0555;
+    st->st_size    = 0;
+    st->st_blocks  = 0;
+}
+
 // ============================================================
 // SAFE COPY OPERATIONS
 // ============================================================
@@ -1538,8 +1566,16 @@ static void put_file_slot(file_slot_t* slot) {
         f_close((FIL*)slot->obj);
         kfree(slot->obj);
     } else if (slot->kind == FILE_KIND_DIR) {
-        f_closedir((DIR*)slot->obj);
-        kfree(slot->obj);
+        /*
+         * A synthesized PROC directory (open_resolved) has no
+         * DIR* behind it -- obj is PROC_DIR_SENTINEL.  Do not
+         * f_closedir or kfree it.  dir_path is still a real
+         * kmalloc'd string and is freed either way.
+         */
+        if (slot->obj != PROC_DIR_SENTINEL) {
+            f_closedir((DIR*)slot->obj);
+            kfree(slot->obj);
+        }
         if (slot->dir_path) kfree(slot->dir_path);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
@@ -2090,6 +2126,48 @@ static long open_resolved(const char* in_path, int flags, int backend) {
      * PROC_ENTRY_* value cast to a pointer, or fall through.
      */
     if (backend == BACKEND_PROC) {
+        /*
+         * /proc and /proc/self are directories, not table
+         * entries.  A FILE_KIND_DIR slot is required so
+         * sys_getdents64's get_file_slot(fd, FILE_KIND_DIR)
+         * accepts the fd; the obj is PROC_DIR_SENTINEL rather
+         * than a DIR*, because there is no FatFs directory
+         * behind it.  put_file_slot knows not to f_closedir it.
+         *
+         * dir_path is still the absolute Unix-form path, so an
+         * *at() syscall with this fd as dirfd resolves relative
+         * names against /proc or /proc/self.
+         */
+        int is_proc_root = (in_path[0] == '/' && in_path[1] == 'p'
+                            && in_path[2] == 'r' && in_path[3] == 'o'
+                            && in_path[4] == 'c' && in_path[5] == '\0');
+        int is_proc_self = (in_path[0] == '/' && in_path[1] == 'p'
+                            && in_path[2] == 'r' && in_path[3] == 'o'
+                            && in_path[4] == 'c' && in_path[5] == '/'
+                            && in_path[6] == 's' && in_path[7] == 'e'
+                            && in_path[8] == 'l' && in_path[9] == 'f'
+                            && in_path[10] == '\0');
+        if (is_proc_root || is_proc_self) {
+            file_slot_t* dslot = NULL;
+            int dfd = alloc_file_slot(&dslot);
+            if (dfd == -1) return -(long)EIO_;
+            dslot->kind = FILE_KIND_DIR;
+            dslot->obj  = PROC_DIR_SENTINEL;
+            dslot->end  = 0;   /* readdir cursor: not yet drained */
+            size_t plen = 0;
+            while (in_path[plen]) plen++;
+            dslot->dir_path = (char*)kmalloc(plen + 1);
+            if (dslot->dir_path) {
+                for (size_t i = 0; i <= plen; i++)
+                    dslot->dir_path[i] = in_path[i];
+            }
+            FDTRACE({ serial_print("open  proc dir -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" path=");
+                      serial_print(in_path); });
+            return dfd;
+        }
+
         uint32_t entry = proc_lookup(in_path);
         if (entry != PROC_ENTRY_NONE) {
             file_slot_t* pslot = NULL;
@@ -3168,6 +3246,29 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      * PROC backend.  Same shape as DEV.
      */
     if (backend == BACKEND_PROC) {
+        /*
+         * /proc and /proc/self report as directories.  Same two
+         * paths open_resolved accepts; stat and open must agree,
+         * or a caller that stats before opening sees the wrong
+         * thing.  The test checks both.
+         */
+        int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '\0');
+        int is_proc_self = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '/'
+                            && abs_path[6] == 's' && abs_path[7] == 'e'
+                            && abs_path[8] == 'l' && abs_path[9] == 'f'
+                            && abs_path[10] == '\0');
+        if (is_proc_root || is_proc_self) {
+            kernel_stat_t st;
+            fill_kstat_as_dir(&st);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
         uint32_t entry = proc_lookup(abs_path);
         if (entry != PROC_ENTRY_NONE) {
             kernel_stat_t st;
@@ -6410,6 +6511,49 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
 
     file_slot_t* slot = get_file_slot(fd, FILE_KIND_DIR);
     if (!slot) return -(long)EBADF_;
+
+    /*
+     * A synthesized PROC directory has no DIR* to f_readdir.
+     * Emit the entries by hand, one per call, the same record
+     * shape the FatFs path emits below.  The cursor is
+     * slot->end: 0 = nothing emitted yet, 1 = "self" emitted.
+     *
+     * /proc/self is a leaf (ps reads its stat/status, never its
+     * directory); its readdir returns 0 immediately.
+     */
+    if (slot->obj == PROC_DIR_SENTINEL) {
+        const char* nm = NULL;
+        if (slot->dir_path
+            && slot->dir_path[0] == '/' && slot->dir_path[1] == 'p'
+            && slot->dir_path[2] == 'r' && slot->dir_path[3] == 'o'
+            && slot->dir_path[4] == 'c' && slot->dir_path[5] == '\0'
+            && slot->end == 0) {
+            nm = "self";
+            slot->end = 1;
+        } else {
+            return 0;   /* /proc/self, or /proc after self */
+        }
+        size_t nlen = 0;
+        while (nm[nlen]) nlen++;
+        size_t reclen = GETDENTS64_HDR + nlen + 1;
+        reclen = (reclen + 7) & ~(size_t)7;
+        if (reclen > count) return -(long)EINVAL_;
+
+        uint8_t entbuf[GETDENTS64_MAXREC];
+        uint8_t* p = entbuf;
+        *(uint64_t*)(p + 0)  = 0;                /* d_ino    */
+        *(int64_t*)(p + 8)   = 0;                /* d_off    */
+        *(uint16_t*)(p + 16) = (uint16_t)reclen; /* d_reclen */
+        p[18] = DT_DIR;
+        for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = nm[i];
+        p[GETDENTS64_HDR + nlen] = '\0';
+        for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+
+        if (safe_copy_to_user(dirp, entbuf, reclen) != 0) {
+            return -(long)EFAULT_;
+        }
+        return (long)reclen;
+    }
 
     FILINFO fno;
     FRESULT r = f_readdir((DIR*)slot->obj, &fno);
