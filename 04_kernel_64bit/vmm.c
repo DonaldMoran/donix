@@ -33,7 +33,25 @@ void* ensure_hhdm_mapped(uint64_t phys) {
     uint64_t virt = HHDM_START + phys;
 
     if (!vmm_is_mapped(virt)) {
-        vmm_map_page(virt, phys, PT_PRESENT | PT_WRITE | PAGE_UNCACHED);
+        if (vmm_map_page(virt, phys, PT_PRESENT | PT_WRITE | PAGE_UNCACHED) != 0) {
+            /*
+             * Unrecoverable.  ensure_hhdm_mapped's whole job is to
+             * make `phys` reachable through the HHDM; a caller that
+             * asked for that and got a mapping-less virtual address
+             * back has no correct continuation.  There is no error
+             * channel: the function returns a pointer, and every
+             * caller dereferences it.
+             *
+             * This is a boot-path failure (vmm_init, heap_init,
+             * process_create's stack setup all call this), so the
+             * message is the machine's last words, not a diagnostic
+             * a process sees.
+             */
+            serial_print("VMM: FATAL ensure_hhdm_mapped failed; no HHDM for phys=0x");
+            serial_print_hex(phys);
+            serial_print("\n");
+            while (1) __asm__ volatile("hlt");
+        }
     }
 
     return (void*)virt;
@@ -61,7 +79,22 @@ void vmm_init(BootInfo* info) {
     vmm_max_physical = max_phys;
 
     for (uint64_t addr = 0; addr < 0x200000; addr += 0x1000) {
-        vmm_map_page(addr, addr, PT_PRESENT | PT_WRITE);
+        if (vmm_map_page(addr, addr, PT_PRESENT | PT_WRITE) != 0) {
+            /*
+             * Unrecoverable, and it is the boot identity map.
+             *
+             * The low 2 MB must be mapped 1:1 for the kernel to
+             * run at all: the bootloader's GDT, the stage2 stack,
+             * and the early page tables all live there, and the
+             * kernel dereferences them before any process exists.
+             * If a page-table allocation fails here, there is no
+             * kernel to report the failure to.
+             */
+            serial_print("VMM: FATAL identity map failed at addr=0x");
+            serial_print_hex(addr);
+            serial_print("\n");
+            while (1) __asm__ volatile("hlt");
+        }
     }
 
     serial_lock();

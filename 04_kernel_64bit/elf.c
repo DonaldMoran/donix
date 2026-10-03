@@ -107,7 +107,38 @@ uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data) {
             }
 
             uint64_t map_flags = 0x1FULL;
-            vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags);
+            if (vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags) != 0) {
+                /*
+                 * A page-table allocation failed while mapping this
+                 * segment page.  The mapping was NOT made.
+                 *
+                 * The page just allocated for the segment (`phys`)
+                 * has not been added to pcb->elf_page_list yet, so
+                 * process_cleanup_elf_pages will not free it.  Free
+                 * it here before returning, or it leaks.
+                 *
+                 * The pages mapped for earlier iterations of this
+                 * loop ARE in elf_page_list (elf_add_page_to_pcb was
+                 * called for each), so the caller's cleanup frees
+                 * them.  That is why this returns 0 rather than
+                 * trying to unwind: the caller already knows how.
+                 *
+                 * Returning 0 is elf_load_into_process's existing
+                 * "load failed" contract.  Both callers check it:
+                 * sys_execve treats it as fatal (the old address
+                 * space is already torn down by the time this runs
+                 * -- see the sys_execve header comment), and
+                 * kmain.c's load_elf_into_user_process returns 0 and
+                 * the caller destroys the process.  So the failure
+                 * is reported; what the caller does with it is the
+                 * caller's business.
+                 */
+                serial_print("ELF: map failed at vaddr=");
+                serial_print_hex(virt);
+                serial_print(" (out of page-table pages)\n");
+                pmm_free_page(phys);
+                return 0;
+            }
             ensure_hhdm_mapped(phys);
             elf_add_page_to_pcb(pcb, phys);
         }

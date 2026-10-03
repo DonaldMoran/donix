@@ -180,7 +180,37 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
             uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
             map_flags &= ~(0x80ULL | 0x40ULL | 0x200ULL | 0x800ULL);
 
-            vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags);
+            if (vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags) != 0) {
+                /*
+                 * A page-table allocation failed while mapping this
+                 * stack page.  The mapping was NOT made.
+                 *
+                 * The page just allocated (`phys`) is not yet in
+                 * pcb->elf_page_list -- elf_add_page_to_pcb runs
+                 * below -- so process_destroy cannot free it.
+                 * Free it here, then take the same failure path the
+                 * allocation failure above takes.
+                 *
+                 * NOTE ON THE FAILURE PATH.  `return NULL` here is
+                 * the existing process_create failure contract, but
+                 * it is NOT a complete cleanup: it leaks the PCB's
+                 * kernel stack slot and any pages already tracked in
+                 * elf_page_list.  That is a pre-existing defect in
+                 * process_create, present before this commit and not
+                 * introduced by it.  This commit only adds the new
+                 * vmm_map_page_in_cr3 failure to the existing path
+                 * rather than inventing a second one.  The leak is
+                 * tracked separately; do not fix it here, because a
+                 * fix needs its own test (a forced allocation
+                 * failure) and this commit has no way to produce
+                 * one.
+                 */
+                serial_print("PROCESS: stack map failed at virt=0x");
+                serial_print_hex(virt);
+                serial_print(" (out of page-table pages)\n");
+                pmm_free_page(phys);
+                return NULL;
+            }
 
             void* hhdm = (void*)(HHDM_START + phys);
             for (uint64_t j = 0; j < 4096 / 8; j++) {

@@ -58,7 +58,44 @@ static uint64_t heap_extend(size_t bytes) {
         }
 
         uint64_t virt = region_start + (i * PAGE_SIZE);
-        vmm_map_page(virt, phys, PT_PRESENT | PT_WRITE);
+        if (vmm_map_page(virt, phys, PT_PRESENT | PT_WRITE) != 0) {
+            /*
+             * A page-table allocation failed while mapping this
+             * heap page.  The mapping was NOT made.
+             *
+             * heap_brk and heap_mapped are only advanced after the
+             * whole loop succeeds, so on this path the pages already
+             * mapped in this call are NOT part of the heap's
+             * accounting -- find_free_block/coalesce_blocks will
+             * never look at them, and the caller gets back 0 as if
+             * the extension never started.
+             *
+             * So every page this call allocated -- the ones already
+             * mapped and the one just allocated (`phys`) -- must be
+             * unmapped and freed here, or they leak: the heap's
+             * own bookkeeping does not know they exist, and the
+             * process's elf_page_list does not track heap pages
+             * (heap_extend uses the raw PMM, not elf_add_page_to_pcb).
+             *
+             * Unmap before free, so no live PTE points at a freed
+             * page.  The HHDM window is per-process and this mapping
+             * is in the current process's address space, so
+             * vmm_unmap_page is the right call.
+             */
+            serial_print("HEAP: extend failed at virt=0x");
+            serial_print_hex(virt);
+            serial_print(" (out of page-table pages)\n");
+            pmm_free_page(phys);
+            for (size_t j = 0; j < i; j++) {
+                uint64_t prior = region_start + (j * PAGE_SIZE);
+                uint64_t prior_phys = vmm_get_phys(prior);
+                if (prior_phys) {
+                    vmm_unmap_page(prior);
+                    pmm_free_page(prior_phys & ~0xFFFULL);
+                }
+            }
+            return 0;
+        }
 
         __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
     }

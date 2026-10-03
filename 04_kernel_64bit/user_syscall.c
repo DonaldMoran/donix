@@ -4212,7 +4212,29 @@ static uint64_t exec_alloc_user_stack(pcb_t* pcb) {
         uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
         map_flags &= ~(0x80ULL | 0x40ULL | 0x200ULL | 0x800ULL);
 
-        vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags);
+        if (vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags) != 0) {
+            /*
+             * A page-table allocation failed while mapping the new
+             * stack.  `phys` was allocated above and is not yet in
+             * elf_page_list; free it.  Pages mapped on earlier
+             * iterations ARE tracked, so the caller's cleanup frees
+             * them.
+             *
+             * Return 0, the function's existing failure contract
+             * (see the pmm_alloc_page_for_elf failure above).
+             * sys_execve checks it and treats it as fatal -- it has
+             * already torn down the old address space by the time
+             * this runs, so there is no recovering to the old
+             * program.  The header comment on sys_execve says so;
+             * this path is no different from an allocation failure
+             * there.
+             */
+            serial_print("exec_alloc_user_stack: map failed at virt=0x");
+            serial_print_hex(virt);
+            serial_print(" (out of page-table pages)\n");
+            pmm_free_page(phys);
+            return 0;
+        }
 
         void* hhdm = (void*)(HHDM_START + phys);
         for (uint64_t j = 0; j < 4096 / 8; j++) {
@@ -5656,7 +5678,32 @@ void* sys_brk(void* addr) {
             for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
 
             uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
-            vmm_map_page_in_cr3(current->cr3, virt, phys, map_flags);
+            if (vmm_map_page_in_cr3(current->cr3, virt, phys, map_flags) != 0) {
+                /*
+                 * A page-table allocation failed mid-growth.  `phys`
+                 * was allocated one line above and is not yet in
+                 * elf_page_list; free it.  Pages mapped on earlier
+                 * iterations are tracked and are reclaimed at
+                 * process exit.
+                 *
+                 * Return the OLD break, exactly as the
+                 * pmm_alloc_page_for_elf failure above does.  The
+                 * brk ABI says a failure is signalled by returning
+                 * the unchanged break -- not by an errno -- and
+                 * musl's caller compares the return to its request
+                 * and treats a mismatch as "cannot grow".  The
+                 * partially-grown range stays mapped and tracked;
+                 * that is the same state the allocation-failure path
+                 * already leaves, so a caller cannot tell the two
+                 * failures apart, which is correct: they are the
+                 * same failure from the caller's side.
+                 */
+                serial_print("sys_brk: map failed at virt=0x");
+                serial_print_hex(virt);
+                serial_print(" (out of page-table pages)\n");
+                pmm_free_page(phys);
+                return (void*)old_brk;
+            }
             elf_add_page_to_pcb(current, phys);
         }
     } else if (new_brk < old_brk) {
@@ -6757,6 +6804,13 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
     for (uint64_t v = base; v < base + rounded; v += 0x1000) {
         uint64_t phys = pmm_alloc_page_for_elf();
         if (!phys) {
+            /* The mapping for this page was not made and `phys` is
+             * not yet tracked; free it.  Pages mapped on earlier
+             * iterations ARE tracked (elf_add_page_to_pcb), so the
+             * process's cleanup path frees them.  Returning -ENOMEM
+             * is the same errno the allocation failure above
+             * returns; the caller sees one failure, not two. */
+            pmm_free_page(phys);
             return -(long)ENOMEM_;
         }
 
@@ -6764,7 +6818,28 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
 
         uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
-        vmm_map_page_in_cr3(self->cr3, v, phys, map_flags);
+        if (vmm_map_page_in_cr3(self->cr3, v, phys, map_flags) != 0) {
+            /*
+             * A page-table allocation failed.  `phys` is not yet in
+             * elf_page_list, so free it.  Earlier iterations are
+             * tracked and the process's cleanup handles them.
+             *
+             * A partial mmap is reported as a failure: the caller
+             * gets -ENOMEM and no base address, so it cannot use
+             * the pages that did get mapped.  They stay mapped (and
+             * tracked) until the process exits, which matches how
+             * sys_brk's partial growth is left tracked today.  Not
+             * unmapping them here keeps this edit the same shape as
+             * the other recovery sites; if a caller ever needs the
+             * partial range unmapped, that is a separate change
+             * with its own test.
+             */
+            serial_print("sys_mmap: map failed at v=0x");
+            serial_print_hex(v);
+            serial_print(" (out of page-table pages)\n");
+            pmm_free_page(phys);
+            return -(long)ENOMEM_;
+        }
         elf_add_page_to_pcb(self, phys);
     }
 
@@ -7185,8 +7260,16 @@ long sys_fork(void) {
                 for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i]; \
                                                                          \
                 uint64_t _map_flags = PT_PRESENT | PT_WRITE | PT_USER;   \
-                vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,        \
-                                    _map_flags);                         \
+                if (vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,    \
+                                        _map_flags) != 0) {              \
+                    serial_print("sys_fork: map failed at virt=0x");     \
+                    serial_print_hex(_virt);                             \
+                    serial_print(" (out of page-table pages)\n");        \
+                    pmm_free_page(_new_phys);                            \
+                    process_destroy(child);                              \
+                    __asm__ volatile("sti");                             \
+                    return -(long)ENOMEM_;                               \
+                }                                                        \
                 elf_add_page_to_pcb(child, _new_phys);                   \
             }                                                            \
         } while (0)
