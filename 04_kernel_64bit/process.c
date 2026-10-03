@@ -117,6 +117,89 @@ static void process_initialize_pcb(pcb_t* pcb) {
     process_count++;
 }
 
+/*
+ * Free the page-table hierarchy vmm_clone_page_table built for a
+ * process that is being torn down before it ever ran.
+ *
+ * This mirrors vmm_clone_page_table's walk exactly, in reverse:
+ *
+ *   - PML4 entries 0..255 are deep copies owned by this process;
+ *     free every PDPT, PD, and PT below them, then the PML4.
+ *   - PML4 entries 256..511 are SHARED with the parent -- they cover
+ *     the HHDM (0xFFFF800000000000) and the kernel image
+ *     (0xFFFFFFFF80000000).  Freeing them would unmap the parent's
+ *     kernel and crash the machine.  Skip them.
+ *   - RECURSIVE_PML4_INDEX points at the PML4 itself and is skipped
+ *     by the clone; skip it here too.
+ *
+ * WHY THIS EXISTS AS A SEPARATE FUNCTION.  process_reclaim and
+ * process_destroy free a process's ELF pages and its kernel stack
+ * slot, but neither frees the page-table hierarchy: on the success
+ * path the cloned tables are the process's live address space and
+ * stay until the process is destroyed, at which point the tables
+ * are simply abandoned (the leak is the abandoned tables, not the
+ * frames, and it is a separate question from this one).  A process
+ * that FAILS to finish process_create has no such excuse: it never
+ * ran, nothing points at its tables except the PCB we are about to
+ * recycle, and leaving them is a leak with no owner.
+ *
+ * Called only from process_create's failure paths, and only after
+ * vmm_clone_page_table has succeeded (so cr3 is non-zero and the
+ * hierarchy is complete for entries 0..255).
+ *
+ * The HHDM alias for each page is live -- vmm_clone_page_table
+ * built these pages with pmm_alloc_page_for_tables, and every
+ * physical page is reachable through HHDM_START -- so the walk
+ * reads the tables through the same window the clone wrote them
+ * through.
+ */
+static void process_free_clone(uint64_t cr3) {
+    if (!cr3) return;
+
+    uint64_t* pml4 = (uint64_t*)(HHDM_START + (cr3 & ~0xFFFULL));
+
+    for (int i = 0; i < 512; i++) {
+        if (i == RECURSIVE_PML4_INDEX) continue;
+
+        uint64_t pml4e = pml4[i];
+        if (!(pml4e & PT_PRESENT)) continue;
+
+        /* High-half entries are shared with the parent.  Do not
+         * free them; see the header comment. */
+        if (i >= 256) continue;
+
+        uint64_t* pdpt = (uint64_t*)(HHDM_START + (pml4e & ~0xFFFULL));
+
+        for (int j = 0; j < 512; j++) {
+            uint64_t pdpte = pdpt[j];
+            if (!(pdpte & PT_PRESENT)) continue;
+
+            uint64_t* pd = (uint64_t*)(HHDM_START + (pdpte & ~0xFFFULL));
+
+            for (int k = 0; k < 512; k++) {
+                uint64_t pde = pd[k];
+                if (!(pde & PT_PRESENT)) continue;
+
+                /* A 2 MB huge page is a leaf, not a table: there
+                 * is no PT below it.  The clone copies huge pages
+                 * verbatim (vmm_clone_page_table's `src_pde & 0x80`
+                 * case), so one can appear here.  Skip it -- the
+                 * page it maps is the parent's, not ours. */
+                if (pde & 0x80) continue;
+
+                uint64_t pt_phys = pde & ~0xFFFULL;
+                if (pt_phys) pmm_free_page(pt_phys);
+            }
+
+            pmm_free_page(pdpte & ~0xFFFULL);
+        }
+
+        pmm_free_page(pml4e & ~0xFFFULL);
+    }
+
+    pmm_free_page(cr3 & ~0xFFFULL);
+}
+
 pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
     (void)flags;
 
@@ -160,6 +243,30 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
     asm volatile("mov %%cr3, %0" : "=r"(current_cr3));
     pcb->cr3 = vmm_clone_page_table(current_cr3);
 
+    /*
+     * vmm_clone_page_table returning 0 means it could not allocate
+     * the new PML4 or a page-table page below it.  The old code
+     * assigned the 0 into pcb->cr3 and continued, which is not a
+     * leak but something worse: a PCB whose cr3 is 0 will be loaded
+     * into %cr3 by context_switch.asm, and any vmm_map_page_in_cr3
+     * against it walks page tables through HHDM_START + 0.  Fail
+     * the create instead.
+     *
+     * Nothing was cloned, so there is nothing to free but the PCB
+     * slot: process_initialize_pcb already bumped process_count and
+     * took a pid, and the PCB is state READY.  Undo those.
+     */
+    if (pcb->cr3 == 0) {
+        serial_print("PROCESS: page-table clone failed for ");
+        if (name) serial_print(name);
+        else serial_print("unnamed");
+        serial_print("\n");
+        pcb->state = PROC_STATE_UNUSED;
+        pcb->pid = 0;
+        process_count--;
+        return NULL;
+    }
+
     if (entry_point != 0 && entry_point < KERNEL_BASE) {
         #define USER_STACK_PAGES 16
         #define USER_STACK_SIZE (USER_STACK_PAGES * 4096)
@@ -173,6 +280,12 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
             uint64_t phys = pmm_alloc_page_for_elf();
             if (!phys) {
                 serial_print("PROCESS: Failed to allocate user stack page\n");
+                process_cleanup_elf_pages(pcb);
+                process_free_clone(pcb->cr3);
+                pcb->cr3 = 0;
+                pcb->state = PROC_STATE_UNUSED;
+                pcb->pid = 0;
+                process_count--;
                 return NULL;
             }
 
@@ -185,30 +298,22 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
                  * A page-table allocation failed while mapping this
                  * stack page.  The mapping was NOT made.
                  *
-                 * The page just allocated (`phys`) is not yet in
-                 * pcb->elf_page_list -- elf_add_page_to_pcb runs
-                 * below -- so process_destroy cannot free it.
-                 * Free it here, then take the same failure path the
-                 * allocation failure above takes.
-                 *
-                 * NOTE ON THE FAILURE PATH.  `return NULL` here is
-                 * the existing process_create failure contract, but
-                 * it is NOT a complete cleanup: it leaks the PCB's
-                 * kernel stack slot and any pages already tracked in
-                 * elf_page_list.  That is a pre-existing defect in
-                 * process_create, present before this commit and not
-                 * introduced by it.  This commit only adds the new
-                 * vmm_map_page_in_cr3 failure to the existing path
-                 * rather than inventing a second one.  The leak is
-                 * tracked separately; do not fix it here, because a
-                 * fix needs its own test (a forced allocation
-                 * failure) and this commit has no way to produce
-                 * one.
+                 * `phys` was allocated above and is not yet in
+                 * elf_page_list, so free it explicitly.  Pages
+                 * mapped on earlier iterations ARE tracked, and
+                 * process_cleanup_elf_pages frees them.  The cloned
+                 * page-table hierarchy is freed by process_free_clone.
                  */
                 serial_print("PROCESS: stack map failed at virt=0x");
                 serial_print_hex(virt);
                 serial_print(" (out of page-table pages)\n");
                 pmm_free_page(phys);
+                process_cleanup_elf_pages(pcb);
+                process_free_clone(pcb->cr3);
+                pcb->cr3 = 0;
+                pcb->state = PROC_STATE_UNUSED;
+                pcb->pid = 0;
+                process_count--;
                 return NULL;
             }
 
@@ -235,6 +340,9 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
     int slot = kernel_stack_slot_alloc(pcb);
     if (slot == KERNEL_STACK_SLOT_NONE) {
         serial_print("PROCESS: kernel stack pool exhausted\n");
+        process_cleanup_elf_pages(pcb);
+        process_free_clone(pcb->cr3);
+        pcb->cr3 = 0;
         pcb->state = PROC_STATE_UNUSED;
         pcb->pid = 0;
         process_count--;
@@ -621,7 +729,7 @@ void process_test_clone(void) {
         }
     } else {
         vga_print("  Status: FAILED! Recursive index entry flag is marked NOT PRESENT.\n");
-        serial_print("  Status: FAILED! Recursive index entry flag is marked NOT PRESENT.\n");
+        serial_print("  Status: FAILED! Recursive index entry flag is flagged NOT PRESENT.\n");
     }
 
     extern void pmm_free_page(uint64_t phys_addr);
