@@ -13,6 +13,191 @@ annotations, not repeated here.
 
 ---
 
+## Session 50 — the fault-injection test; `process_create`'s failure exits run
+
+One commit on `dev`, scratch-tagged, unpushed.  **Not a milestone**
+— the test session 49's own commit message asked for.  Three of
+`process_create`'s four failure exits are now exercised; the fourth
+is documented and left by inspection.
+
+| Tag | What |
+|---|---|
+| `20261003-fail-inject` | two kernel-side fault-injection hooks; `test_create_fail`, one selftest row, 18 passed (was 17) |
+
+### What the commit does
+
+Session 49's `20261003-process-create-cleanup` added real cleanup to
+`process_create`'s four failure exits — `process_free_clone` and
+friends — and its commit message said plainly: *correct by
+inspection; UNEXERCISED*.  A healthy boot does not fail an
+allocation, so none of the new cleanup had ever run.  This session
+adds the facility that makes it run.
+
+**Two hooks, not one.**  The handoff proposed a single `static int`
+in `pmm.c`.  Reading `process_create` and `vmm_clone_page_table`
+showed two problems with that shape:
+
+- **A bare boolean cannot target exits independently.**  If the
+  flag is armed before `process_create`, it trips inside
+  `vmm_clone_page_table` — which makes *several*
+  `pmm_alloc_page` calls — so it can only ever reach exit 1.  The
+  user-stack loop (exit 2) runs after the clone, and there is no
+  hook for "arm after the clone, before the stack loop."
+- **Exit 4 is not an allocation at all.**  It fires when
+  `kernel_stack_slot_alloc` finds all `MAX_PROCESSES` slots taken.
+  No `pmm` hook can reach it.
+
+So the commit adds two:
+
+    pmm_debug_fail_next_of_type(page_type_t type)
+
+armed for a *type*, not a count.  The clone's allocations are
+`PAGE_PAGE_TABLE`; the user-stack page is `PAGE_USER_DATA`.  Arming
+for `PAGE_USER_DATA` lets the clone succeed and trips the first
+stack-page allocation — which is exit 2, deterministically, without
+counting the clone's allocations (a count that would be brittle
+against any future change to `vmm_clone_page_table`'s shape).
+
+    process_debug_fail_next_stack_slot(void)
+
+for exit 4.  Both are one branch, both self-disarming, both
+kernel-side only.
+
+### What each case exercises, and what each does *not*
+
+This is the part worth carrying forward, because the four exits do
+not all do the same thing:
+
+- **Exit 1** (`vmm_clone_page_table` returns 0): armed for
+  `PAGE_PAGE_TABLE`, trips on the clone's PML4.  The clone returns
+  0 with **nothing allocated**, and `process_create` takes the
+  `pcb->cr3 == 0` branch, which undoes the PCB slot and does **not**
+  call `process_free_clone` — there is nothing to free.  **This
+  case exercises the undo-PCB-slot logic, not the walk.**  The
+  handoff's framing ("the cleanup is what stands between a failed
+  allocation and a corrupted machine") implies exit 1 runs cleanup;
+  it does not.
+- **Exit 2** (`pmm_alloc_page_for_elf` returns 0): the clone
+  succeeded and built a real hierarchy, then the first user-stack
+  page failed.  **This is the exit that exercises
+  `process_free_clone` on a fully-built clone** — the case the
+  session-49 gotcha entry is actually about.
+- **Exit 4** (`kernel_stack_slot_alloc` exhausts): the 16
+  user-stack pages are already allocated and tracked when the slot
+  call fails, so this runs the most cleanup of the three
+  (`process_cleanup_elf_pages` frees 16 pages, `process_free_clone`
+  frees the clone, the slot is undone).
+- **Exit 3** (`vmm_map_page_in_cr3` returns -1 in the stack loop):
+  **NOT TESTED**, and the commit message says so.  Reaching it
+  needs a page-table allocation to fail after the clone succeeded
+  but before the stack loop's map call; the clone's own tables are
+  the same type, so a type-filtered hook cannot separate them, and
+  a countdown would be brittle.  Exit 3 remains correct by
+  inspection, and this commit does not change that.
+
+### The assertion, and the two things it catches
+
+Each case reads `pmm_get_free_pages()` before and after the failed
+`process_create` and asserts the value is unchanged.  A leak in
+any cleanup path shows as a deficit; an overlap between the
+table-free (`process_free_clone`) and the frame-free
+(`process_cleanup_elf_pages`) shows as a `PMM: WARNING - Double
+free` line from `pmm_free_page`.  Neither appeared.
+
+The three `PROCESS:` lines in the output are the **production**
+diagnostics on the failure paths:
+
+    PROCESS: page-table clone failed for fail_clone
+    PROCESS: Failed to allocate user stack page
+    PROCESS: kernel stack pool exhausted
+
+That is the point of the design — the hooks drove `process_create`
+into its real exits, not into a test-only copy of them.
+
+### What is now superseded, and what is not
+
+`20261003-process-create-cleanup`'s "correct by inspection;
+UNEXERCISED" is superseded **for exits 1, 2, and 4**.  Exit 3 is
+not.  The gotcha entry "A function that has never run is correct by
+inspection only" is now three-quarters closed: `process_free_clone`
+has run on a real clone (exit 2 and exit 4), and the
+undo-PCB-slot path has run (exit 1).  The entry's *rule* still
+stands — a path that does not fire is still a claim — but the
+specific claim it recorded is now answered for three of its four
+cases.
+
+### The first boot's `#PF`, and why it is a separate matter
+
+**The first boot after this image change reproduced a `#PF`** at
+`CR2 = RIP = 0x400000` during the `musl_sh` ELF load:
+
+    === PAGE FAULT (#PF) ===
+      CR2 (Bad Address) : 0x0000000000400000
+      Faulting RIP      : 0x0000000000400000
+      Raw Error Code    : 0x0000000000000015
+      ...
+      pde               : 0x0000000000400083
+      PDE IS 2 MB PAGE, phys base 0x0000000000400000
+    ELF: COPY-FAIL phys=0 at vaddr=0000000000400000
+    PANIC: musl_sh ELF load failed
+
+It did **not** reproduce on the next two boots, which is the shape
+sessions 45 and 48 both described: layout-dependent, appears on
+the first boot after an image change, clears on the next.  It is
+**not related to this commit's hooks** — no test ran on that boot,
+and both hooks are `static`, zero-initialized, and unarmed.
+
+**It is diagnosed better than it was in session 45, and that is
+session 49's doing.**  Session 45's version of this fault was
+silent — the mapping failed, `vmm_map_page_in_cr3` returned without
+the caller knowing, and the process faulted later in user mode.
+This boot printed `ELF: COPY-FAIL phys=0 at vaddr=0x400000` and
+panicked at the ELF load, at the call site.  That is item 7's
+return-value plumbing working: the failure is reported, not
+swallowed.
+
+**It is not fixed.**  An intermittent fault that stops reproducing
+is unobserved, not closed — the standing rule from session 45.  It
+is recorded as an open issue; the two candidate causes (a genuine
+PMM exhaustion in a new shape, or a half-built clone whose
+PDPT/PD was missing so the map's own table allocation failed) are
+not distinguished by this capture, and the next session that
+touches it should instrument rather than guess.
+
+### Verification
+
+Both boot paths, one boot after the tag:
+
+| Test | Result |
+|---|---|
+| `selftest` (`k` path) | **18 passed, 0 failed** (was 17) |
+| `canary` | **15 passed, 0 failed** |
+| `canary --full` | **28 passed, 0 failed** |
+
+`test_create_fail` reports `SUCCESS (3 of 4 exits exercised)`; the
+three sub-cases each print `no leak`; no `PMM: WARNING - Double
+free`.  The image is unchanged at **48 files** staged — this
+commit adds no new ELF, only kernel code.
+
+The first boot's `#PF` is the one red mark, and it is a
+pre-existing fault, not a result of the test.
+
+### A process note
+
+The handoff's proposed design — "one `static` in `pmm.c`" — was
+read against the actual source before it was written, and reading
+it showed the design could reach at most one of the four exits.
+That is the same rule the handoff opens with ("Ask for source you
+do not have"), applied to a *design* rather than a patch: the
+handoff's sketch was a claim about code the session had not yet
+seen, and the code said otherwise.  The two-hook shape is what the
+source dictated; the handoff's one-static shape is what the sketch
+assumed.
+
+**Scratch tag kept:** `20261003-fail-inject`, local, not pushed.
+
+---
+
 ## Session 49 — item 7 closed; the `process_create` failure paths and the exit-path page-table leak
 
 Five commits on `dev`, scratch-tagged, unpushed.  **Not a
