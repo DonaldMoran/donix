@@ -56,7 +56,11 @@ static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
 static long access_resolved(const char* abs_path, int backend);
-
+/* Defined below, in the safe-copy section.  proc_readlink (above
+ * that definition) calls it. */
+static int safe_copy_to_user(void* user_dest, const void* kernel_src,
+                             size_t count);
+                             
 /* ENOTDIR (20) on Linux x86_64.  Guarded, so the block in the
  * sys_chdir section further down is a no-op once this one is seen
  * -- the #ifndef there skips its own define.  Needed here because
@@ -188,6 +192,28 @@ static char g_write_bounce[WRITE_CHUNK];
  * warranted, gets designed against two devices instead of one.
  */
 #define FILE_KIND_DEV_NULL 5
+
+/*
+ * A character device that is stat-able but not openable.
+ *
+ * /dev/console, in commit 4.  The difference from FILE_KIND_DEV_NULL
+ * is not read/write behavior -- nothing opens /dev/console in this
+ * commit -- but identity: /dev/console must report the same
+ * (st_dev, st_ino) as the console sentinel on fds 0/1/2, so that
+ * musl's ttyname_r(3) accepts it as the terminal.  See
+ * fill_kstat_as_chardev and the console-sentinel case in
+ * sys_fstat_body.
+ *
+ * open_resolved refuses this kind explicitly: a DEV table entry
+ * with this kind is known to stat and unknown to open, which is
+ * what "/dev/console is not openable yet" means.  sys_read and
+ * sys_write have no case for it, because nothing can hold one.
+ * If a future commit makes /dev/console openable, that commit
+ * adds the read/write cases and removes the refusal in
+ * open_resolved -- and it will be designing against a second
+ * openable device, not a first.
+ */
+#define FILE_KIND_DEV_CHAR 7
 
 /*
  * A /proc slot.
@@ -487,7 +513,8 @@ static const struct {
     const char* name;
     uint32_t    kind;
 } g_dev_table[] = {
-    { "null", FILE_KIND_DEV_NULL },
+    { "null",    FILE_KIND_DEV_NULL },
+    { "console", FILE_KIND_DEV_CHAR },
 };
 #define G_DEV_TABLE_LEN (sizeof(g_dev_table) / sizeof(g_dev_table[0]))
 
@@ -589,6 +616,79 @@ static uint32_t proc_lookup(const char* abs_path) {
         }
     }
     return 0;
+}
+
+/*
+ * The /proc/self/fd/N readlink target, for the fds that have one.
+ *
+ * This is the seam's first positive readlink.  Before commit 4,
+ * readlink returned -EINVAL for every existing path -- the honest
+ * answer when nothing on the system is a symlink.  /proc/self/fd/N
+ * is a symlink in Linux's model: it names the file the fd refers
+ * to.  donix provides it for fds 0, 1, and 2, whose target is
+ * /dev/console.
+ *
+ * WHICH FDS RESOLVE.  Only 0, 1, and 2, and only to /dev/console.
+ * That is what musl's ttyname_r(3) needs -- it readlinks fd 0 and
+ * compares the result's (st_dev, st_ino) to fstat(0)'s.  Any other
+ * N returns -EINVAL, which is the same answer readlink gives for
+ * every other existing non-symlink on donix.  A future commit that
+ * wants fd 3+ to resolve would need every slot to remember the path
+ * it was opened with, which no non-DIR slot does today; that is a
+ * different, larger change and is not this one.
+ *
+ * RETURN CONVENTION.  Returns:
+ *
+ *   > 0            a real target was copied; the value is its length
+ *   -EINVAL        the path is a self/fd/N form, but N is not 0/1/2
+ *   0              the path is not a self/fd/N form at all
+ *
+ * The 0 return is the "not mine" sentinel: a successful readlink
+ * always returns at least 1 byte (a symlink target cannot be the
+ * empty string), so 0 is unambiguous.  sys_readlink treats it as
+ * "fall through to the normal access_resolved check."
+ */
+#define PROC_READLINK_NOT_MINE 0
+
+static long proc_readlink(const char* abs_path,
+                          char* buf, size_t bufsiz) {
+    /* Path shape: "/proc/self/fd/<digits>".  Everything before the
+     * digits is a fixed prefix. */
+    static const char prefix[] = "/proc/self/fd/";
+    const size_t plen = sizeof(prefix) - 1;   /* without NUL */
+
+    for (size_t i = 0; i < plen; i++) {
+        if (abs_path[i] != prefix[i]) return PROC_READLINK_NOT_MINE;
+    }
+
+    /* Parse one or more decimal digits, and only digits: a trailing
+     * '/', a letter, or end-of-string-with-no-digits is not a
+     * self/fd/N form. */
+    const char* p = abs_path + plen;
+    if (p[0] < '0' || p[0] > '9') return PROC_READLINK_NOT_MINE;
+
+    unsigned long n = 0;
+    while (*p >= '0' && *p <= '9') {
+        n = n * 10 + (unsigned long)(*p - '0');
+        if (n > 1000000) break;   /* overflow guard; no fd is this big */
+        p++;
+    }
+    if (*p != '\0') return PROC_READLINK_NOT_MINE;   /* trailing junk */
+
+    /* Only the console fds resolve, and only to /dev/console. */
+    if (n != 0 && n != 1 && n != 2) {
+        return -(long)EINVAL_;
+    }
+
+    static const char target[] = "/dev/console";
+    const size_t tlen = sizeof(target) - 1;
+
+    if (bufsiz < tlen) return -(long)ERANGE_;
+
+    if (safe_copy_to_user(buf, target, tlen) != 0) {
+        return -(long)EFAULT_;
+    }
+    return (long)tlen;
 }
 
 /*
@@ -1201,10 +1301,30 @@ static void fill_kstat_as_root(kernel_stat_t* st) {
 }
 
 /* Fill a kernel_stat_t describing a DEV backend character device.
- * This is what /dev/null reports, and what commit 4's
- * /dev/console would report (with different st_dev/st_ino). */
-static void fill_kstat_as_chardev(kernel_stat_t* st) {
+ *
+ * The (dev, ino) pair is a parameter, because /dev/null and
+ * /dev/console must be distinguishable from each other and the
+ * console must match the console sentinel's fstat.  The convention
+ * (see the earlier design discussion, and fill_kstat_as_root for
+ * the FAT side):
+ *
+ *   /dev/null       (1, 2)
+ *   /dev/console    (1, 1)   -- must equal the console sentinel's
+ *   console sentinel (1, 1)      fstat; that is ttyname_r's gate 3b
+ *
+ * A future device gets its own st_ino, and st_dev stays 1 for the
+ * DEV backend, matching how real Unix lays out device nodes in one
+ * directory: same st_dev, distinct st_ino.
+ *
+ * mode is always S_IFCHR | 0666 for the devices donix has; if a
+ * future one wants different permissions, that is a third
+ * parameter, added then.
+ */
+static void fill_kstat_as_chardev(kernel_stat_t* st,
+                                  uint64_t dev, uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_dev     = dev;
+    st->st_ino     = ino;
     st->st_nlink   = 1;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFCHR | 0666;
@@ -1425,6 +1545,11 @@ static void put_file_slot(file_slot_t* slot) {
         /* obj is NULL; nothing to close or free. */
     } else if (slot->kind == FILE_KIND_DEV_NULL) {
         /* obj is NULL; nothing to close or free. */
+    } else if (slot->kind == FILE_KIND_DEV_CHAR) {
+        /* obj is NULL; nothing to close or free.  Unreachable
+         * today -- open_resolved refuses this kind -- but the
+         * case is here so the switch is total.  A future commit
+         * that opens /dev/console reaches it. */
     } else if (slot->kind == FILE_KIND_PROC) {
         /*
          * obj is the PROC_ENTRY_* value cast to a pointer, not an
@@ -1929,7 +2054,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
      */
     if (backend == BACKEND_DEV) {
         uint32_t kind = dev_lookup(in_path);
-        if (kind != 0) {
+        if (kind == FILE_KIND_DEV_NULL) {
             file_slot_t* dslot = NULL;
             int dfd = alloc_file_slot(&dslot);
             if (dfd == -1) return -(long)EIO_;
@@ -1941,6 +2066,22 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                       serial_print_dec((uint64_t)kind); });
             return dfd;
         }
+        /*
+         * A DEV table entry that is stat-able but not openable --
+         * /dev/console in commit 4.  Refuse it rather than
+         * producing a slot with no read/write behavior.  Linux
+         * allows open("/dev/console"); donix does not yet, and
+         * the honest answer is ENOENT rather than a slot that
+         * misbehaves the first time someone reads from it.
+         *
+         * When a future commit makes it openable, this is the
+         * branch that changes, and that commit adds the
+         * read/write cases at the same time.
+         */
+        if (kind == FILE_KIND_DEV_CHAR) {
+            return -(long)ENOENT_;
+        }
+        /* Unknown /dev entry: fall through to FAT. */
     }
 
     /*
@@ -2829,18 +2970,32 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
 static long sys_fstat_body(int fd, void* user_stat) {
     if (!user_stat) return -(long)EFAULT_;
 
-    file_slot_t* slot = get_file_slot(fd, 0);
+    file_slot_t* slot = get_file_slot_any(fd);
     if (!slot) return -(long)EBADF_;
 
     kernel_stat_t st;
     FILINFO fno;
     for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
 
+    if (slot->kind == FILE_KIND_CONSOLE) {
+        /*
+         * The console sentinel on fds 0/1/2.  Reports the same
+         * (st_dev, st_ino) as /dev/console, so musl's ttyname_r(3)
+         * accepts the path as this fd's terminal -- that comparison
+         * is the whole reason the pair is a fixed value.
+         */
+        fill_kstat_as_chardev(&st, 1, 1);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
+
     if (slot->kind == FILE_KIND_DEV_NULL) {
         /* Character device, like Linux's /dev/null.  Nothing calls
          * fstat on an open devnull fd yet; this keeps the answer
          * correct if something does. */
-        fill_kstat_as_chardev(&st);
+        fill_kstat_as_chardev(&st, 1, 2);
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
@@ -2990,7 +3145,17 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         uint32_t kind = dev_lookup(abs_path);
         if (kind == FILE_KIND_DEV_NULL) {
             kernel_stat_t st;
-            fill_kstat_as_chardev(&st);
+            fill_kstat_as_chardev(&st, 1, 2);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        if (kind == FILE_KIND_DEV_CHAR) {
+            /* /dev/console: S_IFCHR, (st_dev, st_ino) = (1, 1),
+             * matching the console sentinel's fstat. */
+            kernel_stat_t st;
+            fill_kstat_as_chardev(&st, 1, 1);
             if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                 return -(long)EFAULT_;
             }
@@ -3405,6 +3570,18 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     int backend;
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
+
+    /*
+     * PROC backend: /proc/self/fd/N is a symlink.  proc_readlink
+     * handles the fds donix provides a target for; a 0 return means
+     * "not a self/fd/N form" and we fall through to the normal
+     * existence check below, which returns -EINVAL for a
+     * synthesized file like /proc/self/status.
+     */
+    if (backend == BACKEND_PROC) {
+        long rl = proc_readlink(resolved, buf, bufsiz);
+        if (rl != PROC_READLINK_NOT_MINE) return rl;
+    }
 
     /* Validate the path exists, so a missing path is -ENOENT and a
      * present one is -EINVAL (not a symlink).  access_resolved does
