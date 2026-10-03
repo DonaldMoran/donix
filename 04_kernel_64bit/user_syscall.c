@@ -3779,11 +3779,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * The caller's original `path` is kept for the proc_name
      * extraction in section 4.
      */
+    /*
+     * Resolve against the process cwd, the way every other path
+     * syscall does.  execve is a caller like any other: a relative
+     * path resolves against pcb->cwd, an absolute path passes
+     * through unchanged.
+     *
+     * Before this, execve took the path as given.  No caller
+     * exercised the difference -- musl_sh builds an absolute
+     * /usr/bin/NAME and ash's execvp walks $PATH and passes the
+     * full path -- but a relative execve would have resolved
+     * against the FAT root instead of the cwd, and that is the one
+     * path syscall that did not.
+     *
+     * A non-FAT backend is not executable.  /dev/null and
+     * /proc/self/status are not ELF files, and -ENOEXEC is the
+     * honest errno: the same one the "not an ELF" checks below
+     * return, and the same one a shell keys its interpreter
+     * fallback on.
+     */
     char exec_path[USER_PATH_MAX];
     {
+        char resolved[USER_PATH_MAX];
+        int backend;
+        int rr = resolve_at(AT_FDCWD_, path, resolved,
+                            sizeof(resolved), &backend);
+        if (rr != 0) {
+            __asm__ volatile("sti");
+            return rr;
+        }
+        if (backend != BACKEND_FAT) {
+            __asm__ volatile("sti");
+            return -(long)ENOEXEC;
+        }
+
         size_t i = 0;
-        while (path[i] && i < sizeof(exec_path) - 1) {
-            exec_path[i] = path[i];
+        while (resolved[i] && i < sizeof(exec_path) - 1) {
+            exec_path[i] = resolved[i];
             i++;
         }
         exec_path[i] = '\0';
@@ -3792,69 +3824,26 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     
     /* ---- 2. Open and read the whole ELF file. ----
      *
-     * TWO attempts, in order:
+     * ONE attempt: the path resolved in section 1 and stripped
+     * for FatFs.  FatFs has no cwd, so it walks the path from the
+     * drive root, and "usr/bin/HELLO" is a valid path there.
      *
-     *   (a) the path exactly as the caller supplied it;
-     *   (b) if the path starts with '/', "0:" + path, preserving
-     *       case -- the Unix-style absolute path form.
+     * HISTORY.  This used to be two attempts: (a) the path as
+     * given, (b) "0:" + path if (a) failed and the path had no
+     * drive.  Attempt (b) was unreachable: section 1 applies
+     * strip_dot_prefix to exec_path before section 2 runs, so
+     * exec_path never starts with '/' by the time the retry
+     * checked for it, and the retry never fired.  It was dead
+     * code -- not merely unused by the current callers, but
+     * impossible to reach -- and it is deleted here.
      *
-     * A bare name does NOT resolve.  Every caller passes a path:
-     * musl_sh's run_external builds "/usr/bin/NAME" or "/bin/NAME"
-     * and passes it; ash's execvp walks $PATH itself and passes
-     * the full path it found.  There is no bare-name fallback
-     * because nothing calls one.
-     *
-     * HISTORY: a third attempt used to guess a bare name's
-     * location -- uppercase it, append ".ELF", try it at the root
-     * and in /bin.  It was removed in session 42: the binaries
-     * are staged bare (/usr/bin/HELLO, not HELLO.ELF) and live
-     * under /usr/bin, so all three sub-attempts could only fail.
-     * The helpers it called (exec_resolve_bare_name,
-     * exec_resolve_bin_name) are gone with it.
-     */
-    /*
-     * The remaining shim: attempt (b)'s "0:" + path translation.
-     * FatFs rejects a leading '/', so an absolute Unix path has to
-     * become "0:/...".  That is the one piece of path handling the
-     * kernel still does on execve's behalf; a VFS would subsume it.
-     * When a VFS lands, delete this and call the VFS resolver
-     * once.
+     * An earlier third attempt that guessed a bare name's
+     * location (uppercase, append ".ELF", try root and /bin) was
+     * removed in session 42 for the same reason: the binaries
+     * are staged bare, so its sub-attempts could only fail.
      */
     FIL file;
     FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
-    if (fr != FR_OK) {
-        int has_drive = 0;
-        for (const char* p = exec_path; *p; p++) {
-            if (*p == ':') { has_drive = 1; break; }
-        }
-
-        /*
-         * Attempt (b): Unix-style absolute path -> "0:" + path.
-         *
-         * Preserves case and any suffix: the caller named an
-         * exact path, so we honor it as written and only add the
-         * drive prefix FatFs requires.  No uppercasing, no
-         * ".ELF" appended.
-         */
-        if (!has_drive && exec_path[0] == '/') {
-            char resolved[USER_PATH_MAX];
-            size_t plen = 0;
-            while (exec_path[plen]) plen++;
-            if (plen + 3 <= sizeof(resolved)) {   /* "0:" + path + NUL */
-                resolved[0] = '0';
-                resolved[1] = ':';
-                for (size_t i = 0; i <= plen; i++) {
-                    resolved[2 + i] = exec_path[i];
-                }
-                FRESULT fr2 = f_open(&file, resolved,
-                                     FA_READ | FA_OPEN_EXISTING);
-                if (fr2 == FR_OK) {
-                    fr = FR_OK;
-                }
-            }
-            /* if too long, (b) is skipped; the open fails below */
-        }
-    }
 
     if (fr != FR_OK) {
         serial_print("sys_execve: f_open(");
