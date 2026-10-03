@@ -1,8 +1,8 @@
 ### donix is not Linux.
 
 It runs Linux binaries. It speaks the Linux syscall ABI. It boots
-straight into **busybox `ash`** — the shell, the line editor, the
-applets, the whole thing — on top of a from-scratch x86_64 kernel. No
+straight into **busybox `ash`** - the shell, the line editor, the
+applets, the whole thing - on top of a from-scratch x86_64 kernel. No
 kernel source from Linus, no glibc, no distro. It is a small operating
 system that talks to real, statically linked musl binaries as if they
 were natively compiled for it.
@@ -30,7 +30,7 @@ faked.**
 
 It is for people who want to understand how an operating system
 actually works. Not how one is configured, not how one is packaged, not
-how one is deployed — how one is *built*. Every stage from the first
+how one is deployed - how one is *built*. Every stage from the first
 instruction off the boot sector to the moment a musl program prints
 `hello from donix` is in this repository, in C and assembly, under a
 few thousand lines. There is no hidden kernel, no borrowed scheduler,
@@ -52,61 +52,71 @@ That's the point. That's the whole point.
 ## What it does
 
 - **Boots from BIOS to a busybox shell** with no dependency on a
-  bootloader like GRUB or Limine. Every stage — the boot sector, the
-  long-mode entry, the kernel loading, the transition to ring 3 — is
+  bootloader like GRUB or Limine. Every stage - the boot sector, the
+  long-mode entry, the kernel loading, the transition to ring 3 - is
   hand-written. On boot you land in `ash`, the busybox shell, at a `$`
   prompt.
 - **Runs static musl binaries** compiled against musl 1.2.5, built from
   source into the project. Programs are ordinary C, linked the way any
   Unix program is linked; they just happen to run on a kernel that
   isn't Unix.
-- **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `close`,
-  `pipe`, `dup`, `dup2`, `fork`, `execve`, `wait4`, `brk`, `mmap`,
-  `munmap`, `getdents64`, `stat`, `fstat`, `lstat`, `access`, `chdir`,
-  `getcwd`, `geteuid`, `prctl`, `ftruncate`, `lseek`, `rename`,
-  `utimensat`, `unlink`, `rmdir`, `uname`, `readv`, `writev`,
-  `readlink`, `clock_gettime`, `nanosleep` — the numbers and semantics
-  match Linux x86_64. musl's `printf`, `malloc`, and `opendir` work
-  unmodified.
+- **Speaks Linux x86_64 syscalls.** `read`, `write`, `open`, `openat`,
+  `close`, `pipe`, `dup`, `dup2`, `fork`, `execve`, `wait4`, `brk`,
+  `mmap`, `munmap`, `getdents64`, `stat`, `fstat`, `lstat`,
+  `newfstatat`, `access`, `faccessat`, `chdir`, `getcwd`, `geteuid`,
+  `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`,
+  `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
+  `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) - the numbers
+  and semantics match Linux x86_64. musl's `printf`, `malloc`, and
+  `opendir` work unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
   are real; `cd /bin; ls` lists `/bin`; `cd ..` walks back up; the
   change survives `fork` and `execve`. Relative paths (`.`, `..`,
   `./x`, plain names) resolve against the cwd in every path-taking
-  syscall — `sys_open`, `sys_stat`, `sys_access`, `sys_chdir`,
-  `sys_unlink`, `sys_mkdir`.
+  syscall - `sys_open`, `sys_stat`, `sys_access`, `sys_chdir`,
+  `sys_unlink`, `sys_mkdir`, and every `*at` syscall through
+  `resolve_at`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
   backspace, line editing, history), and it supports real shell
-  redirection — `cat < file`, `echo hi > out.txt`, and repeated
-  redirects in one shell all work — as well as real pipelines:
+  redirection - `cat < file`, `echo hi > out.txt`, and repeated
+  redirects in one shell all work - as well as real pipelines:
   `cat hello-world.txt | head -n 2`, `echo hi | wc`, `echo hello |
-  cat`. Its file and text applets — `ls`, `cat`, `echo`, `pwd`,
+  cat`. Its file and text applets - `ls`, `cat`, `echo`, `pwd`,
   `wc`, `head`, `tail`, `cp`, `mv`, `find`, `grep`, `sed`, `cut`,
   `sort`, `stat`, `tee`, `test`, `tr`, `cmp`, `od`, `uniq`,
   `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
   `clear`, `basename`, `dirname`, `unlink`, `ttysize`, `tty`,
-  `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
-  `printenv` — run
+  `stty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
+  `printenv` - run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the
-  strongest evidence that the syscall ABI is right — busybox expects
+  strongest evidence that the syscall ABI is right - busybox expects
   a real Unix kernel underneath it, and on donix it gets one.
+- **Lists processes.** `ps` works: it reads `/proc`, and prints a
+  process table with pid, user, vsize, state, and command - for
+  `idle`, `musl_sh`, `busybox`, and every process you start.
+  `pstree` works too. The kernel serves `/proc` as a real directory:
+  `readdir("/proc")` returns `self` and the live pids, and each
+  `/proc/<pid>/stat`, `status`, and `cmdline` reads back real
+  per-process fields. (See "Synthesizes `/dev` and `/proc`", below,
+  for what `/proc` does *not* do yet.)
 - **Has a real terminal on a linear framebuffer.** The console is a
-  VT100 emulator drawing on a 1024×768 VBE linear framebuffer, with
-  **Terminus 10×18** text (OFL-1.1) rendered unscaled — 102 columns
+  VT100 emulator drawing on a 1024Ă—768 VBE linear framebuffer, with
+  **Terminus 10Ă—18** text (OFL-1.1) rendered unscaled - 102 columns
   by 42 rows. Full CSI parsing, cursor addressing, SGR colors, the
   erase, insert, and delete families, and a software alternate
   screen. Full-screen software gets what it expects: `vi don.txt`
   fills the screen, edit, `:wq`, then `cat don.txt` reads it back.
   The framebuffer was chosen over VGA text mode because VGA text is
   hard to read in a half-screen window on a modern display; the
-  console grid is 102×42 instead of 80×25.
+  console grid is 102Ă—42 instead of 80Ă—25.
 - **Has a second, real shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
   forks, execs, and waits like the busybox shell does, and it strips
-  quotes and parses `<`, `>`, `>>`, `|`, `&&`, and `;` — so
+  quotes and parses `<`, `>`, `>>`, `|`, `&&`, and `;` - so
   redirection and pipelines work at `donix>` directly, not only in
   `ash`. `cat hello-world.txt | head -n 2`, `echo hi > out.txt`, and
   `echo a && echo b` all behave. `cat hello-world.txt` prints the
@@ -117,24 +127,29 @@ That's the point. That's the whole point.
   can't read in ten minutes. You can read it end to end in an evening.
 - **Synthesizes `/dev` and `/proc` entries, and knows its own
   terminal.**  The kernel has a small pathname-dispatch layer: a
-  path's first component selects a backend — FatFs for ordinary
-  files, a device table for `/dev`, a proc table for `/proc` — and
+  path's first component selects a backend - FatFs for ordinary
+  files, a device table for `/dev`, a proc table for `/proc` - and
   that is the whole of it, no inode layer and no VFS.  It serves
   `/dev/null` across `open`, `stat`, and `access` (`2>/dev/null`
   works); `/proc/self/status`, which reads back five real
   per-process fields; `/dev/console`; and
-  `/proc/self/fd/0`–`2`, whose `readlink` target is
+  `/proc/self/fd/0`â€“`2`, whose `readlink` target is
   `/dev/console`.  The point of the last one is that
-  `tty` now prints `/dev/console` instead of `not a tty` —
+  `tty` now prints `/dev/console` instead of `not a tty` -
   `ttyname(3)`'s three gates all pass, including the one that
-  compares `stat("/dev/console")` against `fstat(0)`.  Neither
-  `/dev` nor `/proc` is a *listable directory* yet; `ls /dev` and
-  `ls /proc` fail.  See `docs/strategy.md`, "When a feature may
-  force architecture," and `handoff.md`.
-  
+  compares `stat("/dev/console")` against `fstat(0)`.
+
+  **`/proc` is now a real directory**: `readdir("/proc")` lists
+  `self` and the live pids, which is what `ps` and `pstree` read.
+  **`/dev` is not**: `ls /dev` fails, and adding it is the same
+  directory shape `/proc` already has.  `/dev/tty` and
+  `/dev/urandom` do not exist, and `/dev/console` is stat-able but
+  not openable.  See `docs/strategy.md`, "When a feature may force
+  architecture," and `handoff.md`.
+
 donix is a fork of [dons-os](https://github.com/DonaldMoran/dons-os-x86_64).
-The kernel infrastructure — boot chain, PMM, VMM, heap, scheduler, ATA
-driver, FatFs — carried forward intact. What changed is the syscall ABI
+The kernel infrastructure - boot chain, PMM, VMM, heap, scheduler, ATA
+driver, FatFs - carried forward intact. What changed is the syscall ABI
 (Linux numbers, not dons-os-private ones) and the userland C library
 (musl 1.2.5, not newlib).
 
@@ -147,15 +162,15 @@ untested.
 
 **Host tools:**
 
-- `nasm` — assembler for the boot chain and kernel stubs
-- `clang` and `ld.lld` — kernel C compiler and linker
-- `qemu-system-x86_64` — the emulator donix runs in
-- `mtools` — `mcopy`, `mdir`, `mkfs.vfat`, for building the FAT image
-- `xxd` — for embedding the kernel-side test program and the console font
-- `gcc` — the *host* compiler, used to build musl from source
-- `git` and `make` — obvious
+- `nasm` - assembler for the boot chain and kernel stubs
+- `clang` and `ld.lld` - kernel C compiler and linker
+- `qemu-system-x86_64` - the emulator donix runs in
+- `mtools` - `mcopy`, `mdir`, `mkfs.vfat`, for building the FAT image
+- `xxd` - for embedding the kernel-side test program and the console font
+- `gcc` - the *host* compiler, used to build musl from source
+- `git` and `make` - obvious
 
-**`/opt/cross/bin/x86_64-elf-gcc`** — a cross-compiler used only for
+**`/opt/cross/bin/x86_64-elf-gcc`** - a cross-compiler used only for
 FatFs (`fatfs/ff.c` and `fatfs/ffunicode.c`). Clang 22.1.8 miscompiles
 `ff.c` at every optimization level; the cross-GCC produces correct code.
 If it isn't installed, the kernel build will fail on those two files.
@@ -165,19 +180,21 @@ The toolchain is not packaged; the copy in use is GCC 15.2.0, built for
 [`docs/LLD_BUG_REPORT.md`](docs/LLD_BUG_REPORT.md) for why it is needed
 and how it was built.
 
-**musl 1.2.5** — do **not** install your distro's musl package. donix
+**musl 1.2.5** - do **not** install your distro's musl package. donix
 builds musl 1.2.5 from source into a project-local tree, because the
 project needs the exact version and install layout. Step 2 below does
 this for you.
 
-**busybox 1.36.1** — do **not** install your distro's busybox. The
+**busybox 1.36.1** - do **not** install your distro's busybox. The
 project builds busybox from source the first time you build a disk
 image, driven by `configs/busybox.config`. The source is cloned into
 `third_party/busybox/` (gitignored). **Network access is required on
-first run** — it clones from `https://git.busybox.net/busybox`. The
+first run** - it clones from `https://git.busybox.net/busybox`. The
 tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
-`CONFIG_FEATURE_SH_STANDALONE=y`, and `CONFIG_FEATURE_VI_WIN_RESIZE=y`
-(so `vi` fills the framebuffer console).
+`CONFIG_FEATURE_SH_STANDALONE=y`, `CONFIG_PS=y` (with
+`CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, and
+`CONFIG_FEATURE_VI_WIN_RESIZE=y` (so `vi` fills the framebuffer
+console).
 
 ---
 
@@ -185,8 +202,8 @@ tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
 
 ### Quick start
 
-If your host already has the tools listed under **What you need** —
-including `/opt/cross/bin/x86_64-elf-gcc` — the whole install is:
+If your host already has the tools listed under **What you need** -
+including `/opt/cross/bin/x86_64-elf-gcc` - the whole install is:
 
 ```sh
 git clone https://github.com/DonaldMoran/donix.git donix
@@ -230,7 +247,7 @@ This clones upstream musl at `v1.2.5`, configures it for
 `musl-gcc.specs` file that `toolchain/musl-gcc.sh` uses as the compiler
 wrapper.
 
-**Network access is required on first run** — it clones from
+**Network access is required on first run** - it clones from
 `https://git.musl-libc.org/git/musl`.
 
 Idempotent: safe to re-run. It bails if `third_party/musl-src/` is
@@ -249,8 +266,8 @@ The `run` script is a menu. Open it in an editor, uncomment exactly one
 line inside the `menu()` function, and execute the script. It will:
 
 1. `make clean`
-2. `make FAT_CONFIG=single` — build the kernel, single-drive layout
-3. `make -C 05_boot_kernel64 hdd-single.img` — build the FAT image,
+2. `make FAT_CONFIG=single` - build the kernel, single-drive layout
+3. `make -C 05_boot_kernel64 hdd-single.img` - build the FAT image,
    which includes compiling every musl userland binary from source
    and building busybox (first time only; the source is cached in
    `third_party/busybox/` thereafter)
@@ -306,7 +323,9 @@ userland/musl/          musl userland source tree
                         memtest, musl_sh)
   tests/                regression and diagnostic binaries (canary,
                         at_step1/2, pipe_step1-3b, envp_step1,
-                        fcntl_lowfd, musl_exec2, musl_min, ...)
+                        fcntl_lowfd, musl_exec2, musl_min, proc_dir,
+                        proc_stat, proc_walk, mmap_stress, exec_churn,
+                        ...)
   Makefile              builds every .c into build/*.elf; also builds
                         busybox from source
 configs/                tracked build configs (busybox.config)
@@ -326,26 +345,30 @@ not reach into `userland/musl/`; the image Makefile invokes
 
 ## Where to look for more
 
-- [`handoff.md`](handoff.md) — **the current state of the project.**
+- [`handoff.md`](handoff.md) - **the current state of the project.**
   Session log, canary state, open issues, current gotchas. Updated
   every session; this is the file to read if you want to know what
   is true right now.
-- [`ROADMAP.md`](ROADMAP.md) — what's next. Future work only;
+- [`ROADMAP.md`](ROADMAP.md) - what's next. Future work only;
   completed milestones are in the handoff's session history.
-- [`docs/`](docs/) — reference material:
-  - `docs/strategy.md` — Phase A/B plan, rules, tagging convention,
+- [`docs/`](docs/) - reference material:
+  - `docs/strategy.md` - Phase A/B plan, rules, tagging convention,
     git hygiene.
-  - `docs/gotchas.md` — every bug writeup, by subsystem.
-  - `docs/open-issues.md` — the full deferred-work list.
-  - `docs/session-log.md` — commit tables and per-test canary notes.
-  - `docs/migration-history.md` — the A1–A6 migration from dons-os
+  - `docs/gotchas.md` - every bug writeup, by subsystem.
+  - `docs/open-issues.md` - the full deferred-work list.
+  - `docs/session-log.md` - the session narrative: what each session
+    did, the bugs it found, the canary counts, the abandoned
+    attempts.  Recent sessions in full; older ones indexed.  Not a
+    second commit record — `git log` and the `v*` tag annotations
+    carry that.
+  - `docs/migration-history.md` - the A1â€“A6 migration from dons-os
     (newlib) to musl, step by step.
-  - `docs/dons-os-history.md` — the pre-fork dons-os version-by-version
+  - `docs/dons-os-history.md` - the pre-fork dons-os version-by-version
     story.
-  - `docs/CHECKLIST.md` — capability checklist, frozen at v0.6.0.
-  - `docs/MAINTENANCE.md` — known debt and latent bugs, frozen at
+  - `docs/CHECKLIST.md` - capability checklist, frozen at v0.6.0.
+  - `docs/MAINTENANCE.md` - known debt and latent bugs, frozen at
     v0.6.0. Open items are lifted into `handoff.md`.
-  - `docs/LLD_BUG_REPORT.md` — Clang/LLD toolchain bugs and the
+  - `docs/LLD_BUG_REPORT.md` - Clang/LLD toolchain bugs and the
     FatFs workaround.
 
 ---
@@ -356,7 +379,7 @@ MIT License. Use freely, modify freely, credit appreciated.
 
 Note on third-party components: donix builds against musl (MIT-style)
 and busybox (GPLv2), and bundles the Terminus console font (OFL-1.1).
-musl and busybox are not vendored into the donix source tree — both are
+musl and busybox are not vendored into the donix source tree - both are
 fetched from upstream by the build system and live under
 `third_party/` (gitignored). The Terminus `.psf` is tracked under
 `04_kernel_64bit/fonts/`. The donix source itself remains MIT.

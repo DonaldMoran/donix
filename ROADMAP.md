@@ -9,7 +9,8 @@ framebuffer** with Terminus 10×18 text, so full-screen software
 runs: `vi` fills the screen, edits, and saves. Pipelines work:
 `cat file | head`, `echo hi | wc` — from `ash` and from donix's own
 `donix>` shell. Files and directories can be created and removed; a
-faulting process is killed cleanly.
+faulting process is killed cleanly. `ps` lists processes, reading a
+real `/proc`.
 
 This file is **future work only**. For the current state of the
 project, see [`handoff.md`](handoff.md). For how donix got here, see
@@ -19,7 +20,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, v0.6.9
+## Done — Phases A through B, v0.6.11
 
 For the record, so this file does not re-plan finished work:
 
@@ -63,9 +64,76 @@ For the record, so this file does not re-plan finished work:
   is enabled and works.
 - **v0.6.9 — envp, the `/usr/bin` layout, the shim removal — and
   what grew from them.**  See below.
+- **v0.6.10 — a tail on `v0.6.9`.**  `realpath` (config-only),
+  the `readlink` errno closed by test (`readlink_errno.c`), and
+  `/dev/null` working across `open`/`stat`/`access`.  No new
+  subsystem.
+- **v0.6.11 — the pathname dispatch seam, `/proc` and `ps`, and the
+  PMM zone-scan fix.**  Three sessions' work, and a large milestone:
+  session 44's seam (see below), session 47's `/proc` per-pid
+  support and working `ps`/`pstree`, and session 48's fix for the
+  intermittent boot-time `#PF`.
 
 The narratives are in the annotated scratch tags,
 `docs/session-log.md`, and `handoff.md`.
+
+---
+
+## v0.6.11 — the seam, `/proc`, and the PMM fix
+
+**The pathname dispatch seam (session 44).**  The first feature the
+previous architecture could not express at all: `resolve_at` returns
+a backend tag from a path's first component, and FAT / DEV / PROC
+are selected by it.  No VFS — no inode, no vnode, no mount table.
+Its first three consumers: `/dev/null`, `/proc/self/status`, and
+`/dev/console` + `/proc/self/fd/N` (which is what makes `tty` print
+`/dev/console`).  `/dev/null`'s old exact-path predicate was deleted
+in the process.
+
+**`/proc` per-pid, and `ps` (session 47).**  `/proc` became a
+listable directory: `readdir("/proc")` returns `self` and the live
+pids, and `/proc/<pid>/stat`, `status`, and `cmdline` each read back
+real per-process fields.  `ps` and `pstree` were enabled and work.
+The bug worth remembering: `ps` printed a header and no rows because
+libbb's `procps_scan` does `stat("/proc/<pid>/")` — **with a
+trailing slash** — and skipped the entry when it failed.  donix
+served the per-pid *files* but not the per-pid *directory*.
+
+**The PMM zone-scan fix (session 48).**  The intermittent boot-time
+`#PF` at `0x400000` — first boot after adding userland ELFs, cleared
+by the second or third — was **not** the silent `vmm_map_page*`
+returns.  It was the PMM zone scan: `pmm_alloc_page` started at a
+cursor and moved one direction, so a page free on the far side was
+never found.  Adding ELFs pushed the cursor past such pages, and the
+boot ELF load's page-table allocation returned 0 with
+`pmm_free_pages` healthy.  `pmm_scan_zone` now wraps.  Ten-plus
+consecutive boots on the trigger image, no fault.
+
+**What `v0.6.11` does not close** (all in `open-issues.md`):
+
+- The silent `vmm_map_page*` returns (item 7) — the allocator fix
+  is why the allocation succeeds; the silent returns are why a
+  *future* failure would be invisible.  **The next session's work.**
+- `open("/proc/<pid>", O_DIRECTORY)` — `ps` stats the directory, it
+  does not open it.
+- `readdir("/dev")` — `/dev` is not a directory; `ls /dev` fails.
+- Symlinks (item 8) — design recorded, buildable as the seam's next
+  consumer.
+- `sys_gettimeofday` (99) — so `ps -l` is off.
+- `/etc/passwd` — so `ps`'s USER column shows the numeric uid.
+
+---
+
+## v0.6.10 — `realpath`, the `readlink` errno, `/dev/null` (shipped)
+
+A tail on `v0.6.9` with no new subsystem.  `CONFIG_REALPATH=y`
+(config-only — the applet routes through musl's `realpath()` plus
+`libbb`'s `xmalloc_readlink` and `getcwd`, all present).  The
+`readlink` errno split (`-ENOENT` for a missing path, `-EINVAL` for
+an existing non-symlink) was already in the tree and was closed with
+a run behind it, `readlink_errno.c`.  `/dev/null` works across
+`open`/`stat`/`access` (`2>/dev/null` discards stderr), which was
+the seam's first consumer.
 
 ---
 
@@ -125,25 +193,6 @@ and `printenv` — all config-only once the syscalls above existed.
 **Three small gaps.**  `munmap` (counted above), `fcntl` now accepts
 fd 0/1/2 for all subcommands, and Ctrl-`[` produces ESC (0x1B).
 
-**`realpath`, a post-ship tail (session 43).**  `CONFIG_REALPATH=y`,
-config-only — the trace showed it routes through musl's
-`realpath()` plus `libbb`'s `xmalloc_readlink` and `getcwd`, all
-present.  Two of the handoff's own test expectations were wrong:
-`realpath /nonexistent` succeeds (parent `/` exists); the failing
-case is a path whose parent does not exist.  The run also
-sharpened the `/dev` entry — `2>/dev/null` does not merely fail to
-discard, it stops the command from running.  Committed and
-scratch-tagged `20261002-realpath`, not yet pushed.
-
-**`readlink` errno, closed by test (session 43).**  `sys_readlink`
-already returned `-ENOENT` for a missing path and `-EINVAL` for an
-existing non-symlink; the fix had been in the tree, untested, and
-`open-issues.md` item 8 still described the defect as open.
-`tests/readlink_errno.c` calls `readlink(2)` directly, since no
-applet does, and asserts both answers.  3/3.  Item 8 is closed with
-a run behind it.  See `gotchas.md`, "A fix with no test is
-indistinguishable from an unfixed defect."
-
 The live state, the canary rows, and the NEXT SESSION list are in
 [`handoff.md`](handoff.md).
 
@@ -176,93 +225,51 @@ added on the belief that `rm -r` needs it, and `rm -r` does not.
 
 ---
 
-## Make `/proc` possible — the next major direction
+## `/proc` — shipped, with edges
 
-**This is the next major direction, not a scheduled milestone.**
-The `realpath` enable (session 43) is done and closed; the
-`readlink` errno fix is done too (`readlink_errno.c`, session 43).
-What `/proc` is: the shape the next real subsystem will take, and
-the thing that forces the pathname dispatch seam into existence.
-It is not scoped, sized, or scheduled.  When a session picks it up,
-it gets planned then.
+**This was the next major direction; it is now largely done.**  The
+seam exists, `/proc` is a listable directory, and `ps` and `pstree`
+work.  What follows is the shape it took and what remains — not a
+plan, a record.
 
-`/proc` is not a "VFS milestone."  It is the first feature that the
-current architecture **cannot express at all**, and building it is
-what forces the pathname dispatch seam into existence.
+### Why it forced architecture, and did
 
-### Why this, and not symlinks
+`resolve_against_cwd` plus `fat_lookup` could not produce
+`/proc/self/status`.  There is no FAT entry and never will be.  That
+is the test from `docs/strategy.md`, "When a feature may force
+architecture," and `/proc` passed it: it forced the pathname
+dispatch seam into existence, and the seam now serves every path
+that is not a FAT file.
 
-`resolve_against_cwd` plus `fat_lookup` cannot produce
-`/proc/self/status`.  There is no FAT entry and never will be.
-That is the test from `docs/strategy.md`, "When a feature may force
-architecture": a feature forces change when the current
-architecture cannot express it, not when a new architecture would
-be cleaner.
+### What it does not yet do
 
-Symlinks fail that test -- they are deferrable, and they can be
-added later as a *consumer* of the seam.  `/proc` passes it.
-`/proc` also delivers observability the kernel needs
-(`/proc/self/status`, `/proc/self/maps`), which makes kernel
-development itself easier.  It is the right first customer.
+- **`open("/proc/<pid>", O_DIRECTORY)`** — `ps` *stats* the per-pid
+  directory; nothing opens it.  `ls /proc/1` would need
+  `open_resolved` to accept the same two paths `stat_resolved` does,
+  producing a `FILE_KIND_DIR` slot with `PROC_DIR_SENTINEL` — the
+  mechanism `/proc` itself already uses.
+- **`/dev` is not a directory.**  `ls /dev` fails; adding it is the
+  same directory shape `/proc` got, and is the prerequisite for
+  `/dev/tty` and `/dev/urandom`.
+- **`sys_gettimeofday` (99)** — `PS_LONG`/`PS_TIME` need it, so
+  `ps -l` is off.
+- **`/etc/passwd`** — so `ps`'s USER column shows a name instead of
+  the numeric uid.
+- **A nonexistent pid stats as a directory** — the check is on the
+  path shape, not on `process_find_by_pid`.
 
-### Scope — one deliverable, two parts, sized to one file
+### The seam's remaining consumers, in order
 
-The work is **"the minimal dispatch seam plus the smallest
-open-file representation that one `/proc` file requires."**  Both
-parts, together, sized to `/proc/self/status` and nothing larger.
+Each is a consumer of the seam, ordered by what it unlocks.  None
+is scheduled.
 
-**The dispatch seam.**  Today path lookup is conceptually
-`path -> FAT -> result`.  `/proc` makes it
-`path -> first component -> procfs | fat | devfs`.  That is
-dispatch, and it is the VFS front door whether it is called that or
-not.  Design it knowing `/dev` and mounts are coming; do not build
-them now.
-
-**The minimal open-file representation.**  `open("/proc/self/status")`
-must return something `read`, `stat`, and `close` can act on, and
-that something is not a FAT file.  This is forced by the *first*
-`/proc` file -- it cannot be deferred past it.  The minimal form is
-a small `file_ops`-style struct with `read`/`stat`/`close`, with FAT
-and proc both implementing it.  **No inode layer, no vnode layer,
-no superblocks, no reference counts, no mount framework.**
-
-**Acceptance test:** one `/proc` file, probably `/proc/self/status`,
-opens, reads its contents, stats as a regular file, and closes --
-from `donix>` and from ash.  Add it to the canary.
-
-### What it subsumes
-
-`open-issues.md` item 1: `sys_execve`'s two remaining path attempts
-and `resolve_against_cwd` are shims the seam subsumes.  **Delete
-them as part of this work; do not extend them.**
-
-### The two failure modes to avoid
-
-- **Over-abstraction.**  Do not schedule "VFS."  Do not build an
-  inode/vnode/mount/superblock stack.  Build the seam `/proc`
-  needs and stop.
-- **Under-abstraction.**  Do not special-case `/proc` inside
-  `sys_open`, then `sys_stat`, then `sys_access`.  This is the
-  failure mode donix is *more* at risk of, because its history is
-  "implement the syscall when a feature needs it."
-  `resolve_against_cwd` and `sys_execve`'s shims are already the
-  existing instance of this pattern.
-
-### After it lands — consumers, in order
-
-Each of these is a consumer of the seam, ordered by what it
-unlocks.  None is scheduled yet.
-
-1. **`/dev`** — `/dev/null`, `/dev/tty`, `/dev/urandom`; lets
-   `tty` name its terminal.  `/dev/null` is first: its acceptance
-   test already exists (`realpath /no/such/dir/file 2>/dev/null`
-   must exit non-zero, silently; today the command does not run at
-   all).
+1. **`/dev` as a listable directory** — `/dev/tty`, `/dev/urandom`,
+  and `ls /dev`.  Small, patterned work.
 2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
-   ordinary file, hidden entirely inside the seam.  See
-   `open-issues.md` item 8.
+  ordinary file, hidden entirely inside the seam.  See
+  `open-issues.md` item 8.
 3. **`ln`, `link`, `readlink` with real targets**, and archive
-   symlink restoration (`tar`, `unzip`).
+  symlink restoration (`tar`, `unzip`).
 4. **A mount framework**, if and when a second filesystem exists.
 
 ---
@@ -284,10 +291,14 @@ value.
   (`vmm_map_page_in_cr3` and `vmm_map_page`, the PDPT/PD/PT
   allocation paths) still `return` without mapping when a
   page-table allocation fails, and the caller cannot tell.  The
-  huge-page-split instance was fixed in session 42 (`20261001-splitfix`).
-  The rest are a deliberate decision per site: change the signature
-  and check every caller, or halt on failure as the split path now
-  does.  See `open-issues.md` item 7.
+  huge-page-split instance was fixed in session 42
+  (`20261001-splitfix`).  **The allocator-state dependence that
+  used to trigger this was a different bug — the PMM zone scan —
+  and is fixed (`20261003-pmm-wrap`, session 48).**  These six
+  silent returns are a latent defect on their own terms: the next
+  allocation that fails for any reason will be invisible.  The fix
+  is to change the signature and check every caller, or halt on
+  failure as the split path does.  See `open-issues.md` item 7.
 - **Page-table teardown on process exit.**
 - **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
   non-executable.
@@ -364,7 +375,7 @@ assumed:**
   `/dev/...` through the pathname dispatch seam.  The VFS is on the
   critical path for *donix generally*, not for Wayland.
 
-Revisit when `v0.6.10` opens.
+Revisit when the next major direction opens.
 
 ---
 
