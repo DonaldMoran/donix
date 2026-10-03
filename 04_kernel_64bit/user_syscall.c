@@ -190,6 +190,33 @@ static char g_write_bounce[WRITE_CHUNK];
 #define FILE_KIND_DEV_NULL 5
 
 /*
+ * A /proc slot.
+ *
+ * slot->obj is NOT an allocated object.  It is the PROC_ENTRY_*
+ * value cast to a pointer -- i.e. (void*)(uintptr_t)PROC_ENTRY_SELF_STATUS.
+ * There is one entry today, and a struct with one field, or a
+ * kmalloc'd descriptor, would be designed from a single example.
+ * When a second /proc file arrives (commit 4's /proc/self/fd/N,
+ * or a later /proc/<pid>/status), that is when the descriptor
+ * becomes a struct, designed against two entries instead of one.
+ *
+ * put_file_slot's FILE_KIND_PROC case does nothing, because
+ * nothing was allocated.  It is present as a comment marking the
+ * place a future kmalloc'd descriptor would be freed.
+ *
+ * The bytes are produced by sys_read on demand from the kernel's
+ * own state -- the calling process's name and pid, and the fixed
+ * uid/gid the kernel reports.  Nothing is stored on the slot
+ * except which entry it is; see proc_build_status.
+ */
+#define FILE_KIND_PROC 6
+
+/* What a FILE_KIND_PROC slot's obj points at (cast to a pointer).
+ * One entry today; the numbering is from 1 so 0 means "none". */
+#define PROC_ENTRY_NONE        0
+#define PROC_ENTRY_SELF_STATUS 1
+
+/*
  * Which backend owns a resolved path.  THE SEAM.
  *
  * resolve_at produces an absolute Unix-form path AND one of these,
@@ -199,10 +226,12 @@ static char g_write_bounce[WRITE_CHUNK];
  *     /proc/...   -> BACKEND_PROC
  *     anything    -> BACKEND_FAT
  *
- * FAT is the only backend with a *handler* today: DEV is a table
- * of known device names (dev_lookup, below) whose matches produce
- * FILE_KIND_DEV_NULL slots, and everything else still goes to the
- * FAT path.  PROC has no handler until commit 3.
+ * FAT is the backend that reaches FatFs.  DEV is a table of known
+ * device names (dev_lookup) whose matches produce FILE_KIND_DEV_NULL
+ * slots.  PROC is a table of known proc entries (proc_lookup) whose
+ * matches produce FILE_KIND_PROC slots.  Everything else -- a /dev
+ * or /proc path with no table entry -- falls through to the FAT
+ * handler, exactly as an unmatched path did before the seam.
  *
  * This is the VFS front door, whether or not it is called that.
  * It is deliberately NOT a VFS: no inode, no vnode, no mount
@@ -453,15 +482,6 @@ static int path_is_root(const char* p) {
  * "/dev/null" matches "null", "/dev/console" would match
  * "console".  The match is by full component, so "/dev/nullx" does
  * not match "null"; see dev_lookup.
- *
- * This table is the seam's first consumer.  Before commit 2, the
- * same decision was made by path_is_devnull(), a single exact-path
- * predicate called from open_resolved, stat_resolved, and
- * access_resolved.  That predicate is gone; those three call
- * dev_lookup instead.  The change is one definition and one
- * lookup replacing one definition and three call sites -- the
- * shape docs/strategy.md asks for ("build exactly the seam the
- * feature needs"), not a VFS.
  */
 static const struct {
     const char* name;
@@ -517,6 +537,163 @@ static uint32_t dev_lookup(const char* abs_path) {
         }
     }
     return 0;
+}
+
+/*
+ * The PROC backend's entry table.
+ *
+ * ONE entry today: "self/status".  /proc/self/fd/N is commit 4's
+ * work; each is a row here, and nothing else changes.  The `entry`
+ * is the PROC_ENTRY_* a matching open() puts on the slot's obj.
+ *
+ * The name is the component AFTER "/proc/" in the resolved path:
+ * "/proc/self/status" matches "self/status".  The match is by full
+ * remainder, so "/proc/self/statusx" does not match, and neither
+ * does "/proc/self/status/extra".
+ */
+static const struct {
+    const char* name;
+    uint32_t    entry;
+} g_proc_table[] = {
+    { "self/status", PROC_ENTRY_SELF_STATUS },
+};
+#define G_PROC_TABLE_LEN (sizeof(g_proc_table) / sizeof(g_proc_table[0]))
+
+/*
+ * Look up a resolved absolute path in the PROC backend's table.
+ *
+ * Same shape and the same rules as dev_lookup: the path is the
+ * UNSTRIPPED resolved form with a leading '/', the match is by
+ * full component on the remainder after "/proc/", and 0 means
+ * "PROC backend but no such entry".
+ */
+static uint32_t proc_lookup(const char* abs_path) {
+    if (abs_path[0] != '/') return 0;
+
+    /* Skip "/proc/". */
+    const char* p = abs_path + 1;
+    if (!(p[0] == 'p' && p[1] == 'r' && p[2] == 'o' && p[3] == 'c' &&
+          p[4] == '/')) {
+        return 0;
+    }
+    const char* name = p + 5;   /* after "proc/" */
+
+    if (name[0] == '\0') return 0;
+
+    for (size_t i = 0; i < G_PROC_TABLE_LEN; i++) {
+        const char* entry = g_proc_table[i].name;
+        size_t j = 0;
+        while (entry[j] && name[j] == entry[j]) j++;
+        if (entry[j] == '\0' && name[j] == '\0') {
+            return g_proc_table[i].entry;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The byte length of a PROC entry's synthesized text.
+ *
+ * Used by stat_resolved and sys_fstat_body to report st_size
+ * without generating the text: the length is a function of the
+ * entry, the process name, and the pid/ppid/uid/gid, and the only
+ * variable part is the digits of the numbers.  Rather than
+ * duplicate the format here, the size is computed by the same
+ * routine that builds the text -- see proc_build_status, which
+ * returns its own length.
+ *
+ * For stat, we do not need the exact byte count, only a plausible
+ * nonzero one.  Linux's stat st_size for /proc files is usually 0
+ * (the bytes are produced on read and the size is not known until
+ * then), but a zero-size S_IFREG reads as a special case in some
+ * callers, and musl's stdio treats a zero size as "empty, do not
+ * bother reading".  So we report a fixed upper bound: the entry's
+ * text is never longer than PROC_STATUS_MAX.  That is what
+ * /proc/self/status's st_size reports.
+ */
+#define PROC_STATUS_MAX 256
+
+static uint32_t proc_entry_size(uint32_t entry) {
+    if (entry == PROC_ENTRY_SELF_STATUS) return PROC_STATUS_MAX;
+    return 0;
+}
+
+/*
+ * Build the synthesized text for a PROC entry into `out`, which
+ * holds `cap` bytes, and return the number of bytes written
+ * (excluding the NUL that is also written).
+ *
+ * The text is per-process: the calling process's name, pid, ppid,
+ * and the fixed uid/gid the kernel reports (1000, from
+ * sys_geteuid).  Nothing is cached on the slot; a second open
+ * builds the text again, which is what Linux does too.
+ *
+ * Format, matching Linux's /proc/self/status for these five keys:
+ *
+ *     Name:\t<comm>\n
+ *     Pid:\t<pid>\n
+ *     PPid:\t<ppid>\n
+ *     Uid:\t1000\n
+ *     Gid:\t1000\n
+ *
+ * A tab separates the key from the value, and each line ends in
+ * '\n'.  That is what musl's and busybox's /proc parsers expect,
+ * and what `cat /proc/self/status` shows on a real Linux.
+ *
+ * Returns the byte count.  If the text would not fit in `cap`,
+ * truncates at the last complete line that fits and returns that
+ * length.  PROC_STATUS_MAX (256) is generous for these five lines.
+ *
+ * No libc string functions or snprintf, matching this file's
+ * convention (see path_is_devnull's comment from before commit 2,
+ * and dev_lookup now).
+ */
+static size_t proc_build_status(uint32_t entry, char* out, size_t cap) {
+    if (entry != PROC_ENTRY_SELF_STATUS || cap == 0) return 0;
+
+    pcb_t* self = process_get_current();
+
+    size_t o = 0;
+
+    /* Helper: append a literal. */
+    #define APPEND_LIT(s) do { \
+        const char* _p = (s); \
+        while (*_p && o + 1 < cap) out[o++] = *_p++; \
+    } while (0)
+
+    /* Helper: append an unsigned decimal. */
+    #define APPEND_UDEC(v) do { \
+        unsigned long _v = (unsigned long)(v); \
+        char _tmp[24]; int _n = 0; \
+        if (_v == 0) { _tmp[_n++] = '0'; } \
+        else { while (_v > 0) { _tmp[_n++] = '0' + (int)(_v % 10); _v /= 10; } } \
+        while (_n > 0 && o + 1 < cap) out[o++] = _tmp[--_n]; \
+    } while (0)
+
+    APPEND_LIT("Name:\t");
+    if (self && self->name[0]) {
+        const char* p = self->name;
+        while (*p && o + 1 < cap) out[o++] = *p++;
+    }
+    APPEND_LIT("\n");
+
+    APPEND_LIT("Pid:\t");
+    APPEND_UDEC(self ? self->pid : 0);
+    APPEND_LIT("\n");
+
+    APPEND_LIT("PPid:\t");
+    APPEND_UDEC((self && self->parent_pid) ? self->parent_pid : 0);
+    APPEND_LIT("\n");
+
+    APPEND_LIT("Uid:\t1000\n");
+    APPEND_LIT("Gid:\t1000\n");
+
+    #undef APPEND_LIT
+    #undef APPEND_UDEC
+
+    if (o + 1 < cap) out[o] = '\0';
+    else out[cap - 1] = '\0';
+    return o;
 }
 
 /*
@@ -1035,6 +1212,19 @@ static void fill_kstat_as_chardev(kernel_stat_t* st) {
     st->st_blocks  = 0;
 }
 
+/* Fill a kernel_stat_t describing a PROC backend synthesized file.
+ * This is what /proc/self/status reports: a regular file, mode
+ * 0444 (read-only), with a size that is the entry's maximum text
+ * length.  See proc_entry_size. */
+static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFREG | 0444;
+    st->st_size    = (int64_t)proc_entry_size(entry);
+    st->st_blocks  = (st->st_size + 511) / 512;
+}
+
 // ============================================================
 // SAFE COPY OPERATIONS
 // ============================================================
@@ -1235,6 +1425,13 @@ static void put_file_slot(file_slot_t* slot) {
         /* obj is NULL; nothing to close or free. */
     } else if (slot->kind == FILE_KIND_DEV_NULL) {
         /* obj is NULL; nothing to close or free. */
+    } else if (slot->kind == FILE_KIND_PROC) {
+        /*
+         * obj is the PROC_ENTRY_* value cast to a pointer, not an
+         * allocation -- see the FILE_KIND_PROC comment above.
+         * Nothing to free.  When a future entry carries an
+         * allocated descriptor, this is where it is freed.
+         */
     } else if (slot->kind == FILE_KIND_PIPE) {
         /*
          * This is the last reference to this END (the slot refcount
@@ -1700,19 +1897,22 @@ long sys_pipe(int* user_pipefd) {
  * absolute Unix-form path (from resolve_at or a direct caller).
  *
  * sys_open and sys_openat both funnel into this; it is where the
- * FatFs translation, the DIR-vs-FILE decision, the DEV backend
- * dispatch, and the fd allocation live.  It does NOT resolve a cwd
- * or a dirfd -- the caller has done that with resolve_at.
+ * FatFs translation, the DIR-vs-FILE decision, the DEV and PROC
+ * backend dispatch, and the fd allocation live.  It does NOT
+ * resolve a cwd or a dirfd -- the caller has done that with
+ * resolve_at.
  *
  * `in_path` must be absolute (leading '/') or a FatFs-form path
  * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
  *
- * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
- * the path goes to the DEV backend: dev_lookup is consulted and a
- * match produces the corresponding device slot without touching
- * FatFs.  A path with BACKEND_DEV and no matching table entry
- * falls through to the FAT path, which is what produced -ENOENT
- * for unknown /dev paths before commit 2 as well.
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV
+ * or BACKEND_PROC, the path goes to the corresponding backend
+ * first: dev_lookup or proc_lookup is consulted and a match
+ * produces the backend's slot kind without touching FatFs.  A
+ * path with BACKEND_DEV or BACKEND_PROC and no matching table
+ * entry falls through to the FAT path, which is what produced
+ * -ENOENT for unknown /dev and /proc paths before the seam as
+ * well.
  */
 static long open_resolved(const char* in_path, int flags, int backend) {
     pcb_t* self = process_get_current();
@@ -1725,9 +1925,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
      *
      * If the path is a known device, return its slot and be done.
      * If not -- "/dev/tty" before commit 4, "/dev" alone, or
-     * anything else under /dev -- fall through to the FAT path,
-     * exactly as the pre-commit-2 predicate did when it failed to
-     * match.
+     * anything else under /dev -- fall through to the FAT path.
      */
     if (backend == BACKEND_DEV) {
         uint32_t kind = dev_lookup(in_path);
@@ -1742,6 +1940,29 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                       serial_print(" kind=");
                       serial_print_dec((uint64_t)kind); });
             return dfd;
+        }
+    }
+
+    /*
+     * PROC backend.  Same shape as DEV: match on the unstripped
+     * resolved path, return a FILE_KIND_PROC slot whose obj is the
+     * PROC_ENTRY_* value cast to a pointer, or fall through.
+     */
+    if (backend == BACKEND_PROC) {
+        uint32_t entry = proc_lookup(in_path);
+        if (entry != PROC_ENTRY_NONE) {
+            file_slot_t* pslot = NULL;
+            int pfd = alloc_file_slot(&pslot);
+            if (pfd == -1) return -(long)EIO_;
+            pslot->kind = FILE_KIND_PROC;
+            pslot->obj  = (void*)(uintptr_t)entry;
+            pslot->end  = 0;   /* read cursor: not yet drained */
+            /* refcount is 1 from alloc_file_slot. */
+            FDTRACE({ serial_print("open  proc -> fd=");
+                      serial_print_dec((uint64_t)pfd);
+                      serial_print(" entry=");
+                      serial_print_dec((uint64_t)entry); });
+            return pfd;
         }
     }
 
@@ -2626,6 +2847,17 @@ static long sys_fstat_body(int fd, void* user_stat) {
         return 0;
     }
 
+    if (slot->kind == FILE_KIND_PROC) {
+        /* Synthesized file: report S_IFREG | 0444, st_size is the
+         * entry's maximum text length (see proc_entry_size). */
+        uint32_t entry = (uint32_t)(uintptr_t)slot->obj;
+        fill_kstat_as_proc(&st, entry);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
+
     if (slot->kind == FILE_KIND_FILE) {
         FIL* f = (FIL*)slot->obj;
         /*
@@ -2710,14 +2942,15 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * The shared stat body, given an absolute Unix-form path.  This is
  * what sys_newfstatat (and therefore stat/lstat/fstat) all use.
  *
- * Handles the root aliases, the DEV backend, and the
- * kernel_stat_t fill.  Does NOT resolve against a cwd or a dirfd;
- * the caller has done that with resolve_at.
+ * Handles the root aliases, the DEV backend, the PROC backend,
+ * and the kernel_stat_t fill.  Does NOT resolve against a cwd or a
+ * dirfd; the caller has done that with resolve_at.
  *
- * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
- * the path goes to the DEV backend: dev_lookup is consulted and a
- * match produces the character-device stat without touching FatFs.
- * Before commit 2, the same decision was made by path_is_devnull().
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV or
+ * BACKEND_PROC, the path goes to that backend first: dev_lookup or
+ * proc_lookup is consulted and a match produces the backend's stat
+ * without touching FatFs.  Before commit 2, the DEV decision was
+ * made by path_is_devnull(); the PROC decision is new in commit 3.
  */
 static long stat_resolved(const char* abs_path, void* user_stat,
                           int backend) {
@@ -2764,6 +2997,22 @@ static long stat_resolved(const char* abs_path, void* user_stat,
             return 0;
         }
         /* Unknown /dev entry: fall through to FAT, as before. */
+    }
+
+    /*
+     * PROC backend.  Same shape as DEV.
+     */
+    if (backend == BACKEND_PROC) {
+        uint32_t entry = proc_lookup(abs_path);
+        if (entry != PROC_ENTRY_NONE) {
+            kernel_stat_t st;
+            fill_kstat_as_proc(&st, entry);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
     FILINFO fno;
@@ -2886,10 +3135,10 @@ long sys_lstat(const char* user_path, void* user_stat) {
  * ("0:/..."); it is strip_dot_prefix'd here before reaching FatFs.
  * The root aliases (".", "/", "0:/") always "exist".
  *
- * `backend` is the tag from resolve_at.  When it is BACKEND_DEV,
- * dev_lookup is consulted: a known device "exists" and returns 0
- * without touching FatFs; an unknown /dev path falls through, as
- * before.
+ * `backend` is the tag from resolve_at.  When it is BACKEND_DEV or
+ * BACKEND_PROC, the corresponding lookup is consulted: a known
+ * entry "exists" and returns 0 without touching FatFs; an unknown
+ * /dev or /proc path falls through, as before.
  */
 static long access_resolved(const char* abs_path, int backend) {
     char path[USER_PATH_MAX];
@@ -2915,6 +3164,14 @@ static long access_resolved(const char* abs_path, int backend) {
             return 0;
         }
         /* Unknown /dev entry: fall through to FAT, as before. */
+    }
+
+    /* PROC backend: a known entry exists. */
+    if (backend == BACKEND_PROC) {
+        if (proc_lookup(abs_path) != PROC_ENTRY_NONE) {
+            return 0;
+        }
+        /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
     FILINFO fno;
@@ -4401,6 +4658,42 @@ long sys_read(int fd, void* buf, size_t count) {
         file_slot_t* dn = get_file_slot_any(fd);
         if (dn && dn->kind == FILE_KIND_DEV_NULL) {
             return 0;
+        }
+    }
+
+    /*
+     * /proc: synthesized file.  read() produces the entry's text
+     * into a kernel buffer and copies it out.
+     *
+     * The slot carries a one-byte "drained" flag in slot->end:
+     * after the first read, slot->end is set to 1 and subsequent
+     * reads return 0 (EOF).  That is not a real cursor -- a
+     * caller that reads a prefix shorter than the text gets EOF
+     * rather than the remainder -- but the current callers
+     * (musl's stdio, cat) read once with a large buffer and stop.
+     * A future entry whose text can exceed one read, or a caller
+     * that reads in small chunks, is when this becomes a real
+     * cursor; see the FILE_KIND_PROC comment.
+     *
+     * slot->end is free here: FILE_KIND_PROC slots do not use it
+     * for anything else (pipes do, and a PROC slot is never a
+     * pipe).  open_resolved initializes it to 0 when the slot is
+     * created.
+     */
+    {
+        file_slot_t* ps = get_file_slot_any(fd);
+        if (ps && ps->kind == FILE_KIND_PROC) {
+            if (ps->end != 0) return 0;   /* already drained: EOF */
+            uint32_t entry = (uint32_t)(uintptr_t)ps->obj;
+            char kbuf[PROC_STATUS_MAX];
+            size_t klen = proc_build_status(entry, kbuf, sizeof(kbuf));
+            ps->end = 1;
+            if (klen == 0) return 0;
+            size_t to_copy = count < klen ? count : klen;
+            if (safe_copy_to_user(buf, kbuf, to_copy) != 0) {
+                return -(long)EFAULT_;
+            }
+            return (long)to_copy;
         }
     }
 
