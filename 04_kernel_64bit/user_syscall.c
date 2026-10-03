@@ -242,6 +242,8 @@ static char g_write_bounce[WRITE_CHUNK];
 #define PROC_ENTRY_NONE        0
 #define PROC_ENTRY_SELF_STATUS 1
 #define PROC_ENTRY_PID_STAT    2
+#define PROC_ENTRY_PID_STATUS  3
+#define PROC_ENTRY_PID_CMDLINE 4
 
 /*
  * For the per-pid entries, a FILE_KIND_PROC slot's obj carries
@@ -758,6 +760,8 @@ static long proc_readlink(const char* abs_path,
 static uint32_t proc_entry_size(uint32_t entry) {
     if (entry == PROC_ENTRY_SELF_STATUS) return PROC_STATUS_MAX;
     if (entry == PROC_ENTRY_PID_STAT)    return PROC_STAT_MAX;
+    if (entry == PROC_ENTRY_PID_STATUS)  return PROC_STATUS_MAX;
+    if (entry == PROC_ENTRY_PID_CMDLINE) return PROC_NAME_LEN + 1;
     return 0;
 }
 
@@ -836,6 +840,105 @@ static size_t proc_build_status(uint32_t entry, char* out, size_t cap) {
 
     if (o + 1 < cap) out[o] = '\0';
     else out[cap - 1] = '\0';
+    return o;
+}
+
+/*
+ * Build the synthesized text for /proc/<pid>/status.
+ *
+ * Deliberately a near-copy of proc_build_status rather than a
+ * generalization of it.  proc_build_status is on the working
+ * /proc/self/status path; a refactor that changes its signature
+ * would touch that path in the same commit that adds this one.
+ * The duplication is ~30 lines and it goes away in the refactor
+ * commit that follows, once ps works and there is a green applet
+ * behind the change.
+ *
+ * libbb/procps.c reads this file for the Uid:/Gid: keys:
+ *
+ *     SCAN_TWO("Uid:", ruid, continue);
+ *     SCAN_TWO("Gid:", rgid, break);
+ *
+ * so both keys must be present with a numeric value.  The other
+ * three (Name:, Pid:, PPid:) are emitted for the same reason
+ * /proc/self/status emits them -- they are what the file is, and
+ * a reader that wants them should find them.
+ */
+static size_t proc_build_pid_status(uint64_t pid, char* out, size_t cap) {
+    if (cap == 0) return 0;
+    pcb_t* p = process_find_by_pid(pid);
+    if (!p) return 0;
+
+    size_t o = 0;
+
+    #define APPEND_LIT(s) do { \
+        const char* _p = (s); \
+        while (*_p && o + 1 < cap) out[o++] = *_p++; \
+    } while (0)
+
+    #define APPEND_UDEC(v) do { \
+        unsigned long _v = (unsigned long)(v); \
+        char _tmp[24]; int _n = 0; \
+        if (_v == 0) { _tmp[_n++] = '0'; } \
+        else { while (_v > 0) { _tmp[_n++] = '0' + (int)(_v % 10); _v /= 10; } } \
+        while (_n > 0 && o + 1 < cap) out[o++] = _tmp[--_n]; \
+    } while (0)
+
+    APPEND_LIT("Name:\t");
+    if (p->name[0]) {
+        const char* q = p->name;
+        while (*q && o + 1 < cap) out[o++] = *q++;
+    }
+    APPEND_LIT("\n");
+
+    APPEND_LIT("Pid:\t");
+    APPEND_UDEC(p->pid);
+    APPEND_LIT("\n");
+
+    APPEND_LIT("PPid:\t");
+    APPEND_UDEC(p->parent_pid ? p->parent_pid : 0);
+    APPEND_LIT("\n");
+
+    APPEND_LIT("Uid:\t1000\n");
+    APPEND_LIT("Gid:\t1000\n");
+
+    #undef APPEND_LIT
+    #undef APPEND_UDEC
+
+    if (o + 1 < cap) out[o] = '\0';
+    else out[cap - 1] = '\0';
+    return o;
+}
+
+/*
+ * Build the synthesized text for /proc/<pid>/cmdline.
+ *
+ * Linux's cmdline is the process's argv, NUL-separated, with a
+ * trailing NUL.  donix does not keep argv on the pcb, so this
+ * emits the process's comm followed by a single NUL -- a
+ * one-argument cmdline.  That is enough for libbb's read_cmdline
+ * (ps.c), which reads it, cuts at the first space, and prints the
+ * result as the COMMAND column.
+ *
+ * The return value is the byte count, and it INCLUDES the
+ * trailing NUL, because that NUL is part of the file's content
+ * on Linux.  A caller reading `len` bytes gets the name and its
+ * terminator.  This differs from proc_build_status/stat, whose
+ * count excludes the NUL they append for C-string safety -- those
+ * are text files, this one is a NUL-separated argv.
+ *
+ * If donix later keeps argv on the pcb, this builder changes and
+ * nothing else does.
+ */
+static size_t proc_build_pid_cmdline(uint64_t pid, char* out, size_t cap) {
+    if (cap < 2) return 0;
+    pcb_t* p = process_find_by_pid(pid);
+    if (!p) return 0;
+
+    size_t o = 0;
+    const char* q = p->name;
+    while (*q && o + 1 < cap) out[o++] = *q++;
+    out[o++] = '\0';       /* the argv terminator */
     return o;
 }
 
@@ -2360,15 +2463,30 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                 int is_stat = (ok_component
                     && q[0]=='/' && q[1]=='s' && q[2]=='t'
                     && q[3]=='a' && q[4]=='t' && q[5]=='\0');
-                if (is_stat) {
+                int is_status = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
+                    && q[6]=='s' && q[7]=='\0');
+                int is_cmdline = (ok_component
+                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
+                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
+                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
+                if (is_stat || is_status || is_cmdline) {
                     if (!process_find_by_pid(pid)) return -(long)ENOENT_;
                     file_slot_t* sslot = NULL;
                     int sfd = alloc_file_slot(&sslot);
                     if (sfd == -1) return -(long)EIO_;
                     sslot->kind = FILE_KIND_PROC;
-                    sslot->obj  = PROC_OBJ_MAKE(pid, PROC_ENTRY_PID_STAT);
+                    sslot->obj  = PROC_OBJ_MAKE(pid,
+                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                                   : is_status ? PROC_ENTRY_PID_STATUS
+                                               : PROC_ENTRY_PID_STAT);
                     sslot->end  = 0;   /* read cursor: not yet drained */
-                    FDTRACE({ serial_print("open  proc stat -> fd=");
+                    FDTRACE({ serial_print("open  proc ");
+                              serial_print(is_cmdline ? "cmdline"
+                                          : is_status ? "status"
+                                                      : "stat");
+                              serial_print(" -> fd=");
                               serial_print_dec((uint64_t)sfd);
                               serial_print(" pid=");
                               serial_print_dec(pid); });
@@ -3456,10 +3574,24 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      */
     if (backend == BACKEND_PROC) {
         /*
-         * /proc and /proc/self report as directories.  Same two
-         * paths open_resolved accepts; stat and open must agree,
-         * or a caller that stats before opening sees the wrong
-         * thing.  The test checks both.
+         * /proc, /proc/self, and /proc/<pid> report as
+         * directories.  The first two are the paths
+         * open_resolved accepts; /proc/<pid> is here because
+         * libbb's procps_scan stats it, not opens it.
+         *
+         * procps_scan (with PSSCAN_UIDGID, which ps's default
+         * flag set and pstree's both have) builds "/proc/<pid>/"
+         * -- with a trailing slash -- and calls stat() on it:
+         *
+         *     if (stat(filename, &sb)) continue;
+         *
+         * If that stat fails, every entry is skipped, which is
+         * exactly the "header but no rows" symptom.  The bare
+         * pid form is accepted too, because a caller may stat
+         * either.
+         *
+         * This commit handles stat only.  open("/proc/<pid>")
+         * is the follow-up; ps does not need it.
          */
         int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
                             && abs_path[2] == 'r' && abs_path[3] == 'o'
@@ -3470,7 +3602,27 @@ static long stat_resolved(const char* abs_path, void* user_stat,
                             && abs_path[6] == 's' && abs_path[7] == 'e'
                             && abs_path[8] == 'l' && abs_path[9] == 'f'
                             && abs_path[10] == '\0');
-        if (is_proc_root || is_proc_self) {
+
+        /*
+         * is_proc_pid_dir: "/proc/<digits>" or "/proc/<digits>/".
+         * Digits only -- "self" is handled above, and a name with
+         * any other character is not a per-pid directory.
+         */
+        int is_proc_pid_dir = 0;
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                int ndig = 0;
+                while (*q >= '0' && *q <= '9') { q++; ndig++; }
+                if (ndig > 0 && *q == '\0') is_proc_pid_dir = 1;
+                else if (ndig > 0 && q[0] == '/' && q[1] == '\0')
+                    is_proc_pid_dir = 1;
+            }
+        }
+
+        if (is_proc_root || is_proc_self || is_proc_pid_dir) {
             kernel_stat_t st;
             fill_kstat_as_dir(&st);
             if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
@@ -3507,10 +3659,21 @@ static long stat_resolved(const char* abs_path, void* user_stat,
                 int is_stat = (ok_component
                     && q[0]=='/' && q[1]=='s' && q[2]=='t'
                     && q[3]=='a' && q[4]=='t' && q[5]=='\0');
-                if (is_stat) {
+                int is_status = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
+                    && q[6]=='s' && q[7]=='\0');
+                int is_cmdline = (ok_component
+                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
+                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
+                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
+                if (is_stat || is_status || is_cmdline) {
                     if (!process_find_by_pid(pid)) return -(long)ENOENT_;
                     kernel_stat_t st;
-                    fill_kstat_as_proc(&st, PROC_ENTRY_PID_STAT);
+                    fill_kstat_as_proc(&st,
+                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                                   : is_status ? PROC_ENTRY_PID_STATUS
+                                               : PROC_ENTRY_PID_STAT);
                     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                         return -(long)EFAULT_;
                     }
@@ -5215,6 +5378,30 @@ long sys_read(int fd, void* buf, size_t count) {
                 }
                 return (long)to_copy;
             }
+            if (tag == PROC_ENTRY_PID_STATUS) {
+                char kbuf[PROC_STATUS_MAX];
+                klen = proc_build_pid_status(PROC_OBJ_PID(ps->obj),
+                                             kbuf, sizeof(kbuf));
+                ps->end = 1;
+                if (klen == 0) return 0;
+                size_t to_copy = count < klen ? count : klen;
+                if (safe_copy_to_user(buf, kbuf, to_copy) != 0) {
+                    return -(long)EFAULT_;
+                }
+                return (long)to_copy;
+            }
+            if (tag == PROC_ENTRY_PID_CMDLINE) {
+                char kbuf[PROC_NAME_LEN + 1];
+                klen = proc_build_pid_cmdline(PROC_OBJ_PID(ps->obj),
+                                              kbuf, sizeof(kbuf));
+                ps->end = 1;
+                if (klen == 0) return 0;
+                size_t to_copy = count < klen ? count : klen;
+                if (safe_copy_to_user(buf, kbuf, to_copy) != 0) {
+                    return -(long)EFAULT_;
+                }
+                return (long)to_copy;
+            }
             char kbuf[PROC_STATUS_MAX];
             klen = proc_build_status(tag, kbuf, sizeof(kbuf));
             ps->end = 1;
@@ -6773,7 +6960,11 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
     if (count == 0) return -(long)EINVAL_;
 
     file_slot_t* slot = get_file_slot(fd, FILE_KIND_DIR);
-    if (!slot) return -(long)EBADF_;
+    if (!slot) {
+        serial_print("GETD: no DIR slot for fd=");
+        serial_print_dec((uint64_t)fd); serial_print("\n");
+        return -(long)EBADF_;
+    }
 
     /*
      * A synthesized PROC directory has no DIR* to f_readdir.
