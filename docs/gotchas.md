@@ -1,14 +1,137 @@
+## A function that has never run is correct by inspection only
+
+*Session 49 (the `process_create` failure-path cleanup), commits
+`20261003-process-create-cleanup` and `20261003-exit-frees-tables`.
+A helper written for a path that does not fire was unexercised until
+a second caller put it on a hot path -- and only then did the run
+mean anything.*
+
+Session 49 fixed a real defect: `process_create`'s failure exits
+leaked, and one of them was worse than a leak -- `vmm_clone_page_table`'s
+return was unchecked, so a `0` clone became `pcb->cr3 = 0` and the
+next `vmm_map_page_in_cr3` walked page tables at `HHDM_START + 0`.
+The fix added `process_free_clone` -- a walk that frees the cloned
+PML4 and its low-half hierarchy -- and called it from the three
+failure exits in `process_create`.
+
+**Every one of those exits is a path a healthy boot never takes.**
+No `pmm_alloc_page_for_elf` failure, no `vmm_map_page_in_cr3`
+failure, no kernel-stack-pool exhaustion.  The commit message said
+so -- "correct by inspection; UNEXERCISED" -- and the boot confirmed
+it: none of the new `PROCESS:` diagnostics printed.  The helper
+**existed and was correct and had never executed.**
+
+**The next commit made it execute.**  `process_reclaim` and
+`process_destroy` leaked the same hierarchy on the *success* path,
+and the same helper closes it.  That put `process_free_clone` on
+every process exit.  The `exec_churn` test -- 24 rounds of
+fork/execve/wait4 -- then ran the walk 24 times, and the `k`-shell
+selftest's three exception children ran it 3 more.  No fault, no
+double-free warning from `pmm_free_page`.  **That is what turned
+"correct by inspection" into "verified."**
+
+Before the `exec_churn` run, the two states were indistinguishable.
+The helper's code was not wrong; it was *unread by the machine*.
+A function whose only callers are failure paths is a function the
+test suite cannot confirm, and a commit that says "correct by
+inspection" is saying exactly that.
+
+**The rule.**
+
+> **A fix to a path that does not fire is a fix no run has
+> confirmed.**  Write it, say so in the commit message, and treat
+> its correctness as a claim, not a fact.  When a later change puts
+> the same code on a path that *does* fire, that run is the first
+> evidence -- and if it is not run, nothing has changed except the
+> number of places that depend on an unexercised function.
+
+**The tell.**  A commit message that uses the phrase "by
+inspection," or "unexercised," or "this path does not fire on a
+healthy boot."  All three are honest.  None of them is a test.  A
+reader who later modifies the function needs to know it has never
+run; if the message does not say so, the reader will assume a green
+boot meant the code worked.
+
+**Where this shape recurs.**  Same family as "A fix with no test is
+indistinguishable from an unfixed defect" (session 43), but a
+different case.  That entry is about a fix *believed absent* when
+present, or *believed present* when absent -- a claim about
+**existence**.  This one is about a fix that exists and is correct
+and has never **run** -- a claim about **exercise**.  Both produce
+wasted motion, but for opposite reasons: the session-43 case wastes
+a session re-implementing what is there, and this case wastes a
+session's *confidence* in what is not.  The check is different too:
+the session-43 fix was answered by `grep` for the function body;
+this one can only be answered by a run that reaches the path, which
+means putting the code where a test can get to it.
+
+## A comment that names its callers goes stale the moment a new caller appears
+
+*Session 49 (`process_free_clone`'s header comment), commit
+`20261003-exit-frees-tables`.  The code was correct; the comment
+became false, and it was the comment a reader would have trusted.*
+
+`process_free_clone` was added in `20261003-process-create-cleanup`
+with a header comment that said, in the section headed "WHY THIS
+EXISTS AS A SEPARATE FUNCTION":
+
+    Called only from process_create's failure paths, and only after
+    vmm_clone_page_table has succeeded (so cr3 is non-zero and the
+    hierarchy is complete for entries 0..255).
+
+The next commit added two more callers -- `process_reclaim` and
+`process_destroy`, on the process-exit path.  **The code was
+correct; the comment was now false.**  A reader modifying the walk
+would have read "called only from failure paths," reasoned about a
+process that never ran, and been wrong about the case it now
+actually handles: a process that has run, whose cr3's low half has
+grown (ELF segments, user stack, brk, mmap, execve teardown), and
+for which "every table under index 256 is this process's" is true
+for a different reason.
+
+The comment had to be rewritten to describe both callers and both
+cases -- the never-ran case and the has-run case, and why the walk
+is correct for each.  **That rewrite was part of the commit that
+added the callers, not a separate docs pass**, because the comment
+is the thing that makes the function safe to modify and it was
+wrong the instant the second caller landed.
+
+**The rule.**
+
+> **When you add a caller to an existing function, grep for
+> comments that enumerate its callers.**  A comment that says
+> "called only from X" or "the caller is Y" is a fact about the
+> call graph, and the call graph just changed.  The code compiles
+> either way; only the comment is stale, and only the comment is
+> what a future reader will believe.
+
+**The tell.**  A function comment that contains the word "only,"
+or "always," or "never" about its callers, its inputs, or its
+state.  Those are the sentences that a new call site silently
+falsifies.  `grep -n "Called only from\|only called\|the caller"
+<file>` before committing a new caller is one command and finds
+them.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"A consumer inferred from behavior is not a consumer" (session 40):
+a written claim about the code that was true when written and is
+checked by nothing.  The PIT case was a wrong *number*, the
+`unlinkat` case a wrong *causal claim*, this one a wrong
+*enumeration*.  All three are settled by going to the source --
+here, the call sites -- rather than trusting the prose.
+
 ## A zone scan that moves one way does not find pages behind its cursor
 
 *Session 48 (the double fault on the first boot after adding ELFs),
-commit pending.  The allocator was not out of memory; its scan could
-not reach the free pages it was counting.*
+commit `20261003-pmm-wrap`.  The allocator was not out of memory; its
+scan could not reach the free pages it was counting.*
 
-A fresh boot after adding userland ELFs faulted at `0x400000` -- the
-`#PF` item 7 describes -- and then double-faulted.  It reproduced for
-a session, cleared on the second or third boot, and came back after
-the next image change.  The `#PF` was real, but the *reason the
-allocation failed* was in the PMM, not in `vmm_map_page_in_cr3`.
+A fresh boot after adding userland ELFs faulted at `0x400000` and
+then double-faulted.  It reproduced for a session, cleared on the
+second or third boot, and came back after the next image change.
+The `#PF` was real, but the *reason the allocation failed* was in
+the PMM, not in `vmm_map_page_in_cr3`.
 
 **The zone scan started at a cursor and moved one direction.**
 
@@ -45,14 +168,15 @@ cursor is found on the second pass.  A failed scan does not move the
 cursor.  The per-type `phys < 0x200000` skip became a `min_page`
 parameter so both zones and all types share one scan function.
 
-**Why this is not item 7.**  Item 7 is the silent `if (!phys)
+**Why this was not item 7.**  Item 7 was the silent `if (!phys)
 return;` in `vmm_map_page_in_cr3`: the caller cannot see that the
-mapping failed.  That is a real defect and still needs the return
+mapping failed.  That was a real defect and it needed the return
 value.  But *this* bug is why the allocation returned 0 in the first
 place, and it is a different thing: an allocator that cannot find
 memory it has.  Fixing item 7 alone would have turned "boots into a
 broken shell that double-faults" into "refuses to boot the shell,"
-which is a better failure but not a fix.
+which is a better failure but not a fix.  (Item 7 was closed in
+session 49; see `open-issues.md` history in `docs/session-log.md`.)
 
 **Where this shape recurs.**  Same family as "A fix with no test is
 indistinguishable from an unfixed defect" (session 43): a mechanism
@@ -62,7 +186,6 @@ enough to reach the far side; adding ELFs does; and no test drove
 the allocator past its cursor until `mmap_stress` and `exec_churn`
 were written.  A test of the allocator's *accounting*
 (`pmm_free_pages`) is not a test of its *reach*.
-
 
 ## A /proc consumer can stat a path it never opens
 
@@ -1045,7 +1168,6 @@ path.  A deletion is caught only by a test that exercises the
 exercises it, which is exactly when the deletion is safe and
 exactly when there is no test to say so.  That asymmetry is why
 deletion wants a run, not a review.
-
 
 ## An input-only `syscall` asm block does not tell GCC that `%rax` is overwritten
 

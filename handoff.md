@@ -3,9 +3,10 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-03 (session 48: the PMM zone-scan bug was
-found and fixed; the boot-time `#PF` it caused does not reproduce.
-**Next: item 7's silent `vmm_map_page*` returns.**)
+**Last updated:** 2026-10-03 (session 49: item 7 was closed, and the
+session's work shipped as `v0.6.12`.  **Next: the failure paths
+session 49 added are correct by inspection and unexercised; the
+fault-injection test is the recommended next session.**)
 
 **Repo state — run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -16,31 +17,32 @@ lands, so this file does not carry one:
     git tag --list 'v*' | tail -1   # last milestone
     git tag --list '2026*'          # live scratch tags
 
-> **The boot-time `#PF` is explained and the cause is fixed; item 7
-> is not.**  The intermittent fault at `0x400000` — first boot after
-> adding ELFs, clears by the second or third — was the PMM zone
-> scan, not the silent `vmm_map_page*` returns:
-> `pmm_alloc_page`'s scan started at a cursor and moved one
-> direction, so a free page on the far side of the cursor was never
-> found, and the boot ELF load's page-table allocation returned 0.
-> Fixed in `20261003-pmm-wrap`; ten-plus boots on the trigger image
-> with no fault.  **What remains is item 7's real subject:** the
-> silent returns themselves, a function that cannot report failure.
-> That is the next session's work.  See `open-issues.md` item 7 and
-> `gotchas.md`, "A zone scan that moves one way does not find pages
-> behind its cursor."
+> **Item 7 is closed and shipped in `v0.6.12`; one thing the session
+> added is unverified.**  Item 7 — the silent `vmm_map_page*`
+> returns — is fixed: `vmm_map_page` and `vmm_map_page_in_cr3`
+> return `int`, all nine callers act on it, and the `isr14_handler`
+> diagnostic item 7 required is in the tree.  The session-45
+> virtual-1 fault did not reproduce.  **What is not verified:**
+> `process_create`'s four failure exits, which now run a real
+> cleanup (`process_free_clone` and friends) but have never
+> executed — a healthy boot does not fail an allocation.  The
+> commit message says "correct by inspection; UNEXERCISED," and
+> that is still true.  Closing it needs a **fault-injection
+> facility** — one `static` in `pmm.c` and a `selftest` row — which
+> is the recommended next session.  See `gotchas.md`, "A function
+> that has never run is correct by inspection only," and
+> `docs/session-log.md`, session 49.
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
 `v0.6.9` envp, the `/usr/bin` layout, the `execve` shim removal;
 `v0.6.10` a tail on `v0.6.9` — `realpath`, the `readlink` errno,
-and `/dev/null`.  **Post-`v0.6.10`, on `dev`, untagged, three
-sessions' work awaits `v0.6.11`:** session 44's **pathname dispatch
-seam** (FAT/DEV/PROC backends, `/dev/null`, `/proc/self/status`,
-`/dev/console`, `/proc/self/fd/N`, `tty`), session 47's **`/proc`
-per-pid and `ps`** (per-pid `stat`, `status`, `cmdline`, the pid
-directory, `ps` and `pstree` enabled and working), and session 48's
-**PMM zone-scan fix**.  **That is a large milestone, not a tail.**
+and `/dev/null`; `v0.6.11` the pathname dispatch seam, `/proc`
+per-pid and `ps`, and the PMM zone-scan fix; **`v0.6.12` a
+correctness milestone** — item 7 closed, `process_create`'s failure
+exits fixed, the exit-path page-table leak closed, and one dead
+`f_stat_with_retry` block deleted.  **No new subsystem in
+`v0.6.12`.**
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -67,11 +69,14 @@ no `YYYYMMDD-*` either.  It rides along on `dev` until the next
 a commit with no tag.
 
 **Note on commit messages:** a commit message is a claim, not a
-fact.  Two instances to remember.  `95c6337 handoff: rewrite fresh
-for the v0.6.9 bump` did not rewrite the handoff body.  And session
+fact.  Three instances to remember.  `95c6337 handoff: rewrite fresh
+for the v0.6.9 bump` did not rewrite the handoff body.  Session
 45's Fix B (`157627c`, later reverted) claimed to close the
 boot-time `#PF`; it did not — the fault reproduces with a different
-presentation.  Read the diff, not the subject.
+presentation.  And session 49's commit
+`20261003-process-create-cleanup` says "correct by inspection;
+UNEXERCISED" — which is honest, and is the reason the next session
+exists.  Read the diff, not the subject.
 
 ---
 
@@ -174,14 +179,14 @@ banner commit is named `kmain: bump the shell banner to vX.Y.Z`.
 The tag is **annotated** (`-a -F -`) — the annotation is the
 milestone narrative, and it is what a future reader sees first.
 The merge is `--no-ff`, so `main` keeps a real merge commit for
-each version (`Merge dev into main for v0.6.10`, etc.).
+each version (`Merge dev into main for v0.6.12`, etc.).
 
 **A version is not necessarily a milestone.**  `v0.6.10` is a tail
 on `v0.6.9` with no new subsystem.  When that happens, the tag
 annotation and the session-log row should *say so*, so a future
 reader does not hunt for a milestone narrative that is not there.
-**`v0.6.11` is the opposite** — three sessions' work, and the
-annotation should say so.
+**`v0.6.12` is a correctness milestone, not a feature one** — the
+annotation should say so plainly.
 
 ---
 
@@ -218,210 +223,186 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Session 45 — reverted, and what it left
+## Where we are — session 49, shipped as `v0.6.12`
 
-Session 45 attempted the item-7 kernel fix three ways and reverted
-all three; **no kernel change was committed.**  Its findings are
-in `open-issues.md` item 7.  The one thing it kept was the `run`
-script's build-and-capture fix.
+**A correctness milestone.**  Five commits, all on kernel failure
+paths.  No new subsystem, no new applet, no new syscall.
 
-**Note, session 48:** the *allocator* half of what session 45 was
-chasing turned out to be a different bug — the PMM zone scan — and
-it is fixed.  Session 45's own findings (the virtual-1 fault, the
-`pmm_get_page_type` result, the `vmm_clone_page_table` lessons) are
-still unresolved and still worth reading before item 7 is redone.
+### Item 7, closed
 
----
+The silent `if (!phys) return;` in `vmm_map_page_in_cr3` and
+`vmm_map_page` — six sites, the PDPT/PD/PT allocation paths in each
+— where a failed page-table allocation meant no mapping and the
+caller could not tell.  Fixed in two commits:
 
-## Where we are — the seam, shipped on `dev`
+- **`20261003-vmm-int-return`** — the signature change.  Both
+  functions return `int` (0 = mapped, -1 = failed); the six sites
+  `return -1;`; both `return 0` on success.  The huge-page split's
+  halt was left alone — it already halts with `VMM: FATAL` (session
+  42).  The `isr14_handler` `pmm_get_page_type` diagnostic went in
+  **in the same commit**, because item 7 required it be in place
+  before the signature change was attempted.  **The session-45
+  virtual-1 fault did not reproduce.**
+- **`20261003-vmm-callers`** — the nine callers handle the `-1`.
+  Two **halt** (`ensure_hhdm_mapped`, `vmm_init`'s identity map —
+  boot paths with no caller to report to); seven **recover**
+  (`elf_load_into_process`, `process_create`'s stack loop,
+  `heap_extend`, `sys_mmap`, `sys_brk`, `exec_alloc_user_stack`,
+  `sys_fork`'s `EAGER_COPY_REGION` macro).  `heap_extend` is the
+  nontrivial one: it unmaps and frees its partial region, because
+  nothing else tracks those pages.
 
-Session 44 built the **pathname dispatch seam**: the first feature
-the previous architecture could not express.  Eight commits on
-`dev`, all verified, none tagged `v*` and none pushed.
+### The defect the item-7 work surfaced
 
-### The seam, in one paragraph
+`process_create` had `pcb->cr3 = vmm_clone_page_table(current_cr3);`
+**with no check** — a `0` return became `pcb->cr3 = 0`, and the next
+`vmm_map_page_in_cr3` walked page tables at `HHDM_START + 0`.  Worse
+than a leak.  The same function's failure exits also leaked the
+cloned page-table hierarchy.
 
-`resolve_at` now returns, alongside the resolved absolute path, a
-**backend tag** computed from the path's first component:
-`/dev/...` -> `BACKEND_DEV`, `/proc/...` -> `BACKEND_PROC`,
-anything else -> `BACKEND_FAT`.  Every path syscall passes the tag.
-FatFs serves FAT; a small table (`dev_lookup`, `proc_lookup`) serves
-DEV and PROC, or falls through to FAT for an unknown path under
-those prefixes.  There is **no VFS**: no inode, no vnode, no mount
-table.  See `docs/strategy.md`, "When a feature may force
-architecture."
+**`20261003-process-create-cleanup`** fixes both: a new
+`process_free_clone(cr3)` walks the cloned PML4 and frees entries
+0..255 and the PML4, skipping the recursive index, entries >= 256
+(shared with the parent — the HHDM and kernel image), and 2 MB huge
+PDEs.  The four failure exits run full cleanup.
 
-### Session 48 — the PMM zone-scan fix, and the boot-time `#PF`
+**"Correct by inspection; UNEXERCISED."**  Every one of those four
+is a path a healthy boot does not take.
 
-**This is the newest thing on `dev`.**  One commit, scratch-tagged
-`20261003-pmm-wrap`.
+### The exit-path leak, and the run that verified the helper
 
-The intermittent boot-time `#PF` at `0x400000` — first boot after
-adding userland ELFs, clears by the second or third, reproduced
-again this session — was **not** item 7's silent
-`vmm_map_page_in_cr3` returns.  It was the **PMM zone scan**:
+**`20261003-exit-frees-tables`** — `process_reclaim` and
+`process_destroy` abandoned the cloned page-table hierarchy at exit;
+they now call `process_free_clone`.  Correct for a process that has
+*run*, though written for one that never did: the low half has grown
+(ELF, stack, brk, mmap), but it is still this process's own, and the
+walk frees tables only — `process_cleanup_elf_pages` frees the data
+pages, and the two are disjoint.
 
-- `pmm_alloc_page` scanned for a free page starting at a cursor
-  (`pmm_next_low_page`, `pmm_next_high_page`) and moved **one
-  direction**.  The free paths rewound the cursor to a freed page
-  on the *near* side, but a page that had been free the whole time
-  on the **far** side was never reached.
-- Adding ELFs to the image pushed the cursor past such pages before
-  the boot ELF load ran, so the split's page-table allocation
-  returned 0 — **with `pmm_free_pages` healthy.**
-- `pmm_compute_zones` resets the cursor on boot, which is why a
-  reboot cleared it.
+**This is what first exercised `process_free_clone`.**  `exec_churn`
+(24 rounds of fork/execve/wait4) ran it 24 times, the `k`-shell
+selftest's three exception children 3 more — no fault, and no
+`PMM: WARNING - Double free`.  `exec_churn` now has a second use:
+it is the test that exercises the exit-path teardown.
 
-**The fix:** `pmm_scan_zone` wraps — `[cursor, far]` then
-`[near, cursor)` — and the cursor is not moved by a failed scan.
-`min_page` replaces the in-loop `phys < 0x200000` skip so both
-zones share one scan.  Committed as `20261003-pmm-wrap`.
+### Dead code
 
-**Why this is not item 7.**  Item 7 is the silent `if (!phys)
-return;` in `vmm_map_page_in_cr3`: the caller cannot see a failed
-mapping.  That is still open and still worth fixing.  But it is why
-a *future* failure would be invisible, not why *this* one happened.
-Fixing item 7 alone would have turned "boots into a broken shell
-that double-faults" into "refuses to boot the shell" — a better
-failure, not a fix.  The PMM fix is why the allocation succeeds.
+**`20261003-dead-has-drive`** — `f_stat_with_retry`'s `has_drive`
+computed a variable, cast it to `(void)`, and did nothing with it.
+Deleted.  `kernel.bin` unchanged after the commit, confirming the
+code was dead.
 
-**New tests, both kept:**
+### The two older milestones, condensed
 
-- `mmap_stress` — map/touch/unmap/remap, the `munmap` free path.
-- `exec_churn` + `churn_helper` — fork/execve/wait4, 24 rounds,
-  the exit free path and 24 ELF loads per run.
+**The pathname dispatch seam (`v0.6.11`, session 44).**
+`resolve_at` returns a backend tag from a path's first component;
+FAT / DEV / PROC are selected by it.  No VFS.  Its consumers:
+`/dev/null`, `/proc/self/status`, `/dev/console` +
+`/proc/self/fd/N`.  Full narrative in `ROADMAP.md`.
 
-**Verified:** more than ten consecutive boots on the trigger image
-(two new ELFs added, 48 files staged) with no `#PF`, no double
-fault, no `EXIT-FALLBACK`; `exec_churn` and `mmap_stress` pass on
-every run; canary 15/15 and `canary --full` 28/28.  **This is
-"does not reproduce in ten-plus boots," not a proof the fault can
-never occur.**
+**`/proc` per-pid and `ps` (`v0.6.11`, session 47).**  `/proc` is a
+listable directory; `ps` and `pstree` work.  The bug worth
+remembering: `procps_scan` stats `/proc/<pid>/` **with a trailing
+slash** and skips the entry when that fails.  Full narrative in
+`ROADMAP.md`; the lesson is in `gotchas.md`.
 
-The double-fault capture is `DFAULT.txt` (gitignored).
+**The PMM zone-scan fix (`v0.6.11`, session 48).**  The
+intermittent boot-time `#PF` at `0x400000` was `pmm_alloc_page`'s
+one-directional scan, not item 7.  `pmm_scan_zone` now wraps.  Full
+narrative in `ROADMAP.md`.
 
-### Session 47 — `/proc` per-pid, and `ps` works
+### Session 45 — the one thing it left
 
-Four commits, scratch-tagged `20261003-proc-*`:
+Session 45 attempted the item-7 fix three ways and reverted all
+three.  Its **fault is the surviving artifact**: a user-mode `#PF`
+at virtual 1 (`CR2 = RIP = 0x1`, error `0x15`, `pte = 0x3` present /
+write / **no user**, phys 1, every page of the walk `PAGE_TABLE`),
+observed with the signature change and **not seen since** — including
+through session 49's full signature change.
 
-| Tag | What |
-|---|---|
-| `20261003-proc-dir` | `/proc` and `/proc/self` are directories; `readdir` returns `self` |
-| `20261003-proc-pids` | `readdir("/proc")` lists the live pids |
-| `20261003-proc-stat` | `/proc/<pid>/stat`, with `/proc/self/stat` |
-| `20261003-proc-ps` | `/proc/<pid>/status`, `cmdline`, and the pid directory; **`ps` works** |
-
-**The bug that took the session:** `ps` printed a header and no
-rows.  `libbb`'s `procps_scan`, under `PSSCAN_UIDGID`, does
-`stat("/proc/<pid>/")` — **with a trailing slash** — and `continue`s
-the entry when it fails.  donix served the per-pid *files* but not
-the per-pid *directory*, so every entry was skipped before any file
-was read.  See `gotchas.md`, "A /proc consumer can stat a path it
-never opens."
-
-**`ps` and `pstree` are enabled and work.**  `ps` lists the
-processes; `pstree` shows only `idle`, because `musl_sh`'s ppid is
-0 (the shell is a second root, not a child of pid 1) — correct for
-donix, not a bug.
-
-**Known edges, not closed:** `open("/proc/<pid>", O_DIRECTORY)` is
-not done (`ps` only stats the directory); a nonexistent pid still
-stats as a directory; `PS_LONG`/`PS_TIME` need `gettimeofday`
-(syscall 99); and `proc_walk`/`proc_walk_fds` are diagnostics that
-report and pass, not assertion tests.
-
-### Session 44, in full — eight commits
-
-| Commit | What |
-|---|---|
-| `seam: resolve_at returns a backend tag; FAT is the only backend` | `resolve_at` gains `int* backend_out`; `path_backend()` computes the tag from the first component. |
-| `seam: /dev/null through the DEV backend; delete path_is_devnull` | `g_dev_table[]` + `dev_lookup()`; the exact-path predicate deleted. |
-| `proc: /proc/self/status through the PROC backend` | `g_proc_table[]` + `proc_lookup()`; `FILE_KIND_PROC`; `proc_build_status()`. |
-| `dev: /dev/console; proc: /proc/self/fd/N readlinks; tty flips` | DEV table gains `console`; `proc_readlink()`; `tty` prints `/dev/console`. |
-| `canary: a tty row` | `busybox tty` must print `/dev/console`; read-only. |
-| `execve: resolve the path through the seam; delete the dead retry` | `sys_execve` calls `resolve_at`; the unreachable `"0:"` retry deleted. |
-| `docs: session 44 — the seam, its tests, and the state` | Session log and doc updates for the above. |
-
-(Two more commits are in the session-44 span; count them from
-`git log --oneline 20261002-handoff-v0610..20261002-docs-seam` when
-writing the session log.)
-
-### The seam's three consumers
-
-- **`/dev/null`** — `open`, `stat`, `access`.  `ls -l /dev/null`
-  shows `crw-rw-rw-`; `read` returns 0, `write` returns the count.
-- **`/proc/self/status`** — opens, reads five real per-process
-  fields, stats as `S_IFREG | 0444`, closes.
-- **`/dev/console` + `/proc/self/fd/N`** — `readlink`
-  (`/proc/self/fd/0`) returns `/dev/console`; `stat("/dev/console")`
-  reports `S_IFCHR` with `(st_dev, st_ino) = (1, 1)`, **the same
-  pair `fstat(0)` reports**.  That match is `ttyname_r(3)`'s gate
-  3b, and it is what makes **`tty` print `/dev/console`**.
-
-### Verification (session 44)
-
-| Test | Result |
-|---|---|
-| canary (read-only) | **15 passed, 0 failed** |
-| canary `--full` | **28 passed, 0 failed** |
-| readlink_errno | **3/3** |
-| at_step1 | **10/10** |
-| at_step2 | **8/8** |
-| proc_status | **ALL PASS** |
-| proc_fd | **ALL PASS** |
-| pipe_step1/2/3/3b | **all OK** |
-
-Boot clean, no `Unknown syscall:` lines, no faults.
+**Disposition: instrumented, not fixed.**  `isr14_handler` prints
+the four page types of every `#PF` walk, permanently.  If it
+recurs, the dump is in the serial log at the moment it happens.  Its
+one kept commit is the `run` script's build-capture fix (`6cfb0e6`),
+which rides on `dev` untagged.
 
 ---
 
-## NEXT SESSION — item 7's silent `vmm_map_page*` returns
+## NEXT SESSION — the failure paths session 49 added are unexercised
 
-**This is the target.**  The live fault is gone (session 48 fixed
-its cause), so the change can be made without pressure — which is
-the right condition for it, because it is a correctness change, not
-a bug chase.
+**This is the recommended target.**  Session 49's commit
+`20261003-process-create-cleanup` added real cleanup to
+`process_create`'s four failure exits — `pmm_alloc_page_for_elf`
+failure, `vmm_map_page_in_cr3` failure, `kernel_stack_slot_alloc`
+failure, and the `vmm_clone_page_table == 0` case.  **None has ever
+run**, because a healthy boot does not fail an allocation.  The
+commit message says so; the session log says so; the gotcha entry
+"A function that has never run is correct by inspection only" says
+so.
+
+**Why it is worth a session now.**  The cleanup is what stands
+between a failed allocation and a corrupted machine.  Today it is
+verified by reading only.  The first time it matters may be the day
+an allocation fails on a real system, at which point the cleanup
+either works or makes the failure worse.  Closing it while the code
+is fresh is cheaper than closing it after a fault.
 
 ### What the work is
 
-`vmm_map_page_in_cr3` and `vmm_map_page` have six
-`if (!phys) return;` sites (the PDPT, PD, and PT allocation paths in
-each).  A failed allocation means no mapping is made and the caller
-cannot tell.  The fix is one of:
+A **fault-injection facility**, permanent and non-production:
 
-- **change the signature** to return an error, and check it at every
-  caller (the honest fix, and the larger one); or
-- **halt on failure at each site**, as the session-42 split fix does
-  (smaller, but turns a recoverable failure into a dead machine).
+- In `pmm.c`: a `static int pmm_fail_next_alloc` and a
+  `void pmm_debug_fail_next(void)` that sets it; at the top of
+  `pmm_alloc_page`, `if (pmm_fail_next_alloc) { pmm_fail_next_alloc
+  = 0; return 0; }`.  One branch on the hot path — predictable and
+  cheap.
+- In `kmain.c`'s self-test: a `test_create_fail` row that sets the
+  flag, calls `process_create` four times (once per failing exit —
+  the clone case needs the flag to trip on the very first
+  `pmm_alloc_page_for_tables`, so the test may need to call
+  `vmm_clone_page_table` indirectly or order the calls), and
+  asserts `pmm_get_free_pages()` is unchanged across each.
 
-Read `open-issues.md` item 7 before starting — it has the session-45
-findings, including the virtual-1 fault that the *last* attempt at
-the signature change produced.  **Treat that fault as unknown, not
-as fixed by the revert.**  Re-apply the `pmm_get_page_type`
-diagnostic in `isr14_handler` at the start of the work; if the fault
-reproduces, isolate it before doing anything else.
+**No new syscall.**  The flag is kernel-side and the self-test runs
+in kernel context, so the facility does not need a user-visible
+door.  That keeps the change small and keeps the debug hook out of
+the syscall table.
 
-**Do not** change `vmm_clone_page_table`'s leaf copy to filter on
-`PT_USER`; that broke the kernel's own identity map in session 45.
-See `open-issues.md` item 7.
+### What "done" looks like
 
-### Candidates after item 7, none blocking
+- `selftest` gains the row and reports **18 passed, 0 failed** (was
+  17).
+- `pmm_get_free_pages()` before each `process_create` equals the
+  value after its failure — the leak is measurably gone.
+- The `PMM: WARNING - Double free` message does not appear.
+- `process_create`'s failure path is exercised, and the "correct by
+  inspection; UNEXERCISED" claim in
+  `20261003-process-create-cleanup`'s message is superseded by the
+  new commit's message — which can say "exercised by `test_create_fail`."
+
+**Read first:** `process.c`'s `process_create` (the four exits and
+`process_free_clone`), `pmm.c`'s `pmm_alloc_page`, and
+`docs/gotchas.md`, "A function that has never run is correct by
+inspection only."
+
+### If you would rather do something small
+
+**`sys_gettimeofday` (99)** — a few lines from `g_ticks`, like the
+existing `sys_clock_gettime` (228).  It unlocks busybox `ps -l` /
+`ps -e` (`PS_LONG`, `PS_TIME`), which currently hit
+`Unknown syscall: 99`.  Small, patterned, and independent.
+
+### Candidates after that, none blocking
 
 - **`open("/proc/<pid>", O_DIRECTORY)`** — the "complete" half of
-  session 47's fix.  `stat` accepts `/proc/<pid>` and
-  `/proc/<pid>/`; `open` does not.  Same two paths in
-  `open_resolved`, producing a `FILE_KIND_DIR` slot with
-  `PROC_DIR_SENTINEL`, which already exists.  Makes `ls /proc/1`
-  work.
-- **`/dev` as a listable directory** — `ls /dev` fails with
-  `ENOENT`.  Same directory shape `/proc` got in session 47.  Small,
-  patterned work; prerequisite for `/dev/tty` and `/dev/urandom`.
+  session 47's fix.  Same two paths in `open_resolved`, producing a
+  `FILE_KIND_DIR` slot with `PROC_DIR_SENTINEL`, which exists.
+- **`/dev` as a listable directory** — `ls /dev` fails.  Same
+  directory shape `/proc` got.  Prerequisite for `/dev/tty` and
+  `/dev/urandom`.
 - **`musl_sh` as a child of `idle`** — so `pstree` shows a
   Unix-like tree.  A `kmain`/`process_create` change.
-- **`/etc/passwd`** — makes `ps`'s USER column show names instead
-  of `0`.
-- **`sys_gettimeofday` (99)** — enables `ps -l` / `ps -e`
-  (`PS_LONG`, `PS_TIME`).
+- **`/etc/passwd`** — makes `ps`'s USER column show names.
 - **`kill` / `pidof`** — `pidof` needs the per-pid entries (now
   present) and a lookup; `kill` additionally needs signal delivery.
 - **The `proc_walk` assertion test** — turn the diagnostic into a
@@ -431,8 +412,9 @@ See `open-issues.md` item 7.
 
 ### Do not
 
-Do not reopen the PMM fix — it is committed and verified.  One
-change at a time.  Do not edit `third_party/`.
+Do not reopen the PMM fix or item 7 — both are committed, shipped
+in `v0.6.12`, and verified.  One change at a time.  Do not edit
+`third_party/`.
 
 ---
 
@@ -475,10 +457,10 @@ Not a defect — a limit.
 ### What each still-off applet needs
 
 Each row is a **cost estimate, not a prohibition**.  Sometimes the
-missing piece is small and we write it — that is how `tty` and
-`ps` were enabled.  Sometimes it is a whole subsystem and we do
-not write it just to turn on one applet.  The rule is **know what
-you are signing up for** before you enable.
+missing piece is small and we write it — that is how `tty` and `ps`
+were enabled.  Sometimes it is a whole subsystem and we do not
+write it just to turn on one applet.  The rule is **know what you
+are signing up for** before you enable.
 
 | Config | Applet | Needs |
 |---|---|---|
@@ -507,9 +489,12 @@ you are signing up for** before you enable.
 
 ## Canary state
 
-**Green as of session 48** — `canary` 15/15 and `canary --full`
+**Green as of session 49** — `canary` 15/15 and `canary --full`
 28/28, plus `exec_churn` and `mmap_stress` pass.  The kernel
-self-test runs at boot and reports 17/17.
+self-test runs at boot and reports 17/17.  **Session 49 added a
+second use for `exec_churn`:** it exercises the process-exit
+page-table teardown (`process_free_clone` via `process_reclaim` /
+`process_destroy`), so run it when changing those.
 
 **The canary is a program: `canary`.**  `tests/canary.c` runs every
 non-interactive canary row, checks exit status and output
@@ -548,7 +533,8 @@ find `/usr/bin/CANARY`.
                    # REPORTS (does not assert); the detailed check
     proc_walk_fds  # the same walk with low fds occupied
     mmap_stress    # map/touch/unmap/remap; the munmap free path
-    exec_churn     # fork/execve/wait4, 24 rounds; the exit free path
+    exec_churn     # fork/execve/wait4, 24 rounds; the exit free
+                   # path, and the process-exit page-table teardown
                    # (needs CHURN_HELPER staged)
 
 **Pipe regression suite (`userland/musl/tests/`):**
@@ -578,15 +564,19 @@ looking for `/etc/passwd` are expected diagnostics.  `sys_execve:
 f_open FAIL` lines no longer appear, and neither do the `f_open
 FAIL path=dev/null` lines from `2>/dev/null`.
 
+**Session 49's own noise to expect:** none.  Every message session
+49 added is on a failure path, and a healthy boot runs none of
+them.  If a `PROCESS:` or `sys_mmap: map failed` or `sys_brk: map
+failed` or `VMM: FATAL` line appears, that is a real failure the
+new checks are now reporting — not noise.
+
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **`open-issues.md` item 7: the silent `vmm_map_page*` returns.**
-   **Open, and the next session's work.**  The boot-time `#PF`
-   this item used to be about was a different bug (the PMM zone
-   scan) and is fixed; what remains is a function that cannot
-   report failure.  See the NEXT SESSION section.
+1. **`open-issues.md` item 1: the remaining FatFs-form
+   conversions.**  `strip_dot_prefix` and the `"0:"` prefix are the
+   FAT backend's own business now; a future VFS absorbs them.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
 4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
@@ -595,6 +585,12 @@ FAIL path=dev/null` lines from `2>/dev/null`.
    signal delivery — the same subsystem `reboot`/`halt`/`poweroff`
    need.
 
+**Item 7 is closed** (session 49, shipped in `v0.6.12`).  The
+`open-issues.md` list keeps its numbering and has a **gap where 7
+was**; a one-line note at the top of the list says so, and that note
+plus the "item 7" references in older docs come out in the next
+documentation round.
+
 Also open: `unlinkat` has no consumer; `sys_brk`'s fixed
 `heap_base` and the 4 MB mmap window; real FatFs timestamp
 storage; `prctl` is minimal; busybox applet symlinks not
@@ -602,17 +598,18 @@ installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
 spins; `sys_mmap` rejects all non-anonymous mappings; pipes
 support one concurrent reader and one concurrent writer;
 `put_file_slot`'s pipe wake is coupled to `sys_close`'s wake;
-**`readdir("/dev")` fails** (a directory shape, like `/proc` now
-has); **`st_rdev` is 0 on device nodes**;
-**`f_stat_with_retry` has dead `has_drive`**;
-**`open("/proc/<pid>", O_DIRECTORY)` is not done** (the "complete"
-half of session 47); **a nonexistent pid stats as a directory**;
-**`sys_gettimeofday` (99) is not implemented**, so `ps -l` is off.
+**`readdir("/dev")` fails**; **`st_rdev` is 0 on device nodes**;
+**`open("/proc/<pid>", O_DIRECTORY)` is not done**; **a
+nonexistent pid stats as a directory**; **`sys_gettimeofday` (99)
+is not implemented**, so `ps -l` is off.
 
-**Session 45 added:** the user-mode `#PF` at virtual 1
-(`CR2 = RIP = 0x1`, `pte = 0x3`, phys 1, `pmm=2` on every page of
-the walk) — observed with the signature change, not since,
-**unresolved**.  Recorded in `open-issues.md` item 7.
+**The session-45 virtual-1 fault is unobserved, not fixed.**  It
+did not reproduce through session 49's full signature change.  Its
+diagnostic is permanently in `isr14_handler`; if it recurs, the
+four page types print at the moment it happens.  **Standing
+caution:** do not filter `vmm_clone_page_table`'s leaf copy on
+`PT_USER` — session 45 found it breaks the kernel's own identity
+map.
 
 ---
 
@@ -644,10 +641,10 @@ the walk) — observed with the signature change, not since,
   — gitignored; rebuild with `./toolchain/install_musl.sh`.
   **Do not edit these.**
 - `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
-- `PFcapture.txt` — the vmm crash capture (presentation 2).
+- `PFcapture.txt` — the session-45 fault capture (presentation 2).
   Gitignored; **still on disk — `ls` it, `git status` will not
   show it.**  Presentation 1's capture is not on disk; its dump is
-  in `docs/open-issues.md` item 7.
+  in `docs/session-log.md`, session 49.
 - `DFAULT.txt` — the session-48 double-fault capture.  Gitignored.
 - `run` — tracked; the build-and-capture fix lives here.
 
@@ -664,32 +661,41 @@ needs it.  Paths relative to the tree root
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
 - `docs/gotchas.md` — every bug writeup, by subsystem.
-  **Session 48 added one entry**: "A zone scan that moves one way
-  does not find pages behind its cursor" (the PMM bug behind the
-  boot-time `#PF`).  Session 47 added "A /proc consumer can stat a
-  path it never opens."  Session 46 added "A redirection binds to
-  the last command in an `&&` chain."  Session 45's
-  `pmm_get_page_type` result (the virtual-1 fault's walk was all
-  `PAGE_TABLE`, ruling out use-after-free) is a finding about one
-  fault, not a general lesson, and lives in `open-issues.md` item 7
-  rather than here.
+  **Session 49 added two entries**: "A function that has never run
+  is correct by inspection only" and "A comment that names its
+  callers goes stale the moment a new caller appears."  Session 48
+  added "A zone scan that moves one way does not find pages behind
+  its cursor."  Session 47 added "A /proc consumer can stat a path
+  it never opens."  Session 46 added "A redirection binds to the
+  last command in an `&&` chain."  Session 45's `pmm_get_page_type`
+  result (the virtual-1 fault's walk was all `PAGE_TABLE`, ruling
+  out use-after-free) is a finding about one fault, not a general
+  lesson, and lives in `docs/session-log.md`, session 49, rather
+  than here.
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Session 48's section is at the top; session 47's, then 46's,
-  below it.  Session 44's section is recorded but **misplaced** (it
+  Session 49's section is at the top; then 48's, 47's, 46's, and
+  44's.  Session 44's section is recorded but **misplaced** (it
   sits after session 34), noted at the top of the file and
   deferred.  There is no session-45 section: session 45's one kept
   commit is the tooling fix, named in the session-46 section.
-- `docs/open-issues.md` — full open-issues list.  Item 7 is **open
-  and the next session's work** (the silent `vmm_map_page*`
-  returns); item 8 is symlinks.
+- `docs/open-issues.md` — full open-issues list.  **Item 7 is
+  closed; the list has a gap where it was, with a one-line note.**
+  Item 8 is symlinks.  The "Test-design notes" section at the
+  bottom is **misplaced** (it is instructions, not issues) and is
+  flagged for a move to this file's canary section in the next
+  documentation round, together with the item-7 note.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative.
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
-- `ROADMAP.md` — future work only.  Its "Make `/proc` possible"
-  section is largely done; the remaining direction is the
-  post-`/proc` list.
-- `README.md` — reviewed at the `v0.6.11` bump.
+- `ROADMAP.md` — future work only.  **Its `v0.6.12` section is the
+  session-49 narrative**; the "Done — Phases A through B" list
+  includes `v0.6.12`.  The `v0.6.11` "does not close" list is now
+  a historical statement (item 7 was closed in `v0.6.12`).  Its
+  "`/proc` — shipped, with edges" section is largely done; the
+  remaining direction is the post-`/proc` list.
+- `README.md` — reviewed at the `v0.6.11` bump; **review it at the
+  `v0.6.12` bump.**
 - `run` — tracked; the build-and-capture fix lives here.
 
 ---
@@ -701,14 +707,16 @@ Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` shipped the shell and the framebuffer;
 `v0.6.8` the `*at()` family; `v0.6.9` envp, the `/usr/bin` layout,
 the `execve` shim removal; `v0.6.10` `realpath`, the `readlink`
-errno, and `/dev/null`.  On top of `v0.6.10`, on `dev` and
-untagged, await `v0.6.11`: session 44's pathname dispatch seam,
-session 47's `/proc` per-pid and **`ps`**, and session 48's **PMM
-zone-scan fix** for the boot-time `#PF`.  Session 45 attempted the
-item-7 fix and reverted all kernel changes; it committed one
-tooling fix (the `run` script's build line).  **Item 7's silent
-`vmm_map_page*` returns are open and are the next session's work**
-— see `open-issues.md` item 7 and NEXT SESSION.  One change at a
+errno, and `/dev/null`; `v0.6.11` the pathname dispatch seam,
+`/proc` per-pid and `ps`, and the PMM zone-scan fix; **`v0.6.12` a
+correctness milestone** — item 7's silent `vmm_map_page*` returns
+closed, `process_create`'s failure exits fixed, the exit-path
+page-table leak closed, and one dead `f_stat_with_retry` block
+deleted.  **The recommended next session is the fault-injection
+test for `process_create`'s four failure exits** — they are correct
+by inspection and unexercised, and that test is what would make
+them verified.  See NEXT SESSION and `gotchas.md`, "A function that
+has never run is correct by inspection only."  One change at a
 time.**
 
 ---
@@ -734,9 +742,11 @@ the step in place — do not just add a paragraph above it.**
 **Before proposing any command block, read the "Working style"
 section at the top.**
 
-**Four gotchas worth reading before the next change.**  "A fix with
+**Five gotchas worth reading before the next change.**  "A fix with
 no test is indistinguishable from an unfixed defect."  "A test can
 encode an earlier version's behavior."  "A consumer inferred from
-behavior is not a consumer."  And session 45's own: a fix can fail
-to close the thing it claims to close, and an intermittent fault
-that stops reproducing is not fixed — it is unobserved.
+behavior is not a consumer."  Session 45's: a fix can fail to close
+the thing it claims to close, and an intermittent fault that stops
+reproducing is not fixed — it is unobserved.  And session 49's: **a
+function that has never run is correct by inspection only** — which
+is the reason the next session exists.

@@ -20,7 +20,7 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ---
 
-## Done — Phases A through B, v0.6.11
+## Done — Phases A through B, v0.6.12
 
 For the record, so this file does not re-plan finished work:
 
@@ -73,9 +73,81 @@ For the record, so this file does not re-plan finished work:
   session 44's seam (see below), session 47's `/proc` per-pid
   support and working `ps`/`pstree`, and session 48's fix for the
   intermittent boot-time `#PF`.
+- **v0.6.12 — item 7 closed; the process failure paths.**  A
+  correctness milestone, not a feature one.  Session 49 made
+  `vmm_map_page*` able to report a failed page-table allocation and
+  taught its nine callers to act on it (item 7, the silent returns);
+  fixed `process_create`'s failure exits and its unchecked
+  `vmm_clone_page_table` return; closed the same page-table leak on
+  the process-exit path; and deleted one piece of dead code.  No new
+  subsystem, no new applet.  See below.
 
-The narratives are in the annotated scratch tags,
+The narratives are in the annotated `v*` tags,
 `docs/session-log.md`, and `handoff.md`.
+
+---
+
+## v0.6.12 — item 7 closed; the process failure paths
+
+**A correctness milestone.**  Five commits, and every one of them is
+about a kernel path that could not report a failure, or a leak on a
+path that does.  No new subsystem, no new applet, no new syscall.
+
+**Item 7: the silent `vmm_map_page*` returns.**  `vmm_map_page` and
+`vmm_map_page_in_cr3` had six sites — the PDPT, PD, and PT
+allocation paths in each — where a failed page-table allocation
+meant no mapping was made and the caller could not tell.  The change
+was the one item 7 named as the honest fix, in two commits:
+
+- The **signature change** — both functions return `int` (0 =
+  mapped, -1 = allocation failed) — with the six `if (!phys)
+  return;` sites becoming `return -1;`.  No caller handled the
+  return in this commit; the point was to isolate the signature
+  change from the caller changes, and to ship the `isr14_handler`
+  diagnostic item 7 required be in place first.  **The session-45
+  virtual-1 fault did not reproduce.**
+- The **nine callers** handle the `-1`, in the shape each caller
+  dictated: `ensure_hhdm_mapped` and `vmm_init`'s identity map
+  **halt** (boot paths, no caller to report to); `elf_load_into_process`,
+  `process_create`'s stack loop, `heap_extend`, `sys_mmap`,
+  `sys_brk`, `exec_alloc_user_stack`, and `sys_fork`'s
+  `EAGER_COPY_REGION` macro **recover**.  `heap_extend` is the
+  nontrivial one: it unmaps and frees its partial region, because
+  nothing else tracks those pages.
+
+**`process_create`'s failure exits, and the unchecked clone.**
+Reading the nine call sites turned up `pcb->cr3 =
+vmm_clone_page_table(current_cr3);` with no check — a `0` return
+became `pcb->cr3 = 0`, and the next `vmm_map_page_in_cr3` walked
+page tables at `HHDM_START + 0`.  Worse than a leak.  The same
+function's failure exits leaked the cloned page-table hierarchy.
+Both are fixed by a new `process_free_clone(cr3)` and full cleanup
+on every failure exit.
+
+**The exit-path page-table leak.**  `process_reclaim` and
+`process_destroy` freed a process's ELF pages and its kernel stack
+slot but abandoned the cloned page-table hierarchy.  Both now call
+`process_free_clone`.  This is what first *exercised* the helper
+commit 3 added — `exec_churn` ran it 24 times, and the `k`-shell
+selftest's three exception children 3 more, with no fault and no
+double-free.
+
+**Dead code.**  `f_stat_with_retry`'s `has_drive` computed a
+variable, cast it to `(void)`, and did nothing with it; the whole
+`if` block was dead.  Deleted.
+
+**The milestone's own lesson**, and the reason it is recorded here:
+a helper written for failure paths is **correct by inspection
+only** until something on a hot path calls it.  Commit 3's
+`process_free_clone` and commit 4's use of it on the exit path are
+the two states; only the second was verified, and `exec_churn` is
+what made it so.  See `docs/gotchas.md`, "A function that has never
+run is correct by inspection only."
+
+**Verification.**  Both boot paths, every commit: `canary` 15/15,
+`canary --full` 28/28, `selftest` 17/17, `exec_churn` 24 rounds all
+children exit 0, `mmap_stress` 16 rounds.  No `#PF`, no `#DF`, no
+`#GP`, no `Unknown syscall:`, no `PMM: WARNING - Double free`.
 
 ---
 
@@ -109,11 +181,9 @@ boot ELF load's page-table allocation returned 0 with
 `pmm_free_pages` healthy.  `pmm_scan_zone` now wraps.  Ten-plus
 consecutive boots on the trigger image, no fault.
 
-**What `v0.6.11` does not close** (all in `open-issues.md`):
+**What `v0.6.11` did not close** (the list as it stood at the
+`v0.6.11` bump; item 7 was closed in `v0.6.12`):
 
-- The silent `vmm_map_page*` returns (item 7) — the allocator fix
-  is why the allocation succeeds; the silent returns are why a
-  *future* failure would be invisible.  **The next session's work.**
 - `open("/proc/<pid>", O_DIRECTORY)` — `ps` stats the directory, it
   does not open it.
 - `readdir("/dev")` — `/dev` is not a directory; `ls /dev` fails.
@@ -287,19 +357,6 @@ value.
   `v0.6.6` and earlier.  Session 41 bisected a perceived slowdown
   in `musl_wait` and found the change was in the console (VGA text
   → framebuffer), not in `fork`; see `session-log.md`, session 41.
-- **The remaining silent `vmm_map_page*` returns.**  Six sites
-  (`vmm_map_page_in_cr3` and `vmm_map_page`, the PDPT/PD/PT
-  allocation paths) still `return` without mapping when a
-  page-table allocation fails, and the caller cannot tell.  The
-  huge-page-split instance was fixed in session 42
-  (`20261001-splitfix`).  **The allocator-state dependence that
-  used to trigger this was a different bug — the PMM zone scan —
-  and is fixed (`20261003-pmm-wrap`, session 48).**  These six
-  silent returns are a latent defect on their own terms: the next
-  allocation that fails for any reason will be invisible.  The fix
-  is to change the signature and check every caller, or halt on
-  failure as the split path does.  See `open-issues.md` item 7.
-- **Page-table teardown on process exit.**
 - **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
   non-executable.
 - **`sys_brk` heap base and the mmap window.**  Fixed addresses;

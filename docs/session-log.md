@@ -13,6 +13,215 @@ annotations, not repeated here.
 
 ---
 
+## Session 49 — item 7 closed; the `process_create` failure paths and the exit-path page-table leak
+
+Five commits on `dev`, scratch-tagged, unpushed.  **Not a
+milestone** — five separate changes that add up to a session on
+kernel failure paths, plus one dead-code deletion.
+
+| Tag | What |
+|---|---|
+| `20261003-vmm-int-return` | `vmm_map_page*` return `int`; the six silent returns now report `-1`; `isr14_handler` gains the `pmm_get_page_type` diagnostic (item 7, commit 1 of 2) |
+| `20261003-vmm-callers` | the nine callers handle the `-1`; **item 7 closed** (commit 2 of 2) |
+| `20261003-process-create-cleanup` | `process_create`'s failure exits clean up; the unchecked `vmm_clone_page_table` return now fails the create; new `process_free_clone` |
+| `20261003-dead-has-drive` | `f_stat_with_retry`'s dead `has_drive` and its `if` block deleted |
+| `20261003-exit-frees-tables` | `process_reclaim` and `process_destroy` free the page tables via `process_free_clone` |
+
+### Item 7, and how it closed
+
+Item 7 was the silent `if (!phys) return;` in `vmm_map_page_in_cr3`
+and `vmm_map_page`: six sites — the PDPT, PD, and PT allocation paths
+in each — where a page-table allocation failure meant no mapping was
+made and the caller could not tell.  Item 7's own text calls this "a
+function that cannot report failure, called by code that assumes
+success."
+
+**The reason this was not done in session 45.**  Session 45
+attempted the signature change and reverted it, because `canary
+--full` then faulted at a different address and mechanism:
+
+    CR2 = RIP = 0x1
+    Raw Error Code = 0x15       (present, write, user, fetch)
+    pte = 0x0000000000000003    (present, write, NO user)
+    PTE PRESENT, phys 0x0000000000000001
+    pmm: pml4=2 pdpt=2 pd=2 pt=2    (every page PAGE_TABLE)
+
+A `pmm_get_page_type` diagnostic in `isr14_handler` proved the walk's
+pages were all `PAGE_TABLE`, ruling out a use-after-free of a
+page-table page.  The mechanism was never isolated, and the fault
+has not been seen since.  Item 7's instruction was to **re-apply the
+diagnostic before redoing the signature change**, and to treat the
+fault as unknown.
+
+**What this session did, in order:**
+
+- **`20261003-vmm-int-return`** — the signature change only, with
+  the `isr14_handler` diagnostic in the same commit.  `vmm_map_page`
+  and `vmm_map_page_in_cr3` return `int` (0 = mapped, -1 =
+  page-table allocation failed); the six `if (!phys) return;` sites
+  became `return -1;`; both functions `return 0` on success.  The
+  huge-page split's halt was left alone — it already halts with
+  `VMM: FATAL` (session 42).  Two `kmain.c` inline `extern`s
+  (`test_map`, `test_nx`) changed to match.  **No caller handled the
+  return yet** — the point was to isolate the signature change from
+  the caller changes.  Verified on both boot paths; the
+  `pmm_get_page_type` diagnostic **did not fire**, so the session-45
+  fault did not reproduce.
+
+- **`20261003-vmm-callers`** — the nine callers handle the `-1`,
+  in the shape the callers themselves dictated:
+
+  | Site | Class |
+  |---|---|
+  | `vmm.c`, `ensure_hhdm_mapped` | **halt** — no caller to report to |
+  | `vmm.c`, `vmm_init`'s identity map | **halt** — boot |
+  | `elf.c`, `elf_load_into_process` | recover — returns 0; both callers check |
+  | `process.c`, `process_create`'s stack loop | recover — `return NULL` |
+  | `heap.c`, `heap_extend` | recover — unmaps and frees its partial region, returns 0 |
+  | `user_syscall.c`, `sys_mmap` | recover — `-ENOMEM` |
+  | `user_syscall.c`, `sys_brk` | recover — returns `old_brk`, per the brk ABI |
+  | `user_syscall.c`, `exec_alloc_user_stack` | recover — returns 0 |
+  | `user_syscall.c`, `sys_fork`'s `EAGER_COPY_REGION` macro | recover — destroys the child, `-ENOMEM` |
+
+  `heap_extend` is the one nontrivial site: `heap_brk`/`heap_mapped`
+  advance only on full success, so a partial extension is invisible
+  to the heap's own bookkeeping *and* to process exit (the heap uses
+  the raw PMM, not `elf_add_page_to_pcb`).  On failure it unmaps and
+  frees every page the call allocated.
+
+  **Item 7 is closed.**  The session-45 virtual-1 fault did not
+  reproduce on either boot path, with the diagnostic in place to
+  catch it if it had.
+
+### The defect the item-7 work surfaced
+
+Reading the nine call sites turned up something adjacent: in
+`process_create`,
+
+    pcb->cr3 = vmm_clone_page_table(current_cr3);
+
+**had no check.**  A `0` return became `pcb->cr3 = 0`, and the next
+`vmm_map_page_in_cr3(pcb->cr3, …)` walked page tables at
+`HHDM_START + 0` — a wild write into physical page 0's HHDM alias.
+For a kernel-mode `entry_point` it avoided the mapping but still
+handed out a PCB whose `cr3` would be loaded into `%cr3` by
+`context_switch.asm`.  Either way it is worse than a leak.
+
+The same function's failure exits also leaked: the user-stack loop's
+two `return NULL`s and the kernel-stack-pool exhaustion exit left
+the cloned page-table hierarchy, the pages already in `elf_page_list`,
+a live pid, and `process_count` all behind.
+
+**`20261003-process-create-cleanup`** fixes both: a new
+`process_free_clone(uint64_t cr3)` walks the cloned PML4 and frees
+entries 0..255 and the PML4 itself, skipping `RECURSIVE_PML4_INDEX`,
+skipping entries >= 256 (shared with the parent — the HHDM and the
+kernel image), and skipping 2 MB huge PDEs (leaves, not tables).
+The four failure exits now run
+`process_cleanup_elf_pages` + `process_free_clone` + the PCB-slot
+bookkeeping.
+
+**No test.**  All four are failure paths, and nothing on a healthy
+boot runs them.  The commit message says so: "correct by inspection;
+UNEXERCISED."
+
+### The exit-path leak, and the run that verified it
+
+**`20261003-exit-frees-tables`** closes the same leak on the
+*success* path: `process_reclaim` and `process_destroy` freed a
+process's ELF pages and its kernel stack slot, but abandoned the
+cloned page-table hierarchy when the PCB slot was recycled.
+
+Calling `process_free_clone` from those two functions is correct for
+a process that has *run*, even though the function was written for
+one that never did.  On the exit path the cr3 is still the clone,
+but its low half has grown — `elf_load_into_process`,
+`exec_alloc_user_stack`, `sys_brk`, `sys_mmap`, `sys_execve`, and
+`munmap` all added or removed tables under it.  The walk frees every
+present table it finds, which is right: `vmm_clone_page_table`
+deep-copied the low half, so every PDPT/PD/PT under index 256
+belongs to this process.  The walk frees **tables only**, never the
+data pages the leaf PTEs point at; `process_cleanup_elf_pages` runs
+first and frees those, and the two are disjoint.
+
+**This commit is what exercised `process_free_clone` for the first
+time.**  `exec_churn` — 24 rounds of fork/execve/wait4, all children
+exit 0 — ran the walk 24 times, and the `k`-shell selftest's three
+exception children ran it 3 more.  No fault, and **no `PMM: WARNING
+- Double free`** from `pmm_free_page`, which is where an overlap
+between the table-free and the frame-free would have shown.
+
+The helper's header comment was rewritten in the same commit: it
+said "called only from `process_create`'s failure paths," which the
+two new callers had just falsified.
+
+### Dead code
+
+**`20261003-dead-has-drive`** deletes `f_stat_with_retry`'s
+`has_drive`: it computed the variable, cast it to `(void)`, and did
+nothing with it, and the whole `if (r == FR_INVALID_NAME || …)`
+block was dead — the function returned `r` unchanged either way.
+All five call sites collapse the return to `OK`-or-`fatfs_errno`, so
+no caller could observe the deletion.  The comment explaining why
+the bare-name retry is gone was kept, reflowed to the top of the
+function.
+
+`kernel.bin` was **unchanged** at 160632 bytes after this commit —
+the code was already optimized away at `-O2`, which is itself the
+confirmation that it was dead.
+
+### A process note
+
+This session's own lesson, worth carrying forward: **the helper
+commit 3 added was unexercised until commit 4 put it on a hot path.**
+Before the `exec_churn` run, "the cleanup is correct" and "the
+cleanup has never run" were the same state.  The two are recorded as
+separate gotchas — "A function that has never run is correct by
+inspection only" and "A comment that names its callers goes stale
+the moment a new caller appears" — and the distinction (a claim
+about *exercise*, not about *existence*) is why they are separate
+from the older session-43 entry about a fix with no test.
+
+The same session re-taught an older rule the cheap way: the first
+attempt to write item 4's edits described them from memory of the
+pre-commit-2 `process.c`, and the correction was to ask for the
+current bytes and quote them.  See the handoff's "When editing a
+large file, quote the bytes."
+
+### Verification
+
+Both boot paths, every commit:
+
+| Test | Result |
+|---|---|
+| `canary` | **15 passed, 0 failed** |
+| `canary --full` | **28 passed, 0 failed** |
+| `selftest` (`k` path) | **17 passed, 0 failed** |
+| `exec_churn` | **24 rounds, all children exit 0, EXEC_CHURN-ALL-PASS** |
+| `mmap_stress` | **16 rounds, MMAP_STRESS-ALL-PASS** |
+
+No `#PF`, no `#DF`, no `#GP`, no `Unknown syscall:`, no
+`VMM: FATAL`, no `PMM: WARNING - Double free`, and no new
+diagnostics from the failure paths — which is the expected result,
+since every message the session added is on a path a healthy boot
+does not take.
+
+`kernel.bin` grew across the session from 158744 (commit 1) to
+160696 (commit 4), the signature change plus the checks plus
+`process_free_clone`.
+
+The one-page PMM shift at commit 3 (`free=31967` → `31966`,
+`KERNEL` 674 → 675) is the kernel image crossing a page boundary,
+not a leak: the reservation line moved from `[0x100000, 0x301000)`
+to `[0x100000, 0x302000)`.
+
+### Scratch tags kept
+
+All five `20261003-*` tags, local, not pushed.  `dev` is five ahead
+of `origin/dev`; nothing is on `main`.
+
+---
+
 ## Session 48 — the PMM zone scan wraps; the boot-time `#PF` is fixed
 
 One commit on `dev`, scratch-tagged, unpushed.  **Not a milestone**
@@ -69,17 +278,18 @@ capture and then instrumenting.  The session's order:
    move the cursor.  The per-type `phys < 0x200000` skip became a
    `min_page` parameter so both zones share one function.
 
-### Why this is not item 7
+### Why this was not item 7
 
-Item 7 is the silent `if (!phys) return;` in `vmm_map_page_in_cr3`:
-the caller cannot see that the mapping failed.  That is a real
-defect and still open.  But *this* bug is why the allocation
-returned 0 in the first place.  **Fixing item 7 alone would have
-turned "boots into a broken shell that double-faults" into
-"refuses to boot the shell"** — a better failure, not a fix.  The
-session's first plan was the signature change (item 7); the
+Item 7 was the silent `if (!phys) return;` in
+`vmm_map_page_in_cr3`: the caller cannot see that the mapping
+failed.  That was a real defect.  But *this* bug is why the
+allocation returned 0 in the first place.  **Fixing item 7 alone
+would have turned "boots into a broken shell that double-faults"
+into "refuses to boot the shell"** — a better failure, not a fix.
+The session's first plan was the signature change (item 7); the
 observation that it converts a corrupt boot into a failed boot is
-what sent the work at the allocator instead.
+what sent the work at the allocator instead.  Item 7 was then
+closed in session 49.
 
 ### The two new tests
 

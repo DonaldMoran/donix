@@ -1,5 +1,15 @@
 ### Open
 
+> **Item 7 is closed and the list is not renumbered.**  Item 7 was
+> the silent `vmm_map_page*` returns; session 49 fixed it (the
+> signature change, the nine callers, and the `isr14_handler`
+> diagnostic) and it is no longer an open issue.  The items below
+> keep their original numbers, so there is a gap where 7 was.
+> References to "item 7" in older docs resolve to nothing, which is
+> correct: it is closed.  *(This note is scaffolding for the docs
+> edited in session 49; the next documentation round removes it and
+> the references it exists to satisfy.)*
+
 1. **The remaining FatFs-form conversions, now that the seam has
    landed.**  The pathname dispatch seam shipped in session 44
    (six commits on `dev`, scratch-tagged `20261002-seam` through
@@ -80,97 +90,6 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
-7. **The silent `vmm_map_page*` returns.**  **Open, and the next
-   session's work.**
-
-   `vmm_map_page_in_cr3` and `vmm_map_page` walk the page tables
-   and, at each level, call `pmm_alloc_page_for_tables()` if the
-   next table does not exist.  Every one of those calls is followed
-   by `if (!phys) return;` — the function gives up without mapping
-   anything, and **the caller has no way to know.**
-   `elf_load_into_process`, `sys_brk`, `sys_mmap`, and `sys_execve`
-   all call these and treat a return as "the mapping was made."
-
-   **The boot-time `#PF` this item used to be about is explained,
-   and it was a different bug.**  The fault was intermittent and
-   allocator-state dependent: it appeared on the first boot after
-   adding userland ELFs and cleared by the second or third.  The
-   reason was the PMM's zone scan, not the silent returns here —
-   the scan started at a cursor and moved one direction, so a page
-   that had been free the whole time on the far side of the cursor
-   was never found.  Adding ELFs pushed the cursor past such pages,
-   the boot ELF load's page-table allocation returned 0, and the
-   split never happened.  **That is fixed** (`20261003-pmm-wrap`:
-   the scan wraps; `pmm_scan_zone`).  See `gotchas.md`, "A zone
-   scan that moves one way does not find pages behind its cursor."
-
-   **What remains is this item's real subject:** a function that
-   cannot report failure, called by code that assumes success.  It
-   is a latent defect on its own terms — the next allocation that
-   fails for any reason will be invisible, exactly as this one was
-   — and it is worth fixing now that the live fault is gone and the
-   change can be made without pressure.
-
-   **The huge-page-split path was fixed in session 42**
-   (`20261001-splitfix`), because it was the one with evidence: a
-   silent return there leaves the bootloader's 2 MB **supervisor**
-   identity-map page in place where the caller asked for a **user**
-   page, and the process later faults on a user instruction fetch
-   of `0x400000`.  The split path now halts with a `VMM: FATAL`
-   message instead of returning.
-
-   **The remaining sites are still silent.**  In
-   `vmm_map_page_in_cr3`: the PDPT, PD, and PT allocation paths each
-   have their own `if (!phys) return;`.  In `vmm_map_page`: the same
-   three.  The pattern is the same defect.
-
-   The fix is one of:
-   - **change the signature** to return an error, and check it at
-     every caller (the honest fix, and the larger one — it touches
-     every `vmm_map_page*` call site in the tree); or
-   - **halt on failure at each site**, as the split path now does
-     (matches the kernel idiom, smaller, but turns a recoverable
-     allocation failure into a dead machine).
-
-   **Session 45 observations (kept for whoever does this).**  Session
-   45 attempted the signature change and reverted it.  It compiled
-   and booted, but `canary --full` faulted at a different address and
-   mechanism:
-
-   ```
-   CR2 = RIP = 0x1
-   Raw Error Code = 0x15       (present, write, user, fetch)
-   pte = 0x0000000000000003    (present, write, NO user)
-   PTE PRESENT, phys 0x0000000000000001
-   pmm: pml4=2 pdpt=2 pd=2 pt=2    (every page PAGE_TABLE)
-   ```
-
-   A `pmm_get_page_type` diagnostic in `isr14_handler` proved the
-   walk's pages were all `PAGE_TABLE`, ruling out a use-after-free
-   of a page-table page.  The mechanism was never isolated; the
-   fault has not been seen since.  **Treat it as unknown.**  Re-apply
-   the diagnostic before redoing the signature change; if the fault
-   reproduces, isolate it before doing anything else.
-
-   Session 45 also found that `vmm_clone_page_table`'s low-half
-   deep copy should skip supervisor huge PDEs (`if (src_pde & 0x80)
-   continue;`), and that filtering the *leaf* copy on `PT_USER` is
-   wrong — it breaks the kernel's own identity map, because the
-   clone serves kernel processes too.
-
-   **The two captures.**  Presentation 1 (`pde = 0x400083`, the
-   supervisor huge page) is **not on disk**; its fault dump is
-   quoted above.  Presentation 2 (`pde = 0`) is in
-   **`PFcapture.txt`** at the project root — gitignored, so `ls` it;
-   `git status` will not show it.  The double-fault capture from
-   session 48 is `DFAULT.txt`, also gitignored.
-
-   **Read `gotchas.md`, "A shim's dead code is only dead if you
-   watch it not run," together with this.**  That entry is about a
-   deletion whose consumers were not all found; this is about a
-   *failure path* whose consumers do not check.  Both are
-   "correct only for the cases known at the time."
-
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
    committed to FAT.  The correct frame is therefore **Unix
@@ -192,7 +111,7 @@
    `access`).  That is the technical debt the dispatch seam exists
    to prevent.  **The seam now exists** (session 44), so this is no
    longer "scheduled after the seam" — it is buildable as the
-   seam's next consumer, once the `vmm` bug is closed.
+   seam's next consumer.
 
    Payoff when it lands: `ln`, `link`, `readlink` with real
    targets, `realpath` correctness, `tar`/`unzip` link restoration,
@@ -233,27 +152,12 @@ established; this is small, patterned work.  It is what would let
 for `/dev/tty` and `/dev/urandom`.  See `handoff.md`, "Busybox
 enablement."
 
-**`stty` is enabled and runs, but cannot change the terminal.**
-`stty` prints a plausible state (speed, control characters, flags)
-and `tty` prints `/dev/console`, both confirmed session 48.  The
-kernel console has no termios, so `stty -icanon`, `stty erase X`,
-and the like do nothing — the applet reads and reports, it cannot
-write.  Not a defect to fix; a limit to know.  Line editing in
-`ash` is busybox's own (`CONFIG_FEATURE_EDITING`), independent of
-the kernel.
-
 **`st_rdev` is 0 on device nodes.**  `ls -l /dev/console` prints
 `0, 0` for the major/minor column; a real Unix prints the tty
 driver's `4, 0`.  `fill_kstat_as_chardev` sets `st_dev` and
 `st_ino` (needed for `ttyname_r`'s gate 3b) but not `st_rdev`.
 Cosmetic: `tty` does not read it.  One line when someone wants
 `ls -l /dev/...` to look right.
-
-**`f_stat_with_retry` has dead `has_drive` at line 3077.**  It
-computes `has_drive`, does nothing with it, and casts it to
-`(void)`.  Same shape as the `"0:"` retry that commit 6 deleted:
-code that is present, correct-looking, and has no effect.  Small
-cleanup; not urgent.
 
 **No `/dev` directory.**  `ttyname(3)` names the console —
 `readlink("/proc/self/fd/0")` returns `/dev/console` and the
@@ -284,40 +188,13 @@ line when `/proc` is next touched.
 reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
 small syscall from `g_ticks`, like `clock_gettime`.
 
-**The `/dev/null` history, kept because it is the seam's first
-consumer.**  Session 43 made `/dev/null` work across
-`open`/`stat`/`access` with `path_is_devnull`, an exact-path
-predicate in three call sites.  Session 44's seam **deleted that
-predicate** and replaced it with `g_dev_table[]` + `dev_lookup()`,
-the DEV backend's first entry.  `2>/dev/null` now works — the
-command runs, and stderr is discarded:
-
-    $ realpath /no/such/dir/file 2>/dev/null
-    $ echo $?
-    1
-
-Silent, non-zero.  And the path is visible:
-
-    $ ls -l /dev/null
-    crw-rw-rw-    1    0,   2 /dev/null
-    $ test -e /dev/null && echo yes
-    yes
-    $ stat /dev/null
-      File: '/dev/null'
-      Size: 0    ...    character special file
-      Access: (0666/crw-rw-rw-)
-
-`open` returns a `FILE_KIND_DEV_NULL` slot: read returns 0, write
-returns count, close frees.  `stat` and `fstat` agree, both
-reporting `S_IFCHR | 0666`.  `readlink("/dev/null")` returns
-`-EINVAL` (not a symlink) for free, via `access_resolved`.
-
-**Noted but not a bug:** busybox `vi` calls `TIOCGWINSZ` on every
-keystroke (visible as a syscall per key in a trace).  This is
-`FEATURE_VI_WIN_RESIZE` re-checking the size; it is `vi`'s behavior,
-harmless, and the reason `vi` fills the screen.  No action.
-
 ### Test-design notes
+
+> **This section is not an open-issue list and does not belong in
+> this file.**  It is here because it was here, and moving it is a
+> separate edit.  It should move to `handoff.md`'s canary section
+> (where the test list already lives) in the next documentation
+> round, together with the item-7 note at the top of this list.
 
 - **The old `musl_sh` ash-only caveats are gone.**  Through
   `v0.6.6`, `donix>` did not parse `<`, `>`, `|`, `&&`, `;`, or
@@ -367,7 +244,10 @@ harmless, and the reason `vi` fills the screen.  No action.
   the `procps_scan` sequence; `mmap_stress` and `exec_churn` drive
   the two free paths (munmap and process exit) that the PMM
   zone-scan bug depended on.  `exec_churn` needs its helper,
-  `churn_helper`, staged as `/usr/bin/CHURN_HELPER`.
+  `churn_helper`, staged as `/usr/bin/CHURN_HELPER`.  **Session 49
+  added a second use for `exec_churn`:** it is the test that
+  exercises `process_free_clone` on the process-exit path, so run
+  it when changing `process_reclaim` or `process_destroy`.
 
 - **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
   `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.
