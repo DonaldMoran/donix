@@ -3478,23 +3478,21 @@ long sys_fstat(int fd, void* user_stat) {
 static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
     FRESULT r = f_stat(path, out_fno);
 
-    if (r == FR_INVALID_NAME || r == FR_NO_FILE || r == FR_NO_PATH) {
-        int has_drive = 0;
-        for (const char* p = path; *p; p++) {
-            if (*p == ':') { has_drive = 1; break; }
-        }
-        /*
-         * No bare-name retry any more.  The binaries are staged
-         * bare and live under /usr/bin, and FatFs resolves
-         * multi-component paths (find traverses /usr/bin with
-         * f_opendir, so f_stat("/usr/bin/ls") works).  A PATH
-         * probe like ash's access("/usr/bin/ls", X_OK) therefore
-         * succeeds on its own, and the old retry -- which
-         * uppercased the name and appended ".ELF" -- could only
-         * fail.  See sys_execve's history comment.
-         */
-        (void)has_drive;
-    }
+    /*
+     * No bare-name retry any more.  The binaries are staged bare and
+     * live under /usr/bin, and FatFs resolves multi-component paths
+     * (find traverses /usr/bin with f_opendir, so
+     * f_stat("/usr/bin/ls") works).  A PATH probe like ash's
+     * access("/usr/bin/ls", X_OK) therefore succeeds on its own, and
+     * the old retry -- which uppercased the name and appended
+     * ".ELF" -- could only fail.  See sys_execve's history comment.
+     *
+     * The function is kept, and kept named "with_retry", because the
+     * name is what the five call sites know it by; the retry it once
+     * performed is gone, and this wrapper is now a plain f_stat.  If
+     * a future caller needs the three-way FRESULT distinction back,
+     * it is made here, not at the call sites.
+     */
     return r;
 }
 
