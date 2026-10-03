@@ -164,6 +164,7 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags);
 pcb_t* process_get_current(void);
 void process_set_current(pcb_t* proc);
 pcb_t* process_find_by_pid(uint64_t pid);
+pcb_t* process_get_pcb(int index);
 void process_dump_all(void);
 void process_test_clone(void);
 void process_start(pcb_t* process);

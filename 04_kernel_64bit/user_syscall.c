@@ -6522,19 +6522,72 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
      * directory); its readdir returns 0 immediately.
      */
     if (slot->obj == PROC_DIR_SENTINEL) {
-        const char* nm = NULL;
-        if (slot->dir_path
+        /*
+         * Synthesized /proc directory entries.
+         *
+         * The cursor, slot->end, is a small state machine:
+         *
+         *   end == 0        nothing emitted yet
+         *   end >= 1        "self" has been emitted; the next
+         *                   pcb_pool index to examine is
+         *                   (end - 1)
+         *
+         * /proc emits "self", then one decimal pid per live
+         * process.  /proc/self is a leaf: 0 immediately.
+         *
+         * A pid entry with a name that is not all digits is
+         * skipped by libbb's procps_scan (bb_strtou sets errno),
+         * so "self" is harmless there; it is emitted because
+         * /proc/self exists on Linux and the directory listing
+         * should say so.
+         */
+        char nm[16];
+        size_t nlen = 0;
+
+        int is_proc_root = (slot->dir_path
             && slot->dir_path[0] == '/' && slot->dir_path[1] == 'p'
             && slot->dir_path[2] == 'r' && slot->dir_path[3] == 'o'
-            && slot->dir_path[4] == 'c' && slot->dir_path[5] == '\0'
-            && slot->end == 0) {
-            nm = "self";
+            && slot->dir_path[4] == 'c' && slot->dir_path[5] == '\0');
+        if (!is_proc_root) return 0;   /* /proc/self: a leaf */
+
+        if (slot->end == 0) {
+            nm[0] = 's'; nm[1] = 'e'; nm[2] = 'l'; nm[3] = 'f';
+            nlen = 4;
             slot->end = 1;
         } else {
-            return 0;   /* /proc/self, or /proc after self */
+            /*
+             * Find the next live pcb_pool entry at or after
+             * index (slot->end - 1).  State UNUSED means free;
+             * everything else (READY, RUNNING, BLOCKED,
+             * ZOMBIE) is a live pid and is listed, matching
+             * Linux, where a zombie still has a /proc entry
+             * until it is reaped.
+             */
+            int found = 0;
+            for (int i = (int)(slot->end - 1); i < MAX_PROCESSES; i++) {
+                pcb_t* p = process_get_pcb(i);
+                if (!p) continue;
+                uint64_t pid = p->pid;
+                /* Decimal, no libc. */
+                char tmp[24];
+                int t = 0;
+                if (pid == 0) {
+                    tmp[t++] = '0';
+                } else {
+                    while (pid > 0) {
+                        tmp[t++] = (char)('0' + (pid % 10));
+                        pid /= 10;
+                    }
+                }
+                for (int k = 0; k < t; k++) nm[k] = tmp[t - 1 - k];
+                nlen = (size_t)t;
+                slot->end = (uint32_t)(i + 2);
+                found = 1;
+                break;
+            }
+            if (!found) return 0;   /* end of directory */
         }
-        size_t nlen = 0;
-        while (nm[nlen]) nlen++;
+
         size_t reclen = GETDENTS64_HDR + nlen + 1;
         reclen = (reclen + 7) & ~(size_t)7;
         if (reclen > count) return -(long)EINVAL_;
