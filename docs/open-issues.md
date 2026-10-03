@@ -80,12 +80,8 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
-7. **The silent `vmm_map_page*` returns, and the boot-time `#PF`
-   they cause.**  **TABLED as of session 46.**  The fault is
-   intermittent and allocator-state dependent; it is not currently
-   observed.  Do not start a session on it unless it reappears.
-   The findings are kept below so a future session does not have to
-   rediscover them.  A `v*` bump may ship with this item open.
+7. **The silent `vmm_map_page*` returns.**  **Open, and the next
+   session's work.**
 
    `vmm_map_page_in_cr3` and `vmm_map_page` walk the page tables
    and, at each level, call `pmm_alloc_page_for_tables()` if the
@@ -95,6 +91,26 @@
    `elf_load_into_process`, `sys_brk`, `sys_mmap`, and `sys_execve`
    all call these and treat a return as "the mapping was made."
 
+   **The boot-time `#PF` this item used to be about is explained,
+   and it was a different bug.**  The fault was intermittent and
+   allocator-state dependent: it appeared on the first boot after
+   adding userland ELFs and cleared by the second or third.  The
+   reason was the PMM's zone scan, not the silent returns here —
+   the scan started at a cursor and moved one direction, so a page
+   that had been free the whole time on the far side of the cursor
+   was never found.  Adding ELFs pushed the cursor past such pages,
+   the boot ELF load's page-table allocation returned 0, and the
+   split never happened.  **That is fixed** (`20261003-pmm-wrap`:
+   the scan wraps; `pmm_scan_zone`).  See `gotchas.md`, "A zone
+   scan that moves one way does not find pages behind its cursor."
+
+   **What remains is this item's real subject:** a function that
+   cannot report failure, called by code that assumes success.  It
+   is a latent defect on its own terms — the next allocation that
+   fails for any reason will be invisible, exactly as this one was
+   — and it is worth fixing now that the live fault is gone and the
+   change can be made without pressure.
+
    **The huge-page-split path was fixed in session 42**
    (`20261001-splitfix`), because it was the one with evidence: a
    silent return there leaves the bootloader's 2 MB **supervisor**
@@ -103,53 +119,10 @@
    of `0x400000`.  The split path now halts with a `VMM: FATAL`
    message instead of returning.
 
-   **That fix did not fire on the crash session 44 saw.**  One boot
-   of the session-44 tree hit the same `#PF`, at the same address,
-   **with no `VMM: FATAL`**:
-
-   ```
-       === PAGE FAULT (#PF) ===
-         CR2 (Bad Address) : 0x0000000000400000
-         Faulting RIP      : 0x0000000000400000
-         Raw Error Code    : 0x0000000000000015
-         pde               : 0x0000000000400083
-         PDE IS 2 MB PAGE, phys base 0x400000 -> effective phys 0x400000
-   ```
-
-   `0x83` is present, write, PS — and **`PT_USER` clear**.  `0x15`
-   is present + read + user + instruction-fetch.  **This
-   presentation-1 capture is not on disk**; the fault dump above is
-   its record.  The only capture in the tree is **`PFcapture.txt`**,
-   which holds presentation 2 (below).
-
-   **Two observations make it reproducible, and they are the
-   useful part:**
-
-   1. **It usually follows a rebuild that adds userland
-      programs.**  The last one came after a session-44 rebuild
-      that added `proc_fd.elf` and `proc_status.elf`.
-   2. **After a reboot or two — by the third, say — it goes away
-      and stays away for a long time.**  A fresh boot of the same
-      image is usually clean.
-
-   That combination is the signature of a **page-frame allocation
-   condition**, not a logic error in the split: the split needs a
-   fresh frame, the allocation's outcome depends on how many
-   frames were consumed before it ran, and a reboot reinitializes
-   the allocator's state so the condition clears.
-
-   **The likely reason no `VMM: FATAL` printed:** `20261001-splitfix`
-   added the halt to *one* return in the split path.  If the failure
-   is a *different* silent return in the same path — one of the six
-   below — the split leaves the supervisor page in place without a
-   message.  **The first thing to read for is which `if (!phys)
-   return;` the split takes.**
-
    **The remaining sites are still silent.**  In
    `vmm_map_page_in_cr3`: the PDPT, PD, and PT allocation paths each
    have their own `if (!phys) return;`.  In `vmm_map_page`: the same
-   three.  The pattern is the same defect: **a void function that
-   cannot report failure, called by code that assumes success.**
+   three.  The pattern is the same defect.
 
    The fix is one of:
    - **change the signature** to return an error, and check it at
@@ -159,10 +132,10 @@
      (matches the kernel idiom, smaller, but turns a recoverable
      allocation failure into a dead machine).
 
-   **Session 45 observations (unresolved; kept for whoever reopens
-   this).**  Session 45 attempted the signature change and reverted
-   it.  It compiled and booted, but `canary --full` faulted at a
-   different address and mechanism:
+   **Session 45 observations (kept for whoever does this).**  Session
+   45 attempted the signature change and reverted it.  It compiled
+   and booted, but `canary --full` faulted at a different address and
+   mechanism:
 
    ```
    CR2 = RIP = 0x1
@@ -175,15 +148,22 @@
    A `pmm_get_page_type` diagnostic in `isr14_handler` proved the
    walk's pages were all `PAGE_TABLE`, ruling out a use-after-free
    of a page-table page.  The mechanism was never isolated; the
-   fault has not been seen since.  Treat it as unknown, not as
-   "fixed by the revert."  Re-apply the diagnostic before redoing
-   the signature change.
+   fault has not been seen since.  **Treat it as unknown.**  Re-apply
+   the diagnostic before redoing the signature change; if the fault
+   reproduces, isolate it before doing anything else.
 
    Session 45 also found that `vmm_clone_page_table`'s low-half
    deep copy should skip supervisor huge PDEs (`if (src_pde & 0x80)
    continue;`), and that filtering the *leaf* copy on `PT_USER` is
    wrong — it breaks the kernel's own identity map, because the
    clone serves kernel processes too.
+
+   **The two captures.**  Presentation 1 (`pde = 0x400083`, the
+   supervisor huge page) is **not on disk**; its fault dump is
+   quoted above.  Presentation 2 (`pde = 0`) is in
+   **`PFcapture.txt`** at the project root — gitignored, so `ls` it;
+   `git status` will not show it.  The double-fault capture from
+   session 48 is `DFAULT.txt`, also gitignored.
 
    **Read `gotchas.md`, "A shim's dead code is only dead if you
    watch it not run," together with this.**  That entry is about a
@@ -240,16 +220,27 @@ a `dup`'d chain stop waking the peer and the peer hangs until a
 keystroke — read the `put_file_slot` comment and this entry before
 touching either).
 
-**`readdir("/dev")` and `readdir("/proc")` fail.**  The seam
-serves individual entries, not directories.  `open_resolved` has a
-DEV branch (`dev_lookup`) and a PROC branch (`proc_lookup`), each a
-small table keyed by the path component; there is no synthesized
-directory for either prefix, so `ls /dev` and `ls /proc` fail with
-`ENOENT`.  Adding them is a **directory shape**, not an
-architectural change — the mechanism is proven — and it is the
-piece of work that would let `readdir("/proc")` return `self`,
-which is what `ps`/`top`/`kill`/`pidof` need before they can be
-enabled.  See `handoff.md`, "Busybox enablement."
+**`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc` is
+a listable directory as of session 47: `readdir("/proc")` returns
+`self` and the live pids, and `ls /proc` works.  `/dev` has not had
+the same treatment — `ls /dev`, `ls /dev/`, and `ls dev` all fail
+with `ENOENT`, confirmed session 48.  Adding it is the **same
+directory shape** `/proc` got: a synthesized entry list in
+`sys_getdents64`, and an `open_resolved`/`stat_resolved` branch
+for the prefix.  The mechanism is proven and the pattern is
+established; this is small, patterned work.  It is what would let
+`tty` and `null` appear in `ls /dev`, and it is the prerequisite
+for `/dev/tty` and `/dev/urandom`.  See `handoff.md`, "Busybox
+enablement."
+
+**`stty` is enabled and runs, but cannot change the terminal.**
+`stty` prints a plausible state (speed, control characters, flags)
+and `tty` prints `/dev/console`, both confirmed session 48.  The
+kernel console has no termios, so `stty -icanon`, `stty erase X`,
+and the like do nothing — the applet reads and reports, it cannot
+write.  Not a defect to fix; a limit to know.  Line editing in
+`ash` is busybox's own (`CONFIG_FEATURE_EDITING`), independent of
+the kernel.
 
 **`st_rdev` is 0 on device nodes.**  `ls -l /dev/console` prints
 `0, 0` for the major/minor column; a real Unix prints the tty
@@ -264,15 +255,34 @@ computes `has_drive`, does nothing with it, and casts it to
 code that is present, correct-looking, and has no effect.  Small
 cleanup; not urgent.
 
-**No `/dev` directory and no `/proc` directory.**  `ttyname(3)` now
-names the console — `readlink("/proc/self/fd/0")` returns
-`/dev/console` and the `(st_dev, st_ino)` match passes, so `tty`
-prints `/dev/console`.  What remains is that **neither `/dev` nor
-`/proc` is listable**: `readdir` on either fails.  `/dev/tty` and
+**No `/dev` directory.**  `ttyname(3)` names the console —
+`readlink("/proc/self/fd/0")` returns `/dev/console` and the
+`(st_dev, st_ino)` match passes, so `tty` prints `/dev/console`.
+What remains is that **`/dev` is not a directory**: `readdir` on it
+fails, so `ls /dev` fails (see above).  `/dev/tty` and
 `/dev/urandom` do not exist, and `/dev/console` is stat-able but
 not openable (`open("/dev/console")` returns `-ENOENT`; nothing
-opens it yet).  The seam is the mechanism; the directories and the
+opens it yet).  The seam is the mechanism; the directory and the
 remaining entries are the work.
+
+**`open("/proc/<pid>", O_DIRECTORY)` is not done.**  `ps` *stats*
+the per-pid directory (that is what session 47 fixed); it does not
+*open* it.  `ls /proc/1` and `opendir("/proc/1")` would need
+`open_resolved` to accept the same two paths `stat_resolved` now
+does, producing a `FILE_KIND_DIR` slot with `PROC_DIR_SENTINEL` —
+the mechanism session 47 already built for `/proc` itself.  Small.
+
+**A nonexistent pid stats as a directory.**  `stat("/proc/999999/")`
+reports `S_IFDIR` rather than `ENOENT`, because the check is on the
+path shape, not on `process_find_by_pid`.  `ps` only stats pids
+`readdir` gave it, so it does not affect the consumer.  Worth one
+line when `/proc` is next touched.
+
+**`sys_gettimeofday` (99) is not implemented.**  `clock_gettime`
+(228) is, and is what musl reaches for in most cases, but
+`PS_LONG`/`PS_TIME` in `ps` call `time()`/`localtime()`, which
+reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
+small syscall from `g_ticks`, like `clock_gettime`.
 
 **The `/dev/null` history, kept because it is the seam's first
 consumer.**  Session 43 made `/dev/null` work across
@@ -348,6 +358,16 @@ harmless, and the reason `vi` fills the screen.  No action.
   `resolve_at`, the DEV or PROC backend, `sys_readlink`, or
   `access_resolved`.  The `tty` canary row is the fast check; these
   are the detailed ones.
+
+- **`proc_dir`, `proc_stat`, `proc_walk`, `proc_walk_fds`,
+  `mmap_stress`, and `exec_churn`** (sessions 47 and 48) are run by
+  hand, not as canary rows.  `proc_dir` (8 checks) and
+  `proc_stat` (7 checks) are the `/proc` file tests; `proc_walk`
+  and `proc_walk_fds` **report** rather than assert, and reproduce
+  the `procps_scan` sequence; `mmap_stress` and `exec_churn` drive
+  the two free paths (munmap and process exit) that the PMM
+  zone-scan bug depended on.  `exec_churn` needs its helper,
+  `churn_helper`, staged as `/usr/bin/CHURN_HELPER`.
 
 - **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
   `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.
