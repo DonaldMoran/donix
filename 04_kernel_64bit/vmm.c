@@ -407,7 +407,16 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
     uint64_t* pdpt;
     if (!(pml4[pml4_idx] & PT_PRESENT)) {
         uint64_t new_pdpt_phys = pmm_alloc_page_for_tables();
-        if (!new_pdpt_phys) return -1;
+        if (!new_pdpt_phys) {
+            serial_print("VMM: map failed site=PDPT virt=0x");
+            serial_print_hex(virt);
+            serial_print(" cr3=0x");
+            serial_print_hex(cr3);
+            serial_print(" free=");
+            serial_print_dec(pmm_get_free_pages());
+            serial_print("\n");
+            return -1;
+        }
         memset(phys_to_virt(new_pdpt_phys), 0, PAGE_SIZE);
         pml4[pml4_idx] = new_pdpt_phys | dir_flags;
         pdpt = (uint64_t*)phys_to_virt(new_pdpt_phys);
@@ -419,7 +428,16 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
     uint64_t* pd;
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) {
         uint64_t new_pd_phys = pmm_alloc_page_for_tables();
-        if (!new_pd_phys) return -1;
+        if (!new_pd_phys) {
+            serial_print("VMM: map failed site=PD virt=0x");
+            serial_print_hex(virt);
+            serial_print(" cr3=0x");
+            serial_print_hex(cr3);
+            serial_print(" free=");
+            serial_print_dec(pmm_get_free_pages());
+            serial_print("\n");
+            return -1;
+        }
         memset(phys_to_virt(new_pd_phys), 0, PAGE_SIZE);
         pdpt[pdpt_idx] = new_pd_phys | dir_flags;
         pd = (uint64_t*)phys_to_virt(new_pd_phys);
@@ -510,7 +528,16 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
     uint64_t* pt;
     if (!(pd[pd_idx] & PT_PRESENT)) {
         uint64_t new_pt_phys = pmm_alloc_page_for_tables();
-        if (!new_pt_phys) return -1;
+        if (!new_pt_phys) {
+            serial_print("VMM: map failed site=PT virt=0x");
+            serial_print_hex(virt);
+            serial_print(" cr3=0x");
+            serial_print_hex(cr3);
+            serial_print(" free=");
+            serial_print_dec(pmm_get_free_pages());
+            serial_print("\n");
+            return -1;
+        }
         memset(phys_to_virt(new_pt_phys), 0, PAGE_SIZE);
         pd[pd_idx] = new_pt_phys | dir_flags;
         pt = (uint64_t*)phys_to_virt(new_pt_phys);
