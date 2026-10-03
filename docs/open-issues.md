@@ -90,6 +90,56 @@
    applet set calls it.  See `gotchas.md`, "A consumer inferred
    from behavior is not a consumer."
 
+7a. **The boot-time `#PF` at `0x400000` is back, and diagnosed
+   better.**  Session 50's first boot after the fault-injection
+   commit reproduced it:
+
+       === PAGE FAULT (#PF) ===
+         CR2 (Bad Address) : 0x0000000000400000
+         Faulting RIP      : 0x0000000000400000
+         Raw Error Code    : 0x0000000000000015
+         CS                : 0x0000000000000033
+         CR3               : 0x000000000030D000
+         pde               : 0x0000000000400083
+         PDE IS 2 MB PAGE, phys base 0x400000
+       ELF: COPY-FAIL phys=0 at vaddr=0000000000400000
+       PANIC: musl_sh ELF load failed
+
+   It did **not** reproduce on the next two boots.  This is the
+   shape sessions 45 and 48 described: layout-dependent, appears on
+   the first boot after an image change, clears on the next.  It is
+   **not** session 48's PMM zone scan (that wraps now) and **not**
+   the closed item 7 (the returns are plumbed).
+
+   **What is new is the reporting, not the fault.**  Session 45's
+   version was silent: `vmm_map_page_in_cr3` returned without the
+   caller knowing, and the process faulted later in user mode at
+   virtual 1.  Session 49's item-7 plumbing is what makes this boot
+   print `ELF: COPY-FAIL phys=0 at vaddr=0x400000` and panic *at
+   the ELF load*, at the call site.  A silent failure became a
+   reported one; the underlying allocation still failed.
+
+   **Two candidate causes, not distinguished by the capture.**
+   Either (a) `pmm_alloc_page` genuinely returned 0 — an
+   exhaustion in a shape the session-48 wrap does not cover — or
+   (b) the clone `vmm_clone_page_table` built for `musl_sh` was
+   missing the PDPT or PD for `0x400000`'s region, so
+   `vmm_map_page_in_cr3`'s own table allocation failed.  The log
+   shows the walk against the *parent's* cr3 (`0x30D000`), whose
+   PDPT/PD are present and whose PDE is the bootloader's user 2 MB
+   huge page (`0x400083`); it does not show the *child's* clone.
+   Distinguishing the two needs the child's cr3 walked, or a
+   free-page count printed at the failure site.
+
+   **Unobserved, not fixed** — the standing rule from session 45.
+   An intermittent fault that stops reproducing is not closed.
+   Next session that touches it should instrument (print which
+   allocation in `vmm_map_page_in_cr3` returned 0, and
+   `pmm_get_free_pages()`) rather than reason from the dump.  The
+   session-45 virtual-1 fault's diagnostic is permanently in
+   `isr14_handler`; this one is its sibling and wants the same
+   treatment.
+
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
    committed to FAT.  The correct frame is therefore **Unix
