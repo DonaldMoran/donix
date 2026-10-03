@@ -1,3 +1,158 @@
+## Session 47 — /proc per-pid files and the pid directory; `ps` works
+
+Four commits on `dev`, scratch-tagged, unpushed.  **Not a
+milestone** — a working feature with known edges.  Finishes the
+`/proc` work session 44's seam started: `readdir("/proc")` lists
+the pids, `/proc/<pid>/stat`, `status`, and `cmdline` read, and
+`ps` and `pstree` are enabled and work.
+
+| Tag | What |
+|---|---|
+| `20261003-proc-dir` | `/proc` and `/proc/self` are directories; `readdir` returns `self` |
+| `20261003-proc-pids` | `readdir("/proc")` lists the live pids |
+| `20261003-proc-stat` | `/proc/<pid>/stat`, with `/proc/self/stat` |
+| `20261003-proc-ps` | `/proc/<pid>/status`, `cmdline`, and the pid directory; `ps` works |
+
+### The four commits, and what each needed
+
+**Commit 1 — `/proc` is a directory.**  `open_resolved` and
+`stat_resolved` accept `/proc` and `/proc/self` and produce a
+`FILE_KIND_DIR` slot whose `obj` is `PROC_DIR_SENTINEL` — a tag,
+not a `DIR*`, because there is no FatFs directory behind it.
+`sys_getdents64` synthesizes one entry, `self`, and the cursor is
+`slot->end`.  `put_file_slot` checks for the sentinel before
+`f_closedir`.  `fill_kstat_as_dir` reports `KSTAT_IFDIR | 0555`.
+Test `proc_dir.c`, 8 checks.  **`ps` still printed nothing** — the
+directory was necessary but not sufficient.
+
+**Commit 2 — numeric pids.**  `process_get_pcb(int)` is added to
+`process.c` and declared in `process.h`, because `pcb_pool` is
+`static` there and `user_syscall.c` cannot index it.  `readdir`
+grows a second phase: after `self`, one decimal pid per live
+process, from the pool.  `proc_dir.c` gains checks 7 and 8 (a
+numeric entry, and this process's own pid).  **`ps` still printed
+nothing.**
+
+**Commit 3 — `/proc/<pid>/stat`.**  `PROC_ENTRY_PID_STAT`; the
+`(pid, tag)` pair packed into the slot's `obj`
+(`PROC_OBJ_MAKE`/`PROC_OBJ_TAG`/`PROC_OBJ_PID`); `proc_build_stat`
+emits the field order libbb's `procps_scan` parses with a fixed
+`sscanf`.  Real fields from the `pcb`: pid, comm, state, ppid,
+utime, stime, start_time, vsize.  Zeros where donix tracks nothing.
+`open_resolved` and `stat_resolved` accept `/proc/<digits>/stat`
+**and the literal `self`**.  Test `proc_stat.c`, 7 checks.
+`cat /proc/self/stat` printed the right line.  **`ps` still printed
+nothing.**
+
+**Commit 4 — the rest, and the fix.**  `PROC_ENTRY_PID_STATUS` and
+`PROC_ENTRY_PID_CMDLINE`; `proc_build_pid_status` and
+`proc_build_pid_cmdline`; the read-path dispatch grows both cases;
+`open_resolved` and `stat_resolved` accept the two files.  And the
+fix for the skip: **`stat_resolved` accepts `/proc/<digits>` and
+`/proc/<digits>/` and reports a directory.**  `ps` works.
+
+### The bug: `ps` skips every entry on a directory stat
+
+`ps` printed its header and no rows.  The cause is in
+`libbb/procps.c`'s `procps_scan`, under `PSSCAN_UIDGID` (which
+`ps`'s default flag set and `pstree`'s both have):
+
+    if (flags & PSSCAN_UIDGID) {
+        struct stat sb;
+        if (stat(filename, &sb))     /* "/proc/<pid>/" */
+            continue;                 /* skip the entry */
+        sp->uid = sb.st_uid;
+        sp->gid = sb.st_gid;
+    }
+
+`filename` has a **trailing slash**.  donix served the per-pid
+*files* but not the per-pid *directory*, so `stat("/proc/1/")` fell
+through to FAT and returned `-ENOENT`, and every entry was skipped
+before any file under it was read.
+
+**How it was found, in the order it took.**  The tests passed
+(`proc_dir`, `proc_stat`, `proc_status`, `proc_walk`); the config
+was right (`PS=y`, `!DESKTOP`, `PS_WIDE=y`); fd state was not the
+cause (`proc_walk_fds` held six fds and the walk still worked); the
+kernel trace showed `ps` opening `/proc`, calling `getdents64` six
+times, and then **nothing** — no row, and no open of
+`/proc/<n>/cmdline` from the row printer.  So `procps_scan`
+returned NULL after draining the directory, and the only `continue`
+not yet reproduced was the `PSSCAN_UIDGID` stat.  `proc_walk` was
+extended with `stat("/proc/<n>")` and `stat("/proc/<n>/")`, and
+both printed `FAILED ... <-- procps_scan would SKIP` for every pid.
+That was the bug.
+
+### Two process notes, both worth keeping
+
+- **The diagnostic was a kernel trace, not a `third_party/` patch.**
+  When the walk had to be seen, the first proposal was to add
+  `fprintf`s to `libbb/procps.c`.  That is wrong: `third_party/` is
+  gitignored and rebuilt by the toolchain, so the edit is invisible
+  to the repo and vanishes on the next build.  The right instrument
+  is a **first-party test that reproduces the consumer's sequence**
+  — `proc_walk` — plus, when needed, a **kernel-side trace** in our
+  own file.  Both are committable; the `third_party/` patch is not.
+- **`proc_walk` did not call `stat` on the directory.**  It opened
+  the files and ran the consumer's `sscanf`, so it proved every
+  *file* worked.  It did not make the one *directory* call
+  `procps_scan` makes.  A test of the files under a directory says
+  nothing about whether the directory can be stat'd.  See
+  `gotchas.md`, "A /proc consumer can stat a path it never opens."
+
+### Busybox
+
+`configs/busybox.config`: `CONFIG_PS=y`, `CONFIG_FEATURE_PS_WIDE=y`,
+`CONFIG_PSTREE=y`.  `PS_LONG` and `PS_TIME` stay **off** — they pull
+in `time()`/`localtime()` → `gettimeofday`, which donix does not
+implement (syscall 99).  `DESKTOP` stays off, so it is the simple
+`!DESKTOP` `ps_main`.
+
+**`ps` works:**
+
+    $ ps
+      PID USER       VSZ STAT COMMAND
+        1 0            0 RW   idle
+        2 0           92 S    musl_sh
+        3 0          364 S    busybox
+        4 0          424 R    busybox
+
+The `USER` column reads `0` because `/etc/passwd` does not exist;
+`get_cached_username` falls back to the numeric uid.  The
+`sys_open: f_open FAIL path=etc/passwd` line is that fallback.
+
+**`pstree` works but shows only `idle`** — which is correct for
+donix's process model: `musl_sh`'s `ppid` is 0, so the shell is a
+second root, not a child of pid 1.  `pstree` starts at pid 1 and
+prints pid 1's subtree.  Not a bug; a consequence of the shell
+having no parent process.
+
+### Known edges, not closed by this session
+
+- **`open("/proc/<pid>", O_DIRECTORY)` is not done.**  `ps` *stats*
+  the directory; it does not open it.  `ls /proc/1` would need
+  `open_resolved` to accept the same two paths `stat_resolved` now
+  does.
+- **`stat("/proc/<pid>/")` for a pid with no live process still
+  reports a directory.**  The check is on the path shape, not on
+  `process_find_by_pid`.  `ps` only stats pids `readdir` gave it, so
+  it does not affect the consumer.
+- **`sys_gettimeofday` (99) is not implemented**, so `PS_LONG` and
+  `PS_TIME` stay off and `ps -l` still hits the unknown syscall.
+- **`proc_walk` and `proc_walk_fds` report and pass** — they are
+  diagnostics, not assertion tests.  Now that the answer is known,
+  the assertion version is the permanent regression test.
+
+### Verification
+
+`proc_dir` 8/8; `proc_stat` 7/7; `proc_status` ALL PASS;
+`proc_walk` runs the consumer's own `sscanf` and reports `n=11` for
+every pid; `ps` lists four processes.  The tabled boot-time `#PF`
+did not appear in any boot this session.
+
+**Scratch tags kept:** the four `20261003-*` tags, local, not
+pushed.
+
 ## Session 46 — the boot-time `#PF` is tabled; the next session is busybox enablement
 
 One commit on `dev`, untagged, unpushed.  **Not a milestone** — a

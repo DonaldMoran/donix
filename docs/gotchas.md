@@ -1,3 +1,72 @@
+## A /proc consumer can stat a path it never opens
+
+*Session 47 (`ps` printing no rows), commit `20261003-proc-ps`.  The
+consumer stats a directory, skips the entry when that fails, and
+never opens anything under it -- so a test of the files inside the
+directory passes and the applet still prints nothing.*
+
+`ps` printed its header and no rows, and `pstree` printed only the
+one process it starts from.  Every per-pid FILE existed --
+`/proc/<pid>/stat`, `/proc/<pid>/status`, `/proc/<pid>/cmdline` --
+and `proc_walk`, a first-party test that ran the consumer's own
+`sscanf`, proved each of them opened and parsed.  The applet still
+listed nothing.
+
+**The missing call was a `stat` on the directory.**  libbb's
+`procps_scan`, under `PSSCAN_UIDGID` (which `ps`'s default flag set
+and `pstree`'s both include), does:
+
+    if (flags & PSSCAN_UIDGID) {
+        struct stat sb;
+        if (stat(filename, &sb))     /* filename = "/proc/<pid>/" */
+            continue;                 /* SKIP the entry */
+        sp->uid = sb.st_uid;
+        sp->gid = sb.st_gid;
+    }
+
+`filename` is built by `sprintf(filename, "/proc/%u/", pid)` --
+**with a trailing slash**.  donix served the per-pid files but not
+the per-pid *directory*, so `stat("/proc/1/")` fell through to FAT
+and returned `-ENOENT`, and **every entry was `continue`d before any
+file under it was read.**  Header, no rows.
+
+**Why the tests did not catch it.**  `proc_walk` opened
+`/proc/<pid>/stat`, `status`, and `cmdline` -- the files -- and
+never called `stat` on `/proc/<pid>/` itself.  A test of the files
+under a directory says nothing about whether the directory can be
+stat'd.  The diagnostic that found it was two added `stat` calls in
+`proc_walk`:
+
+    stat('/proc/1')  FAILED: No such file or directory
+    stat('/proc/1/') FAILED: No such file or directory  <-- SKIP
+
+**How it was isolated.**  The kernel trace showed `ps` opening
+`/proc` and calling `getdents64` six times (five entries plus the
+terminating NULL) and then **nothing** -- no row, and no
+`open("/proc/<n>/cmdline")` from the row printer.  The walk worked;
+the loop body never ran, because `procps_scan` returned NULL after
+draining the directory.  The only `continue` not yet reproduced was
+the `PSSCAN_UIDGID` stat, and the test confirmed it.
+
+**The fix.**  `stat_resolved` accepts `/proc/<digits>` and
+`/proc/<digits>/` and reports `KSTAT_IFDIR | 0555`, the same
+`fill_kstat_as_dir` used for `/proc` and `/proc/self`.  `open` is
+untouched; `ps` stats the directory, it does not open it.
+
+**The rule.**  When a consumer reads `/proc` (or any synthesized
+directory), find out every path it *stats*, not just the paths it
+*opens*.  A directory entry can be stat'd for its metadata and
+skipped on failure, before any file inside it is touched.  A test
+that exercises the files under the directory will pass while the
+consumer lists nothing.
+
+**The tell.**  A consumer that prints a header and no rows (or
+partial output) while a first-party test of its files passes.  Add
+the `stat` the consumer makes on the directory itself.  The general
+shape -- a path the consumer touches that no test touches -- is the
+same as "A consumer inferred from behavior is not a consumer"
+(session 40), from the other side.
+
 ## A case in a switch is not reached if an earlier guard refuses the input
 
 *Session 44 (`fstat(0)` on a console sentinel), commit

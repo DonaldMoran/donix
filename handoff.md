@@ -3,9 +3,9 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-02 (session 46: the boot-time `#PF` is
-**tabled**, not fixed; the next session is pointed at busybox
-enablement)
+**Last updated:** 2026-10-03 (session 47: `/proc` per-pid files and
+the pid directory shipped; **`ps` works**.  Next target not yet
+chosen.)
 
 **Repo state — run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -35,6 +35,13 @@ and `/dev/null`.  **Post-`v0.6.10`, on `dev`, untagged:** session
 `/dev/null`, `/proc/self/status`, `/dev/console`,
 `/proc/self/fd/N`, `tty`.  Eight commits, all verified, none
 pushed.
+
+**Session 47 added `/proc` per-pid support** on top of the seam:
+`readdir("/proc")` lists the pids, `/proc/<pid>/stat`, `status`,
+and `cmdline` read, `/proc/<pid>/` stats as a directory, and **`ps`
+and `pstree` are enabled and work.**  Four commits, scratch-tagged
+`20261003-*`.  Not a milestone — a working feature with known
+edges.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -133,6 +140,15 @@ binaries whose build log had been silently discarded.  When the
 whole chain's output matters, wrap it:
 `{ a && b && c && d ; } 2>&1 | tee file`.  See `docs/gotchas.md`.
 
+**Do not edit `third_party/`.**  Session 47 added this.  The
+vendored sources there are gitignored and rebuilt by the toolchain,
+so an edit is invisible to the repo and vanishes on the next build.
+When a diagnostic needs to see inside a third-party applet — a
+`printf` in busybox, say — the right instrument is a **first-party
+test that reproduces the applet's sequence** (e.g. `proc_walk` for
+`procps_scan`), or a **trace in our own kernel**, not a patch to
+`third_party/`.  Both are committable; the patch is not.
+
 **The push / merge / tag sequence** (the project's own order,
 used for every `v*` bump):
 
@@ -228,6 +244,38 @@ those prefixes.  There is **no VFS**: no inode, no vnode, no mount
 table.  See `docs/strategy.md`, "When a feature may force
 architecture."
 
+### Session 47 — `/proc` per-pid, and `ps` works
+
+**This is the newest thing on `dev`, and it builds on the seam.**
+Four commits, scratch-tagged `20261003-*`:
+
+| Tag | What |
+|---|---|
+| `20261003-proc-dir` | `/proc` and `/proc/self` are directories; `readdir` returns `self` |
+| `20261003-proc-pids` | `readdir("/proc")` lists the live pids |
+| `20261003-proc-stat` | `/proc/<pid>/stat`, with `/proc/self/stat` |
+| `20261003-proc-ps` | `/proc/<pid>/status`, `cmdline`, and the pid directory; **`ps` works** |
+
+**The bug that took the session:** `ps` printed a header and no
+rows.  `libbb`'s `procps_scan`, under `PSSCAN_UIDGID`, does
+`stat("/proc/<pid>/")` — **with a trailing slash** — and `continue`s
+the entry when it fails.  donix served the per-pid *files* but not
+the per-pid *directory*, so every entry was skipped before any file
+was read.  See `gotchas.md`, "A /proc consumer can stat a path it
+never opens."
+
+**`ps` and `pstree` are enabled** (`CONFIG_PS`, `CONFIG_PSTREE`;
+`PS_WIDE` on, `PS_LONG`/`PS_TIME` off because they need
+`gettimeofday`, syscall 99).  `ps` lists the processes; `pstree`
+shows only `idle`, because `musl_sh`'s ppid is 0 (the shell is a
+second root, not a child of pid 1) — correct for donix, not a bug.
+
+**Known edges, not closed:** `open("/proc/<pid>", O_DIRECTORY)` is
+not done (`ps` only stats the directory); a nonexistent pid still
+stats as a directory; `PS_LONG`/`PS_TIME` need syscall 99; and
+`proc_walk`/`proc_walk_fds` are diagnostics that report and pass,
+not assertion tests.
+
 ### Session 44, in full — eight commits
 
 | Commit | What |
@@ -273,10 +321,59 @@ Boot clean, no `Unknown syscall:` lines, no faults.
 
 ---
 
-## NEXT SESSION — busybox enablement
+## NEXT SESSION — no single target chosen
 
-**Turn on one applet.**  The seam is shipped; the tree is green;
-the `#PF` is tabled.  This is feature work.
+`ps` works; `/proc` is done for the consumer that needed it.  The
+next step is a **choice** from the list below, not a blocked
+dependency.  Pick one, read its consumer's source before writing
+(see the rule in the busybox section), and make the smallest change
+that does it.
+
+### Candidates, and what each actually needs
+
+- **`open("/proc/<pid>", O_DIRECTORY)`** — the "complete" half of
+  session 47's fix.  `stat` accepts `/proc/<pid>` and
+  `/proc/<pid>/`; `open` does not.  Small: the same two paths in
+  `open_resolved`, producing a `FILE_KIND_DIR` slot with
+  `PROC_DIR_SENTINEL`, which already exists.  Makes `ls /proc/1`
+  and `opendir("/proc/1")` work.
+- **`musl_sh` as a child of `idle`** — so `pstree` shows a
+  Unix-like tree instead of one node.  A `kmain`/`process_create`
+  change: set the shell's `parent_pid` to 1.  Small, and it
+  changes `ps`'s `PPid` column for the shell.
+- **`/etc/passwd`** — makes `ps`'s USER column show names instead
+  of `0`.  A synthesized file through the seam, or a real one on
+  FAT; either way small, and it removes the
+  `sys_open: f_open FAIL path=etc/passwd` line.
+- **`sys_gettimeofday` (99)** — enables `ps -l` / `ps -e`
+  (`PS_LONG`, `PS_TIME`).  A small syscall from `g_ticks`, like
+  `clock_gettime`.
+- **`kill` / `pidof`** — `pidof` needs the per-pid entries (now
+  present) and a lookup; `kill` additionally needs signal
+  delivery, which is item 5's subsystem.  Read
+  `procps/kill.c` before deciding.
+- **`top`** — needs `ps -l`-class fields and a redraw loop; larger.
+- **The `proc_walk` assertion test** — turn the diagnostic into a
+  test that asserts (stat `/proc/<n>/` must succeed, the
+  consumer's `sscanf` must give ≥ 11).  Small, and it pins the
+  session-47 fix.
+- **Symlinks** (`open-issues.md` item 8) — larger; design is
+  recorded, the seam exists to hide the encoding.
+- **`/dev/tty`** — unblocks the pagers (`less`/`more`).
+
+### Do not
+
+Do not tag `v*` in this session unless the change is verified and
+you choose to.  Do not reopen item 7.  One change at a time.  Do
+not edit `third_party/`.
+
+---
+
+## Busybox enablement — state of play
+
+**`ps` and `pstree` are enabled and work.**  That is the change
+from session 47, and it is worth stating plainly because the
+sessions before it said they could not be enabled.
 
 ### The rule
 
@@ -286,68 +383,26 @@ name.**  When something is missing, the question is "how big is
 it?" — a table entry and a directory shape is a session's work; a
 signal-delivery subsystem is not.  A syscall that exists but
 cannot do its job (a `chmod` on a filesystem with no permissions)
-is worse than a missing one: it makes the applet lie.  See
-`docs/gotchas.md`, "A consumer inferred from behavior is not a
-consumer."
+is worse than a missing one: it makes the applet lie.
 
-### Candidates, and what each actually needs
+**A `/proc` consumer can stat a path it never opens.**  Session
+47's lesson: `procps_scan` stats `/proc/<pid>/` (trailing slash)
+under `PSSCAN_UIDGID` and skips the entry when it fails, before
+reading any file.  Every per-pid *file* can exist and the applet
+still prints nothing.  See `gotchas.md`, "A /proc consumer can
+stat a path it never opens."
 
-The seam made the next pieces smaller rather than turning any
-applet on by itself: `readdir("/proc")` and a per-pid entry are
-now a table entry and a directory shape, not an architectural
-change.  Some applets need only that; some need a subsystem.  Read
-the applet's source and judge the size.  Concrete near-term
-candidates:
-
-- **`/proc` directory shape** — `readdir("/proc")` returning
-  `self`, plus a per-pid `stat` entry.  This is the prerequisite
-  for `ps`/`top`/`kill`/`pidof`.  It is the seam's next consumer.
-- **Symlinks** (`open-issues.md` item 8) — `ln`, `link`,
-  `readlink` with real targets, `realpath` correctness, archive
-  link restoration.  Design is recorded; the seam exists to hide
-  the encoding.
-- **`/dev/tty`** — unblocks the pagers (`less`/`more`).
-- **`stat` on many paths for tab completion** — probably works
-  already; test it.
-
-Pick one, read the applet's source against the implemented syscall
-set, and make the smallest change that turns it on.
-
-### Do not
-
-Do not tag `v*` in this session unless the change is verified and
-you choose to.  Do not reopen item 7.  One change at a time.
-
----
-
-## Busybox enablement — state of play
-
-**The seam did not make any applet in the table below enableable
-by itself.**  It made the next pieces smaller.  This is worth
-stating plainly, because the seam is `/dev` and `/proc` work and
-the intuition is that `/proc` applets should now turn on.  They do
-not yet — but the work to turn them on is now a table entry and a
-directory shape, not an architectural change.
-
-- **`ps`** reads `/proc/<pid>/stat` for **every** pid and
-  `readdir`s `/proc` to enumerate them.  Neither a listable
-  `/proc` nor any per-pid entry exists.  Needs the `/proc`
-  directory shape.
-- **`top`**, **`kill`**, **`pidof`** — same.
-- **`less`/`more`** need raw-mode terminal control and open
-  `/dev/tty`.  `/dev/tty` does not exist.
-
-**The one applet whose behavior changed is `tty`.**  It prints
-`/dev/console` now.
+**Do not edit `third_party/`.**  When a diagnostic needs to see
+inside an applet, write a first-party test that reproduces its
+sequence, or trace our own kernel.  Both are committable.
 
 ### What each still-off applet needs
 
 Each row is a **cost estimate, not a prohibition**.  Sometimes the
-missing piece is small and we write it — that is how `tty` was
-enabled.  Sometimes it is a whole subsystem (signal delivery, a
-network stack, a VFS) and we do not write it just to turn on one
-applet.  The rule is **know what you are signing up for** before
-you enable.
+missing piece is small and we write it — that is how `tty` and
+`ps` were enabled.  Sometimes it is a whole subsystem and we do
+not write it just to turn on one applet.  The rule is **know what
+you are signing up for** before you enable.
 
 | Config | Applet | Needs |
 |---|---|---|
@@ -361,22 +416,16 @@ you enable.
 | `CONFIG_TAR`/`UNZIP`/`CPIO`/`GZIP`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
 | `CONFIG_AWK` | `awk` | large; needs `FEATURE_AWK_LIBM` |
 | `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control; `/dev/tty` does not exist |
-| `CONFIG_TOP`/`PS`/`KILL`/`PIDOF` | process tools | `/proc` must be **listable** and **per-pid** |
+| `CONFIG_TOP` | `top` | `ps -l`-class fields (`gettimeofday`), a redraw loop |
+| `CONFIG_KILL` | `kill` | signal delivery; `procps/kill.c` |
+| `CONFIG_PIDOF` | `pidof` | per-pid entries (now present) and a lookup |
 | `CONFIG_NETWORKING` (all) | `ping`, `wget`, etc. | no network stack |
 | `CONFIG_ASH_JOB_CONTROL` | ash job control | signal delivery |
 | `CONFIG_FEATURE_TAB_COMPLETION` | ash completion | needs `stat` on many paths; probably works, test it |
 
-### The rule
-
-**Enable an applet only when the syscalls it actually calls are
-implemented — read the applet's source, do not guess from its
-name.**  When something is missing, the question is "how big is
-it?" — a table entry and a directory shape is a session's work; a
-signal-delivery subsystem is not.  A syscall that exists but
-cannot do its job (a `chmod` on a filesystem with no permissions)
-is worse than a missing one: it makes the applet lie.  See
-`docs/gotchas.md`, "A consumer inferred from behavior is not a
-consumer."
+**Enabled and working, for the record:** `ps`, `pstree`, `tty`
+(prints `/dev/console`), plus the applets listed under "State on
+disk."
 
 ---
 
@@ -384,7 +433,8 @@ consumer."
 
 **Green as of session 44** — `canary` and `canary --full` from both
 shells, **15/15** and **28/28**.  The kernel self-test runs at boot
-and reports 17/17.
+and reports 17/17.  Session 47 did not add a canary row; `ps` is
+exercised by hand, and `proc_walk` is the detailed check.
 
 **The canary is a program: `canary`.**  `tests/canary.c` runs every
 non-interactive canary row, checks exit status and output
@@ -416,6 +466,12 @@ find `/usr/bin/CANARY`.
                    # stat (S_IFREG), close; 9 checks
     proc_fd        # /proc/self/fd/N -> /dev/console; the
                    # (st_dev, st_ino) match with fstat(0); 7 checks
+    proc_dir       # /proc is a directory; readdir returns self and
+                   # numeric pids; 8 checks
+    proc_stat      # /proc/<pid>/stat opens, parses; 7 checks
+    proc_walk      # walks /proc the way procps_scan does and
+                   # REPORTS (does not assert); the detailed check
+    proc_walk_fds  # the same walk with low fds occupied
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
@@ -430,7 +486,7 @@ Run these when changing `sys_read`/`sys_write`/`sys_close`/
 
 **New tests must be added to both `USERLAND_ELFS` and the
 `mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image now
-stages **41 files**.
+stages **45 files**.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
@@ -439,10 +495,10 @@ stages **41 files**.
 (trace off); no `[a|b|c]` debug line (removed); no `[faccessat]`
 trace line (removed).  The `FB: mapped N pages ...` line is
 expected.  The `sys_open: f_open FAIL path=...` lines from `vi` on
-a new file and from `busybox stat` on nonexistent paths are
-expected diagnostics.  `sys_execve: f_open FAIL` lines no longer
-appear, and neither do the `f_open FAIL path=dev/null` lines from
-`2>/dev/null`.
+a new file, from `busybox stat` on nonexistent paths, and from `ps`
+looking for `/etc/passwd` are expected diagnostics.  `sys_execve:
+f_open FAIL` lines no longer appear, and neither do the `f_open
+FAIL path=dev/null` lines from `2>/dev/null`.
 
 ---
 
@@ -466,9 +522,12 @@ installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
 spins; `sys_mmap` rejects all non-anonymous mappings; pipes
 support one concurrent reader and one concurrent writer;
 `put_file_slot`'s pipe wake is coupled to `sys_close`'s wake;
-**`readdir("/dev")` and `readdir("/proc")` fail**;
-**`st_rdev` is 0 on device nodes**;
-**`f_stat_with_retry` has dead `has_drive`**.
+**`readdir("/dev")` fails** (a directory shape, like `/proc` now
+has); **`st_rdev` is 0 on device nodes**;
+**`f_stat_with_retry` has dead `has_drive`**;
+**`open("/proc/<pid>", O_DIRECTORY)` is not done** (the "complete"
+half of session 47); **a nonexistent pid stats as a directory**;
+**`sys_gettimeofday` (99) is not implemented**, so `ps -l` is off.
 
 **Session 45 added:** the user-mode `#PF` at virtual 1
 (`CR2 = RIP = 0x1`, `pte = 0x3`, phys 1, `pmm=2` on every page of
@@ -495,7 +554,7 @@ the walk) — observed with the signature change, not since,
   `touch`, `tr`, `true`, `uname`, `uniq`, `wc`, `yes`, `cmp`,
   `grep`, `sed`, `vi`, `clear`, `basename`, `dirname`, `unlink`,
   `ttysize`, `tty`, `arch`, `mktemp`, `sleep`, `usleep`,
-  `truncate`, `realpath`, plus `ash`.
+  `truncate`, `realpath`, `stty`, `ps`, `pstree`, plus `ash`.
 - `userland/musl/` — tracked musl userland (`apps/`, `tests/`).
   `build/` gitignored.  New tests must be added to both
   `USERLAND_ELFS` and the `mcopy_one` chain in
@@ -503,6 +562,7 @@ the walk) — observed with the signature change, not since,
 - `04_kernel_64bit/fonts/ter-u18n.psf` — tracked font source.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   — gitignored; rebuild with `./toolchain/install_musl.sh`.
+  **Do not edit these.**
 - `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
 - `PFcapture.txt` — the vmm crash capture (presentation 2).
   Gitignored; **still on disk — `ls` it, `git status` will not
@@ -523,18 +583,19 @@ needs it.  Paths relative to the tree root
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
 - `docs/gotchas.md` — every bug writeup, by subsystem.
-  **Session 46 added one entry**: "A redirection binds to the last
-  command in an `&&` chain" (session 45's `run` build-capture
-  finding).  Session 45's `pmm_get_page_type` result (the
-  virtual-1 fault's walk was all `PAGE_TABLE`, ruling out
-  use-after-free) is a finding about one fault, not a general
+  **Session 47 added one entry**: "A /proc consumer can stat a path
+  it never opens" (the `stat("/proc/<pid>/")` skip that made `ps`
+  print nothing).  Session 46 added "A redirection binds to the
+  last command in an `&&` chain."  Session 45's `pmm_get_page_type`
+  result (the virtual-1 fault's walk was all `PAGE_TABLE`, ruling
+  out use-after-free) is a finding about one fault, not a general
   lesson, and lives in `open-issues.md` item 7 rather than here.
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Session 46's section is at the top; session 44's section is
-  recorded but **misplaced** (it sits after session 34), noted at
-  the top of the file and deferred.  There is no session-45
-  section: session 45's one kept commit is the tooling fix, named
-  in the session-46 section.
+  Session 47's section is at the top; session 46's is below it.
+  Session 44's section is recorded but **misplaced** (it sits after
+  session 34), noted at the top of the file and deferred.  There is
+  no session-45 section: session 45's one kept commit is the
+  tooling fix, named in the session-46 section.
 - `docs/open-issues.md` — full open-issues list.  Item 7 is
   TABLED (the boot-time `#PF`); item 8 is symlinks.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
@@ -542,7 +603,7 @@ needs it.  Paths relative to the tree root
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
 - `ROADMAP.md` — future work only.  Its "Make `/proc` possible"
-  section is partly done.
+  section is now largely done.
 - `README.md` — needs a review at the `v*` bump.
 - `run` — tracked; the build-and-capture fix lives here.
 
@@ -556,12 +617,14 @@ Newlib is gone.  The userland is a tracked source tree at
 `v0.6.8` the `*at()` family; `v0.6.9` envp, the `/usr/bin` layout,
 the `execve` shim removal; `v0.6.10` `realpath`, the `readlink`
 errno, and `/dev/null`.  On top of `v0.6.10`, on `dev` and
-untagged, session 44 built the pathname dispatch seam.  Session 45
-attempted the item-7 fix, produced a different fault it could not
-isolate, and reverted all kernel changes; it committed one tooling
-fix (the `run` script's build line).  **The boot-time `#PF` is
-TABLED, not fixed** — see `open-issues.md` item 7.  **Next:
-busybox enablement.**  One change at a time.**
+untagged, session 44 built the pathname dispatch seam, and session
+47 finished `/proc`: per-pid `stat`, `status`, and `cmdline`, the
+pid directory, and **`ps` and `pstree` work.**  Session 45
+attempted the item-7 fix and reverted all kernel changes; it
+committed one tooling fix (the `run` script's build line).  **The
+boot-time `#PF` is TABLED, not fixed** — see `open-issues.md` item
+7.  **Next: no single target chosen** — see "NEXT SESSION."  One
+change at a time.**
 
 ---
 
