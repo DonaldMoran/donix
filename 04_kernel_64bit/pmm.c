@@ -105,6 +105,66 @@ static const char* page_type_string(page_type_t type) {
     }
 }
 
+/*
+ * Scan one zone for a free, allocatable page, wrapping once.
+ *
+ * `from` is the zone's cursor; `lo` and `hi` are its bounds
+ * (inclusive); `min_page` is the lowest page number the caller may
+ * use (0, or 0x200 for kernel/table/reserved allocations, which must
+ * stay above 2 MB).  `up` is 1 for the LOW zone (scan from `from`
+ * toward `hi`) and 0 for HIGH (`from` toward `lo`).
+ *
+ * A single linear scan from the cursor does NOT find a page that has
+ * been free the whole time and sits on the far side of the cursor:
+ * the cursor only moves on allocate (past the page just taken) and on
+ * free (to the page just freed, if it is on the near side).  A page
+ * that was never taken, below a LOW cursor, is invisible to an upward
+ * scan -- which is what "Out of LOW-zone memory" with pmm_free_pages
+ * healthy means.  It reproduces after adding userland ELFs, because
+ * the extra early allocations push the cursor past pages that were
+ * free from boot, and it clears on reboot because pmm_compute_zones
+ * resets the cursor to the start of the zone.
+ *
+ * So scan [cursor, far] first; if that finds nothing, scan
+ * [near, cursor).  The cursor is not moved by a failed scan.
+ *
+ * Returns the page index, or 0 if the zone has no usable free page.
+ * (Page 0 is never allocatable, so 0 doubles as "not found".)
+ *
+ * Called with interrupts off (the caller holds pmm_irq_save).
+ */
+static uint64_t pmm_scan_zone(uint64_t from, uint64_t lo, uint64_t hi,
+                              int up, uint64_t min_page) {
+    if (up) {
+        /* Pass 1: cursor up to the far bound. */
+        for (uint64_t page = from; page <= hi; page++) {
+            if (page >= min_page && !bitmap_test(page)) return page;
+            if (page == hi) break;
+        }
+        /* Pass 2: the near bound up to just below the cursor. */
+        if (from > lo) {
+            for (uint64_t page = lo; page < from; page++) {
+                if (page >= min_page && !bitmap_test(page)) return page;
+                if (page == from - 1) break;
+            }
+        }
+    } else {
+        /* Pass 1: cursor down to the near bound. */
+        for (uint64_t page = from; page >= lo; page--) {
+            if (page >= min_page && !bitmap_test(page)) return page;
+            if (page == lo) break;
+        }
+        /* Pass 2: the far bound down to just above the cursor. */
+        if (from < hi) {
+            for (uint64_t page = hi; page > from; page--) {
+                if (page >= min_page && !bitmap_test(page)) return page;
+                if (page == from + 1) break;
+            }
+        }
+    }
+    return 0;
+}
+
 static void pmm_compute_zones(uint64_t max_pages) {
     uint64_t first_free = max_pages;
     uint64_t last_free  = 0;
@@ -378,6 +438,7 @@ static uint64_t pmm_alloc_diag_count = 0;
 uint64_t pmm_alloc_page(page_type_t type) {
     uint64_t max_pages = pmm_max_physical / PAGE_SIZE;
     if (max_pages > MAX_PAGES) max_pages = MAX_PAGES;
+    (void)max_pages;
 
 #if PMM_ALLOC_DIAG
     /*
@@ -425,25 +486,24 @@ uint64_t pmm_alloc_page(page_type_t type) {
             goto done;
         }
 
-        for (uint64_t page = pmm_next_high_page; page >= pmm_high_start_page; page--) {
-            if (!bitmap_test(page)) {
-                bitmap_set(page);
-                pmm_free_pages--;
-                pmm_next_high_page = (page > pmm_high_start_page) ? (page - 1) : pmm_high_start_page;
+        uint64_t page = pmm_scan_zone(pmm_next_high_page,
+                                      pmm_high_start_page, pmm_high_end_page,
+                                      0, 0);
+        if (page != 0) {
+            bitmap_set(page);
+            pmm_free_pages--;
+            pmm_next_high_page = (page > pmm_high_start_page) ? (page - 1) : pmm_high_start_page;
 
-                pmm_page_info[page].type = type;
-                pmm_page_info[page].ref_count = 1;
-                pmm_page_info[page].owner_pid = 0;
-                pmm_page_info[page].owner_virt = 0;
+            pmm_page_info[page].type = type;
+            pmm_page_info[page].ref_count = 1;
+            pmm_page_info[page].owner_pid = 0;
+            pmm_page_info[page].owner_virt = 0;
 
-                pages_by_type[PAGE_FREE]--;
-                pages_by_type[type]++;
+            pages_by_type[PAGE_FREE]--;
+            pages_by_type[type]++;
 
-                result = page * PAGE_SIZE;
-                goto done;
-            }
-
-            if (page == pmm_high_start_page) break;
+            result = page * PAGE_SIZE;
+            goto done;
         }
 
         serial_lock();
@@ -459,31 +519,37 @@ uint64_t pmm_alloc_page(page_type_t type) {
             goto done;
         }
 
-        for (uint64_t page = pmm_next_low_page; page <= pmm_low_end_page; page++) {
-            uint64_t phys = page * PAGE_SIZE;
+        /*
+         * Kernel, page-table, and reserved allocations must stay
+         * above 2 MB, so the scan's min_page is 0x200 for them and 0
+         * for everything else.  The skip is a property of the
+         * allocation type, not of one scan pass, so it is a scan
+         * parameter rather than a check inside the loop.
+         */
+        uint64_t min_page = 0;
+        if (type == PAGE_KERNEL || type == PAGE_PAGE_TABLE
+            || type == PAGE_RESERVED) {
+            min_page = 0x200;
+        }
 
-            if (type == PAGE_KERNEL || type == PAGE_PAGE_TABLE || type == PAGE_RESERVED) {
-                if (phys < 0x200000) continue;
-            }
+        uint64_t page = pmm_scan_zone(pmm_next_low_page,
+                                      pmm_low_start_page, pmm_low_end_page,
+                                      1, min_page);
+        if (page != 0) {
+            bitmap_set(page);
+            pmm_free_pages--;
+            pmm_next_low_page = (page < pmm_low_end_page) ? (page + 1) : pmm_low_end_page;
 
-            if (!bitmap_test(page)) {
-                bitmap_set(page);
-                pmm_free_pages--;
-                pmm_next_low_page = (page < pmm_low_end_page) ? (page + 1) : pmm_low_end_page;
+            pmm_page_info[page].type = type;
+            pmm_page_info[page].ref_count = 1;
+            pmm_page_info[page].owner_pid = 0;
+            pmm_page_info[page].owner_virt = 0;
 
-                pmm_page_info[page].type = type;
-                pmm_page_info[page].ref_count = 1;
-                pmm_page_info[page].owner_pid = 0;
-                pmm_page_info[page].owner_virt = 0;
+            pages_by_type[PAGE_FREE]--;
+            pages_by_type[type]++;
 
-                pages_by_type[PAGE_FREE]--;
-                pages_by_type[type]++;
-
-                result = phys;
-                goto done;
-            }
-
-            if (page == pmm_low_end_page) break;
+            result = page * PAGE_SIZE;
+            goto done;
         }
 
         serial_lock();

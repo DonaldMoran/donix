@@ -1,3 +1,69 @@
+## A zone scan that moves one way does not find pages behind its cursor
+
+*Session 48 (the double fault on the first boot after adding ELFs),
+commit pending.  The allocator was not out of memory; its scan could
+not reach the free pages it was counting.*
+
+A fresh boot after adding userland ELFs faulted at `0x400000` -- the
+`#PF` item 7 describes -- and then double-faulted.  It reproduced for
+a session, cleared on the second or third boot, and came back after
+the next image change.  The `#PF` was real, but the *reason the
+allocation failed* was in the PMM, not in `vmm_map_page_in_cr3`.
+
+**The zone scan started at a cursor and moved one direction.**
+
+    for (uint64_t page = pmm_next_low_page; page <= pmm_low_end_page; page++) {
+        if (!bitmap_test(page)) { ... return page; }
+        if (page == pmm_low_end_page) break;
+    }
+    // ... and if nothing was found:
+    serial_print("PMM: ERROR - Out of LOW-zone memory ...");
+
+The cursor advanced on every allocation, and the free paths rewound it
+when a freed page was on the *near* side.  But a page that had been
+free the whole time and sat on the **far** side of the cursor was
+never reached: the scan starts at the cursor and walks away from it.
+
+**Why adding ELFs triggered it.**  A bigger image moves `first_free`
+up and shrinks the free span, and more early allocations run before
+the boot ELF load.  That pushes `pmm_next_low_page` past pages that
+had been free from boot.  When the split in `vmm_map_page_in_cr3`
+asked for a page-table page, the scan started at the cursor, walked
+to `pmm_low_end_page`, found nothing, and returned 0 -- **with
+`pmm_free_pages` healthy and the free pages sitting just below the
+cursor.**  A reboot reset the cursor via `pmm_compute_zones`, which
+is why it cleared on the second or third boot.
+
+**The tell.**  An "Out of ... zone memory" message with a **nonzero**
+`Free pages:` count.  The counter and the scan disagree, and the
+counter is right: there *are* free pages, and the scan cannot reach
+them.
+
+**The fix.**  The scan wraps.  `pmm_scan_zone` tries `[cursor, far]`
+first and then `[near, cursor)`, so a page on the far side of the
+cursor is found on the second pass.  A failed scan does not move the
+cursor.  The per-type `phys < 0x200000` skip became a `min_page`
+parameter so both zones and all types share one scan function.
+
+**Why this is not item 7.**  Item 7 is the silent `if (!phys)
+return;` in `vmm_map_page_in_cr3`: the caller cannot see that the
+mapping failed.  That is a real defect and still needs the return
+value.  But *this* bug is why the allocation returned 0 in the first
+place, and it is a different thing: an allocator that cannot find
+memory it has.  Fixing item 7 alone would have turned "boots into a
+broken shell that double-faults" into "refuses to boot the shell,"
+which is a better failure but not a fix.
+
+**Where this shape recurs.**  Same family as "A fix with no test is
+indistinguishable from an unfixed defect" (session 43): a mechanism
+that looks correct and is not exercised by the workload that would
+expose it.  The kernel's own boot does not move the cursor far
+enough to reach the far side; adding ELFs does; and no test drove
+the allocator past its cursor until `mmap_stress` and `exec_churn`
+were written.  A test of the allocator's *accounting*
+(`pmm_free_pages`) is not a test of its *reach*.
+
+
 ## A /proc consumer can stat a path it never opens
 
 *Session 47 (`ps` printing no rows), commit `20261003-proc-ps`.  The
