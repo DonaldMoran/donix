@@ -11,6 +11,144 @@ Canary counts and new-test lists are here because they are nowhere
 else.  Commit narratives are in the commit messages and the tag
 annotations, not repeated here.
 
+## Session 51 — the item-7a `#PF` gets its instrument; a `#GP` at `0x42F1A7` appears
+
+One kernel commit and one docs commit on `dev`, both unpushed.
+**Not a milestone** — an instrument, and the record of a new
+intermittent fault found while verifying it.  The kernel commit
+names the failing site in `vmm_map_page_in_cr3`; it did not fire
+on the boots that followed, and the `#PF` did not reproduce.
+
+| Tag | What |
+|---|---|
+| `20261003-vmm-map-diag` | the three silent `return -1;` sites in `vmm_map_page_in_cr3` (PDPT / PD / PT) print `site`/`virt`/`cr3`/`free` before returning |
+| (none — docs commit) | `open-issues: record the session-51 #GP as item 7b; note 7a instrumented` |
+
+### The instrument, and why it is three sites
+
+Session 50's first boot reproduced the item-7a `#PF` and printed
+`ELF: COPY-FAIL phys=0 at vaddr=0x400000` — item 7's return-value
+plumbing working, the failure reported instead of swallowed.  But
+`vmm_map_page_in_cr3` has **four** page-table allocation sites, and
+the log could not say which one returned `-1`:
+
+- **PDPT** and **PD** — the first two directory levels, each still
+  a bare `if (!new_*_phys) return -1;`.
+- **SPLIT-PT** — the huge-page split's own allocation.  This one
+  **already halted loudly** (`VMM: FATAL page-table alloc failed;
+  cannot split huge page`) since session 42.  It was not the
+  silent site and is unchanged.
+- **PT** — the final level, *after* the split block, and the one
+  easy to miss: it shares the pointer name `new_pt_phys` with the
+  split's already-loud block.  Also a bare `return -1;`.
+
+The commit adds a one-line print to the **three silent** sites.  A
+reader scanning for `if (!new_*_phys) return -1;` finds two at a
+glance and the third only by reading past the split; the count was
+confirmed against the file before the patch, not assumed.
+
+    VMM: map failed site=PDPT virt=0x... cr3=0x... free=NNN
+    VMM: map failed site=PD   virt=0x... cr3=0x... free=NNN
+    VMM: map failed site=PT   virt=0x... cr3=0x... free=NNN
+
+The site name is the missing information.  The **`free` field** is
+what separates session 50's two candidates: a healthy count with
+`site=PDPT` or `site=PD` means the clone was missing that table
+(candidate b, a clone-correctness change); a near-zero count means
+genuine exhaustion (candidate a, an allocator change).  Fix after
+the log names the site, not before.
+
+**Failure branch only.**  A healthy boot reaches no new code and
+prints nothing; the linked `kernel.bin` is the same size as
+session 50's.  Permanent, not temporary — the session-48 rule: if
+it does not reproduce in N boots, the log is there when it does,
+and the cost is zero until then.
+
+### Three boots, and the `#GP` on one of them
+
+| Boot | Result |
+|---|---|
+| self-test only (`k` path) | `selftest` **18/18**; `create_fail` prints its three `PROCESS:` lines.  No fault. |
+| interactive, clean | `canary` **15/15**, `canary --full` **28/28**.  No `VMM: map failed` line.  Item-7a `#PF` did not reproduce. |
+| interactive, faulting | a **`#GP`** at `RIP=0x42F1A7`, error `0`, `CS=0x33`, in `busybox` pid=15 during `find / -type d`. |
+
+The item-7a `#PF` did not reproduce on any of the three — the
+session-48 shape, recorded, diagnostic kept in place.  **None of
+the three new sites was reached on the faulting boot**; the
+instrument is orthogonal to what happened there.
+
+### The `#GP`, recorded separately as item 7b
+
+    === GENERAL PROTECTION FAULT (#GP) ===
+      Faulting RIP : 0x000000000042F1A7
+      Code Seg (CS): 0x0000000000000033
+      Stack (RSP)  : 0x00000080000FBD98
+      Error Code   : 0x0000000000000000
+      Current PID : 15
+      Name        : busybox
+      entry_point : 0x0000000000411A92
+    EXIT: pid=15 state=2 parent=4 qhead=(empty)
+    EXIT-FALLBACK: switching to idle, exiting pid=15 name=busybox
+
+The process was killed and the shell fell back to idle; the `find`
+never completed.  The next boot ran the same row to completion.
+The full raw frame dump is in `capture.txt`; the summary and the
+raw facts are in `open-issues.md` item 7b.
+
+**It is not item 7a.**  Different vector (`#GP`, vector 13, not
+`#PF`, vector 14), different error code (`0`, not `0x15`),
+different location (busybox user text at `0x42F1A7`, not
+`0x400000`), different phase (a syscall in a process that had
+already been running, not an ELF load).  Item 7a's fault is at the
+ELF load, before any user instruction runs; this one is at an
+instruction in a live process.
+
+**Third in the same family.**  Session 45's virtual-1 `#PF`,
+session 50's `0x400000` `#PF`, and this: all intermittent,
+layout-dependent, first boot after an image change, gone on the
+next.  Whether the family has a single cause is unknown; the
+point of recording it is that three is a pattern, not a
+coincidence.
+
+**Unobserved, not fixed.**  It did not reproduce on the next boot.
+It needs its own instrument — a first-party reproduction of the
+`find` sequence, or a kernel-side `#GP` handler trace — before it
+is guessed at.  Busybox's symbols are not in the tree.
+
+### A process note
+
+The handoff's NEXT SESSION section listed the three sites to
+instrument.  Reading `vmm_map_page_in_cr3` against that list
+showed the third site — the final PT, after the split — is the
+one that reads like the split's already-loud block, and a session
+that trusted the list's "three sites" without reading would have
+been unsure which three.  The count was checked against the file
+before the patch; the patch quotes the bytes it replaces.  This is
+the handoff's "ask for source you do not have" applied to a list of
+sites rather than a file.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| `selftest` (`k` path) | **18 passed, 0 failed** |
+| `canary` | **15 passed, 0 failed** |
+| `canary --full` | **28 passed, 0 failed** |
+
+No `VMM: map failed` line on a healthy boot — which is the
+expected result, since every message this session added is on a
+path a healthy boot does not take.  No `PMM: WARNING - Double
+free`.  `kernel.bin` unchanged in size (162456 bytes).
+
+### Scratch tag kept
+
+`20261003-vmm-map-diag`, local, not pushed.  The docs commit that
+records item 7b rides untagged on `dev`, per the convention that a
+docs-only change gets no scratch tag.
+
+---
+
+
 ---
 
 ## Session 50 — the fault-injection test; `process_create`'s failure exits run
