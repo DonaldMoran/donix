@@ -6676,16 +6676,42 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
     ws->ws_ypixel = 0;
 }
 
+/*
+ * Is this fd backed by the console?  This is the honest test for
+ * "is a tty", and it is what ioctl(TCGETS) must answer.
+ *
+ * The previous test was `fd != 0 && fd != 1 && fd != 2`, i.e. it
+ * checked the fd NUMBER.  That is wrong: fd 0 can be a regular
+ * file.  gunzip FILE is exactly that case -- busybox opens FILE,
+ * puts it on fd 0, and then asks isatty(0) before deciding its
+ * input is "the terminal".  With the old check, TCGETS on fd 0
+ * succeeded, isatty(0) returned true, and bbunzip.c's guard
+ * (`if (!(option_mask32 & BBUNPK_OPT_FORCE) && isatty(STDIN_FILENO))`)
+ * fired -- refusing to decompress a named file unless -f was given.
+ *
+ * On a real Unix isatty(0) is false when fd 0 is a regular file, so
+ * the guard does not fire.  This makes donix agree: succeed only
+ * when the slot's kind is FILE_KIND_CONSOLE, so ash/stty/tty on the
+ * console keep working and gunzip FILE no longer lies about fd 0.
+ *
+ * A NULL slot (fd not open) and a non-console slot both yield
+ * -ENOTTY, which is what isatty() reports as "not a tty".
+ */
+static int fd_is_console(int fd) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    return slot && slot->kind == FILE_KIND_CONSOLE;
+}
+
 long sys_ioctl(int fd, unsigned long request, void* argp) {
     switch (request) {
         case TCGETS_: {
             /*
-             * Only fds 0/1/2 are terminals; anything else is a file
-             * or directory and gets -ENOTTY, which is the truth.
-             * argp must be a valid user pointer of at least
-             * sizeof(kernel_termios_t) bytes.
+             * Only the console is a terminal.  A regular file on
+             * fd 0/1/2 is NOT a tty and gets -ENOTTY -- see
+             * fd_is_console().  argp must be a valid user pointer
+             * of at least sizeof(kernel_termios_t) bytes.
              */
-            if (fd != 0 && fd != 1 && fd != 2) {
+            if (!fd_is_console(fd)) {
                 return -(long)ENOTTY;
             }
             if (!argp) {
@@ -6700,10 +6726,10 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
         }
         case TIOCGWINSZ_: {
             /*
-             * fd 0 is what ash probes, but answering on 0/1/2 is
-             * harmless and matches the TCGETS handling above.
+             * fd 0 is what ash probes.  Answer only for the
+             * console, matching the TCGETS handling above.
              */
-            if (fd != 0 && fd != 1 && fd != 2) {
+            if (!fd_is_console(fd)) {
                 return -(long)ENOTTY;
             }
             if (!argp) {
@@ -6724,8 +6750,9 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
              * Accept and ignore.  donix's console has no settable
              * line discipline or window size; pretending the write
              * succeeded is what ash expects and costs nothing.
+             * Only for the console -- a file fd is not a tty.
              */
-            if (fd != 0 && fd != 1 && fd != 2) {
+            if (!fd_is_console(fd)) {
                 return -(long)ENOTTY;
             }
             return 0;
