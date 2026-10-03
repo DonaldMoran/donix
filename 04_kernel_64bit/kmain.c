@@ -887,8 +887,30 @@ static int test_exception_proc(int vec, void (*trigger)(void)) {
     pcb_t* child = process_create("faulttest", (uint64_t)trigger, 0);
     if (!child) return SELFTEST_FAIL;
 
+    /*
+     * RACE FIX.  process_create enqueues the child on the ready
+     * queue before it returns, and the child's first instruction is
+     * the faulting one.  If a timer tick preempts us between
+     * process_create returning and g_expect_fault = vec executing,
+     * the scheduler runs the child, it faults, and the handler sees
+     * g_expect_fault == -1 -- takes the UNEXPECTED path, prints the
+     * dump, and halts.  That is the intermittent selftest failure at
+     * [exception_gp] (and the same shape for _de and _pf): the test
+     * passes on most boots and halts the machine on the boot where
+     * the tick lands in the window.
+     *
+     * Close the window by taking the child off the ready queue,
+     * arming the marker, and putting it back.  The child is not
+     * runnable while g_expect_fault is still -1, so there is no
+     * window.  Same pattern kmain.c's load_elf_into_user_process
+     * uses for the same reason.
+     */
+    scheduler_ready_queue_remove(child);
+
     g_fault_observed = -1;
     g_expect_fault   = vec;
+
+    scheduler_ready_queue_add(child);
 
     suspend_self_for_diagnostic();
     scheduler_switch_to(child);
@@ -919,9 +941,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.11\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.12\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.11 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.12 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1155,7 +1177,7 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.11\n> ");
+    vga_print("donix v0.6.12\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
