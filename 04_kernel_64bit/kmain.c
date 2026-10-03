@@ -219,6 +219,7 @@ static int test_syscall(void);
 static int test_ata(void);
 static int test_fat_mount(void);
 static int test_fat_ls(void);
+static int test_create_fail(void);
 
 /* Forward declaration: defined below kmain_shell_loop, called from
  * handle_command (the elfload command) and kmain. */
@@ -924,6 +925,140 @@ static int test_exception_pf(void) { return test_exception_proc(0x0E, fault_pf_t
 static int test_exception_gp(void) { return test_exception_proc(0x0D, fault_gp_trigger); }
 
 /* =====================================================================
+ * process_create failure-path test.
+ *
+ * Session 49 added real cleanup to process_create's failure exits --
+ * process_free_clone and friends -- and every one of them was
+ * "correct by inspection; UNEXERCISED."  A healthy boot never fails
+ * an allocation, so none of the cleanup code had ever run.  This
+ * test arms two fault-injection hooks and drives process_create into
+ * three of its four exits.
+ *
+ * The four exits, in the order process_create reaches them:
+ *
+ *   Exit 1: vmm_clone_page_table returns 0.  Reached by arming the
+ *           allocator hook for PAGE_PAGE_TABLE -- the clone's first
+ *           allocation is its PML4, so the clone returns 0 before
+ *           allocating anything.  process_create takes the
+ *           pcb->cr3 == 0 branch, which undoes the PCB slot and does
+ *           NOT call process_free_clone (the clone never happened,
+ *           so there is nothing to free).  This exercises the
+ *           undo-PCB-slot logic.
+ *
+ *   Exit 2: pmm_alloc_page_for_elf returns 0 in the user-stack loop.
+ *           Reached by arming the allocator hook for PAGE_USER_DATA:
+ *           the clone's allocations are all PAGE_PAGE_TABLE and are
+ *           not tripped, so the clone succeeds, and the first
+ *           user-stack page allocation fails.  process_create calls
+ *           process_cleanup_elf_pages (nothing tracked yet),
+ *           process_free_clone (the whole clone the previous step
+ *           built), and undoes the PCB slot.  This is the exit that
+ *           exercises process_free_clone on a fully-built clone.
+ *
+ *   Exit 3: vmm_map_page_in_cr3 returns -1 inside the stack loop.
+ *           NOT TESTED.  Reaching it deterministically needs a
+ *           page-table allocation to fail after the clone has
+ *           succeeded but before the stack loop's map call -- and
+ *           the clone's own table allocations are the same type
+ *           (PAGE_PAGE_TABLE), so a type-filtered hook cannot
+ *           separate them and a countdown would be brittle against
+ *           future changes to the clone's shape.  Exit 3 remains
+ *           correct by inspection.
+ *
+ *   Exit 4: kernel_stack_slot_alloc returns KERNEL_STACK_SLOT_NONE.
+ *           Not an allocation failure, so the allocator hook cannot
+ *           reach it.  Reached by the second hook,
+ *           process_debug_fail_next_stack_slot, which trips
+ *           kernel_stack_slot_alloc into its exhaustion return.
+ *           process_create calls process_cleanup_elf_pages,
+ *           process_free_clone, and undoes the PCB slot.
+ *
+ * In every case the assertion is the same: pmm_get_free_pages() is
+ * unchanged across the failed process_create.  A leak in any of the
+ * cleanup paths shows up as a free-page deficit, and a double-free
+ * shows up as a "PMM: WARNING - Double free" line on the serial
+ * console.
+ * ===================================================================== */
+static int test_create_fail(void) {
+    PRINT_BOTH("\n=== process_create failure-path test ===\n");
+    int ok = 1;
+
+    /* Exit 1: clone fails on its first table allocation. */
+    {
+        uint64_t before = pmm_get_free_pages();
+        pmm_debug_fail_next_of_type(PAGE_PAGE_TABLE);
+        pcb_t* p = process_create("fail_clone", 0, 0);
+        uint64_t after = pmm_get_free_pages();
+        if (p != NULL) {
+            PRINT_BOTH("  exit1: process_create SUCCEEDED (expected NULL)\n");
+            process_destroy(p);
+            ok = 0;
+        } else if (after != before) {
+            PRINT_BOTH("  exit1: free-page leak before=");
+            PRINT_BOTH_DEC(before);
+            PRINT_BOTH(" after=");
+            PRINT_BOTH_DEC(after);
+            PRINT_BOTH("\n");
+            ok = 0;
+        } else {
+            PRINT_BOTH("  exit1 (clone fail):       no leak\n");
+        }
+    }
+
+    /* Exit 2: clone succeeds; first user-stack page allocation fails. */
+    {
+        uint64_t before = pmm_get_free_pages();
+        pmm_debug_fail_next_of_type(PAGE_USER_DATA);
+        pcb_t* p = process_create("fail_stack", 0x400000ULL, 0);
+        uint64_t after = pmm_get_free_pages();
+        if (p != NULL) {
+            PRINT_BOTH("  exit2: process_create SUCCEEDED (expected NULL)\n");
+            process_destroy(p);
+            ok = 0;
+        } else if (after != before) {
+            PRINT_BOTH("  exit2: free-page leak before=");
+            PRINT_BOTH_DEC(before);
+            PRINT_BOTH(" after=");
+            PRINT_BOTH_DEC(after);
+            PRINT_BOTH("\n");
+            ok = 0;
+        } else {
+            PRINT_BOTH("  exit2 (stack alloc fail): no leak\n");
+        }
+    }
+
+    /* Exit 4: kernel stack pool exhaustion.  The entry point must be
+     * non-zero and below KERNEL_BASE so process_create reaches
+     * kernel_stack_slot_alloc with the user-stack pages already
+     * allocated and tracked -- that is the most cleanup the slot
+     * failure can be made to exercise. */
+    {
+        uint64_t before = pmm_get_free_pages();
+        process_debug_fail_next_stack_slot();
+        pcb_t* p = process_create("fail_slot", 0x400000ULL, 0);
+        uint64_t after = pmm_get_free_pages();
+        if (p != NULL) {
+            PRINT_BOTH("  exit4: process_create SUCCEEDED (expected NULL)\n");
+            process_destroy(p);
+            ok = 0;
+        } else if (after != before) {
+            PRINT_BOTH("  exit4: free-page leak before=");
+            PRINT_BOTH_DEC(before);
+            PRINT_BOTH(" after=");
+            PRINT_BOTH_DEC(after);
+            PRINT_BOTH("\n");
+            ok = 0;
+        } else {
+            PRINT_BOTH("  exit4 (stack slot fail):  no leak\n");
+        }
+    }
+
+    PRINT_BOTH(ok ? "  Status   : SUCCESS (3 of 4 exits exercised)\n"
+                  : "  Status   : FAILED\n");
+    return ok ? SELFTEST_PASS : SELFTEST_FAIL;
+}
+
+/* =====================================================================
  * Shell command dispatch.
  *
  * Each test command is a thin wrapper around its test_xxx function.
@@ -1165,6 +1300,7 @@ static void handle_command(const char *cmd) {
         RUN(exception_de);
         RUN(exception_pf);
         RUN(exception_gp);
+        RUN(create_fail);
 
         #undef RUN
 

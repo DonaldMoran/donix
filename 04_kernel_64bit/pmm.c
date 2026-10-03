@@ -38,6 +38,25 @@ static uint64_t pmm_next_high_page = 0;
 static uint64_t pages_by_type[PAGE_TYPE_COUNT] = {0};
 
 /*
+ * Fault-injection state.  See pmm_debug_fail_next_of_type in pmm.h
+ * for the contract.  `pmm_fail_armed` is the one-shot latch;
+ * `pmm_fail_type` is the type the next matching allocation must
+ * have.  Both are read and written with interrupts off, inside
+ * pmm_alloc_page's critical section, except for the setter, which
+ * runs on the kernel self-test path with interrupts on.
+ *
+ * One branch on the hot path: predictable, and the flag is 0 on a
+ * healthy boot.
+ */
+static int pmm_fail_armed = 0;
+static page_type_t pmm_fail_type = PAGE_FREE;
+
+void pmm_debug_fail_next_of_type(page_type_t type) {
+    pmm_fail_armed = 1;
+    pmm_fail_type = type;
+}
+
+/*
  * Save RFLAGS into *flags and disable interrupts.
  * Restore with pmm_irq_restore(*flags).
  *
@@ -439,6 +458,19 @@ uint64_t pmm_alloc_page(page_type_t type) {
     uint64_t max_pages = pmm_max_physical / PAGE_SIZE;
     if (max_pages > MAX_PAGES) max_pages = MAX_PAGES;
     (void)max_pages;
+
+    /*
+     * Fault-injection hook.  Checked before the diagnostic block and
+     * before the interrupt-save critical section: the hook is armed
+     * and disarmed only on the kernel self-test path, which runs
+     * single-threaded from the kernel shell, so no locking is needed
+     * for the flag itself.  A match consumes the arm and returns 0
+     * exactly as an out-of-memory allocation would.
+     */
+    if (pmm_fail_armed && type == pmm_fail_type) {
+        pmm_fail_armed = 0;
+        return 0;
+    }
 
 #if PMM_ALLOC_DIAG
     /*

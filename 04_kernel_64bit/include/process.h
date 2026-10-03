@@ -208,6 +208,22 @@ void kernel_idle_loop(void);
 void process_wake_all_blocked(void);
 
 /*
+ * Fault-injection hook for the process_create failure-path test
+ * (kmain.c, test_create_fail).
+ *
+ * Arms a one-shot failure on the next kernel_stack_slot_alloc, which
+ * returns KERNEL_STACK_SLOT_NONE without touching the slot table.
+ * The hook disarms itself on that call.
+ *
+ * This is separate from pmm_debug_fail_next_of_type because exit 4
+ * of process_create is not an allocation failure: it fires when the
+ * kernel stack pool is exhausted, which no pmm hook can reach.
+ *
+ * Kernel-side only; no syscall door.
+ */
+void process_debug_fail_next_stack_slot(void);
+
+/*
  * Wake the parent of `child` if it is blocked in waitpid on this
  * child (or on any child, which is wait_pid == (uint64_t)-1).
  * Called from process_exit before the exiting process becomes a

@@ -15,6 +15,18 @@
 
 static uint8_t kernel_stack_pool[MAX_PROCESSES][PROC_STACK_SIZE] __attribute__((aligned(16)));
 static pcb_t* slot_owner[MAX_PROCESSES];
+
+/*
+ * Fault-injection state for the process_create failure-path test.
+ * See process_debug_fail_next_stack_slot in process.h.  One-shot
+ * latch, armed and consumed on the kernel self-test path, which
+ * runs single-threaded from the kernel shell.
+ */
+static int kernel_stack_slot_fail_next = 0;
+
+void process_debug_fail_next_stack_slot(void) {
+    kernel_stack_slot_fail_next = 1;
+}
 static pcb_t pcb_pool[MAX_PROCESSES];
 static pcb_t* current_process = NULL;
 static uint64_t next_pid = 1;
@@ -30,6 +42,16 @@ static void process_initialize_pcb(pcb_t* pcb);
 #define KERNEL_BASE 0xFFFFFFFF80000000ULL
 
 static int kernel_stack_slot_alloc(pcb_t* pcb) {
+    /*
+     * Fault-injection hook.  Consumes the arm and reports the same
+     * exhaustion the loop below reports when the pool is full, so
+     * the caller cannot tell the two apart -- which is the point.
+     */
+    if (kernel_stack_slot_fail_next) {
+        kernel_stack_slot_fail_next = 0;
+        return KERNEL_STACK_SLOT_NONE;
+    }
+
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (slot_owner[i] == NULL) {
             slot_owner[i] = pcb;

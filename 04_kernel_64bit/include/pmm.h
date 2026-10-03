@@ -70,4 +70,21 @@ uint64_t pmm_get_free_pages(void);
 uint64_t pmm_get_total_pages(void);
 void pmm_dump_stats(void);
 
+/*
+ * Fault-injection hook for the process_create failure-path test
+ * (kmain.c, test_create_fail).
+ *
+ * Arms a one-shot failure on the next pmm_alloc_page whose `type`
+ * matches.  The next matching allocation returns 0 without touching
+ * the bitmap, the zone cursor, or any counter; the hook disarms
+ * itself on the first match.  A non-matching allocation is served
+ * normally and does not disarm.
+ *
+ * Kernel-side only; no syscall door.  It exists so a test can drive
+ * process_create into its allocation-failure exits, which a healthy
+ * boot never reaches.  See docs/gotchas.md, "A function that has
+ * never run is correct by inspection only."
+ */
+void pmm_debug_fail_next_of_type(page_type_t type);
+
 #endif
