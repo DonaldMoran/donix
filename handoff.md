@@ -3,67 +3,27 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-02 (session 45 closed; **nothing
-committed for the kernel** -- the session's kernel work was
-reverted)
-**Current HEAD:** branch `dev` at `6cfb0e6` (`run: rebuild the
-kernel explicitly and capture the whole build`), **not pushed** —
-`origin/dev` is at `v0.6.10` (`70c85c6`), nine commits behind.
-Below it, `7745f3d` (`20261002-docs-seam`, session 44's docs
-commit).  `main` is at the `v0.6.10` merge commit `cc38646`.
-Working tree clean.  Two untracked files: `PFcapture.txt` and
-`BOOT_PF.TXT` (see the warning below).
+**Last updated:** 2026-10-02 (session 46: the boot-time `#PF` is
+**tabled**, not fixed; the next session is pointed at busybox
+enablement)
+**Current HEAD:** branch `dev` at `7f1d6b2` (`handoff: rewrite
+fresh for session 45`), **not pushed** — `origin/dev` is at
+`v0.6.10` (`70c85c6`), ten commits behind.  Below it, `6cfb0e6`
+(the `run` build-capture fix) and `7745f3d` (`20261002-docs-seam`).
+`main` is at the `v0.6.10` merge commit `cc38646`.  Working tree
+clean.  One untracked file: `PFcapture.txt` (the presentation-2
+`#PF` capture; keep it).
 **Last milestone:** `v0.6.10` (published).  **No milestone has been
-opened or closed for session 45** — the one commit it produced is a
-tooling fix, not a milestone.
+opened or closed since.**
 
-> ### ⚠ The boot-time `#PF` at `0x400000` is OPEN and reproduces.
->
-> It is `open-issues.md` item 7: a silent `if (!phys) return;` in
-> `vmm_map_page_in_cr3`.  It has **two presentations**, and both are
-> the same root cause:
->
-> **Presentation 1 (with the huge-page path, before session 45):**
-> ```
-> CR2 = RIP = 0x400000
-> Raw Error Code = 0x15       (present, write, user, fetch)
-> pde = 0x400083              (2 MB huge page, SUPERVISOR)
-> ```
-> The bootloader's 2 MB supervisor identity map at `pd[2]`, left in
-> place because the on-demand split in `vmm_map_page_in_cr3` could
-> not allocate a table page and returned silently.  Captured in
-> `BOOT_PF.TXT`.
->
-> **Presentation 2 (after session 45's work, then reverted):**
-> ```
-> CR2 = RIP = 0x400000
-> Raw Error Code = 0x14       (not present, user, fetch)
-> pde = 0x0000000000000000    (absent)
-> ```
-> The PD→PT allocation in `vmm_map_page_in_cr3` returned silently,
-> so the mapping at `0x400000` was never made.  Captured in
-> `PFcapture.txt`.
->
-> Both are intermittent and both are allocator-state dependent: the
-> LOW zone (`pmm_compute_zones` gives it a quarter of free memory)
-> serves every page-table page in the system, and a rebuild that
-> adds userland programs consumes more of it before the boot ELF
-> load runs.
->
-> **`elf_load_into_process` cannot see the failure.**  Its
-> `vmm_map_page_in_cr3` call returns `void`; the loop proceeds;
-> `elf_load_into_process` returns `ehdr->e_entry` even when a
-> segment page was not mapped; `kmain` sees a nonzero entry, adds
-> the shell to the ready queue, and the shell faults on its first
-> fetch.  **This is why no diagnostic printed.**
->
-> **The fix is item 7's honest fix:** give `vmm_map_page_in_cr3`
-> a return value, check it in `elf_load_into_process` and every
-> other caller, and fail the load cleanly.  This was attempted in
-> session 45 and reverted; see "Session 45, and what it reverted."
-> Source needed: `04_kernel_64bit/vmm.c` (the six silent returns),
-> `04_kernel_64bit/elf.c`, `04_kernel_64bit/include/vmm.h`,
-> `docs/open-issues.md` item 7, `PFcapture.txt`, `BOOT_PF.TXT`.
+> **Tabled: the boot-time `#PF` at `0x400000`.**  It is
+> `open-issues.md` item 7, now marked TABLED.  It is intermittent
+> and allocator-state dependent, and not currently observed.  **Do
+> not start a session on it** unless it reappears.  The findings —
+> both presentations, session 45's virtual-1 fault, and the
+> `vmm_clone_page_table` lessons — are in item 7.  The one capture
+> on disk is `PFcapture.txt` (presentation 2); presentation 1's
+> capture is not on disk and its dump lives in item 7.
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
@@ -243,133 +203,13 @@ the real tree without a build and test in the real tree.
 
 ---
 
-## Session 45, and what it reverted
+## Session 45 — reverted, and what it left
 
-Session 45's purpose was to close `open-issues.md` item 7 and the
-boot-time `#PF` it causes.  **No kernel change was committed.**  The
-session attempted three kernel changes and reverted all three.  Its
-findings stand and are recorded here so the next session does not
-repeat them.  It also produced one tooling commit (`6cfb0e6`, the
-`run` fix) which is kept.
-
-### Attempted: Fix B — the clone must not copy supervisor huge pages
-
-`vmm_clone_page_table`'s low-half deep copy copied 2 MB huge PDEs
-verbatim.  For the bootloader's supervisor identity map, that put
-a 2 MB **supervisor** huge page at `pd[2]` in a user process's
-copy.  The only thing that made it usable was the on-demand split
-in `vmm_map_page_in_cr3`; when that split's allocation failed, the
-supervisor page stayed and the process faulted.
-
-The change: in the low-half loop, skip a PDE with the PS bit set
-(`if (src_pde & 0x80) continue;`).
-
-**It was committed (`157627c`, tag `20261002-vmm-clone-nohuge`),
-and then reverted.**  Its reasoning is correct and the change is
-worth making, **but it did not close the fault.**  The commit
-message claimed it closed the boot-time `#PF`; it did not.  The
-fault reproduces with presentation 2 (`pde = 0`, not-present).
-The commit, its tag, and its message were removed in the same
-session, because a commit whose message makes a claim the tree does
-not support is the shape this file warns about.
-
-**The finding stands:** a user process's low half should not
-contain supervisor huge pages.  Re-apply this change when item 7
-is being fixed, and commit it with an honest message.
-
-### Attempted: the signature change (item 7's honest fix)
-
-`vmm_map_page` and `vmm_map_page_in_cr3` were changed to return
-`int` (0 / -1), and `elf_load_into_process` was to check the
-return in its segment loop.  This is what item 7 calls "the honest
-fix, and the larger one."
-
-**It was not committed.**  It compiled and booted, but
-`canary --full` faulted at a **different** address and a
-**different** mechanism:
-
-```
-CR2 = RIP = 0x1
-Raw Error Code = 0x15       (present, write, user, fetch)
-pte = 0x0000000000000003    (present, write, NO user)
-PTE PRESENT, phys 0x0000000000000001
-pmm: pml4=2 pdpt=2 pd=2 pt=2    (every page PAGE_TABLE)
-```
-
-A `pmm_get_page_type` diagnostic was added to `isr14_handler` and
-proved the walk's pages were **all `PAGE_TABLE`** — so the fault is
-**not** a use-after-free of a page-table page.  The leaf PTE
-(`0x3`, phys 1, no `PT_USER`) is a supervisor entry, in a
-hierarchy whose upper levels carry `PT_USER`.  **The mechanism was
-never isolated.**  The signature change was reverted; the fault
-has not been seen since.
-
-**Two hypotheses, both unverified:**
-1. The signature change itself caused it (a caller updated
-   incorrectly), and it will not recur when the change is redone.
-2. It is latent, exposed by the signature change, and will return.
-
-The next session must treat this as **unknown**, not as "fixed by
-the revert."  Re-apply the `pmm_get_page_type` diagnostic at the
-start of the work, and if the fault reproduces, isolate it before
-doing anything else.
-
-**The `pmm_get_page_type` diagnostic** was added to
-`interrupts.c`'s `isr14_handler` and then reverted.  It is worth
-re-adding while item 7 is being worked.  Its result is recorded in
-`docs/gotchas.md`.
-
-### Attempted: a leaf-copy edit — and it broke the kernel
-
-An attempt was made to fix the huge-page problem in
-`vmm_clone_page_table`'s **leaf copy** instead of the PDE loop:
-copy only leaf entries with `PT_USER` set.  This was **wrong**: the
-**kernel's own** low-half identity map is exactly where the kernel
-needs its supervisor entries, and `vmm_clone_page_table` is called
-to clone the kernel's CR3 for the kernel shell and the idle
-process too.  The kernel faulted reading its own identity map at
-`0x18038` on the next boot.  This edit was reverted and never
-committed.
-
-**The lesson:** `vmm_clone_page_table` serves both user and kernel
-processes and does **not** currently know which it is cloning for.
-Any change that treats the low half as "always user" is wrong.  A
-correct fix must distinguish the two, or must not live in the
-clone at all.
-
-### Kept: the `run` script's build-and-capture fix (`6cfb0e6`)
-
-The `run` script's active line was:
-
-```
-make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
-```
-
-Two problems:
-
-1. `> capture.txt` binds only to the last command in the `&&`
-   chain.  The kernel build, the image build, and the top-level
-   `clean` wrote to the terminal and were **not captured**.  Every
-   capture from a run this way was missing the front of the build,
-   including whether the kernel was rebuilt.
-2. The top-level `make FAT_CONFIG=single` (no target) selects
-   `all`, which builds `boot16 boot32 boot64 kernel64 bootkernel64`
-   — the 16-bit, 32-bit, and 64-bit boot demos, which are not part
-   of the kernel build.
-
-The fixed line:
-
-```
-{ make -C 04_kernel_64bit clean && \
-  make -C 04_kernel_64bit FAT_CONFIG=single && \
-  make -C 05_boot_kernel64 hdd-single.img && \
-  make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
-```
-
-The brace group makes the pipe and the redirection apply to the
-whole chain.  `tee` writes to the terminal and to `capture.txt`.
-The explicit `make -C 04_kernel_64bit` stages make the kernel
-build appear in the log.  **Committed as `6cfb0e6`.**
+Session 45 attempted the item-7 kernel fix three ways and reverted
+all three; **no kernel change was committed.**  Its findings are
+now in `open-issues.md` item 7 (the tabled item).  The one thing it
+kept was the `run` script's build-and-capture fix, committed as
+`6cfb0e6`.
 
 ---
 
@@ -436,96 +276,83 @@ Boot clean, no `Unknown syscall:` lines, no faults.
 
 ---
 
-## NEXT SESSION — `open-issues.md` item 7, the honest fix
+## NEXT SESSION — busybox enablement
 
-**This is the only thing between the tree and a `v*` bump.**  It is
-not feature work.  It is the silent `if (!phys) return;` in
-`vmm_map_page_in_cr3` (and `vmm_map_page`), which the boot-time
-`#PF` at `0x400000` comes through.
+**Turn on one applet.**  The seam is shipped; the tree is green;
+the `#PF` is tabled.  This is feature work.
 
-### What the session is
+### The rule
 
-Two changes:
+**Enable an applet only when the syscalls it actually calls are
+implemented — read the applet's source, do not guess from its
+name.**  When something is missing, the question is "how big is
+it?" — a table entry and a directory shape is a session's work; a
+signal-delivery subsystem is not.  A syscall that exists but
+cannot do its job (a `chmod` on a filesystem with no permissions)
+is worse than a missing one: it makes the applet lie.  See
+`docs/gotchas.md`, "A consumer inferred from behavior is not a
+consumer."
 
-1. **The signature change.**  `vmm_map_page` and
-   `vmm_map_page_in_cr3` return `int` (0 / -1); every caller checks;
-   `elf_load_into_process` fails the load cleanly on a failed
-   segment mapping, which `kmain`'s `load_elf_into_user_process`
-   already turns into `PANIC: musl_sh ELF load failed`.
-   - The signature was attempted in session 45 and produced the
-     virtual-1 fault (`pte = 0x3`).  **Re-apply the
-     `pmm_get_page_type` diagnostic in `isr14_handler` at the start
-     of this work**, and if the fault reproduces, isolate it
-     before proceeding.  Treat the virtual-1 fault as **unknown**,
-     not as "fixed by the revert."
-   - The `vmm_clone_page_table` huge-page skip (session 45's
-     "Fix B") belongs with this change and should be committed
-     alongside it, with an honest message.
-   - **Do not** change `vmm_clone_page_table`'s leaf copy to
-     filter on `PT_USER`; that broke the kernel's own identity map
-     in session 45.  See "Session 45, and what it reverted."
+### Candidates, and what each actually needs
 
-2. **Verify with `canary --full` on a fresh, verified build.**
-   The `run` script now captures the whole build (`6cfb0e6`), so
-   the log shows whether the kernel was rebuilt.  The verification
-   bar for this fix is:
-   - a fresh build from source,
-   - boot,
-   - `canary` 15/15,
-   - `canary --full` 28/28,
-   - **and the same on two more consecutive boots.**
+The seam made the next pieces smaller rather than turning any
+applet on by itself: `readdir("/proc")` and a per-pid entry are
+now a table entry and a directory shape, not an architectural
+change.  Some applets need only that; some need a subsystem.  Read
+the applet's source and judge the size.  Concrete near-term
+candidates:
 
-   A single clean boot is not evidence; session 45 showed the
-   fault is intermittent, and one clean boot of the same image
-   proves nothing.
+- **`/proc` directory shape** — `readdir("/proc")` returning
+  `self`, plus a per-pid `stat` entry.  This is the prerequisite
+  for `ps`/`top`/`kill`/`pidof`.  It is the seam's next consumer.
+- **Symlinks** (`open-issues.md` item 8) — `ln`, `link`,
+  `readlink` with real targets, `realpath` correctness, archive
+  link restoration.  Design is recorded; the seam exists to hide
+  the encoding.
+- **`/dev/tty`** — unblocks the pagers (`less`/`more`).
+- **`stat` on many paths for tab completion** — probably works
+  already; test it.
 
-### What the session needs to read
-
-- **`04_kernel_64bit/vmm.c`** — the six `if (!phys) return;`
-  sites in `vmm_map_page` and `vmm_map_page_in_cr3`.
-- **`04_kernel_64bit/elf.c`** — `elf_load_into_process`, its
-  segment loop, and its `return ehdr->e_entry` on success.
-- **`04_kernel_64bit/include/vmm.h`** — the signatures to change.
-- **`04_kernel_64bit/interrupts.c`** — `isr14_handler`, where the
-  `pmm_get_page_type` diagnostic goes.
-- **`docs/open-issues.md` item 7** — the list of silent returns.
-- **`PFcapture.txt`** — presentation 2 of the fault.
-- **`BOOT_PF.TXT`** — presentation 1.
-- **`docs/gotchas.md`** — "A shim's dead code is only dead if you
-  watch it not run," and the new session-45 entries.
+Pick one, read the applet's source against the implemented syscall
+set, and make the smallest change that turns it on.
 
 ### Do not
 
-Do not tag `v*`.  Do not schedule feature work ahead of item 7.
-Do not add a userland program to the image for any purpose other
-than exercising the reproducer the item names.
+Do not tag `v*` in this session unless the change is verified and
+you choose to.  Do not reopen item 7.  One change at a time.
 
 ---
 
-## Busybox enablement — unchanged from session 44
+## Busybox enablement — state of play
 
-**The seam did not make any applet in the "still off" table
-enableable.**  This is worth stating plainly, because the seam is
-`/dev` and `/proc` work and the intuition is that `/proc` applets
-should now turn on.  They do not.
+**The seam did not make any applet in the table below enableable
+by itself.**  It made the next pieces smaller.  This is worth
+stating plainly, because the seam is `/dev` and `/proc` work and
+the intuition is that `/proc` applets should now turn on.  They do
+not yet — but the work to turn them on is now a table entry and a
+directory shape, not an architectural change.
 
 - **`ps`** reads `/proc/<pid>/stat` for **every** pid and
   `readdir`s `/proc` to enumerate them.  Neither a listable
-  `/proc` nor any per-pid entry exists.  Does not turn on.
-- **`top`**, **`kill`**, **`pidof`** — same.  Do not turn on.
+  `/proc` nor any per-pid entry exists.  Needs the `/proc`
+  directory shape.
+- **`top`**, **`kill`**, **`pidof`** — same.
 - **`less`/`more`** need raw-mode terminal control and open
-  `/dev/tty`.  `/dev/tty` does not exist.  Do not turn on.
+  `/dev/tty`.  `/dev/tty` does not exist.
 
 **The one applet whose behavior changed is `tty`.**  It prints
 `/dev/console` now.
 
-**What the seam did do is make the next piece of `/proc` smaller.**
-Adding `readdir("/proc")` and a `/proc/<pid>/stat` entry is now a
-**table entry and a directory shape**, not an architectural change.
+### What each still-off applet needs
 
-### Still off — needs a subsystem (do not enable yet)
+Each row is a **cost estimate, not a prohibition**.  Sometimes the
+missing piece is small and we write it — that is how `tty` was
+enabled.  Sometimes it is a whole subsystem (signal delivery, a
+network stack, a VFS) and we do not write it just to turn on one
+applet.  The rule is **know what you are signing up for** before
+you enable.
 
-| Config | Applet | Blocked by |
+| Config | Applet | Needs |
 |---|---|---|
 | `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous `mmap`); deliberate |
 | `CONFIG_CHMOD` | `chmod` | `chmod`/`fchmodat`; FAT has no permissions |
@@ -546,8 +373,13 @@ Adding `readdir("/proc")` and a `/proc/<pid>/stat` entry is now a
 
 **Enable an applet only when the syscalls it actually calls are
 implemented — read the applet's source, do not guess from its
-name.**  See `docs/gotchas.md`, "A consumer inferred from behavior
-is not a consumer."
+name.**  When something is missing, the question is "how big is
+it?" — a table entry and a directory shape is a session's work; a
+signal-delivery subsystem is not.  A syscall that exists but
+cannot do its job (a `chmod` on a filesystem with no permissions)
+is worse than a missing one: it makes the applet lie.  See
+`docs/gotchas.md`, "A consumer inferred from behavior is not a
+consumer."
 
 ---
 
@@ -620,9 +452,8 @@ appear, and neither do the `f_open FAIL path=dev/null` lines from
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
 1. **`open-issues.md` item 7: the silent `vmm_map_page*` returns,
-   and the boot-time `#PF` they cause.**  **The next session's
-   work.**  See the warning at the top of this file and the
-   "NEXT SESSION" section.  Two presentations, one root cause.
+   and the boot-time `#PF` they cause.**  **TABLED; not currently
+   observed.**  Do not start a session on it unless it reappears.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
 4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
@@ -630,11 +461,6 @@ appear, and neither do the `f_open FAIL path=dev/null` lines from
 5. **`-EPIPE` is delivered without `SIGPIPE`.**  Fixing it means
    signal delivery — the same subsystem `reboot`/`halt`/`poweroff`
    need.
-
-**Item 1 in `open-issues.md` is now stale and must be rewritten.**
-It says `sys_execve`'s path attempts and `resolve_against_cwd` are
-"what the dispatch seam subsumes, when the seam lands."  The seam
-landed in session 44.  Item 1's premise is false.
 
 Also open: `unlinkat` has no consumer; `sys_brk`'s fixed
 `heap_base` and the 4 MB mmap window; real FatFs timestamp
@@ -650,7 +476,7 @@ support one concurrent reader and one concurrent writer;
 **Session 45 added:** the user-mode `#PF` at virtual 1
 (`CR2 = RIP = 0x1`, `pte = 0x3`, phys 1, `pmm=2` on every page of
 the walk) — observed with the signature change, not since,
-**unresolved**.  See "Session 45, and what it reverted."
+**unresolved**.  Recorded in `open-issues.md` item 7.
 
 ---
 
@@ -681,10 +507,9 @@ the walk) — observed with the signature change, not since,
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   — gitignored; rebuild with `./toolchain/install_musl.sh`.
 - `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
-- `BOOT_PF.TXT` — untracked, the vmm crash capture (presentation
-  1); **keep it**.
 - `PFcapture.txt` — untracked, the vmm crash capture
-  (presentation 2); **keep it**.
+  (presentation 2); **keep it**.  Presentation 1's capture is not
+  on disk; its dump is in `docs/open-issues.md` item 7.
 - `run` — tracked; the build-and-capture fix is committed as
   `6cfb0e6`.
 
@@ -708,8 +533,8 @@ needs it.  Paths relative to the tree root
 - `docs/session-log.md` — commit tables and per-test canary notes.
   Session 44's commits are recorded; **session 45's are not** (its
   one commit is the tooling fix, `6cfb0e6`).
-- `docs/open-issues.md` — full open-issues list.  Item 1 is stale;
-  item 7 is the next session's work.
+- `docs/open-issues.md` — full open-issues list.  Item 7 is
+  TABLED (the boot-time `#PF`); item 8 is symlinks.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative.
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
@@ -732,10 +557,9 @@ errno, and `/dev/null`.  On top of `v0.6.10`, on `dev` and
 untagged, session 44 built the pathname dispatch seam.  Session 45
 attempted the item-7 fix, produced a different fault it could not
 isolate, and reverted all kernel changes; it committed one tooling
-fix (`6cfb0e6`, the `run` script's build line).  **Next:
-`open-issues.md` item 7, the silent `vmm_map_page*` returns and the
-boot-time `#PF` at `0x400000`.  Do not tag a `v*`.  One change at a
-time.**
+fix (`6cfb0e6`, the `run` script's build line).  **The boot-time
+`#PF` is TABLED, not fixed** — see `open-issues.md` item 7.  **Next:
+busybox enablement.**  One change at a time.**
 
 ---
 

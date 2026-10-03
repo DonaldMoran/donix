@@ -81,8 +81,11 @@
    from behavior is not a consumer."
 
 7. **The silent `vmm_map_page*` returns, and the boot-time `#PF`
-   they cause.**  This is **the next session's work**, and it is
-   now observed, not theoretical.
+   they cause.**  **TABLED as of session 46.**  The fault is
+   intermittent and allocator-state dependent; it is not currently
+   observed.  Do not start a session on it unless it reappears.
+   The findings are kept below so a future session does not have to
+   rediscover them.  A `v*` bump may ship with this item open.
 
    `vmm_map_page_in_cr3` and `vmm_map_page` walk the page tables
    and, at each level, call `pmm_alloc_page_for_tables()` if the
@@ -114,8 +117,10 @@
    ```
 
    `0x83` is present, write, PS — and **`PT_USER` clear**.  `0x15`
-   is present + read + user + instruction-fetch.  The capture is
-   saved as **`BOOT_PF.TXT`** at the project root.
+   is present + read + user + instruction-fetch.  **This
+   presentation-1 capture is not on disk**; the fault dump above is
+   its record.  The only capture in the tree is **`PFcapture.txt`**,
+   which holds presentation 2 (below).
 
    **Two observations make it reproducible, and they are the
    useful part:**
@@ -154,9 +159,31 @@
      (matches the kernel idiom, smaller, but turns a recoverable
      allocation failure into a dead machine).
 
-   **Do not tag a `v*` until this is closed.**  See `handoff.md`
-   for the next session's reading list: `vmm.c`, the diff of
-   `20261001-splitfix`, and `BOOT_PF.TXT`.
+   **Session 45 observations (unresolved; kept for whoever reopens
+   this).**  Session 45 attempted the signature change and reverted
+   it.  It compiled and booted, but `canary --full` faulted at a
+   different address and mechanism:
+
+   ```
+   CR2 = RIP = 0x1
+   Raw Error Code = 0x15       (present, write, user, fetch)
+   pte = 0x0000000000000003    (present, write, NO user)
+   PTE PRESENT, phys 0x0000000000000001
+   pmm: pml4=2 pdpt=2 pd=2 pt=2    (every page PAGE_TABLE)
+   ```
+
+   A `pmm_get_page_type` diagnostic in `isr14_handler` proved the
+   walk's pages were all `PAGE_TABLE`, ruling out a use-after-free
+   of a page-table page.  The mechanism was never isolated; the
+   fault has not been seen since.  Treat it as unknown, not as
+   "fixed by the revert."  Re-apply the diagnostic before redoing
+   the signature change.
+
+   Session 45 also found that `vmm_clone_page_table`'s low-half
+   deep copy should skip supervisor huge PDEs (`if (src_pde & 0x80)
+   continue;`), and that filtering the *leaf* copy on `PT_USER` is
+   wrong — it breaks the kernel's own identity map, because the
+   clone serves kernel processes too.
 
    **Read `gotchas.md`, "A shim's dead code is only dead if you
    watch it not run," together with this.**  That entry is about a
