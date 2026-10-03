@@ -3,25 +3,68 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-02 (session 43 closed; `v0.6.10` shipped)
-**Current HEAD:** branch `dev` at `v0.6.10` (tag `v0.6.10` on
-`70c85c6`), **pushed** — `origin/dev` is at the same commit.
-`main` is at the merge commit `cc38646`.  Working tree clean.
-**Last milestone:** `v0.6.10` (published) — a tail on `v0.6.9`,
-not a new subsystem.  `realpath` enabled (config-only); the
-`readlink` errno defect closed by a regression test; `/dev/null`
-working across `open`, `stat`, and `access`.
-**Milestone status:** **`v0.6.10` shipped and pushed.**  Session 43
-is closed: five code commits, ten docs commits, all merged to
-`main`, all scratch tags dropped, `v0.6.10` tagged and pushed.
-`main` was merged with `--no-ff` (`cc38646`).  No milestone has
-been opened for the next work.
+**Last updated:** 2026-10-02 (session 44 closed; the seam shipped
+on `dev`, **not tagged `v*`**)
+**Current HEAD:** branch `dev` at `8e8a9df` (scratch tag
+`20261002-execve-seam`), **not pushed** — `origin/dev` is at
+`v0.6.10` (`70c85c6`), six commits behind.  `main` is at the
+`v0.6.10` merge commit `cc38646`.  Working tree clean; two
+untracked files: `BOOT_PF.TXT` (see the next section) and
+`split_for_share.sh` (a helper script, not project material).
+**Last milestone:** `v0.6.10` (published).  **No milestone has been
+opened or closed for session 44** — the seam work is on `dev` under
+scratch tags, awaiting a `v*` bump *and* the vmm fix below.
+
+> ### ⚠ Do not tag a `v*` until the vmm bug is fixed.
+>
+> One boot of this tree hit a `#PF` at `CR2 = 0x400000` **before
+> any user code ran**.  The capture is saved as **`BOOT_PF.TXT`**.
+> The symptom is the huge-page split in `vmm_map_page_in_cr3`
+> leaving the bootloader's 2 MB **supervisor** page in place where
+> a user page was asked for — the defect that `6557f05` (session
+> 42, "vmm: huge-page split must not silently fail") was supposed
+> to close.  It printed **no `VMM: FATAL`**.
+>
+> **Two observations make this reproducible, not random:**
+>
+> 1. **It usually follows a rebuild that adds userland programs.**
+>    The last one came after a session-44 rebuild that added
+>    `proc_fd.elf` and `proc_status.elf`.
+> 2. **After a reboot or two — by the third, say — it goes away
+>    and stays away for a long time.**  A fresh boot of the same
+>    image is usually clean.
+>
+> That combination is the signature of a **page-frame allocation
+> condition**, not a logic error in the split: the split needs a
+> fresh frame, the allocation's outcome depends on how many frames
+> were consumed before it ran (more programs, more frames), and a
+> reboot reinitializes the allocator's state so the condition
+> clears.  It is a **one-time boot state**.
+>
+> **This is likely why no `VMM: FATAL` printed.**  `6557f05` added
+> the halt to *one* return in the split path.  If the failure is a
+> *different* silent return in the same path — one of the returns
+> `open-issues.md` item 7 lists — the split leaves the supervisor
+> page in place without a message.  **The first thing the next
+> session reads for: which `if (!phys) return;` the split takes,
+> and whether it is the one `6557f05` fixed.**
+>
+> This is `open-issues.md` item 7, **still open**.  The next session
+> is this bug, not feature work.  Source needed: `04_kernel_64bit/vmm.c`,
+> the diff of `6557f05`, `BOOT_PF.TXT`, and `docs/open-issues.md`
+> item 7.
+>
+> **A program that adds to the image should expect this** until the
+> bug is fixed.  The fix should come before the image grows again.
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
 `v0.6.9` envp, the `/usr/bin` layout, the `execve` shim removal;
 `v0.6.10` a tail on `v0.6.9` — `realpath`, the `readlink` errno,
-and `/dev/null`.
+and `/dev/null`.  **Post-`v0.6.10`, on `dev`, untagged:** session
+44's **pathname dispatch seam** — FAT/DEV/PROC backends,
+`/dev/null`, `/proc/self/status`, `/dev/console`,
+`/proc/self/fd/N`, `tty`.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** — they exist while
@@ -36,6 +79,12 @@ reference.
 per-commit summary; at a milestone bump the annotations seed the
 final milestone narrative.  This is why each step gets a tag even
 when no `v*` tag is imminent.
+
+**Seven scratch tags are live on `dev`** (all local, none pushed):
+`20261002-handoff-v0610`, `20261002-seam`,
+`20261002-dev-null-backend`, `20261002-proc-status`,
+`20261002-dev-console-tty`, `20261002-canary-tty`,
+`20261002-execve-seam`.
 
 **Note on commit messages:** a commit message is a claim, not a
 fact.  `95c6337 handoff: rewrite fresh for the v0.6.9 bump` did not
@@ -85,6 +134,17 @@ it has not seen in this session, it must **ask for that file**.
 Never guess at a file's contents, never patch from memory of an
 earlier version, never assume a file is unchanged.  This is how
 stale patches and reverted work have been avoided.
+
+**When editing a large file, quote the bytes.**  Session 44 added
+this the hard way.  For an edit inside a big file, the instruction
+must **quote the exact text being replaced and the exact text that
+replaces it**, both copied from output the other side just pasted.
+Do not describe an edit as "the block above" or "after line N" when
+N has not been seen.  Four build failures in session 44 came from
+edits described from memory rather than quoted from the file — the
+fix each time was to read the current bytes and quote them.  A
+whole-half or whole-file return is the safe form; a one-line
+insertion into a 6500-line file is the form that breaks.
 
 **The push / merge / tag sequence** (the project's own order,
 used for every `v*` bump):
@@ -154,576 +214,187 @@ the real tree without a build and test in the real tree.
 
 ---
 
-I general our project tree view up to level 3 is:
+## Where we are — the seam, shipped on `dev`
 
-noneya@fedora:~/code/donix$ tree -L 3
-.
-├── 01_boot_16bit
-│   ├── boot.asm
-│   ├── Makefile
-│   ├── README.md
-│   └── stage2.asm
-├── 02_boot_32bit
-│   ├── boot.asm
-│   ├── build.sh
-│   ├── Makefile
-│   ├── README.md
-│   └── stage2.asm
-├── 03_boot_64bit
-│   ├── boot.asm
-│   ├── kernel.asm
-│   ├── Makefile
-│   ├── README.md
-│   ├── run_debug.sh
-│   └── stage2.asm
-├── 04_kernel_64bit
-│   ├── ata.c
-│   ├── context_switch.asm
-│   ├── elf.c
-│   ├── entry.asm
-│   ├── fatfs
-│   │   ├── diskio.c
-│   │   ├── diskio.h
-│   │   ├── ff16.zip
-│   │   ├── ff.c
-│   │   ├── ffconf.h
-│   │   ├── ff.h
-│   │   └── ffunicode.c
-│   ├── fb.c
-│   ├── fonts
-│   │   └── ter-u18n.psf
-│   ├── gdt.c
-│   ├── heap.c
-│   ├── idt.c
-│   ├── idt_load.asm
-│   ├── include
-│   │   ├── ata.h
-│   │   ├── bootinfo.h
-│   │   ├── debug.h
-│   │   ├── elf.h
-│   │   ├── fat_config.h
-│   │   ├── fb.h
-│   │   ├── gdt.h
-│   │   ├── heap.h
-│   │   ├── idt.h
-│   │   ├── interrupts.h
-│   │   ├── io.h
-│   │   ├── keyboard.h
-│   │   ├── libc.h
-│   │   ├── pmm.h
-│   │   ├── process.h
-│   │   ├── scheduler.h
-│   │   ├── serial.h
-│   │   ├── syscall.h
-│   │   ├── tss.h
-│   │   ├── userlib.h
-│   │   ├── user_msr.h
-│   │   ├── user_space.h
-│   │   ├── user_syscall.h
-│   │   ├── vga.h
-│   │   └── vmm.h
-│   ├── interrupts.c
-│   ├── isr.asm
-│   ├── keyboard.c
-│   ├── kmain.c
-│   ├── linker.ld
-│   ├── Makefile
-│   ├── pmm.c
-│   ├── process.c
-│   ├── ring3.c
-│   ├── ring3_entry.S
-│   ├── scheduler.c
-│   ├── serial.c
-│   ├── string.c
-│   ├── test_program.asm
-│   ├── test_syscall.c
-│   ├── tss.c
-│   ├── user_linker.ld
-│   ├── user_syscall.c
-│   ├── user_syscall_entry.asm
-│   ├── vga.c
-│   └── vmm.c
-├── 05_boot_kernel64
-│   ├── boot.asm
-│   ├── BOOTCHAIN.md
-│   ├── Makefile
-│   └── stage2.asm
-├── capture.txt
-├── configs
-│   └── busybox.config
-├── docs
-│   ├── CHECKLIST.md
-│   ├── dons-os-history.md
-│   ├── gotchas.md
-│   ├── LLD_BUG_REPORT.md
-│   ├── MAINTENANCE.md
-│   ├── migration-history.md
-│   ├── open-issues.md
-│   ├── session-log.md
-│   └── strategy.md
-├── handoff.md
-├── hdd.img
-├── LICENSE
-├── Makefile
-├── migration-tags.txt
-├── README.md
-├── ROADMAP.md
-├── run
-├── test-files
-│   └── HELLO-WORLD.TXT
-├── third_party
-│   ├── busybox
-│   │   ├── applets
-│   │   ├── applets_sh
-│   │   ├── arch
-│   │   ├── archival
-│   │   ├── AUTHORS
-│   │   ├── busybox
-│   │   ├── busybox_ldscript.README.txt
-│   │   ├── busybox_unstripped
-│   │   ├── busybox_unstripped.map
-│   │   ├── busybox_unstripped.out
-│   │   ├── Config.in
-│   │   ├── configs
-│   │   ├── console-tools
-│   │   ├── coreutils
-│   │   ├── debianutils
-│   │   ├── docs
-│   │   ├── e2fsprogs
-│   │   ├── editors
-│   │   ├── examples
-│   │   ├── findutils
-│   │   ├── include
-│   │   ├── init
-│   │   ├── INSTALL
-│   │   ├── klibc-utils
-│   │   ├── libbb
-│   │   ├── libpwdgrp
-│   │   ├── LICENSE
-│   │   ├── loginutils
-│   │   ├── mailutils
-│   │   ├── Makefile
-│   │   ├── Makefile.custom
-│   │   ├── Makefile.flags
-│   │   ├── Makefile.help
-│   │   ├── make_single_applets.sh
-│   │   ├── miscutils
-│   │   ├── modutils
-│   │   ├── networking
-│   │   ├── NOFORK_NOEXEC.lst
-│   │   ├── NOFORK_NOEXEC.sh
-│   │   ├── printutils
-│   │   ├── procps
-│   │   ├── qemu_multiarch_testing
-│   │   ├── README
-│   │   ├── runit
-│   │   ├── scripts
-│   │   ├── selinux
-│   │   ├── shell
-│   │   ├── size_single_applets.sh
-│   │   ├── sysklogd
-│   │   ├── testsuite
-│   │   ├── TODO
-│   │   ├── TODO_unicode
-│   │   └── util-linux
-│   ├── musl-install
-│   │   ├── bin
-│   │   ├── include
-│   │   └── lib
-│   └── musl-src
-│       ├── arch
-│       ├── compat
-│       ├── config.mak
-│       ├── configure
-│       ├── COPYRIGHT
-│       ├── crt
-│       ├── dist
-│       ├── dynamic.list
-│       ├── include
-│       ├── INSTALL
-│       ├── ldso
-│       ├── lib
-│       ├── Makefile
-│       ├── obj
-│       ├── README
-│       ├── src
-│       ├── tools
-│       ├── VERSION
-│       └── WHATSNEW
-├── toolchain
-│   ├── install_musl.sh
-│   └── musl-gcc.sh
-└── userland
-    └── musl
-        ├── apps
-        ├── Makefile
-        └── tests
+Session 44 built the **pathname dispatch seam**: the first feature
+the previous architecture could not express, and the thing that
+forces "path -> first component -> FAT | DEV | PROC" into
+existence.  It is six commits on `dev`, all verified, none tagged
+`v*` and none pushed.
 
----
+### The seam, in one paragraph
 
-## Where we are — `v0.6.10` shipped
+`resolve_at` now returns, alongside the resolved absolute path, a
+**backend tag** computed from the path's first component:
+`/dev/...` -> `BACKEND_DEV`, `/proc/...` -> `BACKEND_PROC`,
+anything else -> `BACKEND_FAT`.  Every path syscall passes the tag.
+FatFs serves FAT; a small table (`dev_lookup`, `proc_lookup`) serves
+DEV and PROC, or falls through to FAT for an unknown path under
+those prefixes.  There is **no VFS**: no inode, no vnode, no mount
+table.  It is "which of three things does this path name," and
+nothing more.  See `docs/strategy.md`, "When a feature may force
+architecture."
 
-`v0.6.8` shipped the `*at()` family.  `v0.6.9` opened as **envp**
-and grew, in session 42, into the **`/usr/bin` layout**, the
-**removal of `execve`'s bare-name guess**, a **page-table bug fix**,
-**four new syscalls**, **ten busybox applets**, **three small
-gaps**, and **four new gotchas**.  Tagged, pushed, scratch tags
-dropped.
-
-`v0.6.10` is a **tail on `v0.6.9`** — session 43's four post-ship
-changes, merged and pushed.  It is not a milestone in the docs'
-sense; there is no new subsystem.  The tag annotation says so.
-
-### Session 43, in full
+### Session 44, in full — six commits
 
 | Commit | What |
 |---|---|
-| `busybox: enable realpath (config-only)` | `CONFIG_REALPATH=y`; the trace showed no new syscalls needed |
-| `readlink: regression test for the errno split (item 8)` | `readlink_errno.c`, 3/3; item 8 closed |
-| `dev/null: open() recognizes the exact path` | `FILE_KIND_DEV_NULL`; `2>/dev/null` works |
-| `dev/null: stat and access know the path` | `path_is_devnull`, one predicate, three call sites |
-| `pipe_step1: drop the Step-1 EAGAIN checks` | stale since session 36; hung rather than failed |
+| `seam: resolve_at returns a backend tag; FAT is the only backend` | `resolve_at` gains `int* backend_out`; `path_backend()` computes the tag from the first component; every path syscall adopts the new signature.  Five callers move off `resolve_against_cwd` onto `resolve_at`, leaving it with one caller.  One named behavior change: cwd-overflow errno becomes `-ENAMETOOLONG`, matching the four callers it absorbs. |
+| `seam: /dev/null through the DEV backend; delete path_is_devnull` | `g_dev_table[]` + `dev_lookup()`; the exact-path predicate and its three call sites are **deleted**.  `open_resolved`, `stat_resolved`, `access_resolved` take the backend tag.  `fill_kstat_as_chardev` extracted. |
+| `proc: /proc/self/status through the PROC backend` | `g_proc_table[]` + `proc_lookup()`; `FILE_KIND_PROC`; `proc_build_status()`; the `FILE_KIND_PROC` cases in `sys_read` / `put_file_slot` / `sys_fstat_body`.  Five real fields (`Name`, `Pid`, `PPid`, `Uid`, `Gid`), no invented ones. |
+| `dev: /dev/console; proc: /proc/self/fd/N readlinks; tty flips` | The DEV table gains `console` (`FILE_KIND_DEV_CHAR`, stat-able not openable); `fill_kstat_as_chardev` takes `(st_dev, st_ino)` — `/dev/null` `(1,2)`, `/dev/console` `(1,1)`, console sentinel `(1,1)`; `proc_readlink()` and the `sys_readlink` backend branch.  **`tty` prints `/dev/console`.**  Also fixes a pre-existing bug the new test found: `sys_fstat_body` used `get_file_slot` (fd < 3 refused), so `fstat(0)` on a console sentinel was `-EBADF`. |
+| `canary: a tty row` | `busybox tty` must print `/dev/console`; read-only; runs in both canary modes. |
+| `execve: resolve the path through the seam; delete the dead retry` | `sys_execve` calls `resolve_at`; a non-FAT backend is `-ENOEXEC`.  The `"0:" + path` retry is **deleted — it was unreachable**, because `strip_dot_prefix` ran before the retry's check for a leading `/`. |
 
-Plus the docs that record them, and two gotchas.
+### The seam's three consumers
 
-**`realpath` — the trace, and two wrong test expectations.**
-`realpath_main` → `xmalloc_realpath_coreutils` → `xmalloc_realpath`
-→ musl `realpath()`, plus `libbb`'s `xmalloc_readlink` (readlink
-89, present) and `xrealloc_getcwd_or_warn` (getcwd, present).  No
-`//config:depends on` for `CONFIG_REALPATH`.  The handoff said
-`realpath /nonexistent` should fail; it does not — its parent `/`
-exists, so `xmalloc_realpath_coreutils`'s `ENOENT` fallback
-succeeds.  The failing case is a path whose parent does not exist.
-The diagnostic goes to stderr.
+- **`/dev/null`** — `open`, `stat`, `access`.  `ls -l /dev/null`
+  shows `crw-rw-rw-`; `read` returns 0, `write` returns the count.
+- **`/proc/self/status`** — opens, reads five real per-process
+  fields, stats as `S_IFREG | 0444`, closes.
+- **`/dev/console` + `/proc/self/fd/N`** — `readlink`
+  (`/proc/self/fd/0`) returns `/dev/console`; `stat("/dev/console")`
+  reports `S_IFCHR` with `(st_dev, st_ino) = (1, 1)`, **the same
+  pair `fstat(0)` reports**.  That match is `ttyname_r(3)`'s gate
+  3b, and it is what makes **`tty` print `/dev/console`**.
 
-**`readlink` errno — the fix was already in.**  `sys_readlink`
-returned `-ENOENT` for a missing path and `-EINVAL` for an existing
-non-symlink; the fix had been in the tree since session 42,
-untested, and `open-issues.md` item 8 still described the defect as
-open.  No applet calls `readlink(2)`; the only consumer is musl's
-`ttyname(3)`, which cannot distinguish the errnos with no `/proc`
-and no `/dev`.  `readlink_errno.c` calls `readlink(2)` directly and
-asserts both answers — 3/3.  Item 8 is closed with a run behind it.
-See `gotchas.md`, "A fix with no test is indistinguishable from an
-unfixed defect."
+### Verification
 
-**`/dev/null` — open, stat, access.**  `path_is_devnull` — one
-predicate, three call sites — is consulted by `open_resolved`,
-`stat_resolved`, and `access_resolved`:
-
-    $ ls -l /dev/null
-    crw-rw-rw-    1    0,   0 /dev/null
-    $ test -e /dev/null && echo yes
-    yes
-    $ stat /dev/null
-      File: '/dev/null'
-      ...    character special file
-
-`open` returns a `FILE_KIND_DEV_NULL` slot: read returns 0, write
-returns count, close frees.  `stat`/`fstat` report `S_IFCHR | 0666`.
-`readlink("/dev/null")` returns `-EINVAL` for free, via
-`access_resolved`.  **Still an exact-path predicate, not the
-dispatch seam.**  **Boundary:** `readdir("/dev")` fails (there is
-no `/dev` directory), and `/dev/tty` and `/dev/urandom` do not
-exist, so `tty` still prints `not a tty`.
-
-**`pipe_step1` — a test that went stale and hung.**  It asserted
-Step-1 non-blocking semantics (empty read → `-EAGAIN`, full write
-→ `-EAGAIN`).  Steps 2/3 made read and write block, so re-running
-the assertions hangs rather than fails: the blocked reader has
-nothing to wake it.  Found by running the pipe suite per the
-`open-issues.md` rule; the suite had not been run since session 36.
-Removed the EAGAIN checks; the empty/full behavior is covered by
-`pipe_step2`/`pipe_step3`/`pipe_step3b`, which fork a peer.  See
-`gotchas.md`, "A test can encode an earlier version's behavior."
-
-**The lesson of the session.**  Three stale artifacts were found by
-reading the source rather than the doc: the handoff's `realpath`
-expectation, `open-issues.md` item 8 (a fix that was already in),
-and `pipe_step1` (a test from six sessions earlier).  All three are
-the same shape — an artifact asserting a state the repository does
-not have — and all three were caught by going to the source.
-
-### Session 42, in full
-
-**The opening themes (envp, layout, shim):**
-
-| Commit subject | What |
+| Test | Result |
 |---|---|
-| `execve: pass envp through, as Linux does` | `sys_execve` copies `envp` onto the new stack; argv region 4 KB → 16 KB; envp snapshot kmalloc'd |
-| `config: enable busybox env and printenv` | config-only |
-| `docs: session 42 — envp` | docs (first pass) |
-| `layout: executables under /usr/bin; canary program` | executables to `/usr/bin`; `canary.c` the smoke test |
-| `layout: drop the .ELF suffix; binaries staged bare` | binaries staged bare |
-| `execve: remove the bare-name attempt; keep (a) and (b)` | the shim shrinks to path-as-given + `"0:"` translation |
-| `docs: session 42 — envp, the /usr/bin layout, the shim removal` | docs (second pass) |
+| canary (read-only) | **15 passed, 0 failed** |
+| canary `--full` | **28 passed, 0 failed** |
+| readlink_errno | **3/3** |
+| at_step1 | **10/10** |
+| at_step2 | **8/8** |
+| proc_status | **ALL PASS** (new) |
+| proc_fd | **ALL PASS** (new) |
+| pipe_step1/2/3/3b | **all OK** (run for commit 2's `FILE_KIND_*`) |
 
-**The envp regression test and the bugs it surfaced:**
+Boot clean, no `Unknown syscall:` lines, no faults.
 
-| Commit subject | What |
-|---|---|
-| `envp: regression test for execve passing the environment through` | `tests/envp_step1.c` + `envp_helper.c`; proved envp survives `execve`.  Found the `%rax`-clobber bug in `puts_raw` |
-| `userland tests: stop hand-counting puts_raw lengths; rewrite musl_exec2` | `puts_raw` computes its own length; `musl_exec2` asserts the shim is gone; two gotchas added |
+### New tests this session
 
-**The page-table bug:**
+`userland/musl/tests/proc_status.c` — opens, reads (checks the five
+keys), stats (`S_IFREG`, nonzero size), closes `/proc/self/status`.
+`userland/musl/tests/proc_fd.c` — three `readlink`s return
+`/dev/console`; `stat("/dev/console")` is `S_IFCHR` and matches
+`fstat(0)` on `(st_dev, st_ino)`; `readlink` on a non-console fd is
+`-EINVAL`.  Both added to `USERLAND_ELFS` and the `mcopy_one`
+chain; staged as `::/usr/bin/PROC_STATUS` and `::/usr/bin/PROC_FD`.
 
-| Commit subject | What |
-|---|---|
-| `vmm: huge-page split must not silently fail` | the split in `vmm_map_page_in_cr3` halts with `VMM: FATAL` on allocation failure.  The intermittent `#PF` at `0x400000` |
-| `vmm: remove the huge-page-split diagnostic` | removed the temporary `VMM: SPLIT` prints |
-| `open-issues: record the remaining silent page-table-allocation returns` | the six remaining silent `vmm_map_page*` returns, item 7 |
+### Session 43, in one line
 
-**The dead code and the syscalls:**
-
-| Commit subject | What |
-|---|---|
-| `execve: delete exec_resolve_bin_name, dead since the shim removal` | dead since the shim removal |
-| `readlink: implement syscall 89 as an honest -EINVAL` | no symlinks; removes `ttyname`'s `Unknown syscall: 89` noise |
-| `clock_gettime: implement syscall 228 from g_ticks; enable mktemp` | reports `g_ticks` (100 Hz PIT) as both clocks |
-| `nanosleep: implement syscall 35 as a g_ticks deadline loop; enable sleep, usleep` | `hlt` loop, 10 ms granularity |
-| `munmap: replace the stub with a real implementation` | frees frames, removes them from `elf_page_list`; the stub leaked |
-
-**The applets:**
-
-| Commit subject | What |
-|---|---|
-| `busybox: enable basename, dirname, unlink` | config-only |
-| `busybox: enable ttysize, tty, arch` | config-only |
-| `busybox: enable truncate` | config-only — it uses `ftruncate`, not `truncate(2)` |
-
-**The doc cleanups and the last gaps:**
-
-| Commit subject | What |
-|---|---|
-| `open-issues: no /dev, no /proc; ttyname cannot name the console` | open-issues |
-| `open-issues: mktemp needs clock_gettime, not getpid+open` | open-issues |
-| `fcntl: accept fd 0/1/2 for all subcommands, not just F_DUPFD` | new `fcntl_lowfd` test |
-| `keyboard: Ctrl-[ produces ESC` | 0x1B |
-| `open-issues: drop the resolved entries` | cleanup |
-
-**The bump:**
-
-| Commit subject | What |
-|---|---|
-| `handoff: rewrite fresh for the v0.6.9 bump` | **did not rewrite the body** — see the note at the top |
-| `session-log: the rest of session 42` | session-42 commit rows |
-| `ROADMAP: v0.6.9 is shipped; refresh hardening list` | ROADMAP |
-| `kmain: bump the shell banner to v0.6.9` | banner |
-| `README: refresh the applet and syscall lists for v0.6.9` | README |
-
-**What it means:**
-
-- **envp:** `execve` passes the caller's environment through
-  verbatim.  `export FOO=bar` then `echo $FOO` prints `bar`;
-  `busybox env` lists variables.  Regression-tested by
-  `tests/envp_step1.c`.
-- **The layout:** `/bin` holds busybox, `/usr/bin` holds the
-  donix-native ELFs, `/tmp` is empty, `/` holds data.  **This is
-  the split the two shells' search rules need** — ash's applets
-  never consult `PATH` so busybox wins there; `musl_sh` searches
-  `/usr/bin` first so a bare name resolves to the donix-native tool.
-- **The shim:** `sys_execve`'s bare-name attempt is gone.  What
-  remains is (a) the path as given and (b) the `"0:"` prefix
-  translation — the smallest the shim can be without a VFS.
-  `musl_exec2` now asserts that a bare name does *not* resolve.
-
-**Key facts for future work:**
-
-- **Every donix-native binary is staged BARE.**  `/usr/bin/HELLO`,
-  not `HELLO.ELF`; `/bin/busybox`, no suffix.  **A file named with
-  `.ELF` will not be found by anything.**
-- **`execve` now takes a path.**  No bare-name resolution.  Callers
-  pass `/usr/bin/NAME` or `/bin/NAME`.
-- **ash does not export `PATH`.**  It keeps `PATH` as a shell
-  variable, so `$PATH` expands and command lookup works, but a child
-  does not see `PATH` in its environment.
-- **The envp snapshot is `kmalloc`'d, not a stack array.**
-  `EXEC_MAX_ENVC` × `EXEC_MAX_ARG_LEN` = 16 KB, and
-  `PROC_STACK_SIZE` is 16 KB.  See `docs/gotchas.md`, "The kernel
-  stack is 16 KB."
-- **The canary is now `canary`, a program.**  `tests/canary.c`.
-  Run from `donix>` or ash, both find `/usr/bin/CANARY`.
-- **`clock_gettime` (228) is the clock.**  It reports `g_ticks`
-  (100 Hz PIT) as both `CLOCK_REALTIME` and `CLOCK_MONOTONIC`.  No
-  wall clock exists.
-- **`nanosleep` (35) is a `hlt` loop** on a `g_ticks` deadline, 10 ms
-  granularity.  Not a scheduler block; correct for a single-process
-  system.
-- **`munmap` (11) is real** and frees frames, removing them from
-  `elf_page_list`.  The old stub was a leak.
-- **`realpath` is enabled** and config-only.  `realpath
-  /nonexistent` succeeds (parent `/` exists); `realpath
-  /no/such/dir/file` fails on stderr.
-- **`readlink` (89) returns `-ENOENT` for a missing path and
-  `-EINVAL` for an existing non-symlink**, verified by
-  `readlink_errno.c`.  Item 8 closed.
-- **`/dev/null` works for `open`, `stat`, and `access`**, one
-  predicate (`path_is_devnull`) shared by `open_resolved`,
-  `stat_resolved`, and `access_resolved`.  `ls -l /dev/null`
-  shows `crw-rw-rw-`; `readlink` returns `-EINVAL` for free.
-  `readdir("/dev")` fails; no other device exists.  An exact-path
-  predicate, not the dispatch seam.
-
-### What `v0.6.8` contributed (prior milestone, pushed)
-
-The `*at()` family: one resolver (`resolve_at`) for every
-dirfd-taking syscall.  `newfstatat` (262), `openat` (257),
-`unlinkat` (263), `faccessat` (269), `utimensat` (280) all route
-through it; the stat family is inverted to wrappers as on Linux.
-busybox `find` (with `-type`) is enabled and works.
-
-The findings that milestone recorded, still load-bearing:
-- **`unlinkat` has no consumer in busybox.**  `rm -r`
-  (`libbb/remove_file.c`) and `find -delete`
-  (`findutils/find.c:923-925`) construct path strings and call
-  `unlink`/`rmdir`.  What made `rm -r` correct was the
-  `unlink`/`rmdir` type check, not `unlinkat`.
-- **`sys_faccessat` must not validate `flags`.**  musl calls it with
-  three arguments, so `%r10` holds the previous syscall's return
-  value.  `sys_utimensat` *does* validate — musl passes it four.
-
-### Known limitations
-
-- **Redirection of a builtin is silently ignored.**  `cd /bin > log`
-  runs `cd`, creates no file, prints no error.
-- **A builtin in a pipeline is refused.**  `cd /bin | cat` prints
-  `sh: builtin in pipeline not supported`.
-- **`/dev/null` works for `open`/`stat`/`access`** (session 43),
-  but `readdir("/dev")` fails (no directory), and no other device
-  exists — so `tty` still prints `not a tty`.  The full `/dev`
-  layer is a direction, not scheduled.
-- **`diff`, `chmod`, `ln`, `mount` are off** — the last three need
-  their own syscalls.
-- **`tty` prints `not a tty`.**  Correct for donix: no `/dev`, no
-  `/proc`.  `readlink` (89) is implemented and now returns the
-  correct errnos, but `ttyname` still cannot name the console.  See
-  `open-issues.md`.
-- **`reboot` / `halt` / `poweroff` cannot be enabled yet.**  They
-  need signal delivery.  `reboot` with no `-f` calls
-  `kill(1, SIGTERM)` — it signals init, and donix has no init and
-  no signal delivery, so it would be a silent no-op.  `reboot -f`
-  would reach `reboot(2)` (169), but it is the *force* path; and
-  `halt`/`poweroff` collapse to the same action as `reboot` on
-  donix (reset), because there is no ACPI and no halt state — so
-  shipping them would be a lie in the applet's behavior.  The
-  blocking dependency is `open-issues.md` item 5, signal delivery,
-  the same subsystem `SIGPIPE` and a Wayland `SIGBUS` need.
-- **`musl_wait`'s WNOHANG loop spins.**  Pre-existing.  See
-  `docs/session-log.md`, session 41.
+`v0.6.10` — `realpath` enabled; the `readlink` errno split closed
+by `readlink_errno.c` (item 8 removed); `/dev/null` across
+`open`/`stat`/`access`.  Details in `docs/session-log.md`.
 
 ---
 
-## NEXT SESSION — the `/dev` + `/proc` direction
+## NEXT SESSION — the vmm bug
 
-`realpath`, the `readlink` errno, and `/dev/null` across
-open/stat/access are all done and shipped as `v0.6.10`.  The next
-real work is the **`/dev` and `/proc` device layer**.  It is not a
-scheduled milestone; it is a **direction**, and the session that
-picks it up **plans it then**, as the docs' own rule says.
+**This is the only thing between the tree and a `v*` bump.**  It is
+not feature work; it is a correctness bug with a saved capture and
+a reproducer.
 
-**Plan first, build second.**  Do not start with a patch.  The
-first task is to read the relevant source and decide the scope, as
-`ROADMAP.md`, "Make `/proc` possible," lays out:
+### What happened
 
-> The work is **"the minimal dispatch seam plus the smallest
-> open-file representation that one `/proc` file requires."**
-> Both parts, together, sized to `/proc/self/status` and nothing
-> larger.
+One boot of the session-44 tree crashed before any user code ran:
 
-`/proc` is the first feature the current architecture **cannot
-express at all**, so it is what forces the pathname dispatch seam
-into existence.  Symlinks and `/dev` are **consumers** of the
-seam, built after it.
+    === PAGE FAULT (#PF) ===
+      CR2 (Bad Address) : 0x0000000000400000
+      Faulting RIP      : 0x0000000000400000
+      Raw Error Code    : 0x0000000000000015
+      pde               : 0x0000000000400083
+      PDE IS 2 MB PAGE, phys base 0x400000 -> effective phys 0x400000
 
-### What the direction still needs
+`0x400000` is the ELF image base.  `0x15` is present + read + user
++ instruction-fetch.  The PDE `0x83` is present, write, PS — and
+**`PT_USER` clear**.  So the kernel tried to fetch a user program's
+first instruction from a **supervisor** mapping, in ring 3.  That
+is the huge-page-split defect `6557f05` was meant to close, and it
+printed **no `VMM: FATAL`**.
 
-- **A real `/dev` that `readdir` can list.**  Today `/dev/null` is
-  an exact-path predicate, one name, not a directory.  `ls /dev`
-  fails.
-- **`tty` naming its terminal.**  `ttyname(3)` walks
-  `/proc/self/fd/N` then `/dev`.  Both fail today; with either one
-  present, `tty` can print a path instead of `not a tty`.
-- **`/dev/tty`, `/dev/urandom`.**
+### The correlation — this is the reproducer
 
-### The two failure modes to avoid
+1. **It usually follows a rebuild that adds userland programs.**
+   The last one came after a session-44 rebuild that added
+   `proc_fd.elf` and `proc_status.elf`.
+2. **After a reboot or two — by the third, say — it goes away and
+   stays away for a long time.**  A fresh boot of the same image is
+   usually clean.
 
-From `ROADMAP.md`, and they are the reason to plan before building:
+That combination is the signature of a **page-frame allocation
+condition**, not a logic error in the split: the split needs a
+fresh frame, the allocation's outcome depends on how many frames
+were consumed before it ran (more programs, more frames), and a
+reboot reinitializes the allocator's state so the condition
+clears.  It is a **one-time boot state**.
 
-- **Over-abstraction.**  Do not schedule "VFS."  No inode layer, no
-  vnode layer, no superblocks, no mount framework.  Build the seam
-  `/proc` needs and stop.
-- **Under-abstraction.**  Do not special-case `/proc` inside
-  `sys_open`, then `sys_stat`, then `sys_access`.  The
-  `path_is_devnull` predicate is the *one* recorded exception, and
-  it is to be deleted when the seam lands — do not add a second.
+**This is likely why no `VMM: FATAL` printed.**  `6557f05` added
+the halt to *one* return in the split path.  If the failure is a
+*different* silent return in the same path — one of the returns
+item 7 lists — the split leaves the supervisor page in place
+without a message, which is exactly what the capture shows.
 
-### What the seam subsumes
+### What the session needs to read
 
-`open-issues.md` item 1: `sys_execve`'s two remaining path attempts
-and `resolve_against_cwd` are shims the seam subsumes.  **Delete
-them as part of this work; do not extend them.**  The
-`path_is_devnull` predicate and its three call sites go with them.
+- **`04_kernel_64bit/vmm.c`** — `vmm_map_page_in_cr3` and the
+  huge-page-split block inside it.  **The first thing to look for:
+  which `if (!phys) return;` the split takes, and whether it is the
+  one `6557f05` fixed.**
+- **The diff of `6557f05`** — what the session-42 fix actually
+  changed, and why it did not fire here.
+- **`BOOT_PF.TXT`** — the capture.
+- **`docs/open-issues.md` item 7** — the six remaining silent
+  `vmm_map_page*` returns.
+- **`docs/gotchas.md`** — "A shim's dead code is only dead if you
+  watch it not run," for the "correct only for the cases known at
+  the time" shape.
 
-### Source the next session will need
+### Do not
 
-The assistant does not have file access; ask for what the task
-needs.  For the seam, at minimum:
-
-- `04_kernel_64bit/include/syscall.h` — the `SYS_*` numbers and
-  the `SYS_REBOOT` (500) define; the seam may add to this file.
-- `04_kernel_64bit/include/process.h` — `pcb_t`,
-  `MAX_PROCESS_FILES`, `PROC_STACK_SIZE`, the `file_table[]`
-  shape.
-- `04_kernel_64bit/user_syscall.c` — the whole file, since the
-  seam lives in its path functions (`resolve_at`,
-  `resolve_against_cwd`, `open_resolved`, `stat_resolved`,
-  `access_resolved`, and the `file_slot_t` definition).
-- `04_kernel_64bit/include/user_syscall.h` — if the seam changes
-  the `file_slot_t` shape, the header is where the contract lives.
-- `docs/strategy.md` — the "When a feature may force architecture"
-  test the seam must pass.
-
-Read `ROADMAP.md`, "Make `/proc` possible," **before** deciding
-anything, and read `docs/strategy.md` for the one-change-at-a-time
-discipline.
-
-### After the seam — candidates
-
-- **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `open-issues.md`
-  item 5.  Unblocks `reboot`/`halt`/`poweroff`, job control,
-  `kill(2)`, and a Wayland `wl_shm` client's `SIGBUS`.
-- **The six remaining silent `vmm_map_page*` returns.**
-  `open-issues.md` item 7.  A deliberate decision per site.
-- **VFS layer.**  `open-issues.md` item 1.  Eventually; delete the
-  remaining shims when it lands, do not extend them.
-- **Wayland (long horizon).**  See `ROADMAP.md`.
-- **PS/2 mouse driver + framebuffer cursor.**  The natural first
-  step toward any interactive GUI.
-- **Font size / resolution.**  See the `v0.6.7` "changing the VBE
-  mode" note in `docs/session-log.md`.
+Do not schedule feature work ahead of this.  Do not tag `v*`.  Do
+not add `st_rdev` or the other cosmetic `/dev` gaps until the page
+fault is closed.  Do not add a userland program to the image until
+this is fixed — that is the condition that reproduces it.
 
 ---
 
-## Busybox enablement
+## Busybox enablement — what the seam did and did not unblock
 
-**All the applets in the handoff's original "Ready now" and "Needs
-one small syscall" tables are now ENABLED, including `realpath`.**
-The tables below are kept for the record and for the still-off ones.
+**The seam did not make any applet in the "still off" table
+enableable.**  This is worth stating plainly, because the seam is
+`/dev` and `/proc` work and the intuition is that `/proc` applets
+should now turn on.  They do not, and here is why, applet by applet:
 
-### Enabled in session 43
+- **`ps`** reads `/proc/<pid>/stat` for **every** pid and
+  `readdir`s `/proc` to enumerate them.  The seam provides
+  `/proc/self/status` and `/proc/self/fd/N`, and **neither a
+  listable `/proc` nor any per-pid entry**.  `ps` does not turn on.
+- **`top`** reads `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`,
+  and per-pid stat.  None exist.  Does not turn on.
+- **`kill`** and **`pidof`** walk `/proc` to find a process by name
+  or id.  Same: no listable `/proc`, no `/proc/<pid>`.  Do not
+  turn on.
+- **`less`/`more`** need raw-mode terminal control and open
+  `/dev/tty`.  `/dev/tty` does not exist, and `/dev/console` is
+  stat-able but **not openable** (commit 4 refuses `open` on it
+  with `-ENOENT`).  Do not turn on.
 
-`realpath` — config-only.  See session 43 above for the trace and
-the test expectations.
+**The one applet whose behavior changed is `tty`.**  It was already
+enabled; before the seam it printed `not a tty`, and now it prints
+`/dev/console`.  That is the enablement story of session 44: **one
+existing applet started working, and no new applet became
+enableable.**
 
-### Enabled in session 42
-
-`basename`, `dirname`, `unlink`, `ttysize`, `tty`, `arch`,
-`mktemp`, `sleep`, `usleep`, `truncate`, plus `env`/`printenv`
-(earlier in the session).
-
-Syscalls added to unblock them: `readlink` (89), `clock_gettime`
-(228), `nanosleep` (35).  `truncate` needed none — it uses
-`ftruncate` (77), which was already there.
+**What the seam did do is make the next piece of `/proc` smaller.**
+Adding `readdir("/proc")` and a `/proc/<pid>/stat` entry is now a
+**table entry and a directory shape**, not an architectural change —
+the mechanism (`BACKEND_PROC`, `proc_lookup`, `FILE_KIND_PROC`,
+`proc_build_status`) is proven.  That is the payoff, and it is
+deferred: it is the piece of work after the vmm fix, and it is
+what would turn `ps` on.
 
 ### Still off — needs a subsystem (do not enable yet)
 
@@ -735,11 +406,11 @@ Syscalls added to unblock them: `readlink` (89), `clock_gettime`
 | `CONFIG_LN` | `ln` | `link`/`symlink`; FAT has no links |
 | `CONFIG_LINK` | `link` | same |
 | `CONFIG_MOUNT`/`UMOUNT` | `mount`/`umount` | `mount` (165); no VFS |
-| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | `halt`/`poweroff`/`reboot` | signal delivery (item 5); no init to signal, no ACPI |
+| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | `halt`/`poweroff`/`reboot` | signal delivery (item 5); no init, no ACPI |
 | `CONFIG_TAR`/`UNZIP`/`CPIO`/`GZIP`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
 | `CONFIG_AWK` | `awk` | large; needs `FEATURE_AWK_LIBM`; `system()`/`getline` need signal delivery |
-| `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control donix's line-discipline stubs do not model |
-| `CONFIG_TOP`/`PS`/`KILL`/`PIDOF` | process tools | `/proc`; donix has none |
+| `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control; `/dev/tty` does not exist |
+| `CONFIG_TOP`/`PS`/`KILL`/`PIDOF` | process tools | `/proc` needs to be **listable** and **per-pid**; the seam provides only `/proc/self/status` and `/proc/self/fd/N` |
 | `CONFIG_NETWORKING` (all) | `ping`, `wget`, etc. | no network stack |
 | `CONFIG_FEATURE_FIND_DELETE` | `find -delete` | works via `unlink`/`rmdir`; needs `FEATURE_FIND_DEPTH`, also off |
 | `CONFIG_ASH_JOB_CONTROL` | ash job control | signal delivery |
@@ -758,9 +429,9 @@ name.**  Two applets were mis-classified by name in session 42:
 
 ## Canary state
 
-**Green as of session 43** — `canary` and `canary --full` from
-both shells, 14/14 and 27/27, unchanged from the `v0.6.9` baseline.
-The kernel self-test runs at boot and reports 17/17.
+**Green as of session 44** — `canary` and `canary --full` from both
+shells, **15/15** and **28/28**.  The kernel self-test runs at boot
+and reports 17/17.
 
 **The canary is a program: `canary`.**  `tests/canary.c` runs every
 non-interactive canary row, checks exit status and output
@@ -787,7 +458,12 @@ find `/usr/bin/CANARY`.
     fcntl_lowfd    # fcntl on fd 0/1/2, 3 checks (redirects fd 0)
     readlink_errno # readlink(2) errno split: ENOENT for a missing
                    # path, EINVAL for an existing non-symlink, 3
-                   # checks (read-only); closes item 8
+                   # checks (read-only)
+    proc_status    # /proc/self/status: open, read the five keys,
+                   # stat (S_IFREG), close; 9 checks (new, s44)
+    proc_fd        # /proc/self/fd/N -> /dev/console; the
+                   # (st_dev, st_ino) match with fstat(0); 7 checks
+                   # (new, s44)
 
 **Pipe regression suite (`userland/musl/tests/`):**
 
@@ -806,7 +482,7 @@ test can encode an earlier version's behavior."
 
 **New tests must be added to both `USERLAND_ELFS` and the
 `mcopy_one` chain in `05_boot_kernel64/Makefile`.**  The image now
-stages 39 files.
+stages **41 files**.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`; use
 `busybox sh` or `/bin/busybox sh`.
@@ -819,34 +495,44 @@ a new file and from `busybox stat` on nonexistent paths (it probes
 `/etc/group`, `/etc/passwd`, `/etc/localtime`) are expected
 diagnostics.  `sys_execve: f_open FAIL` lines no longer appear, and
 neither do the `f_open FAIL path=dev/null` lines from
-`2>/dev/null` — that redirect now succeeds (session 43).
+`2>/dev/null` — that redirect now succeeds.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **VFS layer (eventual).**  `sys_execve`'s two remaining path
-   attempts and `resolve_against_cwd` are shims a VFS would
-   subsume.  When a VFS lands, delete them; do not extend.
+1. **Item 1 in `open-issues.md` is now stale and must be rewritten.**
+   It says `sys_execve`'s path attempts and `resolve_against_cwd`
+   are "what the dispatch seam subsumes, when the seam lands."
+   **The seam landed in session 44.**  `resolve_against_cwd` has
+   one caller (`resolve_at`); `execve` routes through `resolve_at`.
+   Item 1's premise is false and the entry should be reduced to
+   "the remaining `strip_dot_prefix` / `0:` translations belong to
+   FatFs, not the seam" or deleted.  This is the "a doc asserting a
+   state the repository does not have" shape — see `docs/gotchas.md`.
 2. **Redirection of a builtin is silently ignored.**
 3. **A builtin in a pipeline is refused.**
 4. **`rename(2)` does not replace; `chmod`/`ln`/`mount` need their
    own syscalls.**  Deliberate FatFs-limitation first cuts.
-5. **`-EPIPE` is delivered without `SIGPIPE`.**  Narrower than the
-   old docs claimed: `busybox yes | busybox head -n 1` does *not*
-   hang.  Fixing it means signal delivery — the same subsystem
-   `reboot`/`halt`/`poweroff` need.
+5. **`-EPIPE` is delivered without `SIGPIPE`.**  Fixing it means
+   signal delivery — the same subsystem `reboot`/`halt`/`poweroff`
+   need.
+
+**The open-issues file's numbering changed in session 43** — the
+`readlink` errno item was removed, and Symlinks is now item 8.  Do
+not trust an older paste of that file; read it from disk.
 
 Also open: `unlinkat` has no consumer; the six remaining silent
-`vmm_map_page*` returns; `sys_brk`'s fixed `heap_base` and the
-4 MB mmap window are latent collisions; real FatFs timestamp
+`vmm_map_page*` returns (**the next session's work**); `sys_brk`'s
+fixed `heap_base` and the 4 MB mmap window; real FatFs timestamp
 storage; `prctl` is minimal; busybox applet symlinks not installed;
 syscall-table audit script; `musl_wait`'s WNOHANG loop spins;
 `sys_mmap` rejects all non-anonymous mappings; pipes support one
 concurrent reader and one concurrent writer; `put_file_slot`'s pipe
-wake is coupled to `sys_close`'s wake; **no `/dev` directory and no
-`/proc`** — `/dev/null` is one name recognized by a predicate in
-`open`/`stat`/`access`, not a listable directory.
+wake is coupled to `sys_close`'s wake; **`readdir("/dev")` and
+`readdir("/proc")` fail** — the seam serves entries, not
+directories; **`st_rdev` is 0 on device nodes**; **`f_stat_with_retry`
+has dead `has_drive`** at line 3077.
 
 ---
 
@@ -883,10 +569,10 @@ wake is coupled to `sys_close`'s wake; **no `/dev` directory and no
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   — gitignored; rebuild with `./toolchain/install_musl.sh`.
 - `toolchain/{install_musl.sh,musl-gcc.sh}` — tracked.
+- `BOOT_PF.TXT` — untracked, the vmm crash capture; **keep it**.
+- `split_for_share.sh` — untracked helper, not project material.
 
 Kernel sources: `04_kernel_64bit/`.
-
-Scratch workspaces: transient, if any exist.  Not referenced here.
 
 ---
 
@@ -897,28 +583,32 @@ needs it.  Paths relative to the tree root
 (`/home/noneya/code/donix/`).
 
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
-  tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` — every bug writeup, by subsystem.  Session 43
-  added "A test can encode an earlier version's behavior" and "A
-  fix with no test is indistinguishable from an unfixed defect."
-  Session 42 added "The kernel stack is 16 KB," "A shim's dead
-  code is only dead if you watch it not run," "An input-only
-  `syscall` asm block does not tell GCC that `%rax` is
-  overwritten," and "A hand-counted string length in a syscall
-  wrapper will be wrong."
+  tagging convention, git hygiene, recovery.  **"When a feature may
+  force architecture"** is the rule the seam passed.
+- `docs/gotchas.md` — every bug writeup, by subsystem.  **12
+  entries** as of session 43.  Session 44 adds three (below, to be
+  written).  Session 43 added "A test can encode an earlier
+  version's behavior" and "A fix with no test is indistinguishable
+  from an unfixed defect."  Session 42 added "The kernel stack is
+  16 KB," "A shim's dead code is only dead if you watch it not
+  run," "An input-only `syscall` asm block does not tell GCC that
+  `%rax` is overwritten," and "A hand-counted string length in a
+  syscall wrapper will be wrong."
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Session 43's commits are recorded.
-- `docs/open-issues.md` — full open-issues list.  Session 43
-  sharpened the `/dev` entry with the `2>/dev/null` finding,
-  recorded `/dev/null` working across open/stat/access, and
-  **removed item 8** (the `readlink` errno defect), closed by
-  `readlink_errno.c`.
+  Session 43's commits are recorded; **session 44's are not yet**.
+- `docs/open-issues.md` — full open-issues list.  **Item 1 is now
+  stale** (see "Open issues" above) and should be rewritten; item 7
+  is the vmm bug.  Numbering changed in session 43.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
   historical narrative (A1-A6, pre-fork).
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` — the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
 - `ROADMAP.md` — future work only; direction of travel beyond the
-  current milestone.
+  current milestone.  Its "Make `/proc` possible" section is now
+  **partly done** — the seam exists and has three consumers; it
+  needs a refresh at the `v*` bump.
+- `README.md` — needs a review at the `v*` bump: `tty` and the
+  `/dev/console` / `/proc` entries are new and not yet described.
 
 ---
 
@@ -927,13 +617,17 @@ needs it.  Paths relative to the tree root
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 Newlib is gone.  The userland is a tracked source tree at
 `userland/musl/`.  `v0.6.7` shipped the shell and the framebuffer;
-`v0.6.8` shipped the `*at()` family; `v0.6.9` shipped envp, the
-`/usr/bin` layout, the `execve` shim removal, the huge-page-split
-`#PF` fix, four syscalls, and ten busybox applets; `v0.6.10`
-shipped `realpath`, the `readlink` errno, and `/dev/null` across
-open/stat/access — all tagged and pushed.  Next: the `/dev`+`/proc`
-direction, which forces the pathname dispatch seam; plan it first.
-One change at a time.**
+`v0.6.8` the `*at()` family; `v0.6.9` envp, the `/usr/bin` layout,
+the `execve` shim removal; `v0.6.10` `realpath`, the `readlink`
+errno, and `/dev/null`.  On top of `v0.6.10`, on `dev` and
+untagged, session 44 built the pathname dispatch seam — three
+backends, `/dev/null`, `/proc/self/status`, `/dev/console`,
+`/proc/self/fd/N`, and `tty` printing a path.  Six commits, all
+verified, none pushed.  **Next: the vmm bug** (`BOOT_PF.TXT`),
+which reproduces on the first boot after the image grows and
+clears by the second or third.  Then the seam's `v*` bump.  Do not
+tag a `v*` until the page fault is closed.  One change at a
+time.**
 
 ---
 
@@ -957,12 +651,17 @@ problem until it was rewritten.
 
 **Before proposing any command block, read the "Working style"
 section at the top.**  It is the project's git and file-return
-convention, and it is what every prior session has used.
+convention, and it is what every prior session has used.  Session
+44 added one rule to it: **when editing a large file, quote the
+bytes.**
 
-**Three gotchas worth reading before the next change.**  "A fix
-with no test is indistinguishable from an unfixed defect" (item 8
-was already fixed while three docs said otherwise — `grep` before
+**Four gotchas worth reading before the next change.**  "A fix with
+no test is indistinguishable from an unfixed defect" (`grep` before
 scheduling).  "A test can encode an earlier version's behavior"
-(`pipe_step1` hung instead of failing — run the suite a change's own
-rule names).  "A consumer inferred from behavior is not a consumer"
-(read the caller's source).  See `docs/gotchas.md`.
+(run the suite a change's own rule names).  "A consumer inferred
+from behavior is not a consumer" (read the caller's source).  And
+session 44's own: a case in a switch is not reached if an earlier
+guard in the same function refuses the input — `fstat(0)` was
+`-EBADF` for many sessions while the `FILE_KIND_CONSOLE` case that
+would have answered it sat one line below the `get_file_slot` guard
+that rejected it.  See `docs/gotchas.md`.

@@ -115,7 +115,23 @@ That's the point. That's the whole point.
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is a few dozen short C files. There is no build system you
   can't read in ten minutes. You can read it end to end in an evening.
-
+- **Synthesizes `/dev` and `/proc` entries, and knows its own
+  terminal.**  The kernel has a small pathname-dispatch layer: a
+  path's first component selects a backend — FatFs for ordinary
+  files, a device table for `/dev`, a proc table for `/proc` — and
+  that is the whole of it, no inode layer and no VFS.  It serves
+  `/dev/null` across `open`, `stat`, and `access` (`2>/dev/null`
+  works); `/proc/self/status`, which reads back five real
+  per-process fields; `/dev/console`; and
+  `/proc/self/fd/0`–`2`, whose `readlink` target is
+  `/dev/console`.  The point of the last one is that
+  `tty` now prints `/dev/console` instead of `not a tty` —
+  `ttyname(3)`'s three gates all pass, including the one that
+  compares `stat("/dev/console")` against `fstat(0)`.  Neither
+  `/dev` nor `/proc` is a *listable directory* yet; `ls /dev` and
+  `ls /proc` fail.  See `docs/strategy.md`, "When a feature may
+  force architecture," and `handoff.md`.
+  
 donix is a fork of [dons-os](https://github.com/DonaldMoran/dons-os-x86_64).
 The kernel infrastructure — boot chain, PMM, VMM, heap, scheduler, ATA
 driver, FatFs — carried forward intact. What changed is the syscall ABI

@@ -229,8 +229,8 @@ closed fd 0 → `EBADF` (the control).  All three pass.
 
 **Ctrl-`[`** produced `[` because `scancode_to_ascii` had no Ctrl
 parameter.  Added `g_ctrl` (scancodes 0x1D/0x9D) alongside
-`g_shift`/`g_caps`, and a fourth `ctrl` parameter; Ctrl-`[` maps to
-`0x1B` before the table lookup.  Only Ctrl-`[` is mapped, not the
+`g_shift`/`g_caps`, and a fourth `ctrl` parameter; Ctrl- `[` maps to
+`0x1B` before the table lookup.  Only Ctrl- `[` is mapped, not the
 full Ctrl+letter range — the others currently produce their base
 character and changing them would alter what the line editor sees.
 Exercised in `vi`.
@@ -247,7 +247,7 @@ The two "issue" commits recorded findings *while they were fresh*:
 the `/dev` gap found by enabling `tty`, and the `clock_gettime`
 dependency found by reading `__randname.c`.  The cleanup commit then
 removed the four entries that were no longer true (`fcntl`,
-Ctrl-`[`, `munmap`, `mktemp`) — an issues list that claims fixed
+Ctrl- `[`, `munmap`, `mktemp`) — an issues list that claims fixed
 things are broken is one you learn to ignore.
 
 **Gotchas added:** "An input-only `syscall` asm block does not tell
@@ -1248,3 +1248,125 @@ Focused canary green.  New read-only `uniq` rows:
 
     uniq hello-world.txt
     uniq -c < hello-world.txt
+
+## Session 44 — the pathname dispatch seam
+
+Six commits on `dev`, scratch-tagged, **unpushed**, **not tagged
+`v*`**.  Opens the `/dev`+`/proc` direction that `ROADMAP.md` calls
+the next major work.  It is the first feature the previous
+architecture **could not express at all** — `resolve_against_cwd`
+plus `fat_lookup` cannot produce `/proc/self/status`, because there
+is no FAT entry and never will be — so it is the feature that forces
+the pathname dispatch seam into existence.  The seam landed, with
+three consumers, and `tty` now prints a path.
+
+| Tag | What |
+|---|---|
+| `20261002-seam` | `resolve_at` returns a backend tag (FAT/DEV/PROC); `path_backend()` computes it from the first component; every path syscall adopts the new signature; five callers move off `resolve_against_cwd`; cwd-overflow errno becomes `-ENAMETOOLONG` |
+| `20261002-dev-null-backend` | `g_dev_table[]` + `dev_lookup()`; **`path_is_devnull` and its three call sites deleted**; `open_resolved`/`stat_resolved`/`access_resolved` take the tag; `fill_kstat_as_chardev` extracted |
+| `20261002-proc-status` | `g_proc_table[]` + `proc_lookup()`; `FILE_KIND_PROC`; `proc_build_status()`; `FILE_KIND_PROC` cases in `sys_read`/`put_file_slot`/`sys_fstat_body`; five real fields |
+| `20261002-dev-console-tty` | `/dev/console` (`FILE_KIND_DEV_CHAR`, stat-able not openable); `fill_kstat_as_chardev` takes `(st_dev, st_ino)`; `proc_readlink()` + the `sys_readlink` backend branch; **`tty` prints `/dev/console`**; fixes a pre-existing `fstat(0)` bug |
+| `20261002-canary-tty` | one read-only canary row: `busybox tty` must print `/dev/console` |
+| `20261002-execve-seam` | `sys_execve` calls `resolve_at`; non-FAT backend is `-ENOEXEC`; the `"0:" + path` retry is **deleted** — it was unreachable |
+
+**The seam, in one paragraph.**  `resolve_at` returns, alongside the
+resolved absolute path, a backend tag from the path's first
+component.  FatFs serves `BACKEND_FAT`; a small table
+(`dev_lookup`, `proc_lookup`) serves `BACKEND_DEV` and
+`BACKEND_PROC`, or falls through to FAT for an unknown path under
+those prefixes.  **No VFS**: no inode, no vnode, no mount table.
+`path_backend()` is the one place the mapping lives; `resolve_against_cwd`
+now has exactly one caller (`resolve_at`).  See `docs/strategy.md`,
+"When a feature may force architecture."
+
+**Three consumers, and what each proves.**
+
+- **`/dev/null`** — `open`, `stat`, `access`.  Before the seam this
+  was `path_is_devnull`, an exact-path predicate in three call sites.
+  After, it is a table entry.  The seam's first DEV consumer.
+- **`/proc/self/status`** — a synthesized *file*: `open`, `read`
+  (five real fields — `Name`, `Pid`, `PPid`, `Uid`, `Gid`), `stat`
+  (`S_IFREG | 0444`), `close`.  The seam's first PROC consumer.
+- **`/dev/console` + `/proc/self/fd/N`** — the first positive
+  `readlink` in the tree.  `readlink("/proc/self/fd/0")` returns
+  `/dev/console`; `stat("/dev/console")` reports `S_IFCHR` with
+  `(st_dev, st_ino) = (1, 1)`, **the same pair `fstat(0)` reports**.
+  That match is `ttyname_r(3)`'s gate 3b, and it is why **`tty`
+  prints `/dev/console`** instead of `not a tty`.
+
+**A pre-existing bug the new test found.**  `sys_fstat_body` used
+`get_file_slot`, which refuses fds below 3, so `fstat(0)` on a
+console sentinel returned `-EBADF` **before reaching the
+`FILE_KIND_CONSOLE` case that would have answered it** — since
+console sentinels were introduced.  The new `proc_fd` test reported
+exactly that one failure.  Fixed with `get_file_slot_any`, the same
+relaxation `sys_close`/`sys_read`/`sys_write`/`sys_dup2`/`sys_fcntl`
+already have.  See `gotchas.md`, "A case in a switch is not reached
+if an earlier guard refuses the input."
+
+**The dead retry commit 6 deleted.**  `sys_execve` had a `"0:" +
+path` retry whose condition was `exec_path[0] == '/'` — but
+`strip_dot_prefix` ran **before** it and removed the leading `/`, so
+the condition was false by construction.  The retry was **not
+unused; it was unreachable**, and the distinction is the gotcha:
+unused code has no caller, unreachable code has a caller whose path
+can never satisfy the guard.  Deleted in commit 6, with a comment
+recording why.  See `gotchas.md`, "A fix can make an earlier branch
+unreachable."
+
+**A build error, and the gotcha it became.**  `proc_readlink` was
+placed next to `proc_lookup` for thematic locality — and calls
+`safe_copy_to_user`, which is defined **later in the file** with no
+forward declaration above line 649.  The compiler caught it
+(implicit declaration, then "static declaration follows non-static").
+Fix: one line in the forward-declaration block.  See `gotchas.md`,
+"Placing a function near its conceptual neighbors does not place it
+after its callees."
+
+**Verification.**  canary **15/15** (read-only) and **28/28**
+(`--full`); `readlink_errno` 3/3; `at_step1` 10/10; `at_step2` 8/8;
+`proc_status` **ALL PASS** (new); `proc_fd` **ALL PASS** (new);
+`pipe_step1/2/3/3b` all OK (run for commit 2's `FILE_KIND_*`).
+Boot clean, no `Unknown syscall:` lines, no faults.  `tty` prints
+`/dev/console`.
+
+**New tests:** `userland/musl/tests/proc_status.c` (9 checks) and
+`proc_fd.c` (7 checks).  Both added to `USERLAND_ELFS` and the
+`mcopy_one` chain; staged as `::/usr/bin/PROC_STATUS` and
+`::/usr/bin/PROC_FD`.  The image now stages **41 files**.
+
+**Busybox: no applet turns on from the seam.**  `ps`/`top`/`kill`/
+`pidof` need `readdir("/proc")` and `/proc/<pid>/...`, which the
+seam does not provide; `less`/`more` need `/dev/tty` and raw mode,
+which it does not provide.  **`tty` is the one applet whose behavior
+changed** — it was already enabled and printed `not a tty`; it now
+prints `/dev/console`.  The seam's payoff is that the next `/proc`
+piece (`readdir`, per-pid entries) is a table entry and a directory
+shape, not an architectural change.
+
+**A process failure, recorded because it cost four build cycles.**
+The edits to `user_syscall.c` in commits 4 and 6 were described from
+memory ("the block above", "after line N") rather than quoted from
+the file, and four builds failed before the file was re-read and the
+edits quoted.  The rule added to the handoff's working-style section:
+**when editing a large file, quote the bytes.**  It is the same
+lesson as the whole session — a claim about the source is checked
+against the source, not against the claim.
+
+**Open, and not closed by this session:** `readdir("/dev")` and
+`readdir("/proc")` fail (the seam serves entries, not directories);
+`st_rdev` is 0 on device nodes; `f_stat_with_retry` has dead
+`has_drive` at line 3077; `open-issues.md` item 1 is **now stale**
+(it says the seam has not landed) and must be rewritten.
+
+**The vmm bug is the next session, and nothing tags `v*` before it.**
+`BOOT_PF.TXT` — the huge-page-split `#PF` at `CR2 = 0x400000`,
+before any user code ran.  It reproduces on the first boot after an
+image rebuild that adds programs and clears by the second or third.
+`open-issues.md` item 7.  See `handoff.md`.
+
+**The session's headline is not "the seam works."**  It is that
+every claim about the source was checked against the source, and the
+one that was not — the edits described from memory — cost four build
+cycles.  The seam is the work; reading before writing is what made
+it correct.
