@@ -331,10 +331,31 @@ static void run_readonly(void) {
         check4("busybox (no args)", "/bin/busybox", NULL, NULL, NULL,
                w, 0);
     }
+
     {
         static const char* const w[] = { "donix", NULL };
         check4("busybox uname -n", "/bin/busybox", "uname", "-n",
                NULL, w, 0);
+    }
+
+    /*
+     * tty: the seam's visible payoff.  Before the DEV/PROC backends,
+     * this printed "not a tty" -- ttyname_r's three gates all
+     * failed, and the third (the (st_dev, st_ino) match between
+     * stat("/dev/console") and fstat(0)) was unreachable because
+     * fstat(0) itself returned -EBADF on a console sentinel.  Now
+     * all three pass and tty prints /dev/console.
+     *
+     * The check is the positive substring "/dev/console".  Output
+     * is either that or "not a tty", and "not a tty" does not
+     * contain "/dev/console", so a regression fails this row.  No
+     * negative check is needed -- the canary's check() has no
+     * "must not contain" facility, and this row does not need one.
+     */
+    {
+        static const char* const w[] = { "/dev/console", NULL };
+        check4("busybox tty prints /dev/console", "/bin/busybox", "tty",
+               NULL, NULL, w, 0);
     }
 
     /* --- $PATH is not exported by ash (recorded, not a bug) --------- */

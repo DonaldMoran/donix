@@ -396,6 +396,25 @@ pcb_t* process_find_by_pid(uint64_t pid) {
 }
 
 /*
+ * Return the pcb at a fixed pool index, or NULL if the index is
+ * out of range or the slot is unused.
+ *
+ * For callers outside process.c -- pcb_pool is static here, and a
+ * syscall that wants to enumerate live processes (the /proc
+ * directory shape in user_syscall.c) cannot see it.  The index
+ * range is 0..MAX_PROCESSES-1; the caller walks it and skips
+ * NULLs.
+ *
+ * A slot with state != PROC_STATE_UNUSED is returned even if it
+ * is a zombie: Linux keeps /proc/<pid> until the parent reaps.
+ */
+pcb_t* process_get_pcb(int index) {
+    if (index < 0 || index >= MAX_PROCESSES) return NULL;
+    if (pcb_pool[index].state == PROC_STATE_UNUSED) return NULL;
+    return &pcb_pool[index];
+}
+
+/*
  * Wake every process blocked on input (BLOCKED).
  *
  * The kernel shell is deliberately excluded. Its BLOCKED state means

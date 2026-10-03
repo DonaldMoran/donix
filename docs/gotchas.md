@@ -1,3 +1,341 @@
+## A zone scan that moves one way does not find pages behind its cursor
+
+*Session 48 (the double fault on the first boot after adding ELFs),
+commit pending.  The allocator was not out of memory; its scan could
+not reach the free pages it was counting.*
+
+A fresh boot after adding userland ELFs faulted at `0x400000` -- the
+`#PF` item 7 describes -- and then double-faulted.  It reproduced for
+a session, cleared on the second or third boot, and came back after
+the next image change.  The `#PF` was real, but the *reason the
+allocation failed* was in the PMM, not in `vmm_map_page_in_cr3`.
+
+**The zone scan started at a cursor and moved one direction.**
+
+    for (uint64_t page = pmm_next_low_page; page <= pmm_low_end_page; page++) {
+        if (!bitmap_test(page)) { ... return page; }
+        if (page == pmm_low_end_page) break;
+    }
+    // ... and if nothing was found:
+    serial_print("PMM: ERROR - Out of LOW-zone memory ...");
+
+The cursor advanced on every allocation, and the free paths rewound it
+when a freed page was on the *near* side.  But a page that had been
+free the whole time and sat on the **far** side of the cursor was
+never reached: the scan starts at the cursor and walks away from it.
+
+**Why adding ELFs triggered it.**  A bigger image moves `first_free`
+up and shrinks the free span, and more early allocations run before
+the boot ELF load.  That pushes `pmm_next_low_page` past pages that
+had been free from boot.  When the split in `vmm_map_page_in_cr3`
+asked for a page-table page, the scan started at the cursor, walked
+to `pmm_low_end_page`, found nothing, and returned 0 -- **with
+`pmm_free_pages` healthy and the free pages sitting just below the
+cursor.**  A reboot reset the cursor via `pmm_compute_zones`, which
+is why it cleared on the second or third boot.
+
+**The tell.**  An "Out of ... zone memory" message with a **nonzero**
+`Free pages:` count.  The counter and the scan disagree, and the
+counter is right: there *are* free pages, and the scan cannot reach
+them.
+
+**The fix.**  The scan wraps.  `pmm_scan_zone` tries `[cursor, far]`
+first and then `[near, cursor)`, so a page on the far side of the
+cursor is found on the second pass.  A failed scan does not move the
+cursor.  The per-type `phys < 0x200000` skip became a `min_page`
+parameter so both zones and all types share one scan function.
+
+**Why this is not item 7.**  Item 7 is the silent `if (!phys)
+return;` in `vmm_map_page_in_cr3`: the caller cannot see that the
+mapping failed.  That is a real defect and still needs the return
+value.  But *this* bug is why the allocation returned 0 in the first
+place, and it is a different thing: an allocator that cannot find
+memory it has.  Fixing item 7 alone would have turned "boots into a
+broken shell that double-faults" into "refuses to boot the shell,"
+which is a better failure but not a fix.
+
+**Where this shape recurs.**  Same family as "A fix with no test is
+indistinguishable from an unfixed defect" (session 43): a mechanism
+that looks correct and is not exercised by the workload that would
+expose it.  The kernel's own boot does not move the cursor far
+enough to reach the far side; adding ELFs does; and no test drove
+the allocator past its cursor until `mmap_stress` and `exec_churn`
+were written.  A test of the allocator's *accounting*
+(`pmm_free_pages`) is not a test of its *reach*.
+
+
+## A /proc consumer can stat a path it never opens
+
+*Session 47 (`ps` printing no rows), commit `20261003-proc-ps`.  The
+consumer stats a directory, skips the entry when that fails, and
+never opens anything under it -- so a test of the files inside the
+directory passes and the applet still prints nothing.*
+
+`ps` printed its header and no rows, and `pstree` printed only the
+one process it starts from.  Every per-pid FILE existed --
+`/proc/<pid>/stat`, `/proc/<pid>/status`, `/proc/<pid>/cmdline` --
+and `proc_walk`, a first-party test that ran the consumer's own
+`sscanf`, proved each of them opened and parsed.  The applet still
+listed nothing.
+
+**The missing call was a `stat` on the directory.**  libbb's
+`procps_scan`, under `PSSCAN_UIDGID` (which `ps`'s default flag set
+and `pstree`'s both include), does:
+
+    if (flags & PSSCAN_UIDGID) {
+        struct stat sb;
+        if (stat(filename, &sb))     /* filename = "/proc/<pid>/" */
+            continue;                 /* SKIP the entry */
+        sp->uid = sb.st_uid;
+        sp->gid = sb.st_gid;
+    }
+
+`filename` is built by `sprintf(filename, "/proc/%u/", pid)` --
+**with a trailing slash**.  donix served the per-pid files but not
+the per-pid *directory*, so `stat("/proc/1/")` fell through to FAT
+and returned `-ENOENT`, and **every entry was `continue`d before any
+file under it was read.**  Header, no rows.
+
+**Why the tests did not catch it.**  `proc_walk` opened
+`/proc/<pid>/stat`, `status`, and `cmdline` -- the files -- and
+never called `stat` on `/proc/<pid>/` itself.  A test of the files
+under a directory says nothing about whether the directory can be
+stat'd.  The diagnostic that found it was two added `stat` calls in
+`proc_walk`:
+
+    stat('/proc/1')  FAILED: No such file or directory
+    stat('/proc/1/') FAILED: No such file or directory  <-- SKIP
+
+**How it was isolated.**  The kernel trace showed `ps` opening
+`/proc` and calling `getdents64` six times (five entries plus the
+terminating NULL) and then **nothing** -- no row, and no
+`open("/proc/<n>/cmdline")` from the row printer.  The walk worked;
+the loop body never ran, because `procps_scan` returned NULL after
+draining the directory.  The only `continue` not yet reproduced was
+the `PSSCAN_UIDGID` stat, and the test confirmed it.
+
+**The fix.**  `stat_resolved` accepts `/proc/<digits>` and
+`/proc/<digits>/` and reports `KSTAT_IFDIR | 0555`, the same
+`fill_kstat_as_dir` used for `/proc` and `/proc/self`.  `open` is
+untouched; `ps` stats the directory, it does not open it.
+
+**The rule.**  When a consumer reads `/proc` (or any synthesized
+directory), find out every path it *stats*, not just the paths it
+*opens*.  A directory entry can be stat'd for its metadata and
+skipped on failure, before any file inside it is touched.  A test
+that exercises the files under the directory will pass while the
+consumer lists nothing.
+
+**The tell.**  A consumer that prints a header and no rows (or
+partial output) while a first-party test of its files passes.  Add
+the `stat` the consumer makes on the directory itself.  The general
+shape -- a path the consumer touches that no test touches -- is the
+same as "A consumer inferred from behavior is not a consumer"
+(session 40), from the other side.
+
+## A case in a switch is not reached if an earlier guard refuses the input
+
+*Session 44 (`fstat(0)` on a console sentinel), commit
+`20261002-dev-console-tty`.  A pre-existing bug the new test found
+-- a correct case, one line below the guard that made it
+unreachable.*
+
+`sys_fstat_body` has a `FILE_KIND_CONSOLE` case that fills a
+`kernel_stat_t` for a console sentinel -- the slot on fds 0, 1, and
+2.  The case is correct and has been there since console sentinels
+were introduced.  **It had never run.**
+
+The function begins:
+
+    static long sys_fstat_body(int fd, void* user_stat) {
+        ...
+        file_slot_t* slot = get_file_slot(fd, 0);
+        if (!slot) return -(long)EBADF_;
+        ...
+        if (slot->kind == FILE_KIND_CONSOLE) { ... }
+
+`get_file_slot` refuses fds below 3:
+
+    static file_slot_t* get_file_slot(int fd, uint32_t kind) {
+        if (!self || fd < 3 || fd >= MAX_PROCESS_FILES) return NULL;
+
+So `fstat(0)` returned `-EBADF` at the second line, **before the
+`FILE_KIND_CONSOLE` case could be reached.**  The case was not
+wrong; it was dead.  `fstat(0)` -- a thing every Unix does --
+failed for the entire life of console sentinels, and nothing
+noticed because nothing called `fstat` on fd 0.
+
+**What made it matter in session 44.**  `ttyname_r(3)`'s gate 3b
+compares `stat("/dev/console")`'s `(st_dev, st_ino)` against
+`fstat(0)`'s.  `stat` was right; `fstat(0)` was `-EBADF`.  So the
+comparison failed, `ttyname_r` returned an error, and `tty` printed
+`not a tty` -- even after `/dev/console` and the readlink were both
+in place.  The new `proc_fd` test reported exactly one failure:
+
+    ok   stat(/dev/console) succeeds
+    ok   stat(/dev/console) reports S_IFCHR
+    FAIL stat(/dev/console) matches fstat(0) on (st_dev, st_ino)
+
+**The fix is one line** -- `sys_fstat_body` uses `get_file_slot_any`
+instead of `get_file_slot`, the same relaxation `sys_close`,
+`sys_read`, `sys_write`, `sys_dup2`, and `sys_fcntl` already have,
+for the same reason: fds 0/1/2 are real open files.  With it,
+`fstat(0)` reaches the console case and reports `(1, 1)`, the pair
+`stat("/dev/console")` reports, and `ttyname_r`'s gate 3b passes.
+
+**The rule.**  A `switch` on a value, or a chain of `if`s, does not
+run in isolation -- it runs *after everything above it in the
+function*.  When a case "should" fire and does not, the first thing
+to read is not the case; it is what runs before it.  A guard, an
+early return, or a lookup that refuses the input will make every
+case below it unreachable for that input, and the case will look
+perfectly correct while never executing.
+
+**The tell.**  A case in a function that handles several kinds, for
+a kind the function is *supposed* to handle, with no evidence it
+has ever run.  In this instance the evidence was a test that
+failed on a comparison the case existed to satisfy.  In general:
+trace the input from the top of the function and find where it
+stops.
+
+**Where this shape recurs.**  Same family as "A shim's dead code is
+only dead if you watch it not run" (session 42): code that is
+present, correct, and never reached.  The shim case was a *branch*
+whose condition could not be true; this is a *case* whose input was
+filtered out one line earlier.  Both produce a function that looks
+right and behaves as if the code were absent, and both were found
+by running the path and watching it fail to do what the code said.
+
+## Placing a function near its conceptual neighbors does not place it after its callees
+
+*Session 44 (`proc_readlink`), build error, caught before any test
+ran.  A new function put next to its theme rather than checked
+against its call graph.*
+
+`proc_readlink` was written for the `/proc/self/fd/N` readlink
+target.  Its natural home, by theme, was next to `proc_lookup` --
+both are the PROC backend's functions, and `proc_lookup` is at line
+570.  So `proc_readlink` went at line 649, right after it.
+
+`proc_readlink` calls `safe_copy_to_user`.  `safe_copy_to_user` is
+**defined at line 1371**, later in the file, and there was no
+forward declaration for it above 649 -- because until this commit,
+nothing above 1371 called it directly.
+
+The compiler:
+
+    user_syscall.c:684:9: error: call to undeclared function
+        'safe_copy_to_user'; ISO C99 and later do not support
+        implicit function declarations
+
+    user_syscall.c:1371:12: error: static declaration of
+        'safe_copy_to_user' follows non-static declaration
+
+Two errors, one cause: a caller placed above its callee with no
+forward declaration.  **The compiler caught it, no test ran, no
+commit was made** -- which is the good kind of failure.  But it
+would have been avoided by checking what the new function calls
+before choosing where to put it.
+
+**The fix.**  Add `safe_copy_to_user` to the forward-declaration
+block near the top of the file, where `f_stat_with_retry`,
+`sys_fstat_body`, `get_file_slot_any`, and `access_resolved`
+already live for exactly this reason:
+
+    /* Defined below, in the safe-copy section.  proc_readlink
+     * (above that definition) calls it. */
+    static int safe_copy_to_user(void* user_dest,
+                                 const void* kernel_src,
+                                 size_t count);
+
+**The rule.**  Where a function goes is a question about its
+**call graph**, not its **theme**.  Before placing a new function,
+list what it calls and confirm each is declared above the chosen
+line.  A function's neighbors in the file are the functions it
+*relates to*; they are not necessarily the functions it *depends
+on*.
+
+**The tell.**  A new function placed next to its subsystem's other
+functions, in a file large enough that "later" is thousands of
+lines away.  `user_syscall.c` is ~6500 lines; anything placed in
+its first third calls only what is declared in the first third, or
+needs a forward declaration.  The forward-declaration block exists
+because this has happened before -- read it, and add to it.
+
+**Where this shape recurs.**  Same family as "The kernel syscall
+name and the libc name differ" (session 39): a compile-time
+question (does this name resolve here?) answered by convention
+(put it with its friends) rather than by the rule that decides it
+(is it declared above?).  The fix in both is a one-line addition
+to a declaration block, and the lesson in both is that the
+convention is not the check.
+
+## A fix can make an earlier branch unreachable
+
+*Session 44 (`sys_execve`'s `"0:"` retry), commit
+`20261002-execve-seam`.  Dead code that was not merely unused --
+impossible to reach.*
+
+`sys_execve` had two attempts to open the program file: (a) the
+path as given, stripped for FatFs, and (b) `"0:" + path` if (a)
+failed and the path had no drive prefix.  Attempt (b) was
+documented as "the remaining shim" -- the one piece of path
+handling the kernel still did on execve's behalf.
+
+**Attempt (b) never ran.**  Its condition was:
+
+    if (!has_drive && exec_path[0] == '/') {
+
+but `exec_path` was produced by
+
+    strip_dot_prefix(exec_path);
+
+**one step earlier**, and `strip_dot_prefix` removes a leading `/`.
+So for every real path, `exec_path[0]` was `'u'` or `'b'` or the
+first letter of a bare name -- never `/`.  The condition was false
+by construction, and the `"0:"` branch below it was unreachable.
+
+**Attempt (a) is what always worked.**  FatFs has no cwd, so it
+walks every path from the drive root, and `usr/bin/HELLO` -- the
+stripped form -- is a valid path there.  The first `f_open`
+succeeded, the retry was never entered, and `execve` worked for
+every program on the image.
+
+**So the retry was dead because a *later-added fix* solved the
+problem it was written for.**  `strip_dot_prefix` was added to
+normalize `./script.sh` and absolute paths; it happens to remove
+the very leading `/` the retry checked for.  The retry was correct
+when written and became unreachable when the normalization was
+added above it -- and nothing noticed, because "unused by current
+callers" and "impossible to reach" look identical from the
+outside.
+
+**The rule.**  Dead code is not one thing.  *Unused* code has no
+caller; *unreachable* code has a caller whose path can never
+satisfy the guard.  The second is worse, because a reader looking
+for a consumer sees one -- the `sys_execve` function itself -- and
+concludes the code is live.  When removing a branch, check not
+whether it is *called* but whether its *condition* can be true
+given everything that runs before it.
+
+**The tell.**  A guard that tests a property of a variable, where
+the variable was just transformed by something above it.  Read
+what happened to the variable between its assignment and the
+guard.  If the transformation makes the guard's condition
+impossible, the branch below is dead, whatever its comment says.
+
+**Where this shape recurs.**  Same family as "A test can encode an
+earlier version's behavior" (session 43) and "A shim's dead code is
+only dead if you watch it not run" (session 42).  In all three, an
+artifact -- a branch, a test, a helper -- was correct when written
+and false later, and the staleness was invisible because the
+artifact was never *run* against the current state.  The
+difference here is that the change that made it stale was a
+*fix*, not a regression; that is the case people least expect,
+because "I just fixed something" does not feel like "I may have
+broken a branch."  It can.  Check the branches downstream of a
+normalization.
+
 ## A test can encode an earlier version's behavior, and it will hang rather than fail
 
 *Session 43 (`pipe_step1`), commit `20261002-pipe-step1`.  Not a
@@ -801,6 +1139,69 @@ that should not have been there.  The check is the same: when a
 syscall sees an argument or a number that no caller could have
 meant, suspect the boundary between the caller and the kernel, and
 read the asm constraints or the libc wrapper.
+
+## A redirection binds to the last command in an `&&` chain
+
+*Session 45 (the `run` script's build-capture fix), commit
+`6cfb0e6`.  Not a kernel bug -- a shell redirection that scoped to
+one command instead of the whole chain, so every capture was
+missing the front of the build.*
+
+The `run` script's active line was:
+
+    make clean && make FAT_CONFIG=single && \
+        make -C 05_boot_kernel64 hdd-single.img && \
+        make -C 05_boot_kernel64 run-single > capture.txt
+
+The intent was "build everything and capture the whole build."
+What it actually did was `> capture.txt` **binds to the last
+command in the `&&` chain** -- `make -C 05_boot_kernel64
+run-single`.  The `clean`, the kernel build, and the image build
+wrote to the **terminal**, not to `capture.txt`.  So every capture
+produced this way was missing the front of the build, including
+the one line that says whether the kernel was even rebuilt.
+
+**Why it cost half a session.**  Session 45 spent it comparing
+`kernel.bin` binaries and reasoning about allocator state, when
+the log it was reading did not contain the kernel build at all.
+The evidence needed to answer "was the kernel rebuilt?" was never
+in the file, and nothing about the command line said so.
+
+**The fix.**  Wrap the whole chain in a brace group so the pipe
+and the redirection apply to all of it:
+
+    { make -C 04_kernel_64bit clean && \
+      make -C 04_kernel_64bit FAT_CONFIG=single && \
+      make -C 05_boot_kernel64 hdd-single.img && \
+      make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
+
+The brace group makes `2>&1 | tee capture.txt` apply to the whole
+chain.  `tee` writes to the terminal **and** to the file, so the
+terminal is not silenced.  The explicit `make -C 04_kernel_64bit`
+stages make the kernel build appear in the log.  Committed as
+`6cfb0e6`.
+
+**The rule.**  A redirection at the end of an `&&` chain binds to
+the **last** command, not the chain.  `a && b && c && d > file`
+sends only `d`'s output to `file`; `a`, `b`, and `c` write to the
+terminal.  This is easy to miss because the command line *reads*
+as if the redirection covers everything, and because the file it
+produces is non-empty -- it just does not contain what you think.
+
+**The tell.**  A capture file whose first line is not the first
+command you expected.  Or: you are comparing two artifacts whose
+build logs you believe you have, and one of them does not contain
+the build at all.  When the whole chain's output matters, wrap it
+in `{ ... ; }` and pipe the group.
+
+**Where this shape recurs.**  Same family as "The incremental
+kernel build can silently skip" (session 41): a build step whose
+output was believed captured and was not, which presents as a
+mystery about the artifact rather than about the command.  In both
+cases the fix is to make the command do what it reads as doing --
+`make clean` first, or wrap the chain -- and the lesson is that a
+command line is a claim about what ran, checked against the log,
+not against the intent.
 
 ## A hand-counted string length in a syscall wrapper will be wrong
 
