@@ -119,7 +119,7 @@ static void process_initialize_pcb(pcb_t* pcb) {
 
 /*
  * Free the page-table hierarchy vmm_clone_page_table built for a
- * process that is being torn down before it ever ran.
+ * process that is being torn down.
  *
  * This mirrors vmm_clone_page_table's walk exactly, in reverse:
  *
@@ -132,26 +132,36 @@ static void process_initialize_pcb(pcb_t* pcb) {
  *   - RECURSIVE_PML4_INDEX points at the PML4 itself and is skipped
  *     by the clone; skip it here too.
  *
- * WHY THIS EXISTS AS A SEPARATE FUNCTION.  process_reclaim and
- * process_destroy free a process's ELF pages and its kernel stack
- * slot, but neither frees the page-table hierarchy: on the success
- * path the cloned tables are the process's live address space and
- * stay until the process is destroyed, at which point the tables
- * are simply abandoned (the leak is the abandoned tables, not the
- * frames, and it is a separate question from this one).  A process
- * that FAILS to finish process_create has no such excuse: it never
- * ran, nothing points at its tables except the PCB we are about to
- * recycle, and leaving them is a leak with no owner.
+ * TWO CALLERS, TWO LIVES.
  *
- * Called only from process_create's failure paths, and only after
- * vmm_clone_page_table has succeeded (so cr3 is non-zero and the
- * hierarchy is complete for entries 0..255).
+ * On process_create's FAILURE paths, the process never ran: its cr3
+ * is exactly the clone vmm_clone_page_table just built, and nothing
+ * else has touched it.  Freeing entries 0..255 frees precisely what
+ * the clone allocated.
  *
- * The HHDM alias for each page is live -- vmm_clone_page_table
- * built these pages with pmm_alloc_page_for_tables, and every
- * physical page is reachable through HHDM_START -- so the walk
- * reads the tables through the same window the clone wrote them
- * through.
+ * On process_reclaim / process_destroy, the process HAS run.  Its
+ * cr3 is still the clone, but the low half has been modified since:
+ * elf_load_into_process, exec_alloc_user_stack, sys_brk, sys_mmap,
+ * sys_execve, and munmap all added or removed tables under it.
+ * The walk frees every present table it finds, which is correct --
+ * vmm_clone_page_table deep-copied the low half, so every PDPT, PD,
+ * and PT under index 256 in this cr3 belongs to THIS process, and
+ * every later mapping allocated fresh tables into that same copy.
+ *
+ * The walk frees TABLE pages only, never the data pages the leaf
+ * PTEs point at.  Those are freed by process_cleanup_elf_pages,
+ * which runs first and frees every physical page tracked in
+ * elf_page_list.  The two are disjoint: this function never reads
+ * a PTE, and process_cleanup_elf_pages never reads a page table.
+ *
+ * A 2 MB huge PDE is skipped: it is a leaf, not a table, and the
+ * clone copied it verbatim from the parent (vmm_clone_page_table's
+ * `src_pde & 0x80` case), so the page it maps is the parent's.
+ *
+ * The HHDM alias for each page is live -- these pages were built
+ * with pmm_alloc_page_for_tables, and every physical page is
+ * reachable through HHDM_START -- so the walk reads the tables
+ * through the same window they were written through.
  */
 static void process_free_clone(uint64_t cr3) {
     if (!cr3) return;
@@ -760,6 +770,8 @@ void process_reclaim(pcb_t* pcb) {
     if (pcb->state == PROC_STATE_UNUSED) return;
 
     process_cleanup_elf_pages(pcb);
+    process_free_clone(pcb->cr3);
+    pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
 
@@ -771,6 +783,8 @@ void process_reclaim(pcb_t* pcb) {
 void process_destroy(pcb_t* pcb) {
     if (!pcb || pcb->state == PROC_STATE_UNUSED) return;
     process_cleanup_elf_pages(pcb);
+    process_free_clone(pcb->cr3);
+    pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
     pcb->state = PROC_STATE_UNUSED;
