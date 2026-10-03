@@ -526,13 +526,18 @@ needs it.  Paths relative to the tree root
 - `docs/strategy.md` — Phase A/B plan, rules, files-not-to-touch,
   tagging convention, git hygiene, recovery.
 - `docs/gotchas.md` — every bug writeup, by subsystem.
-  **Session 45 adds two entries** (below, to be written):
-  the shell-redirection trap (`a && b && c && d > file` binds to
-  `d`), and the pmm diagnostic result (the virtual-1 fault's walk
-  was all `PAGE_TABLE`, ruling out use-after-free).
+  **Session 46 added one entry**: "A redirection binds to the last
+  command in an `&&` chain" (session 45's `run` build-capture
+  finding).  Session 45's `pmm_get_page_type` result (the
+  virtual-1 fault's walk was all `PAGE_TABLE`, ruling out
+  use-after-free) is a finding about one fault, not a general
+  lesson, and lives in `open-issues.md` item 7 rather than here.
 - `docs/session-log.md` — commit tables and per-test canary notes.
-  Session 44's commits are recorded; **session 45's are not** (its
-  one commit is the tooling fix, `6cfb0e6`).
+  Session 46's section is at the top; session 44's section is
+  recorded but **misplaced** (it sits after session 34), noted at
+  the top of the file and deferred.  There is no session-45
+  section: session 45's one kept commit is the tooling fix,
+  `6cfb0e6`, named in the session-46 section.
 - `docs/open-issues.md` — full open-issues list.  Item 7 is
   TABLED (the boot-time `#PF`); item 8 is symlinks.
 - `docs/migration-history.md`, `docs/dons-os-history.md` —
