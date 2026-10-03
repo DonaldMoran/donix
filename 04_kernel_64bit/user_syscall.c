@@ -241,6 +241,26 @@ static char g_write_bounce[WRITE_CHUNK];
  * One entry today; the numbering is from 1 so 0 means "none". */
 #define PROC_ENTRY_NONE        0
 #define PROC_ENTRY_SELF_STATUS 1
+#define PROC_ENTRY_PID_STAT    2
+
+/*
+ * For the per-pid entries, a FILE_KIND_PROC slot's obj carries
+ * BOTH a tag and a pid, because file_slot_t has no spare field:
+ * the low 8 bits are the PROC_ENTRY_* tag, the rest is the pid.
+ *
+ * The fixed entries (self/status) do NOT use this form -- their
+ * obj stays (void*)(uintptr_t)entry, and proc_build_status reads
+ * it directly.  PROC_OBJ_TAG is therefore only meaningful for a
+ * slot whose tag is one of the PID_* values; for a fixed entry it
+ * returns the entry, which is what the read path wants anyway.
+ *
+ * PROC_DIR_SENTINEL (below) is a DIR slot, not a PROC file slot,
+ * and never goes through these.
+ */
+#define PROC_OBJ_TAG(obj)  ((uint32_t)((uintptr_t)(obj) & 0xFF))
+#define PROC_OBJ_PID(obj)  ((uint64_t)((uintptr_t)(obj) >> 8))
+#define PROC_OBJ_MAKE(pid, tag) \
+    ((void*)(uintptr_t)(((uint64_t)(pid) << 8) | (uint64_t)(tag)))
 
 /*
  * The obj value of a synthesized PROC directory slot.
@@ -726,8 +746,18 @@ static long proc_readlink(const char* abs_path,
  */
 #define PROC_STATUS_MAX 256
 
+/*
+ * The /proc/<pid>/stat text is longer than the status text: it has
+ * ~20 fields.  The cap is busybox's PROCPS_BUFSIZE (1024), which is
+ * the most its single read() can deliver -- a larger value would be
+ * silently truncated by the caller anyway.  See libbb/procps.c's
+ * read_to_buf.
+ */
+#define PROC_STAT_MAX 1024
+
 static uint32_t proc_entry_size(uint32_t entry) {
     if (entry == PROC_ENTRY_SELF_STATUS) return PROC_STATUS_MAX;
+    if (entry == PROC_ENTRY_PID_STAT)    return PROC_STAT_MAX;
     return 0;
 }
 
@@ -800,6 +830,130 @@ static size_t proc_build_status(uint32_t entry, char* out, size_t cap) {
 
     APPEND_LIT("Uid:\t1000\n");
     APPEND_LIT("Gid:\t1000\n");
+
+    #undef APPEND_LIT
+    #undef APPEND_UDEC
+
+    if (o + 1 < cap) out[o] = '\0';
+    else out[cap - 1] = '\0';
+    return o;
+}
+
+/*
+ * Build the synthesized text for /proc/<pid>/stat.
+ *
+ * The format is NOT ours to choose: libbb/procps.c's procps_scan
+ * (line 390) parses it with a fixed sscanf, and the fields must
+ * appear in that order.  The sequence it reads:
+ *
+ *   pid (comm) state ppid pgid sid tty tpgid
+ *   flags min_flt cmin_flt maj_flt cmaj_flt
+ *   utime stime cutime cstime priority
+ *   nice timeout it_real_value
+ *   start_time vsize rss
+ *
+ * procps_scan splits on the LAST ')' of the line, so `comm` may
+ * contain spaces and parentheses; the PID and the opening '(' are
+ * before it, and the rest is after.  The sscanf matches at least
+ * 11 conversions (n >= 11) or the entry is skipped, so every field
+ * must be present as a token even when its value is a placeholder.
+ *
+ * Real values (from the pcb): pid, comm, state, ppid, utime,
+ * stime, start_time, vsize.  utime and stime are both total_ticks
+ * (donix does not split user and system time); start_time is
+ * creation_time; vsize is elf_num_pages * 4096, the ELF image's
+ * mapped bytes -- it does not include the stack, heap, or mmap
+ * window, so it is a lower bound, not the whole address space.
+ *
+ * Zero placeholders (nothing tracks them): pgid, sid, tty, tpgid,
+ * flags, the five *_flt counters, cutime, cstime, priority, nice,
+ * timeout, it_real_value, rss.  A `ps` row that shows 0 in those
+ * columns is honest: donix does not know them.
+ *
+ * Returns the byte count (excluding the NUL), truncating at cap
+ * like proc_build_status.
+ */
+static size_t proc_build_stat(uint64_t pid, char* out, size_t cap) {
+    if (cap == 0) return 0;
+    pcb_t* p = process_find_by_pid(pid);
+    if (!p) return 0;
+
+    size_t o = 0;
+
+    #define APPEND_LIT(s) do { \
+        const char* _p = (s); \
+        while (*_p && o + 1 < cap) out[o++] = *_p++; \
+    } while (0)
+
+    #define APPEND_UDEC(v) do { \
+        unsigned long _v = (unsigned long)(v); \
+        char _tmp[24]; int _n = 0; \
+        if (_v == 0) { _tmp[_n++] = '0'; } \
+        else { while (_v > 0) { _tmp[_n++] = '0' + (int)(_v % 10); _v /= 10; } } \
+        while (_n > 0 && o + 1 < cap) out[o++] = _tmp[--_n]; \
+    } while (0)
+
+    /* pid */
+    APPEND_UDEC(p->pid);
+
+    /* (comm) -- name, parenthesised */
+    APPEND_LIT(" (");
+    if (p->name[0]) {
+        const char* q = p->name;
+        while (*q && o + 1 < cap) out[o++] = *q++;
+    }
+    APPEND_LIT(") ");
+
+    /* state: R / S / Z / T, one character */
+    {
+        char sc = 'S';
+        switch (p->state) {
+            case PROC_STATE_RUNNING: sc = 'R'; break;
+            case PROC_STATE_READY:   sc = 'R'; break;
+            case PROC_STATE_BLOCKED: sc = 'S'; break;
+            case PROC_STATE_ZOMBIE:  sc = 'Z'; break;
+            default:                 sc = 'S'; break;
+        }
+        if (o + 1 < cap) out[o++] = sc;
+    }
+
+    /* ppid */
+    APPEND_LIT(" ");
+    APPEND_UDEC(p->parent_pid);
+
+    /* pgid sid tty tpgid -- all zero */
+    APPEND_LIT(" 0 0 0 0");
+
+    /* flags min_flt cmin_flt maj_flt cmaj_flt -- all zero */
+    APPEND_LIT(" 0 0 0 0 0");
+
+    /* utime stime -- both total_ticks */
+    APPEND_LIT(" ");
+    APPEND_UDEC(p->total_ticks);
+    APPEND_LIT(" ");
+    APPEND_UDEC(p->total_ticks);
+
+    /* cutime cstime priority -- zero */
+    APPEND_LIT(" 0 0 0");
+
+    /* nice -- zero */
+    APPEND_LIT(" 0");
+
+    /* timeout it_real_value -- zero */
+    APPEND_LIT(" 0 0");
+
+    /* start_time */
+    APPEND_LIT(" ");
+    APPEND_UDEC(p->creation_time);
+
+    /* vsize (bytes; procps_scan shifts >> 10 for kB) */
+    APPEND_LIT(" ");
+    APPEND_UDEC(p->elf_num_pages * 4096);
+
+    /* rss (pages; procps_scan shifts for kB) -- zero */
+    APPEND_LIT(" 0");
+
+    APPEND_LIT("\n");
 
     #undef APPEND_LIT
     #undef APPEND_UDEC
@@ -2168,6 +2322,61 @@ static long open_resolved(const char* in_path, int flags, int backend) {
             return dfd;
         }
 
+        /*
+         * /proc/<pid>/stat -- a per-pid synthesized file.  The
+         * pid is in the path, so it cannot be a fixed table key;
+         * parse it here and encode (pid, tag) in the slot's obj
+         * (see PROC_OBJ_MAKE).  Only "stat" today; "status" is
+         * the next commit and adds a second tail check.
+         */
+        {
+            const char* q = in_path;
+            /* must start with "/proc/" */
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                /*
+                 * The component is either a run of digits or the
+                 * literal "self".  "self" resolves to the process
+                 * doing the open, which is what Linux does -- the
+                 * kernel resolves it, not the caller.  libbb and
+                 * musl both open the literal string, and so does
+                 * the test.
+                 */
+                uint64_t pid = 0;
+                int ok_component = 0;
+                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
+                    pcb_t* me = process_get_current();
+                    if (me) { pid = me->pid; ok_component = 1; }
+                    q += 4;
+                } else {
+                    int ndig = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        pid = pid * 10 + (uint64_t)(*q - '0');
+                        q++; ndig++;
+                    }
+                    ok_component = (ndig > 0);
+                }
+                int is_stat = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
+                if (is_stat) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    file_slot_t* sslot = NULL;
+                    int sfd = alloc_file_slot(&sslot);
+                    if (sfd == -1) return -(long)EIO_;
+                    sslot->kind = FILE_KIND_PROC;
+                    sslot->obj  = PROC_OBJ_MAKE(pid, PROC_ENTRY_PID_STAT);
+                    sslot->end  = 0;   /* read cursor: not yet drained */
+                    FDTRACE({ serial_print("open  proc stat -> fd=");
+                              serial_print_dec((uint64_t)sfd);
+                              serial_print(" pid=");
+                              serial_print_dec(pid); });
+                    return sfd;
+                }
+            }
+        }
+
         uint32_t entry = proc_lookup(in_path);
         if (entry != PROC_ENTRY_NONE) {
             file_slot_t* pslot = NULL;
@@ -3269,6 +3478,47 @@ static long stat_resolved(const char* abs_path, void* user_stat,
             }
             return 0;
         }
+        /*
+         * /proc/<pid>/stat: same pattern open_resolved accepts.
+         * Report a regular file with a plausible size.  The same
+         * minimal parse; "status" is the next commit.
+         */
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                /* Same component rule as open_resolved: digits or
+                 * the literal "self" (resolved to this process). */
+                uint64_t pid = 0;
+                int ok_component = 0;
+                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
+                    pcb_t* me = process_get_current();
+                    if (me) { pid = me->pid; ok_component = 1; }
+                    q += 4;
+                } else {
+                    int ndig = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        pid = pid * 10 + (uint64_t)(*q - '0');
+                        q++; ndig++;
+                    }
+                    ok_component = (ndig > 0);
+                }
+                int is_stat = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
+                if (is_stat) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    kernel_stat_t st;
+                    fill_kstat_as_proc(&st, PROC_ENTRY_PID_STAT);
+                    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                        return -(long)EFAULT_;
+                    }
+                    return 0;
+                }
+            }
+        }
+
         uint32_t entry = proc_lookup(abs_path);
         if (entry != PROC_ENTRY_NONE) {
             kernel_stat_t st;
@@ -4951,9 +5201,22 @@ long sys_read(int fd, void* buf, size_t count) {
         file_slot_t* ps = get_file_slot_any(fd);
         if (ps && ps->kind == FILE_KIND_PROC) {
             if (ps->end != 0) return 0;   /* already drained: EOF */
-            uint32_t entry = (uint32_t)(uintptr_t)ps->obj;
+            uint32_t tag = PROC_OBJ_TAG(ps->obj);
+            size_t klen = 0;
+            if (tag == PROC_ENTRY_PID_STAT) {
+                char kbuf[PROC_STAT_MAX];
+                klen = proc_build_stat(PROC_OBJ_PID(ps->obj),
+                                       kbuf, sizeof(kbuf));
+                ps->end = 1;
+                if (klen == 0) return 0;
+                size_t to_copy = count < klen ? count : klen;
+                if (safe_copy_to_user(buf, kbuf, to_copy) != 0) {
+                    return -(long)EFAULT_;
+                }
+                return (long)to_copy;
+            }
             char kbuf[PROC_STATUS_MAX];
-            size_t klen = proc_build_status(entry, kbuf, sizeof(kbuf));
+            klen = proc_build_status(tag, kbuf, sizeof(kbuf));
             ps->end = 1;
             if (klen == 0) return 0;
             size_t to_copy = count < klen ? count : klen;

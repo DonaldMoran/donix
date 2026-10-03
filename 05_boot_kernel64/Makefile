@@ -66,6 +66,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/proc_status.elf \
 	$(USERLAND_BIN)/proc_fd.elf \
 	$(USERLAND_BIN)/proc_dir.elf \
+	$(USERLAND_BIN)/proc_stat.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -156,6 +157,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/proc_status.elf"    PROC_STATUS ; \
 	mcopy_one "$(USERLAND_BIN)/proc_fd.elf"        PROC_FD ; \
 	mcopy_one "$(USERLAND_BIN)/proc_dir.elf"       PROC_DIR ; \
+	mcopy_one "$(USERLAND_BIN)/proc_stat.elf"      PROC_STAT ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
 	@echo "--- staging busybox at /bin/busybox ---"
