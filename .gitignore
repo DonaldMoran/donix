@@ -37,6 +37,11 @@ diff.sh
 collect_full_sources.sh
 capture.txt
 
+# Boot / crash captures (the run script and manual QEMU runs)
+PFcapture.txt
+BOOT_PF.TXT
+boot*.txt
+
 
 # OS-specific build outputs (added)
 04_kernel_64bit/test_program
