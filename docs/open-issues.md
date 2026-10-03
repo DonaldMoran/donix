@@ -140,6 +140,74 @@
    `isr14_handler`; this one is its sibling and wants the same
    treatment.
 
+   **Instrumented (session 51), not fixed.**  The three silent
+   `return -1;` sites in `vmm_map_page_in_cr3` — PDPT, PD, and the
+   final PT after the huge-page split — now each print `VMM: map
+   failed site=<NAME> virt=... cr3=... free=NNN` before returning
+   -1.  The huge-page split block's own alloc failure already
+   halted loudly and is unchanged; it is the fourth site under a
+   different name.  The commit is scratch-tagged
+   `20261003-vmm-map-diag`.
+
+   The diagnostic **did not fire** on the three boots that
+   followed: the item-7a `#PF` did not reproduce.  That is the
+   session-48 result, and the diagnostic stays in place — failure
+   branch only, no new code on a healthy boot, zero cost until the
+   fault returns.  When it does, the `free` field is the piece
+   that separates the two candidates below: a healthy count with
+   `site=PDPT` or `site=PD` is (b); a near-zero count is (a).
+
+7b. **A user-mode `#GP` at `0x42F1A7` in busybox during `find`.**
+   Session 51's first interactive boot — after the
+   `20261003-vmm-map-diag` commit — hit this during the canary's
+   `find / -type d` row:
+
+       === GENERAL PROTECTION FAULT (#GP) ===
+         Faulting RIP : 0x000000000042F1A7
+         Code Seg (CS): 0x0000000000000033
+         Stack (RSP)  : 0x00000080000FBD98
+         Error Code   : 0x0000000000000000
+         Current PID : 15
+         Name        : busybox
+         entry_point : 0x0000000000411A92
+       EXIT: pid=15 state=2 parent=4 qhead=(empty)
+       EXIT-FALLBACK: switching to idle, exiting pid=15 name=busybox
+
+   The process was killed and the shell fell back to idle; the
+   `find` never completed.  The next boot ran the same row to
+   completion, `canary` 15/15 and `canary --full` 28/28.  The
+   full raw frame dump is in `capture.txt` and in
+   `docs/session-log.md`, session 51.
+
+   **This is not item 7a.**  Item 7a is a `#PF` at
+   `CR2 = RIP = 0x400000`, error `0x15`, in `musl_sh`'s ELF load,
+   before any user instruction runs.  This is a `#GP` (vector 13,
+   not 14), error `0` — not present/write/user/fetch — at a user
+   text address in busybox (`0x42F1A7`), during a syscall in a
+   process that had already been running.  Different vector,
+   different location, different phase.  The
+   `20261003-vmm-map-diag` sites are not on this path and none of
+   them printed.
+
+   **Third in the same family.**  Session 45's virtual-1 `#PF`
+   and session 50's `0x400000` `#PF` are the first two: all three
+   are intermittent, layout-dependent, appear on the first boot
+   after an image change, and clear on the next.  A user `#GP`
+   with error `0` is raised for a privileged instruction, a
+   non-canonical address in a base register, or a segment
+   violation — the frame dump's `[2] 0x0000008010001030` and
+   `[3] 0x0000008010000230` are the values the faulting code was
+   working with, and `[6] 0x00000000FFFFFF9C` is `AT_FDCWD`
+   sign-extended, consistent with `newfstatat`.  Which instruction
+   at `0x42F1A7` raised it is not yet known; busybox is a
+   third-party binary and its symbols are not in the tree.
+
+   **Unobserved, not fixed.**  It did not reproduce on the next
+   boot.  It needs its own instrument — a first-party reproduction
+   of the `find` sequence, or a kernel-side `#GP` handler trace —
+   before it is guessed at.  It is not the same fault as 7a and
+   must not be folded into 7a's writeup.
+
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
    committed to FAT.  The correct frame is therefore **Unix
