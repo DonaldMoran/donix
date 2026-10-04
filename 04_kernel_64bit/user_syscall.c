@@ -7370,9 +7370,28 @@ long sys_fork(void) {
         EAGER_COPY_REGION(parent->user_stack_virt, parent->user_stack_top);
     }
 
-    /* brk heap: only the pages the parent actually touched. */
-    if (parent->brk_virt != 0) {
-        EAGER_COPY_REGION(0x0000008000200000ULL, 0x0000008000300000ULL);
+    //~ /* brk heap: only the pages the parent actually touched. */
+    //~ if (parent->brk_virt != 0) {
+        //~ EAGER_COPY_REGION(0x0000008000200000ULL, 0x0000008000300000ULL);
+    //~ }
+
+    /*
+     * brk heap: [heap_base, brk_virt), not a fixed 1 MB window.
+     *
+     * sys_brk has no upper bound -- it refuses new_brk < heap_base
+     * but accepts any new_brk above it, so a program can grow
+     * brk_virt past 0x8000300000.  The old copy walked a fixed
+     * [0x8000200000, 0x8000300000) window and then set
+     * child->brk_virt = parent->brk_virt below.  A child whose
+     * parent had grown past the window got a brk_virt naming pages
+     * it did not have, and read a hole.  Walk the range the
+     * parent's brk_virt actually names; the child then has pages
+     * for exactly what its brk_virt claims.
+     *
+     * 0x8000200000 is heap_base in sys_brk -- keep them in sync.
+     */
+    if (parent->brk_virt > 0x0000008000200000ULL) {
+        EAGER_COPY_REGION(0x0000008000200000ULL, parent->brk_virt);
     }
 
     /* mmap window: same, only the pages that are present. */
