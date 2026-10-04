@@ -4852,8 +4852,25 @@ long sys_wait4(long pid, int* user_status, int options) {
         pcb_t* zombie = NULL;
         pcb_t* live   = NULL;
 
-        for (uint64_t child_pid = 1; child_pid < 1000; child_pid++) {
-            pcb_t* c = process_find_by_pid(child_pid);
+        /*
+         * Walk the PCB pool by INDEX, not by pid.
+         *
+         * The previous scan was `for (child_pid = 1; child_pid < 1000;
+         * child_pid++) process_find_by_pid(child_pid)`.  That has a
+         * hard ceiling at pid 999: a child whose pid is >= 1000 is
+         * invisible to wait4, so when the shell has forked past
+         * ~1000 children over the life of the boot, its children
+         * become unreapable and leak as zombies until the 32-slot
+         * PCB pool is exhausted.
+         *
+         * process_get_pcb(i) returns the PCB at pool index i, or
+         * NULL for an out-of-range index or an unused slot.  It
+         * returns zombies, which is what this scan needs.  The pool
+         * is MAX_PROCESSES (32) entries, so this is also ~30x
+         * cheaper than the pid scan was.
+         */
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            pcb_t* c = process_get_pcb(i);
             if (!c) continue;
             if (c->parent_pid != self->pid) continue;
             if (target != (uint64_t)-1 && c->pid != target) continue;
@@ -4911,8 +4928,8 @@ long sys_wait4(long pid, int* user_status, int options) {
          */
         {
             pcb_t* late_zombie = NULL;
-            for (uint64_t child_pid = 1; child_pid < 1000; child_pid++) {
-                pcb_t* c = process_find_by_pid(child_pid);
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                pcb_t* c = process_get_pcb(i);
                 if (!c) continue;
                 if (c->parent_pid != self->pid) continue;
                 if (target != (uint64_t)-1 && c->pid != target) continue;
