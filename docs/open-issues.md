@@ -208,37 +208,36 @@
    before it is guessed at.  It is not the same fault as 7a and
    must not be folded into 7a's writeup.
 
-7c. **`sha512sum` computes a wrong digest — deterministic.**
-   `printf ABC | sha512sum` produces
+7c. **`sha512sum` is correct; the harness had the wrong expected
+   value.  RETRACTED (session 52).**
 
-       397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119
+   This item claimed `sha512sum` computes a wrong digest for
+   `ABC`.  It does not.
 
-   The correct SHA-512 of the three bytes `ABC` is
+   The digest the harness expected,
 
        ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
 
-   **Every run, every time, at the prompt and in a script, through
-   a plain pipe.**  Not intermittent.  `md5sum`, `sha1sum`, and
-   `sha256sum` all produce their correct digests for the same three
-   bytes through the same pipe on the same boot — only the 512-bit
-   one is wrong.
+   is the SHA-512 of lowercase `abc` — the FIPS 180-4 test vector
+   for the three lowercase letters, not the three uppercase ones.
 
-   **An applet bug, not a kernel bug and not a shell bug.**  The
-   reproducer is `printf ABC | sha512sum` at the interactive
-   prompt: no `sh -c`, no command substitution, no script.  The
-   shell and the pipe are excluded by that.
+   The digest `sha512sum` actually produces,
 
-   **Suspect block size.**  SHA-512 uses 128-byte blocks where
-   SHA-1/SHA-256 use 64, and only SHA-512 is wrong.  A second
-   suspect is the length field (SHA-512 uses a 128-bit length).
-   The next session should read `third_party/busybox`'s SHA-512
-   implementation *as a first-party reading, not an edit* — the
-   vendored tree is gitignored and rebuilt, so a fix goes in
-   `configs/` (disable `CONFIG_SHA512SUM`) or waits for a
-   first-party reproduction, not in a `third_party/` patch.
+       397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119
 
-   Found by `test.sh` row 4.  The row stays in the harness with the
-   correct expected value so the bug is visible every run.
+   is the correct SHA-512 of the three bytes 0x41 0x42 0x43.
+
+   Confirmed four ways, all agreeing: the busybox applet on donix;
+   a self-contained FIPS 180-4 implementation in
+   `userland/musl/tests/sha512_probe.c` run on donix; the same
+   implementation run on the fedora host; and `sha512sum` on the
+   fedora host.
+
+   The row in `userland/scripts/test.sh` now expects
+   `397118fd...`.  The lesson is in `gotchas.md`: a test's
+   expected value is a claim like any other — verify it against a
+   known-good source before treating a mismatch as a bug in the
+   thing under test.
 
 7d. **A chain of command substitutions can lose a wake — racy.**
    A shell running many `x=$(command)` rows will eventually block

@@ -22,13 +22,6 @@
 #
 # KNOWN BUGS this script currently reports (session 51):
 #
-#   sha512sum ABC   -- busybox sha512sum computes the wrong digest
-#                      for the three bytes ABC, from correct input,
-#                      through a plain pipe.  Deterministic.  The
-#                      other three checksums are correct.  This is
-#                      an applet bug, not a test bug; the row
-#                      asserts the correct value and fails.
-#
 #   a mid-script hang -- a chain of command substitutions can lose
 #                      a wake; the shell blocks and the scheduler
 #                      falls to idle.  Racy: the same image runs to
@@ -109,9 +102,10 @@ echo "=== donix applet test ==="
 # ------------------------------------------------------------------
 # Checksums: known answers.  printf feeds the bytes.
 #
-# sha512sum is EXPECTED TO FAIL: it computes the wrong digest for
-# ABC.  See the header.  The row stays in so the bug is visible
-# every run until it is fixed.
+# Session 52: sha512sum is CORRECT.  The previous expected value
+# was the SHA-512 of lowercase 'abc' -- the FIPS test vector for
+# the lowercase letters -- not of the three bytes 0x41 0x42 0x43
+# that the row feeds it.  The value is corrected below.
 # ------------------------------------------------------------------
 check "md5sum ABC" "902fbdd2b1df0c4f70b4a5d23525e932  -" \
     sh -c 'printf ABC | md5sum'
@@ -119,7 +113,7 @@ check "sha1sum ABC" "3c01bdbb26f358bab27f267924aa2c9a03fcfdb8  -" \
     sh -c 'printf ABC | sha1sum'
 check "sha256sum ABC" "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78  -" \
     sh -c 'printf ABC | sha256sum'
-check "sha512sum ABC" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f  -" \
+check "sha512sum ABC" "397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119  -" \
     sh -c 'printf ABC | sha512sum'
 
 # ------------------------------------------------------------------

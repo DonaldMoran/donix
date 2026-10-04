@@ -14,7 +14,8 @@
 # configs/busybox.config changes.
 
 MUSL_GCC := ../../toolchain/musl-gcc.sh
-CFLAGS   := -static -no-pie -O2 -mcmodel=large
+# CFLAGS   := -static -no-pie -O2 -mcmodel=large
+CFLAGS   := -static -no-pie -O2 -mcmodel=large -mno-sse -mno-sse2 -mno-avx -mno-mmx
 
 BUSYBOX_DIR    := ../../third_party/busybox
 BUSYBOX_BIN    := $(BUSYBOX_DIR)/busybox
@@ -34,10 +35,13 @@ ALL_ELFS  := $(APP_ELFS) $(TEST_ELFS) $(BUSYBOX_ELF)
 
 all: $(ALL_ELFS)
 
-build/%.elf: apps/%.c | build
+# The Makefile is a prerequisite so a CFLAGS change forces a
+# rebuild.  Without it, editing a flag does nothing until the
+# target's source changes, which cost a session (session 52).
+build/%.elf: apps/%.c Makefile | build
 	$(MUSL_GCC) $(CFLAGS) -o $@ $<
 
-build/%.elf: tests/%.c | build
+build/%.elf: tests/%.c Makefile | build
 	$(MUSL_GCC) $(CFLAGS) -o $@ $<
 
 # Install the tracked config into the (ignored) busybox source tree.
