@@ -302,19 +302,33 @@
    | 3 | `#GP` | `0x0400000000000000` | — | `r14/r13/r12 = 1/2/3` |
    | 4 | `#PF` | `0x0000000000000000` | `0x0000000000000000` | after the `#PF` frame dump landed |
 
-   **The fingerprint.**  Two captures, on different fault vectors,
-   hold the same two values in the same two registers:
+   **The fingerprint.**  One capture on disk holds these two values
+   in these two registers:
 
        r8 = 0x0000000000415516            (a busybox text address)
        r9 = 0x2F2F2F2F2F2F2F2F            (eight '/' bytes)
 
    `0x2F2F2F2F2F2F2F2F` is the ASCII `/` character repeated eight
-   times.  `r8` holds a legitimate text address.  Both appeared in
-   capture 2 (`#GP`) and again in capture 4 (`#PF`), in the same
-   slots.  That is not random corruption: a specific code path loads
-   those two values into `r8` and `r9` and then transfers control to
-   something derived from them.  The four `RIP`s are downstream of
-   the same corruption, not four separate bugs.
+   times.  `r8` holds a legitimate text address.  In the raw frame
+   dump they sit at **slot 7 (`r8`) and slot 6 (`r9`)**.  That
+   mapping was checked in session 52 against `PUSH_ALL_GPRS` in
+   `04_kernel_64bit/isr.asm` (which pushes `r15` first, `rax`
+   last, so the dump prints in reverse push order) and against the
+   `offset 0x28: r10` comment in `04_kernel_64bit/interrupts.c`
+   (slot 5 = `r10`).  It is not an inference.  A specific code
+   path loads those two values into `r8` and `r9` and then
+   transfers control to something derived from them; the faulting
+   `RIP`s are downstream of the same corruption, not separate
+   bugs.
+
+   The entry above describes four captures.  **Only one 7e capture
+   is in the tree today** -- `capture.txt`, the `#PF` at
+   `CR2 = RIP = 0x1`, error `0x15`, which is a shape the table
+   above does not list.  The four-capture table is not reproducible
+   from what is on disk; the earlier captures were almost certainly
+   overwritten (capture files are truncated per run, per
+   `handoff.md`).  Treat the table as history, not as evidence a
+   future session can re-read.
 
    **Where it appears.**  Every capture was taken while running
    `test.sh` or `pipe_wake_probe.sh`, in a `NOEXEC` busybox applet
@@ -353,10 +367,33 @@
    order.  A future `#PF` and a future `#GP` are comparable
    slot-for-slot.
 
+   **What is in the tree now (session 52).**  `capture.txt` holds
+   **one** 7e fault: a `#PF` at `CR2 = RIP = 0x1`, error `0x15`
+   -- a fifth shape, not one of the four the table lists.
+   `PFcapture.txt` is **item 7a** (`CR2 = RIP = 0x400000`, error
+   `0x14`, in `musl_sh`'s ELF load), not 7e; it must not be
+   reached for as a 7e capture.  Session 52 ran
+   `sh /root/scripts/test.sh` twice and
+   `./pipe_wake_probe.sh` once (200 iterations, clean `loopdone`);
+   **none produced a 7e fault.**  The "within the first dozen rows
+   on most boots" line above is therefore not currently
+   reproducible, and a session that waits for 7e during a harness
+   run may wait a long time.
+
+   The one dump that does exist **supports** the "where to look
+   next" hypothesis rather than contradicting it: `r8` holds
+   `0x415516`, a busybox text address; `r9` holds `/` repeated
+   eight times; the faulting `RIP` is `0x1`.  That is control
+   transferred through a slot that should have held a code pointer
+   and held something that resolved to `0x1`.
+
    **Unobserved, not fixed.**  The standing rule: an intermittent
    fault that has not been reproduced under control is not closed.
-   Four captures and a register fingerprint is a narrowing, not a
-   fix.
+   One on-disk capture and a verified register fingerprint is a
+   narrowing, not a fix.  The next real move is a **targeted
+   first-party reproducer** -- a test that forks a `NOEXEC` busybox
+   child and drives the fork-path the hypothesis names -- not
+   another harness run.
 
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
