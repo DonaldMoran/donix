@@ -1,3 +1,145 @@
+## Session 54 — the zombie leak closed, the NX/non-canonical address family fixed, and user faults made honest
+
+One commit on `dev`, scratch-tagged, unpushed.  **Not a
+milestone** — a correctness session.  Seven fixes and three
+diagnostic changes, all verified against a 4000-iteration
+`pipe_wake_probe.sh` run that completes with `loopdone`.  The run
+surfaced two user-mode `#PF` events the kernel survived; the shell
+now prints `Segmentation fault` for each.  Before this session,
+the same faults were silent.
+
+| Tag | What |
+|---|---|
+| `20261004-zombie-leak-and-nx-family` | the zombie-leak fix; the NX / non-canonical address family; the honest exit-status change |
+
+### The zombie leak (item 11)
+
+`pipe_wake_probe.sh` had been leaking one pipe per iteration past
+~1074, then 2438, then completing — the leak moved as the fixes
+landed.  Session 53 read the trace and proposed the lost
+pipe-EOF wake; the actual cause was that `process_exit` did not
+call `close_all_files`.  `sys_exit` did, but `process_exit` is
+also reached directly from `fault_kill_current`, from
+`user_syscall_entry.asm`'s exit jmp, and from `sys_execve`'s
+failure branch — and those three did not close the file table.
+
+`close_all_files` was `static` in `user_syscall.c`.  It is now
+un-static'd, declared in `include/process.h`, and called at the
+top of `process_exit`.  It is idempotent — NULLs each slot as it
+closes — so a call after `sys_exit`'s own close is a no-op.
+
+Verified: 4000 iterations complete, no PCB exhaustion, no leaks.
+
+### The NX / non-canonical address family
+
+Four fixes, one mechanism.  Every one was found by reading the
+function and the actual bytes, after the trace pointed at the
+wrong thing.
+
+**`vmm_get_phys` and `vmm_get_phys_from_cr3` strip `PT_NX`.**
+`~0xFFFULL` alone leaves bit 63 set when a PTE or PDE has `PT_NX`.
+Callers add `HHDM_START`; with bit 63 set the sum is non-canonical
+and the next load faults with `#GP` error 0.  This was latent
+until `sys_mmap` began honoring `PROT_EXEC` and setting `PT_NX`
+on anonymous mappings.  Both functions now mask `~PT_NX` in
+addition to `~0xFFFULL`, including the huge-page branch in
+`vmm_get_phys_from_cr3`.
+
+**`sys_mmap` honors `PROT_EXEC`.**  Every anonymous mapping was
+previously `PT_PRESENT | PT_WRITE | PT_USER` with no `PT_NX` —
+every mmap window page was executable.  That turned a stray jump
+into the window into a silent fetch-then-run (a fault inside the
+window on whatever the fetched bytes first dereference) instead of
+an immediate `#PF` at the jump.  Now: if `PROT_EXEC` is not set,
+`PT_NX` is.  `PROT_READ`, `PROT_WRITE`, and `PROT_NONE` are
+accepted and ignored; donix has no user page-permission model
+beyond user / not-user.
+
+**The huge-page split sets NX on the PTEs, not on the PDE.**  A
+PDE's NX bit propagates to every page below it, including the
+caller's own page — which the caller then wrote an executable
+PTE for, only to have the CPU refuse the fetch at the PDE level.
+That was the boot `#PF` at `RIP=CR2=0x4010A6` with `error=0x15`:
+musl_sh's `.text` page was NX at the PDE level despite the loader
+asking for an executable mapping.  Now: `carry` (no NX) goes into
+the PDE, `carry | PT_NX` goes into the 512 split PTEs.
+
+**`pte_phys`: a helper that strips `PT_NX` from a table entry.**
+`vmm.c` had `entry & ~0xFFFULL` at every walk step, and every walk
+step fed a pointer to the next level.  With `PT_NX` set, the same
+non-canonical-address bug fired at each level.  A single
+`static inline pte_phys(entry)` does
+`entry & ~0xFFFULL & ~PT_NX`, and every walk site in `vmm.c` uses
+it: `vmm_map_page`, `vmm_unmap_page`, `vmm_get_phys`,
+`vmm_is_mapped`, `vmm_dump_page_table`, `vmm_clone_page_table`,
+`vmm_get_phys_from_cr3`, `vmm_map_page_in_cr3`,
+`vmm_unmap_page_in_cr3`.
+
+### The fault-model changes
+
+**`isr14_handler`'s walk does not halt.**  The `#PF` walk's
+"`PML4E` / `PDPTE` / `PDE` not present" paths used to halt the CPU
+with `while (1) hlt`.  For a user-mode fault at a genuinely
+unmapped address — which is the normal case — that skipped the
+register dump and the stack window, the only diagnostics that
+name the fault.  Each case now sets `walk_incomplete`, prints the
+level, and falls through.
+
+**`fault_signal`: the kernel reports a faulted child honestly.**
+Before this, a faulted child exited with status 0 — the shell
+could not tell a clean exit from a kernel kill.  `fault_kill_current`
+maps the CPU exception vector to a Linux signal number
+(`0x0E` -> `SIGSEGV` = 11, `0x0D` -> `SIGSEGV` = 11, `0x06` ->
+`SIGILL` = 4, `0x00` -> `SIGFPE` = 8, `0x01` -> `SIGTRAP` = 5)
+and stores it on the PCB's new `fault_signal` field.  `sys_wait4`
+encodes a nonzero `fault_signal` as a signal-kill status (the low
+byte is the signal number).  busybox ash's `waitforjob` checks
+`WIFSIGNALED` and prints `Segmentation fault`.  `process_reclaim`
+and `process_destroy` clear `fault_signal` so a reused PCB slot
+cannot carry a stale fault.
+
+Verified: during the 4000-iteration run, two faults printed
+`Segmentation fault` at their iteration; before the change, the
+same faults printed nothing.
+
+### The three diagnostic changes
+
+- **`pmm.c`**: `pmm_init`'s kernel-reservation line prints
+  `pmm_free_pages`.  `pmm_alloc_page`'s HIGH and LOW branches
+  print `PMM REUSE: page 0x... was <type> now <type>` when a page
+  transitions between non-`FREE` types.
+- **`run`**: a commented-out QEMU invocation documenting the
+  `-d int` capture method.
+- **`pipe_wake_probe.sh`**: the iteration count is 4000, up from
+  200.  At 200 the script never reached the fault; at 4000 the
+  leak and the fault family both reproduce.
+
+### Item 7e is a busybox bug, not a donix bug
+
+Every capture across sessions 45-54 has `last sysret rcx` in
+busybox text.  The kernel returns correctly every time.  The user
+process then executes a control transfer to a data value.  donix
+executes the jump faithfully; the CPU faults.  Session 54's
+diagnostic work makes the fault produce a clean `error=0x15` with
+`CR2 == RIP`, and the shell now reports it.  Nothing more for the
+kernel to fix.  A future session that wants to chase it further
+is chasing a busybox bug and would need a first-party reproducer,
+not a kernel change.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| Boot to shell prompt | OK |
+| `sh pipe_wake_probe.sh` | **4000 iterations, `loopdone`** |
+| User-mode `#PF` events during the run | two; each killed only the faulting child; the shell printed `Segmentation fault`; the loop continued |
+| Kernel `#GP` / kernel `#PF` / hang | none |
+
+The image stages the same 49 files as before; the run is against
+the same tree.  `kernel.bin` grew from 164376 to 165144 across
+the session.
+
+
 ## Session 53 — the zombie leak, the wired sysret diagnostic, and four falsified mechanisms
 
 Two code commits and three docs commits on `dev`, all untagged.
