@@ -289,7 +289,23 @@ void __attribute__((noreturn)) process_exit(void) {
 
 void scheduler_switch_to(pcb_t* next) {
     if (!next) return;
-    if (next == current_process) return;
+    if (next == current_process) {
+        /*
+         * Asked to switch to ourselves: nothing to switch, but the
+         * invariant "the running process is RUNNING" must hold.  A
+         * peer wake (process_wake_parent_if_waiting, pipe_wake_waiter,
+         * process_wake_all_blocked) can set state to READY while we
+         * are still on the CPU, before we reach process_yield.  Every
+         * requeue guard in the scheduler (here, process_yield, the
+         * timer handler) tests `state == RUNNING`, so a running
+         * process left in READY is skipped by all of them and ends
+         * up off the ready queue with nothing to reschedule it.
+         * Item 7d.
+         */
+        next->state = PROC_STATE_RUNNING;
+        next->block_kind = BLOCK_KIND_NONE;
+        return;
+    }
 
     if (next->pid == 1 && current_process &&
         current_process->state == PROC_STATE_RUNNING) {
