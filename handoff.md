@@ -3,16 +3,14 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-04 (session 52: a wrong constant in the
-harness.  `test.sh`'s `sha512sum` row expected the SHA-512 of
-lowercase `abc` for the three bytes `ABC`, so the row failed
-forever and a session was spent reading correct sha512 code.  The
-row is corrected, item 7c is **retracted**, and the one real
-finding from the chase is filed as **item 10**: `CR4.OSFXSR` is
-set but the kernel saves no XMM state.  **Next: pick a real
-target -- item 10 is filed and large; items 7a/7b/7e are the
-intermittent family and need boots; the small independent items
-are in "If you would rather do something small and clean."**)
+**Last updated:** 2026-10-04 (session 53: a reproducible zombie
+leak, a wired diagnostic, and a test row corrected.  Two code
+commits and three docs commits on `dev`, all untagged.  **Next:
+item 11 -- the `pipe_wake_probe.sh` zombie leak -- is the
+clearest target: it has a reproducer, a transition point, and a
+place to read.  Item 7e now has a working diagnostic that will
+print the sysret target on the next fault.  Item 10 (the SSE gap)
+remains filed and large.**)
 
 **Repo state -- run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -23,37 +21,15 @@ lands, so this file does not carry one:
     git tag --list 'v*' | tail -1   # last milestone
     git tag --list '2026*'          # live scratch tags
 
-> **The session's real result is a correction, and the lesson is
-> about this file.**  Session 51 filed item 7c as "`sha512sum`
-> computes a WRONG digest for `ABC`", quoting the expected value
-> `ddaf35a1…` and the produced value `397118fd…`.  Session 52
-> read that sentence, believed the expected value, and spent the
-> session reading `sha512_begin`/`hash`/`end`/
-> `sha512_process_block128`, the applet's dispatch and read loop,
-> the swap macros, and `rotr64` — all correct — before anyone
-> checked the constant.  `ddaf35a1…` is the FIPS 180-4 vector for
-> lowercase `abc`; `397118fd…` is the correct SHA-512 of the
-> three bytes `0x41 0x42 0x43`.  **The row had been comparing
-> `ABC`'s digest against `abc`'s digest.**
->
-> Settled by one command on the fedora host:
->
->     echo -n abc | sha512sum   # ddaf35a1...4ca49f
->     echo -n ABC | sha512sum   # 397118fd...dc119
->
-> Four producers agree on both values: the busybox applet on
-> donix, `userland/musl/tests/sha512_probe.c` on donix, the same
-> implementation on the fedora host, and `sha512sum` on the fedora
-> host.
->
-> **The rule this file must carry forward: a handoff's item text
-> is a claim, like a commit message.**  Item 7c stated two things
-> — that `sha512sum` was wrong, and that `ddaf35a1…` was the
-> correct value for `ABC`.  The session read the first, believed
-> the second, and spent its time on the first.  When the next
-> session reads an item here, and the item quotes an expected
-> value, **check the value against a known-good source before
-> acting on the claim it supports.**
+> **The rule this file carries forward, from session 52: an item
+> here that quotes an expected value is a claim.**  Session 51
+> filed item 7c as "`sha512sum` computes a WRONG digest for
+> `ABC`" with a value that turned out to be the SHA-512 of
+> lowercase `abc`.  Session 52 spent its time reading correct
+> code.  Session 53 falsified four mechanisms the same way -- each
+> was a plausible story read off a trace, and each was killed by
+> reading the source.  **Read the function before proposing the
+> fix.**  The greps cost seconds; the wrong fixes cost boots.
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
@@ -66,12 +42,15 @@ exits fixed, the exit-path page-table leak closed, and one dead
 `f_stat_with_retry` block deleted.  **No new subsystem in
 `v0.6.12`.**
 
-**Sessions 51 and 52 are untagged work on `dev`, after `v0.6.12`.**
-Session 51: five commits -- the item-7a instrument, the gzip fix,
-two applet batches, the image tree and harness, and a session-log
-rewrite.  Session 52: three commits -- the `sha512sum` correction
-and item-7c retraction, the gotcha, and open-issues item 10.  No
-`v*` bump; the banner still reads `v0.6.12`.
+**Sessions 51 through 53 are untagged work on `dev`, after
+`v0.6.12`.**  Session 51: five commits -- the item-7a instrument,
+the gzip fix, two applet batches, the image tree and harness, and a
+session-log rewrite.  Session 52: three commits -- the `sha512sum`
+correction and item-7c retraction, the gotcha, and open-issues item
+10.  Session 53: two code commits (`96153e6` the `g_last_sysret`
+wiring, `d2ad311` the `find -not` row and the no-fork `ran`
+failure path) plus three docs commits.  No `v*` bump; the banner
+still reads `v0.6.12`.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** -- they exist while
@@ -83,23 +62,23 @@ resolves to nothing; do not cite one as if it were a stable
 reference.
 
 **A plain commit can exist with no tag.**  Session 45's `run:` fix
-is one.  Sessions 51's and 52's docs commits are the same --
-docs-only, no tag.  **All three of session 52's commits are
-untagged.**  Such commits ride along on `dev` until the next `v*`
-bump.  Do not invent a tag for one, and do not be surprised by a
-commit with no tag.
+is one.  Sessions 51's, 52's, and 53's docs commits are the same --
+docs-only, no tag.  Such commits ride along on `dev` until the next
+`v*` bump.  Do not invent a tag for one, and do not be surprised by
+a commit with no tag.
 
 **Note on commit messages, and now on this file too:** a commit
 message is a claim, not a fact.  Read the diff, not the subject.
 **This file's item text is the same kind of claim** -- session 52
-exists because session 51's item 7c was believed.  Two instances
-to remember from earlier sessions.  Session 49's commit
-`20261003-process-create-cleanup` says "correct by inspection;
-UNEXERCISED" -- honest when written, and now **superseded for
-three of its four exits** by session 50's `20261003-fail-inject`;
-exit 3 is still untested and its commit says so.  And session 45's
-Fix B (`157627c`, later reverted) claimed to close the boot-time
-`#PF`; it did not.
+exists because session 51's item 7c was believed, and session 53
+falsified four mechanisms that were plausible stories read off a
+trace.  Two instances to remember from earlier sessions.  Session
+49's commit `20261003-process-create-cleanup` says "correct by
+inspection; UNEXERCISED" -- honest when written, and now
+**superseded for three of its four exits** by session 50's
+`20261003-fail-inject`; exit 3 is still untested and its commit
+says so.  And session 45's Fix B (`157627c`, later reverted)
+claimed to close the boot-time `#PF`; it did not.
 
 ---
 
@@ -153,19 +132,21 @@ that is how a commit and its tag get separated.
   the new lines.  **Check `git diff --stat` before committing: a
   docs insertion should show zero deletions.**  A full
   *replacement* of a section correctly shows both insertions and
-  deletions; that is the difference.  Session 52 inserted into
-  `gotchas.md`, `open-issues.md`, and `session-log.md`, and each
-  insertion showed insertions only -- the check was run each time.
+  deletions; that is the difference.  Session 53 inserted into
+  `gotchas.md`, `open-issues.md`, and `session-log.md`, and the
+  7e edit was a replacement -- insertions and deletions both, as
+  expected.
 
 **Ask for source you do not have.**  The assistant does not have
 direct file access.  Before patching a file whose current contents
 it has not seen in this session, it must **ask for that file**.
 Never guess at a file's contents, never patch from memory of an
 earlier version, never assume a file is unchanged.  This is how
-stale patches and reverted work have been avoided.  Session 52
-asked for and was given `test.sh`, `open-issues.md`,
-`gotchas.md`, `session-log.md`, `userland/musl/Makefile`, and
-`05_boot_kernel64/Makefile` before writing into any of them.
+stale patches and reverted work have been avoided.  Session 53
+asked for and was given `open-issues.md`, `gotchas.md`,
+`session-log.md`, `handoff.md`, `process.c`, `interrupts.c`,
+`user_syscall_entry.asm`, `user_syscall.c`, and `test.sh` before
+writing into any of them.
 
 **When editing a large file, quote the bytes.**  For an edit inside
 a big file, the instruction must **quote the exact text being
@@ -230,8 +211,8 @@ each version.
 **A version is not necessarily a milestone.**  When that happens,
 the tag annotation and the session-log row should *say so*.
 **`v0.6.12` is a correctness milestone, not a feature one.**
-Sessions 51 and 52 are the same shape: no new subsystem, no `v*`
-yet.
+Sessions 51, 52, and 53 are the same shape: no new subsystem, no
+`v*` yet.
 
 ---
 
@@ -272,49 +253,59 @@ starts with `cd /home/noneya/code/donix || exit 1`.
 
 ---
 
-## Where we are -- session 52, after `v0.6.12`
+## Where we are -- session 53, after `v0.6.12`
 
-**Three commits on `dev`, all untagged, no scratch tags.**
+**Two code commits and three docs commits on `dev`, all untagged,
+no scratch tags.**
 
-### Item 7c is retracted (`b9f78f4`)
+### Item 11: the zombie leak (`open-issues.md`)
 
-The harness expected the SHA-512 of lowercase `abc` for the three
-bytes `ABC`.  The expected value was wrong.  `sha512sum` is
-correct.  The row is corrected, the "KNOWN BUGS" header entry and
-the "EXPECTED TO FAIL" comment are gone, and
-`userland/musl/tests/sha512_probe.c` is in the tree as the
-independent implementation that settled it.
+`pipe_wake_probe.sh` run past ~107 iterations exhausts the 32-slot
+PCB pool.  28 of the 32 slots end up `PROC_STATE_ZOMBIE`, all
+children of the script's shell.  The `WW:` trace shows the
+transition exactly: `drop=c state=1` (parent not blocked, reap
+succeeds) for the first ~90 iterations, then `drop=d kind=2`
+(parent blocked on `PIPE_READ`) and the zombie is never reaped.
+Candidate mechanism: the lost pipe-EOF wake.  **This is the
+clearest next target -- it has a reproducer, a transition point,
+and a place to read (`put_file_slot`'s `FILE_PIPE` case in
+`user_syscall.c`).**
 
-### Item 10: `CR4.OSFXSR` without an XMM save (`4f183b2`)
+### Item 7e: the second capture, and the wired diagnostic (`96153e6`)
 
-The kernel sets CR4.OSFXSR (bit 16) at `kmain.c:37-40`, which
-tells the CPU that the kernel saves SSE state on context switch.
-It does not: no `fxsave`/`fxrstor`/`xsave` anywhere in
-`04_kernel_64bit/`, and `context_switch.asm` saves no XMM
-registers.  Userland compiled by `musl-gcc.sh` can emit SSE --
-before the session's CFLAGS change, `sha512_probe.elf` had 543 XMM
-instructions and `busybox.elf` 485.
+Two 7e captures now, both `#PF`, both error `0x15` (present +
+user + **instruction fetch**), at `RIP = CR2 = 0x1` and
+`RIP = CR2 = 0x9`.  Both carry the `r8`/`r9` fingerprint.  Both
+addresses are `< 0x1000`, which is the exact signature the
+`g_last_sysret_rcx` comment in `user_syscall_entry.asm` names --
+and the globals it describes were never written or read until
+`96153e6`.  **The next 7e fault will print the sysret target.**
 
-The session added `-mno-sse -mno-sse2 -mno-avx -mno-mmx` to the
-userland CFLAGS as a **stopgap**, not a fix.  The fix is
-kernel-side `FXSAVE`/`FXRSTOR` on the switch and interrupt paths.
-No test currently fails because of this; it is latent.
+### `find -not` was an `ENABLE_DESKTOP` gate, not a donix bug (`d2ad311`)
 
-### The gotcha (`5b2245b`)
+The `find -not` row failed every run with `find: unrecognized:
+-not`.  `-not` sits inside an `#if ENABLE_DESKTOP` block in
+`findutils/find.c`, alongside `-and`/`-or`/`-wholename`.  This
+build sets `CONFIG_DESKTOP=n`, so `-not` is not compiled in even
+though `CONFIG_FEATURE_FIND_NOT=y` -- that flag controls the
+POSIX `!` operator.  The row now uses `!`.
 
-`gotchas.md` gained "a test's expected value is a claim, like any
-other."  Tell: a failure that is deterministic, specific, and
-identical across every input path is more often a wrong reference
-value than a wrong algorithm.
+### The `ran` failure path no longer forks (`d2ad311`)
+
+`test.sh`'s `ran` used `echo "$out" | while read` to indent a
+failing row's output.  That pipeline forks a subshell, and the
+fork can lose its wake -- the shell blocks in `wait4` with no
+runnable process, and the scheduler falls to idle.  Replaced with
+`printf '%s\n' "$out"`, which does not fork.  The harness now
+reaches `57 passed, 0 failed` on a clean run.
 
 ### The intermittent family, condensed
 
 **7a** is the boot-time `#PF` at `0x400000` (session 50,
 instrumented, not fired).  **7b** is the `#GP` at `0x42F1A7`
 (session 51, unobserved).  **7e** is the intermittent `#GP`/`#PF`
-control-flow family in fork-heavy workloads (session 51, four
-captures, a cross-vector register fingerprint: `r8 = 0x415516`,
-`r9 = 0x2F2F2F2F2F2F2F2F`).
+control-flow family in fork-heavy workloads (two `test.sh`
+captures now, both `#PF`, both `error 0x15`, shared fingerprint).
 
 **Four faults in one family are unobserved, not fixed:** session
 45's virtual-1 `#PF`, session 50's `0x400000` `#PF` (7a), session
@@ -323,11 +314,12 @@ captures, a cross-vector register fingerprint: `r8 = 0x415516`,
 and layout-dependent.  Diagnostics in place: `isr14_handler`
 prints the four page types of every `#PF` walk; the item-7a sites
 print `site`/`virt`/`cr3`/`free`; `isr13` and `isr14` both dump
-the register frame.  **Standing caution:** do not filter
-`vmm_clone_page_table`'s leaf copy on `PT_USER` -- session 45
-found it breaks the kernel's own identity map.
+the register frame; and, new in session 53, both print the last
+`sysret` target when `fault_rip < 0x1000`.  **Standing caution:**
+do not filter `vmm_clone_page_table`'s leaf copy on `PT_USER` --
+session 45 found it breaks the kernel's own identity map.
 
-### The two older milestones, condensed
+### The older milestones, condensed
 
 **The pathname dispatch seam (`v0.6.11`, session 44).**
 `resolve_at` returns a backend tag from a path's first component;
@@ -352,31 +344,38 @@ four failure exits now run** -- exit 3 is still by inspection.
 
 ---
 
-## NEXT SESSION -- pick a real target
+## NEXT SESSION -- item 11 is the clearest target
 
-**Item 7c is retracted.  There is no `sha512sum` bug.**  The
-recommendation that opened session 52 was built on a wrong
-constant in this file, and the first thing the next session should
-internalize is the rule above: **an item here that quotes an
-expected value is a claim -- check the value before acting on it.**
+**The zombie leak has everything a real fix wants: a
+deterministic reproducer, a transition point in the trace, and a
+specific place to read.**  It is not intermittent in the way the
+7e family is -- once the pool is near exhaustion, every iteration
+leaks.  The failure is arithmetic.
 
 ### The candidates, in the order the handoff would pick them
 
-1. **Item 10, the SSE/`CR4.OSFXSR` gap.**  Filed this session.
-   Large: it is a kernel feature, `FXSAVE`/`FXRSTOR` on the switch
-   and interrupt paths.  Not a one-session fix if done carefully,
-   but it is the one *known* correctness gap and it has no
-   reproducer to chase -- the code either saves XMM state or it
-   does not.
+1. **Item 11, the zombie leak.**  Reproducer:
+   `./pipe_wake_probe.sh` past ~107 iterations.  Read
+   `put_file_slot`'s `FILE_KIND_PIPE` case in
+   `04_kernel_64bit/user_syscall.c` (~lines 1895-1910), where
+   `writers_open` drops to 0 and `pipe_wake_waiter` wakes
+   `reader_waiting`; then the `close_all_files` path a subshell's
+   exit takes, and whether it reaches that wake.  The exit trace
+   in the item names the transition.
 
-2. **Items 7a / 7b / 7e, the intermittent family.**  Fresher, and
-   7e is the best-instrumented (a cross-vector register
-   fingerprint, four captures).  Intermittent; needs boots.  If
-   you take 7e, **start from the fingerprint, not the fault
-   addresses** -- the four faulting `RIP`s are downstream of one
-   corruption, and the shared `r8`/`r9` pair is the narrow end.
+2. **Item 7e, now with a working diagnostic.**  `96153e6` wires
+   the `g_last_sysret` recorder and reporter.  The next 7e fault
+   -- whenever one fires, in `test.sh` or a fork-heavy workload
+   -- will print the sysret target.  That reading bisects the
+   problem: `rcx == 1/9` means the frame was already corrupt at
+   the exit path; a sane address means the corruption is
+   post-resume.
 
-3. **The small independent items** (below).  Each is a short,
+3. **Item 10, the SSE/`CR4.OSFXSR` gap.**  Large, filed, latent;
+   a kernel feature (`FXSAVE`/`FXRSTOR` on the switch and
+   interrupt paths).
+
+4. **The small independent items** (below).  Each is a short,
    patterned change with an obvious test.
 
 ### If you would rather do something small and clean
@@ -405,10 +404,13 @@ ones.
 
 Do not re-open item 7 (closed, `v0.6.12`) or the session-48 zone
 scan (fixed, `v0.6.11`).  Do not re-litigate the fault-injection
-design.  Do not chase the intermittent family (7a, 7b) without a
-reproducer -- every session that tried produced a "did not fire"
-result.  **Do not drop the four older non-`2026*` tags.**  One
-change at a time.  Do not edit `third_party/`.
+design.  **Do not re-read the fork path** -- session 53 read
+`sys_fork`'s stack copy, `process_fork_copy_frame`, and
+`exec_alloc_user_stack`, and all three are correct.  Do not chase
+the intermittent family (7a, 7b) without a reproducer -- every
+session that tried produced a "did not fire" result.  **Do not
+drop the four older non-`2026*` tags.**  One change at a time.
+Do not edit `third_party/`.
 
 ---
 
@@ -417,6 +419,8 @@ change at a time.  Do not edit `third_party/`.
 **Enabled and working:** `ps`, `pstree`, `stty`, `tty`
 (prints `/dev/console`), `gzip`, `gunzip`, plus everything in
 batches 2 and 3.  `sha512sum` **works** -- item 7c was a test bug.
+`find -not` **works with `!`** -- `-not` is a GNU alias gated
+behind `ENABLE_DESKTOP`, which this build does not set.
 
 ### The rule
 
@@ -433,9 +437,10 @@ is worse than a missing one: it makes the applet lie.
 
 **A real applet finds real bugs.**  Session 51's `gzip` found the
 `isatty` bug.  **Session 52 is the counter-example: a real applet
-found a wrong test.**  Both are valuable.  The rule is: when a
-test and an applet disagree, find out which is right, and do not
-assume the test is.
+found a wrong test.**  Session 53 is a third shape: a real applet
+found a **missing feature in the config** (`-not` requires
+`ENABLE_DESKTOP`).  The rule holds: when a test and an applet
+disagree, find out which is right, and do not assume the test is.
 
 **Do not edit `third_party/`.**
 
@@ -470,8 +475,9 @@ Each row is a **cost estimate, not a prohibition**.
 
 ## Canary state
 
-**Green as of session 51** -- `canary` 15/15 and `canary --full`
-28/28 on the clean boot; `selftest` 18/18.
+**Green as of session 53** -- `canary` 15/15 and `canary --full`
+28/28 on the clean boot; `selftest` 18/18; `test.sh` **57 passed,
+0 failed** (was 56/1 before the `find -not` row was corrected).
 
 `exec_churn` has two uses: it exercises the process-exit page-table
 teardown, and it is a 24-round ELF-load stress.
@@ -501,11 +507,11 @@ Run these when changing `sys_read`/`sys_write`/`sys_close`/
 
     test.sh        # ~58 applet rows, staged at /root/scripts/test.sh
 
-**It is not a canary.**  It takes minutes.  **It is expected to
-pass now** -- item 7c is retracted and the row is corrected.  It
-can still hang on the lost-wakeup race (item 7d is fixed, but the
-harness exercises more than one path), so a hang is a finding, not
-a known state.
+**It is not a canary.**  It takes minutes.  **It passes now** --
+item 7c is retracted, the `find -not` row uses `!`, and `ran`'s
+failure path no longer forks.  It can still be driven into the
+item-11 zombie leak by `pipe_wake_probe.sh`, which is a separate
+reproducer.
 
     sh /root/scripts/test.sh
 
@@ -526,16 +532,19 @@ item-7d instrument.
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **`open-issues.md` item 7e: the intermittent `#GP`/`#PF`
-   control-flow family.**  Best-instrumented of the intermittent
-   faults; start from the register fingerprint.
-2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM
-   save.**  Found session 52; latent; the fix is a kernel feature.
-3. **`open-issues.md` item 9: no privilege model.**  uid/gid are
+1. **`open-issues.md` item 11: the `pipe_wake_probe.sh` zombie
+   leak.**  Reproducible; has a transition point in the trace and
+   a place to read.  The clearest next target.
+2. **`open-issues.md` item 7e: the intermittent `#GP`/`#PF`
+   control-flow family.**  Two `test.sh` captures now, both
+   `error 0x15` at tiny addresses, shared fingerprint.  The
+   `g_last_sysret` diagnostic is wired (`96153e6`) and will print
+   on the next fault.
+3. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM
+   save.**  Filed session 52; latent; the fix is a kernel feature.
+4. **`open-issues.md` item 9: no privilege model.**  uid/gid are
    0; the session that adds one changes all five identity
    syscalls.
-4. **`-EPIPE` is delivered without `SIGPIPE`.**  Needs signal
-   delivery.
 5. **`sys_gettimeofday` (99) is not implemented**, so `ps -l` is
    off.  Small.
 
@@ -545,7 +554,8 @@ fixed** (session 52, the scheduler fix `86ffc7c` and the kept
 `WW:` trace `c143cae`).  **Item 7a** is the boot-time `#PF` at
 `0x400000`; **7b** is the `#GP` at `0x42F1A7`; **7e** is the
 control-flow family; **item 8** is symlinks; **item 9** is the
-privilege model; **item 10** is the SSE/CR4 gap.
+privilege model; **item 10** is the SSE/CR4 gap; **item 11** is
+the zombie leak.
 
 ---
 
@@ -560,20 +570,23 @@ privilege model; **item 10** is the SSE/CR4 gap.
     /usr/bin     the donix-native ELFs (apps + tests), staged BARE
     /tmp         empty
     /etc         passwd, group
-    /root        scripts/test.sh, scripts/shatest.sh (deleted), scripts/pipe_wake_probe.sh
+    /root        scripts/test.sh, scripts/pipe_wake_probe.sh
     /home        empty
     /dev         empty (a real FAT directory; the device entries
                  are synthesized by the seam, not stored here)
     /var         empty
 
 - `configs/busybox.config` -- tracked canonical busybox config.
-  **`sha512sum` is enabled and correct.**
+  **`sha512sum` is enabled and correct.**  **`FEATURE_FIND_NOT` is
+  on**, but `-not` is a GNU spelling gated behind `ENABLE_DESKTOP`
+  (off), so the applet accepts `!` only.
 - `userland/musl/` -- tracked musl userland (`apps/`, `tests/`).
-  `build/` gitignored.  **`tests/sha512_probe.c` is new in session
-  52.**  The Makefile's `CFLAGS` carries the `-mno-sse*` stopgap
-  and both `%.elf` rules have `Makefile` as a prerequisite.
+  `build/` gitignored.  `tests/sha512_probe.c` is from session 52.
+  The Makefile's `CFLAGS` carries the `-mno-sse*` stopgap and both
+  `%.elf` rules have `Makefile` as a prerequisite.
 - `userland/scripts/` -- tracked shell scripts staged to
-  `/root/scripts/`.  `shatest.sh` was deleted in session 52.
+  `/root/scripts/`.  `test.sh` was fixed in session 53
+  (`d2ad311`).
 - `04_kernel_64bit/fonts/ter-u18n.psf` -- tracked font source.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   -- gitignored; rebuild with `./toolchain/install_musl.sh`.
@@ -597,17 +610,17 @@ needs it.  Paths relative to the tree root.
 - `docs/strategy.md` -- Phase A/B plan, rules, tagging convention,
   git hygiene, recovery.
 - `docs/gotchas.md` -- every bug writeup, by subsystem, newest
-  first.  **Session 52 added "a test's expected value is a
-  claim".**
+  first.  **Session 53 added "a diagnostic that is declared but
+  never wired is not a diagnostic."**
 - `docs/session-log.md` -- commit tables and per-test canary notes,
-  newest first.  Session 52's section is at the top.
+  newest first.  Session 53's section is at the top.
 - `docs/open-issues.md` -- full open-issues list.  Items 7a, 7b,
-  7e, 8, 9, 10; item 7c is retracted in place.
+  7e, 8, 9, 10, **11**; item 7c is retracted in place.
 - `docs/migration-history.md`, `docs/dons-os-history.md` --
   historical narrative.
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` -- the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
-- `ROADMAP.md` -- future work only.  Session 52 has no
+- `ROADMAP.md` -- future work only.  Sessions 52 and 53 have no
   `ROADMAP.md` section.
 - `README.md` -- reviewed at the `v0.6.11` bump; **review it at the
   next `v*` bump.**
@@ -634,11 +647,16 @@ report was itself wrong: the harness expected the SHA-512 of
 lowercase `abc` for the bytes `ABC`.  **Item 7c is retracted;
 `sha512sum` is correct.**  The chase turned up a real latent bug
 along the way -- `CR4.OSFXSR` is set but the kernel saves no XMM
-state -- now filed as item 10.  **The recommended next session is
-a real target: item 10 (the SSE gap), item 7e (the best-
-instrumented intermittent fault, start from the fingerprint), or
-one of the small independent items.**  See NEXT SESSION.  One
-change at a time.**
+state -- now filed as item 10.  **Session 53** found a
+reproducible zombie leak (`pipe_wake_probe.sh` exhausts the
+32-slot PCB pool with unreaped children -- item 11); found that
+`find -not` was a GNU alias gated behind `ENABLE_DESKTOP`, not a
+donix bug; wired a declared-but-dark `g_last_sysret` diagnostic
+that item 7e's two captures were waiting for; and fixed the
+`ran` failure path in `test.sh` to not fork.  **The recommended
+next session is item 11 -- the zombie leak -- because it has a
+reproducer, a transition point, and a place to read.**  See NEXT
+SESSION.  One change at a time.**
 
 ---
 
@@ -663,7 +681,7 @@ the step in place -- do not just add a paragraph above it.**
 **Before proposing any command block, read the "Working style"
 section at the top.**
 
-**Seven gotchas worth reading before the next change.**  "A fix
+**Eight gotchas worth reading before the next change.**  "A fix
 with no test is indistinguishable from an unfixed defect."  "A
 test can encode an earlier version's behavior."  "A consumer
 inferred from behavior is not a consumer."  Session 45's: a fix
@@ -676,4 +694,6 @@ block and check `git diff --stat`**; and **a test that cannot say
 where it stopped cannot say much -- print the row marker *before*
 the row runs.**  Session 52's: **a test's expected value is a
 claim -- check it against a known-good source before you check the
-code.**  **This file's item text is the same kind of claim.**
+code.**  Session 53's: **a diagnostic that is declared but never
+wired is not a diagnostic -- grep for the writer and the reader.**
+**This file's item text is the same kind of claim.**
