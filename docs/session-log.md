@@ -1,30 +1,20 @@
-# donix session log
+## Session 51 — the applet batches, the shell-script harness, and two bugs the harness found
 
-Newest first.  Each session that did real work has a section; the
-most recent few are kept in full.  Older sessions are indexed at the
-bottom — for their detail see `git log`, the annotated `v*` tags, and
-`ROADMAP.md`, which carry the milestone narratives the index points
-at.  This file's job is "what happened, in what order, and what to
-read for the detail"; it is not a second copy of the commit record.
-
-Canary counts and new-test lists are here because they are nowhere
-else.  Commit narratives are in the commit messages and the tag
-annotations, not repeated here.
-
-## Session 51 — the item-7a `#PF` gets its instrument; a `#GP` at `0x42F1A7` appears
-
-One kernel commit and one docs commit on `dev`, both unpushed.
-**Not a milestone** — an instrument, and the record of a new
-intermittent fault found while verifying it.  The kernel commit
-names the failing site in `vmm_map_page_in_cr3`; it did not fire
-on the boots that followed, and the `#PF` did not reproduce.
+Five commits on `dev`, four scratch-tagged, unpushed.  **Not a
+milestone** — three pieces of work: an instrument for the item-7a
+`#PF`, a fix that makes `gzip` work, and a large applet batch plus
+the first-party harness that tests it.  The harness found two bugs
+that no existing test could see.
 
 | Tag | What |
 |---|---|
 | `20261003-vmm-map-diag` | the three silent `return -1;` sites in `vmm_map_page_in_cr3` (PDPT / PD / PT) print `site`/`virt`/`cr3`/`free` before returning |
-| (none — docs commit) | `open-issues: record the session-51 #GP as item 7b; note 7a instrumented` |
+| `20261003-gzip-ioctl` | `sys_ioctl`'s `TCGETS`/`TIOCGWINSZ`/`TCSETS` answer for the console only, not for any fd number 0/1/2; enables busybox `gzip`/`gunzip` |
+| `20261003-applets` | busybox: enable 22 applets and 9 feature flags (batch 2) |
+| `20261003-applets-harness` | applet batch 3, the standard FAT directory tree, `/etc/passwd` + `/etc/group`, and `test.sh` at `/root/scripts/test.sh` |
+| (none — docs commits) | `open-issues: …item 7b…`; `open-issues: sha512sum…, lost…, privilege model` |
 
-### The instrument, and why it is three sites
+### The item-7a instrument, and why it is three sites
 
 Session 50's first boot reproduced the item-7a `#PF` and printed
 `ELF: COPY-FAIL phys=0 at vaddr=0x400000` — item 7's return-value
@@ -42,90 +32,193 @@ the log could not say which one returned `-1`:
   easy to miss: it shares the pointer name `new_pt_phys` with the
   split's already-loud block.  Also a bare `return -1;`.
 
-The commit adds a one-line print to the **three silent** sites.  A
-reader scanning for `if (!new_*_phys) return -1;` finds two at a
-glance and the third only by reading past the split; the count was
-confirmed against the file before the patch, not assumed.
+The commit adds a one-line print to the **three silent** sites:
 
     VMM: map failed site=PDPT virt=0x... cr3=0x... free=NNN
     VMM: map failed site=PD   virt=0x... cr3=0x... free=NNN
     VMM: map failed site=PT   virt=0x... cr3=0x... free=NNN
 
-The site name is the missing information.  The **`free` field** is
-what separates session 50's two candidates: a healthy count with
-`site=PDPT` or `site=PD` means the clone was missing that table
-(candidate b, a clone-correctness change); a near-zero count means
-genuine exhaustion (candidate a, an allocator change).  Fix after
-the log names the site, not before.
-
 **Failure branch only.**  A healthy boot reaches no new code and
-prints nothing; the linked `kernel.bin` is the same size as
-session 50's.  Permanent, not temporary — the session-48 rule: if
-it does not reproduce in N boots, the log is there when it does,
-and the cost is zero until then.
+prints nothing.  Permanent, not temporary.
 
-### Three boots, and the `#GP` on one of them
+**The diagnostic did not fire.**  The item-7a `#PF` did not
+reproduce on the boots that followed — the session-48 result.  The
+instrument stays in place.  See `open-issues.md` item 7a.
 
-| Boot | Result |
-|---|---|
-| self-test only (`k` path) | `selftest` **18/18**; `create_fail` prints its three `PROCESS:` lines.  No fault. |
-| interactive, clean | `canary` **15/15**, `canary --full` **28/28**.  No `VMM: map failed` line.  Item-7a `#PF` did not reproduce. |
-| interactive, faulting | a **`#GP`** at `RIP=0x42F1A7`, error `0`, `CS=0x33`, in `busybox` pid=15 during `find / -type d`. |
+### The `#GP` at `0x42F1A7`, and the `#PF` at `0x44`
 
-The item-7a `#PF` did not reproduce on any of the three — the
-session-48 shape, recorded, diagnostic kept in place.  **None of
-the three new sites was reached on the faulting boot**; the
-instrument is orthogonal to what happened there.
+Two more faults appeared this session, both during applet runs,
+both distinct from item 7a.
 
-### The `#GP`, recorded separately as item 7b
+**`#GP` at `0x42F1A7`, error `0`, in busybox during `find`.**  The
+canary's `find / -type d` row faulted once; the next boot ran it
+to completion.  Recorded as `open-issues.md` item 7b, deliberately
+not folded into 7a: different vector, location, and phase.
 
-    === GENERAL PROTECTION FAULT (#GP) ===
-      Faulting RIP : 0x000000000042F1A7
-      Code Seg (CS): 0x0000000000000033
-      Stack (RSP)  : 0x00000080000FBD98
-      Error Code   : 0x0000000000000000
-      Current PID : 15
-      Name        : busybox
-      entry_point : 0x0000000000411A92
-    EXIT: pid=15 state=2 parent=4 qhead=(empty)
-    EXIT-FALLBACK: switching to idle, exiting pid=15 name=busybox
+**`#PF` at `CR2=0x44`, `RIP=0x419FD9`, error `0x5`.**  A near-null
+**data read** — error `0x5` is present + user + read, not fetch —
+in busybox.  Page 0 is present but supervisor, so the read faults.
+This is the same page as the session-45 virtual-1 fault (which was
+an *instruction fetch* at `RIP=0x1`, error `0x15`), with a
+different error code.  It appeared once, on the `od` row, and has
+not been given its own item number yet; it is the fourth fault in
+the family and the most legible capture of it.
 
-The process was killed and the shell fell back to idle; the `find`
-never completed.  The next boot ran the same row to completion.
-The full raw frame dump is in `capture.txt`; the summary and the
-raw facts are in `open-issues.md` item 7b.
+**Both are unobserved, not fixed.**  Neither reproduced.
 
-**It is not item 7a.**  Different vector (`#GP`, vector 13, not
-`#PF`, vector 14), different error code (`0`, not `0x15`),
-different location (busybox user text at `0x42F1A7`, not
-`0x400000`), different phase (a syscall in a process that had
-already been running, not an ELF load).  Item 7a's fault is at the
-ELF load, before any user instruction runs; this one is at an
-instruction in a live process.
+### The gzip fix: an `isatty` bug found by running a real applet
 
-**Third in the same family.**  Session 45's virtual-1 `#PF`,
-session 50's `0x400000` `#PF`, and this: all intermittent,
-layout-dependent, first boot after an image change, gone on the
-next.  Whether the family has a single cause is unknown; the
-point of recording it is that three is a pattern, not a
-coincidence.
+`gzip` and `gunzip` were enabled (`CONFIG_GZIP=y`) and nearly
+worked: `gzip FILE` created the `.gz` and then died with
+`compressed data not read from terminal, use -f to force it`.
+`-f` made it work.  The guard is in busybox's `bbunzip.c`:
 
-**Unobserved, not fixed.**  It did not reproduce on the next boot.
-It needs its own instrument — a first-party reproduction of the
-`find` sequence, or a kernel-side `#GP` handler trace — before it
-is guessed at.  Busybox's symbols are not in the tree.
+    if (!(option_mask32 & BBUNPK_OPT_FORCE) && isatty(STDIN_FILENO))
+        bb_simple_error_msg_and_die("compressed data not read from
+            terminal, use -f to force it");
 
-### A process note
+`gunzip FILE` opens FILE, puts it on fd 0, and then asks
+`isatty(0)`.  On a real Unix that is false for a regular file.  On
+donix `sys_ioctl`'s `TCGETS` tested the fd **number** —
 
-The handoff's NEXT SESSION section listed the three sites to
-instrument.  Reading `vmm_map_page_in_cr3` against that list
-showed the third site — the final PT, after the split — is the
-one that reads like the split's already-loud block, and a session
-that trusted the list's "three sites" without reading would have
-been unsure which three.  The count was checked against the file
-before the patch; the patch quotes the bytes it replaces.  This is
-the handoff's "ask for source you do not have" applied to a list of
-sites rather than a file.
+    if (fd != 0 && fd != 1 && fd != 2) return -ENOTTY;
+
+— so `TCGETS` on fd 0 succeeded even when fd 0 was a file,
+`isatty(0)` returned true, and the guard fired.  The fix is
+`fd_is_console(fd)`: ask the file table whether the slot's kind is
+`FILE_KIND_CONSOLE`, and use it in `TCGETS`, `TIOCGWINSZ`, and the
+`TCSETS*`/`TIOCSWINSZ` ignore-case.  A file on fd 0 now gets
+`-ENOTTY`, which is the honest answer.
+
+**Why kernel-side, not a `third_party/` patch:** the honest test
+for "is a tty" belongs in `sys_ioctl`, and it is the same answer
+for every applet that asks.  `third_party/` is gitignored and
+rebuilt; a patch there is invisible and vanishes.
+
+**Verified:** `gzip test` / `gunzip test.gz` round-trips `hello`
+with **no `-f`**; `busybox tty` still prints `/dev/console`;
+`canary` 15/15, `canary --full` 28/28.  Committed as
+`20261003-gzip-ioctl`.
+
+**Lesson, and it is the good kind:** a real applet found a real bug
+that no existing test covered.  `isatty` had been *asserted*
+correct by the session-44 comment; running gzip *tested* it.  The
+comment was a claim, the applet was the test.
+
+### The identity syscalls, and why uid/gid is 0
+
+`id` printed a mix of one real value and three errno values:
+
+    Unknown syscall: 102     (getuid)
+    Unknown syscall: 104     (getgid)
+    Unknown syscall: 108     (getegid)
+    Unknown syscall: 115     (getgroups)
+    uid=4294967258 gid=4294967258 euid=1000
+
+`4294967258` is `-166`, the low 32 bits of a failed syscall return.
+`geteuid` (107) was the only one implemented, and it returned a
+fixed `1000` — chosen in session 30 as "a plausible non-root uid"
+to silence a once-per-boot diagnostic, never a decision about
+privilege.
+
+The commit adds the four missing syscalls — `getuid` (102),
+`getgid` (104), `getegid` (108), `getgroups` (115), all returning
+0 — and **changes `geteuid` from 1000 to 0**, so all four agree.
+`getgroups` takes the POSIX shape: `size == 0` returns the count
+(0); `size > 0` copies nothing and returns 0.
+
+**Why 0 and not 1000:** donix has no privilege model — no
+per-process uid/euid split, no setuid bit (FAT has no mode bits),
+no `chown`, no way to become root.  In that world 0 is the honest
+answer: everything runs as root, and a program that checks "am I
+root" gets yes.  Returning 1000 would make root checks fail with
+no sudo to fix them.  This is TEMPORARY and it is the value that
+changes when a privilege model lands; recorded as `open-issues.md`
+item 9.
+
+### The `/etc` files and the directory tree
+
+`groups` exited 1 without `/etc/group`, because busybox's `groups`
+treats a missing group file as a hard error.  The fix is the file,
+not a syscall: the Makefile stages
+
+    /etc/passwd: root:x:0:0:root:/root:/bin/sh
+    /etc/group:  root:x:0:
+
+With them present, `id` prints `uid=0 gid=0`, `id -un` prints
+`root`, `groups` exits 0 and prints `root`, `whoami` prints `root`,
+and `ps`'s USER column resolves the numeric uid to a name.
+
+The image also gains the standard Unix directory shape: `/etc`,
+`/root`, `/root/scripts`, `/home`, `/dev`, `/var`, alongside the
+existing `/bin`, `/usr`, `/usr/bin`, `/tmp`.
+
+### The applet batches
+
+**Batch 2** (`20261003-applets`): 22 applets and 9 feature flags.
+`cksum`, `crc32`, `comm`, `expand`, `unexpand`, `expr`, `fold`,
+`id`, `groups`, `logname`, `md5sum`, `sha1sum`, `sha256sum`, `nl`,
+`paste`, `printf`, `split`, `tac`, `base64`, `whoami`, `rev`,
+`hexdump`.  Flags: fancy `echo`/`head`/`tail`/`sleep`, `wc`
+large, `find -maxdepth`/`-not`, `grep -A/-B/-C`, `test2`.
+
+**Batch 3** (`20261003-applets-harness`): 20 more applets — `sum`,
+`uuencode`/`uudecode`, `base32`, `sha512sum`, `sha3sum`, `shuf`,
+`strings`, `tree`, `tsort`, `nohup`, `dos2unix`/`unix2dos`,
+`which`, `hostid`, `reset`, `egrep`/`fgrep`, `pidof`, `ascii` —
+and 18 feature flags: `sort`/`split`/`find` options, ash
+`alias`/`getopts`/`help`/`$RANDOM`/`$(( ))`, tab completion, resize
+reflow.
+
+**Both verified by hand first, then by the harness.**  The
+checksums match their known values (`md5sum`/`sha1sum`/`sha256sum`
+of `ABC`), the encoders round-trip, `tree` walks the image, `id`/
+`groups`/`whoami` resolve through `/etc/passwd` and `/etc/group`,
+and the shell features (`$((2 + 3 * 4))` → 14, `$((1 << 40))` →
+the 64-bit value) work.
+
+### `test.sh` — the harness, and the two bugs it found
+
+`userland/musl/tests/test.sh`, staged at `/root/scripts/test.sh`.
+A first-party script that runs each enabled applet through a
+command substitution, asserts known values where there is one, and
+reports pass/fail.  Its design point is the trace:
+
+    [N] run  <name>
+
+printed **before** each row, so a hang names its own row.  That
+trace is what made the session's second bug findable.
+
+**It found two bugs, and neither was visible to any existing test:**
+
+**`sha512sum` computes a wrong digest.**  `printf ABC | sha512sum`
+produces `397118fd…` every time, at the prompt and in a script,
+through a plain pipe.  `md5sum`/`sha1sum`/`sha256sum` are all
+correct on the same three bytes through the same pipe.  **An
+applet bug** — the interactive-prompt reproducer excludes the shell
+and the pipe.  Suspect block size.  Recorded as `open-issues.md`
+item 7c.
+
+**A chain of command substitutions can lose a wake.**  The shell
+blocks, the scheduler falls to `EXIT-FALLBACK`, and no process
+reads the keyboard; only a reboot recovers.  **Confirmed racy by a
+controlled experiment:** the *same image, no rebuild between runs*
+ran to row 54 on one boot and hung at row 29 on the next.  Seven
+runs, seven different hang rows (`id -u`, `seq`, `hostid`,
+`pidof`, `nohup`, `crc32`, `find -maxdepth`), with `nohup` hanging
+one run and passing the next.  **A kernel bug** in the wait/pipe
+wake path.  Recorded as `open-issues.md` item 7d.
+
+**A test-expectation error, corrected:** the first `sleep` row was
+`sleep 0.1`, which fails because `FEATURE_FANCY_SLEEP` is off, so
+busybox `sleep` accepts integers only.  The row is now `sleep 1`.
+This is the "a test can encode an earlier version's behavior"
+gotcha — the row asserted a feature that was not enabled.
+
+**The harness is not a canary.**  It takes minutes, it fails
+`sha512sum` on every run, and it can hang.  Run it by hand, and
+expect a hang or a `FAIL sha512sum` until 7c and 7d are fixed —
+neither is a sign the harness is broken.
 
 ### Verification
 
@@ -134,20 +227,32 @@ sites rather than a file.
 | `selftest` (`k` path) | **18 passed, 0 failed** |
 | `canary` | **15 passed, 0 failed** |
 | `canary --full` | **28 passed, 0 failed** |
+| `test.sh` | 39–54 rows pass per run; `FAIL sha512sum` every run; may hang |
 
-No `VMM: map failed` line on a healthy boot — which is the
-expected result, since every message this session added is on a
-path a healthy boot does not take.  No `PMM: WARNING - Double
-free`.  `kernel.bin` unchanged in size (162456 bytes).
+No `VMM: map failed` line on a healthy boot.  No `PMM: WARNING -
+Double free`.  `kernel.bin` grew from 162456 to 162648 across the
+session; `busybox.elf` from 264184 to 321528.  The image stages 48
+files plus the two `/etc` entries and the script.
 
-### Scratch tag kept
+### A process note
 
-`20261003-vmm-map-diag`, local, not pushed.  The docs commit that
-records item 7b rides untagged on `dev`, per the convention that a
-docs-only change gets no scratch tag.
+The harness found the lost wakeup because the trace printed the row
+*before* running it.  Six earlier runs of the same script, without
+a trace, would have left "it hung somewhere" as the entire record.
+The row marker turned a hang into a named row — and the fact that
+the row **moved** between runs is what proved it a race rather than
+an applet bug.  **A test that cannot say where it stopped cannot
+say much.**
 
----
+A second process note, smaller: `capture.txt` was appended with
+`>>` once, which concatenated two runs into one file and briefly
+made them look like one long run.  Truncate (`>`) per run.
 
+### Scratch tags kept
+
+`20261003-vmm-map-diag`, `20261003-gzip-ioctl`, `20261003-applets`,
+`20261003-applets-harness`, local, not pushed.  The two docs
+commits ride untagged on `dev`.
 
 ---
 
