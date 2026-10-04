@@ -84,9 +84,13 @@
  *  84  rmdir             sys_rmdir
  *  87  unlink            sys_unlink        (dispatched; applet off)
  *  89  readlink          sys_readlink      (honest -EINVAL: no symlinks)
- * 107  geteuid           sys_geteuid       (returns fixed uid 1000)
+ * 102  getuid            sys_getuid        (returns 0; see note below)
+ * 104  getgid            sys_getgid        (returns 0)
+ * 107  geteuid           sys_geteuid       (returns 0)
+ * 108  getegid           sys_getegid       (returns 0)
  * 110  getppid           sys_getppid
  * 112  setsid            sys_setsid
+ * 115  getgroups         sys_getgroups     (returns 0 groups)
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
  * 217  getdents64        sys_getdents64
@@ -162,9 +166,13 @@
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
 #define SYS_READLINK        89
+#define SYS_GETUID          102
+#define SYS_GETGID          104
 #define SYS_GETEUID         107
+#define SYS_GETEGID         108
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
+#define SYS_GETGROUPS       115
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
@@ -271,9 +279,30 @@ long sys_wait4(long pid, int* user_status, int options);
  * Blocking, EOF, and EPIPE are Step 2/3.
  */
 long sys_pipe(int* user_pipefd);
+
+/*
+ * The identity syscalls (102/104/107/108/115) all report 0.
+ *
+ * donix has no privilege model: no per-process uid/euid split, no
+ * setuid bit (FAT has no mode bits to hold one), no chown, and no
+ * way to become root.  In that world 0 is the honest answer --
+ * everything runs as root, and a program that checks "am I root"
+ * gets yes, which is what lets software install today.
+ *
+ * This is TEMPORARY, and it is the value that changes when a
+ * privilege model lands.  The session that adds setuid/seteuid, a
+ * setuid-root marker, and a sudoers equivalent also changes these
+ * to return the unprivileged default (1000) and makes root an
+ * escalation.  See docs/open-issues.md, "No privilege model."
+ */
 long sys_setsid(void);
+long sys_getuid(void);
+long sys_getgid(void);
 long sys_geteuid(void);
+long sys_getegid(void);
 long sys_getppid(void);
+long sys_getgroups(int size, unsigned int* list);
+
 long sys_uname(void* user_buf);
 long sys_clock_gettime(int clk_id, void* user_ts);
 long sys_getcwd(char* buf, unsigned long size);

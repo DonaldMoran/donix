@@ -5801,22 +5801,72 @@ long sys_setsid(void) {
 }
 
 /*
- * Linux x86_64 geteuid(2) — syscall 107.
+ * The identity syscalls -- getuid (102), getgid (104), geteuid
+ * (107), getegid (108) -- all report 0.
  *
- * donix has no users; return a fixed uid.  1000 matches the
- * typical Fedora user and is what musl and busybox expect to see
- * as a plausible non-root uid.  Nothing on donix checks the
- * value; it exists only to stop the once-per-ash-startup
- * "Unknown syscall: 107" diagnostic.
+ * donix has no privilege model: no per-process uid/euid split, no
+ * setuid bit (FAT has no mode bits to hold one), no chown, and no
+ * way to become root.  In that world 0 is the honest answer --
+ * everything runs as root, and a program that checks "am I root"
+ * gets yes.
  *
- * HISTORY: session 24 mistakenly implemented setsid at 107,
- * which meant ash's geteuid() call received the caller's pid
- * where it expected a uid.  Session 27 (tag 20260928-05) moved
- * setsid to 112 and exposed the real 107 gap.  This is the
- * closure of that gap.
+ * This is TEMPORARY.  When a privilege model lands (see
+ * docs/open-issues.md, "No privilege model"), the default becomes
+ * the unprivileged user (1000) and root becomes an escalation.
+ * All four must change together then; a split where getuid and
+ * geteuid disagree is exactly the bug that made `id` print a mix
+ * of values and errno on 2026-10-03.
+ *
+ * HISTORY: sys_geteuid previously returned a fixed 1000, chosen in
+ * session 30 as "a plausible non-root uid" to silence the
+ * once-per-ash-startup "Unknown syscall: 107" line.  That value
+ * was never a decision about privilege -- it was a number picked
+ * to stop a diagnostic -- and it is changed here to match the
+ * three syscalls being added, so the four agree.
  */
+long sys_getuid(void) {
+    return 0;
+}
+
+long sys_getgid(void) {
+    return 0;
+}
+
 long sys_geteuid(void) {
-    return 1000;
+    return 0;
+}
+
+long sys_getegid(void) {
+    return 0;
+}
+
+/*
+ * Linux x86_64 getgroups(2) -- syscall 115.
+ *
+ * Return the calling process's supplementary group list.  donix
+ * tracks no groups, so the list is empty and the count is 0.
+ *
+ * POSIX shape, which is what busybox `id` calls:
+ *
+ *   size == 0          return the number of supplementary groups (0)
+ *   size >  0          copy up to `size` groups and return how many
+ *                      were copied (0) -- nothing to copy, so no
+ *                      write to `list`, and `list` may be NULL
+ *   size <  0          -EINVAL
+ *
+ * busybox `id` does both calls: one with size 0 to get the count,
+ * then (only if the count is nonzero) one with a buffer.  Since the
+ * count is 0, the second call never happens, but the function must
+ * still handle it correctly for any other caller.
+ *
+ * The `list` pointer is a user pointer.  It is not dereferenced here
+ * because nothing is copied; if that ever changes, the copy must go
+ * through safe_copy_to_user.
+ */
+long sys_getgroups(int size, unsigned int* list) {
+    (void)list;
+    if (size < 0) return -(long)EINVAL_;
+    return 0;
 }
 
 /*
@@ -7498,10 +7548,16 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+
         case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
+        case SYS_GETUID:          return (uint64_t)sys_getuid();
+        case SYS_GETGID:          return (uint64_t)sys_getgid();
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
+        case SYS_GETEGID:         return (uint64_t)sys_getegid();
         case SYS_GETPPID:         return (uint64_t)sys_getppid();
         case SYS_SETSID:          return (uint64_t)sys_setsid();
+        case SYS_GETGROUPS:       return (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1);
+
         case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
