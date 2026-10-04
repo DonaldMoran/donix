@@ -22,6 +22,15 @@ DISK_SECTORS     := 40960
 USERLAND_DIR := ../userland/musl
 USERLAND_BIN := $(USERLAND_DIR)/build
 
+# Scripts staged into /root/scripts on the FAT image.
+#
+# Directory-driven, not a per-file list: every regular file under
+# this directory is mcopy'd to ::/root/scripts/ by name, so adding
+# a script does not require editing this Makefile.  The rule fails
+# the build if the directory is empty or a file will not stage --
+# an empty scripts directory is a mistake, not a state to accept.
+USERLAND_SCRIPTS := ../userland/scripts
+
 # Every ELF the musl userland Makefile produces, listed explicitly
 # so the image build has real prerequisites.  If you add a new app
 # or test, add it here and to the FAT-staging list below.
@@ -186,15 +195,23 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/churn_helper.elf"    CHURN_HELPER ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
-	@echo "--- staging /root/scripts/test.sh ---"
-	@if [ -f "$(USERLAND_DIR)/tests/test.sh" ]; then \
-	    echo "mcopy $(USERLAND_DIR)/tests/test.sh -> ::/root/scripts/test.sh"; \
-	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
-	        "$(USERLAND_DIR)/tests/test.sh" "::/root/scripts/test.sh" ; \
-	else \
-	    echo "ERROR: $(USERLAND_DIR)/tests/test.sh missing"; \
+	@echo "--- staging /root/scripts/ from $(USERLAND_SCRIPTS) ---"
+	@if [ ! -d "$(USERLAND_SCRIPTS)" ]; then \
+	    echo "ERROR: $(USERLAND_SCRIPTS) does not exist"; \
 	    exit 1; \
 	fi
+	@if [ -z "$$(ls -A $(USERLAND_SCRIPTS) 2>/dev/null)" ]; then \
+	    echo "ERROR: $(USERLAND_SCRIPTS) is empty -- nothing to stage"; \
+	    exit 1; \
+	fi
+	@for f in $(USERLAND_SCRIPTS)/*; do \
+	    if [ -f "$$f" ]; then \
+	        base=$$(basename "$$f"); \
+	        echo "mcopy $$f -> ::/root/scripts/$$base"; \
+	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	            "$$f" "::/root/scripts/$$base" || exit 1; \
+	    fi \
+	done
 
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
