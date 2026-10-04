@@ -1,3 +1,118 @@
+## Session 52 — a wrong constant in the harness, and a latent kernel bug found while chasing it
+
+Three commits on `dev`, all untagged, unpushed.  **Not a milestone
+and not a session with a product** — the work is a correction: a
+test's expected value was wrong, the code it tested was correct,
+and a session was spent reading correct code before anyone checked
+the constant.  One real finding came out of the chase and is filed
+as item 10.
+
+| Commit | What |
+|---|---|
+| `b9f78f4` | test: `sha512sum` is correct; retract item 7c — the row's expected value was the SHA-512 of lowercase `abc`, not of the three bytes the row feeds it; the new `sha512_probe.c` is the independent implementation that settled it |
+| `5b2245b` | gotchas: "a test's expected value is a claim" — the shape, the FIPS-180-4 trap, and the handoff-source of the wrong constant |
+| `4f183b2` | open-issues: item 10, `CR4.OSFXSR` is set but the kernel saves no XMM state |
+
+Also in `b9f78f4`: `userland/musl/Makefile` gained
+`-mno-sse -mno-sse2 -mno-avx -mno-mmx` (stopgap, see item 10) and
+`Makefile` as a prerequisite of the `%.elf` rules (a CFLAGS edit
+now forces a rebuild); `userland/scripts/shatest.sh`, the
+diagnostic for the non-bug, was deleted.
+
+### Item 7c was not a bug
+
+Session 51 filed item 7c as "`sha512sum` computes a WRONG digest
+for `ABC`", with the expected value
+
+    ddaf35a1...4ca49f
+
+and the produced value
+
+    397118fd...dc119
+
+The symptom was real and reproducible: `printf ABC | sha512sum`
+produced a digest that differed from what the harness expected,
+every run, through a pipe, through a file, and through a redirect.
+`md5sum`, `sha1sum`, and `sha256sum` on the same bytes agreed with
+their harness values.
+
+The expected value was the wrong one.  `ddaf35a1...` is the
+**FIPS 180-4 test vector for lowercase `abc`**; `397118fd...` is
+the correct SHA-512 of the three bytes `0x41 0x42 0x43`.  The
+row had been comparing `ABC`'s digest against `abc`'s digest.
+
+Settled by one command on the fedora host:
+
+    echo -n abc | sha512sum   # ddaf35a1...4ca49f
+    echo -n ABC | sha512sum   # 397118fd...dc119
+
+Four independent producers agree on both values: the busybox
+applet on donix, `userland/musl/tests/sha512_probe.c` on donix,
+the same implementation on the fedora host, and `sha512sum` on the
+fedora host.  **There is no applet bug.**
+
+### What was read before the constant was checked
+
+The session read, in order, and found each correct:
+
+- `sha512_begin`, `sha512_hash`, `sha512_end`, and
+  `sha512_process_block128` in `third_party/busybox/libbb/hash_md5_sha.c`
+  against FIPS 180-4 — the init arrays, the message schedule, all
+  80 rounds, the padding, and the 128-bit length field;
+- the applet's dispatch (`md5_sha1_sum.c`), the `HASH_*` macros,
+  the read loop, the swap macros (`platform.h`), and `rotr64`;
+- the config (`CONFIG_SHA512SUM=y`, and no SHA-512 variant flag to
+  set);
+- the file bytes on disk (`hexdump -C`: `41 42 43`), the pipe
+  path, the file path, and the redirect path.
+
+It then built a first-party SHA-512
+(`userland/musl/tests/sha512_probe.c`), which reproduced the same
+digests for every input, and proposed two fixes — an SSE-state
+theory, and a `-mno-sse` CFLAGS change to the userland Makefile.
+The CFLAGS change was committed and fixed nothing, because there
+was nothing to fix.
+
+**The one command that would have ended it in the first minute was
+`sha512sum` on the input, on a host known correct.**  That check
+was never run because the handoff's item 7c stated the expected
+value as a fact.
+
+### Item 10, the latent bug found on the way
+
+The kernel sets `CR4.OSFXSR` (`kmain.c:37-40`), which tells the
+CPU that the kernel saves SSE state on context switch.  It does
+not: there is no `fxsave`/`fxrstor`/`xsave` anywhere in
+`04_kernel_64bit/`, and `context_switch.asm` saves no XMM
+registers.  Userland compiled by `musl-gcc.sh` can emit SSE —
+before the CFLAGS change, `sha512_probe.elf` carried 543 XMM
+instructions and `busybox.elf` 485 — so an XMM register can be
+clobbered across a switch or an interrupt.
+
+No test currently fails because of this; it is latent.  The
+session's `-mno-sse*` CFLAGS change is a **stopgap** that makes
+the userland ABI match what the kernel preserves, not a fix.  The
+fix is kernel-side `FXSAVE`/`FXRSTOR` (or `XSAVE`/`XRSTOR`) on the
+switch and interrupt paths, and it is filed as item 10.
+
+### Two lessons, one of them about the handoff
+
+`gotchas.md` gained "a test's expected value is a claim, like any
+other" (`5b2245b`).  Its tell: a failure that is deterministic,
+specific, and identical across every input path is more often a
+wrong reference value than a wrong algorithm.
+
+The second lesson is not in a file yet, and the session-end handoff
+now carries it: **a handoff's item text is a claim.**  The wrong
+constant entered through session 51's item 7c, which said both
+"`sha512sum` computes a WRONG digest" and "the correct SHA-512 of
+`ABC` is `ddaf35a1…`".  The session read the first claim, believed
+the second, and spent its time on the first.  The handoff's own
+rule — "a commit message is a claim, not a fact; read the diff,
+not the subject" — applies to handoff prose as much as to commit
+messages.
+
+
 ## Session 51 — the applet batches, the shell-script harness, and two bugs the harness found
 
 Five commits on `dev`, four scratch-tagged, unpushed.  **Not a
