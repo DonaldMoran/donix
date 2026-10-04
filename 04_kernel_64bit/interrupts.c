@@ -7,6 +7,7 @@
 #include "include/scheduler.h"
 #include "include/user_msr.h"
 #include "include/pmm.h"
+#include "include/vmm.h"
 
 /* Written by user_syscall_entry.asm immediately before sysret.  Read
  * here when a fault lands at RIP < 0x1000 in user mode, which is the
@@ -154,8 +155,107 @@ volatile int g_fault_observed = -1;
 void fault_kill_current(int vec) {
     g_fault_observed = vec;
     g_expect_fault   = -1;
+
+    /*
+     * Record the fault vector on the PCB so sys_wait4 can report
+     * it as a signal-kill status.  Without this, a faulted child
+     * exits with status 0 -- indistinguishable from a clean exit
+     * -- and a shell cannot tell that its command was killed.
+     *
+     * process_get_current() is safe to call here: fault_kill_current
+     * runs from the fault handler with the faulting process as
+     * `current`, and interrupts are off.  If the process is somehow
+     * NULL, skip the write and let process_exit do its default
+     * teardown.
+     */
+    pcb_t* self = process_get_current();
+    if (self) {
+        /*
+         * Map the CPU exception vector to a Linux signal number.
+         * The two are different namespaces: 0x0E (#PF) is vector
+         * 14 but SIGSEGV (11), and 0x0D (#GP) is vector 13 but
+         * SIGSEGV (11) as well.  Storing the vector directly makes
+         * busybox ash print "Alarm clock" (SIGALRM = 14) for a
+         * page fault, which is a lie the user would believe.
+         *
+         * Only the exceptions this kernel actually delivers are
+         * mapped.  Anything else falls through to SIGSEGV, which
+         * is the honest answer for "an architectural exception
+         * killed this process" when we do not know better.
+         */
+        int sig;
+        switch (vec) {
+            case 0x00: sig = 8;  break;   /* #DE  -> SIGFPE  */
+            case 0x01: sig = 5;  break;   /* #DB  -> SIGTRAP */
+            case 0x06: sig = 4;  break;   /* #UD  -> SIGILL  */
+            case 0x0D: sig = 11; break;   /* #GP  -> SIGSEGV */
+            case 0x0E: sig = 11; break;   /* #PF  -> SIGSEGV */
+            default:   sig = 11; break;   /* fallback: SIGSEGV */
+        }
+        self->fault_signal = sig;
+    }
+
     process_exit();
     __builtin_unreachable();
+}
+
+/*
+ * Dump a window of the faulting process's user stack, straddling RSP.
+ *
+ * For a corrupted-return-address fault, the bad target is typically
+ * either AT RSP (a `ret` popped it) or just below RSP (the pushed
+ * frame of the function whose return address was overwritten).  The
+ * iteration-600 capture has RIP *below* RSP, which is not a plain
+ * `ret` shape -- so read both directions.
+ *
+ * Each slot is resolved individually through the faulting process's
+ * page tables.  A slot that is not mapped prints (not mapped) and
+ * does not stop the walk; a slot whose physical address cannot be
+ * resolved prints (no phys).  Only user-mode faults call this -- the
+ * CS&3 check is done by the caller.
+ *
+ * Reads 17 slots (0x88 bytes) centered on RSP:
+ *   rsp-0x40, rsp-0x38, ..., rsp-0x08, rsp+0x00, rsp+0x08, ..., rsp+0x40
+ */
+static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
+    if ((fault_cs & 3) != 3) return;
+    if (fault_rsp == 0) return;
+
+    pcb_t* self = process_get_current();
+    if (!self) return;
+
+    serial_print("  --- user stack window [rsp-0x40 .. rsp+0x40] ---\n");
+    serial_print("  (fault_rsp = 0x"); serial_print_hex(fault_rsp); serial_print(")\n");
+
+    /* Signed offset so the loop can start below RSP.  -0x40 .. +0x40
+     * in 8-byte steps.  Note: fault_rsp - 0x40 may wrap if RSP is
+     * near 0; that is the process's problem and we print garbage. */
+    for (int64_t off = -0x40; off <= 0x40; off += 8) {
+        uint64_t slot_va = fault_rsp + (uint64_t)off;
+
+        serial_print("    rsp");
+        if (off < 0) {
+            serial_print("-0x");
+            serial_print_hex((uint64_t)(-off));
+        } else if (off == 0) {
+            serial_print("+0x0");
+        } else {
+            serial_print("+0x");
+            serial_print_hex((uint64_t)off);
+        }
+        serial_print(" = ");
+
+        uint64_t slot_phys = vmm_get_phys_from_cr3(self->cr3, slot_va);
+        if (!slot_phys) {
+            serial_print("(no phys)\n");
+            continue;
+        }
+        uint64_t val = *(volatile uint64_t*)(HHDM_START + slot_phys);
+        serial_print("0x");
+        serial_print_hex(val);
+        serial_print("\n");
+    }
+    serial_print("  --- end user stack window ---\n");
 }
 
 /* The timer preempt handler straddles an ABI boundary that the C compiler
@@ -504,8 +604,33 @@ void isr13_handler(exception_frame_t *frame) {
     }
 
     serial_lock();
-    if (fault_rip < 0x1000) {
-        serial_print("  *** RIP < 0x1000: corrupted sysret target? ***\n");
+    /*
+     * Corrupted-target diagnostics.
+     *
+     * Three fault shapes have been observed in fork-heavy workloads:
+     *
+     *   - RIP < 0x1000        : a corrupted sysret target (RCX was
+     *                           clobbered before the sysret).
+     *   - RIP in mmap window  : a corrupted control transfer whose
+     *                           target happens to land in the mmap
+     *                           data region (0x8010000000..0x8010400000).
+     *   - RIP on the stack    : a corrupted return address, or a
+     *                           control transfer whose target was
+     *                           loaded from a corrupted stack slot.
+     *                           RSP is near RIP.
+     *
+     * g_last_sysret_rcx is meaningful only for the first shape.  For
+     * the second and third, print it anyway -- if it holds the fault
+     * RIP, the kernel returned to the bad address; if it holds a sane
+     * text address, the corruption is post-resume.
+     */
+    int bad_target = 0;
+    if (fault_rip < 0x1000) bad_target = 1;
+    if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
+    if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
+
+    if (bad_target) {
+        serial_print("  *** corrupted control target ***\n");
         serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
         serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
     }
@@ -519,6 +644,23 @@ void isr13_handler(exception_frame_t *frame) {
     }
     serial_print("  --- end frame dump ---\n");
     serial_unlock();
+
+    /*
+     * User stack window.  For a user-mode #GP whose target is on the
+     * stack, the corrupted value and whatever wrote it are within a
+     * frame or two of RSP.  Print the window straddling RSP so both a
+     * plain `ret` target (at RSP) and a pushed-frame corruption
+     * (below RSP) are visible in the same capture.
+     *
+     * Only for user-mode faults; a kernel-mode #GP has no user stack
+     * to read meaningfully.
+     */
+    if ((fault_cs & 3) == 3) {
+        serial_lock();
+        dump_user_stack_window(fault_rsp, fault_cs);
+        serial_unlock();
+    }
+
     if ((fault_cs & 3) == 3) {
         fault_kill_current(0x0D);
     }
@@ -560,8 +702,15 @@ void isr14_handler(exception_frame_t *frame) {
         uint64_t idx_pt   = (fault_addr >> 12) & 0x1FF;
 
         serial_lock();
-        if (fault_rip < 0x1000) {
-            serial_print("  *** RIP < 0x1000: corrupted sysret target? ***\n");
+        /* Same corrupted-target diagnostic as isr13_handler.  See the
+         * comment there for the three shapes. */
+        int bad_target = 0;
+        if (fault_rip < 0x1000) bad_target = 1;
+        if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
+        if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
+
+        if (bad_target) {
+            serial_print("  *** corrupted control target ***\n");
             serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
             serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
         }
@@ -577,14 +726,36 @@ void isr14_handler(exception_frame_t *frame) {
         serial_print("\n");
         serial_unlock();
 
+        /*
+         * Walk the faulting address's page tables and print each
+         * level.  A missing intermediate is normal -- the whole
+         * point of a #PF is that the address is not mapped -- so it
+         * is NOT a halt condition.  Print what we found, mark the
+         * walk incomplete, and fall through to the register dump and
+         * the user stack window below.  Those are the diagnostics
+         * that matter: they show what the CPU was executing and what
+         * was on the stack at the moment of the fault.
+         *
+         * The original code halted on any missing level, which meant
+         * a #PF at a genuinely-unmapped address printed only
+         * "PDPTE NOT PRESENT - stopping walk" and skipped both the
+         * register dump and the stack window.  That is the exact
+         * shape of the mmap-window 7e captures: CR2 in an unmapped
+         * region, and no register or stack data to read.
+         */
+        int walk_incomplete = 0;
+
         uint64_t* pml4 = (uint64_t*)(0xFFFF800000000000ULL + (cr3 & ~0xFFFULL));
         uint64_t pml4e = pml4[idx_pml4];
         serial_lock();
         serial_print("  pml4e             : 0x"); serial_print_hex(pml4e); serial_print("\n");
         serial_unlock();
         if (!(pml4e & 1)) {
-            serial_print("  PML4E NOT PRESENT - stopping walk\n");
-            while (1) __asm__ volatile("hlt");
+            serial_lock();
+            serial_print("  PML4E NOT PRESENT\n");
+            serial_unlock();
+            walk_incomplete = 1;
+            goto walk_done;
         }
 
         uint64_t* pdpt = (uint64_t*)(0xFFFF800000000000ULL + (pml4e & ~0xFFFULL));
@@ -593,8 +764,11 @@ void isr14_handler(exception_frame_t *frame) {
         serial_print("  pdpte             : 0x"); serial_print_hex(pdpte); serial_print("\n");
         serial_unlock();
         if (!(pdpte & 1)) {
-            serial_print("  PDPTE NOT PRESENT - stopping walk\n");
-            while (1) __asm__ volatile("hlt");
+            serial_lock();
+            serial_print("  PDPTE NOT PRESENT\n");
+            serial_unlock();
+            walk_incomplete = 1;
+            goto walk_done;
         }
 
         uint64_t* pd = (uint64_t*)(0xFFFF800000000000ULL + (pdpte & ~0xFFFULL));
@@ -603,8 +777,11 @@ void isr14_handler(exception_frame_t *frame) {
         serial_print("  pde               : 0x"); serial_print_hex(pde); serial_print("\n");
         serial_unlock();
         if (!(pde & 1)) {
-            serial_print("  PDE NOT PRESENT - stopping walk\n");
-            while (1) __asm__ volatile("hlt");
+            serial_lock();
+            serial_print("  PDE NOT PRESENT\n");
+            serial_unlock();
+            walk_incomplete = 1;
+            goto walk_done;
         }
 
         if (pde & 0x80) {
@@ -645,6 +822,11 @@ void isr14_handler(exception_frame_t *frame) {
             serial_print("\n");
             serial_unlock();
         }
+
+    walk_done:
+        if (walk_incomplete) {
+            serial_print("  (walk incomplete; continuing to register/stack dumps)\n");
+        }
     }
 
     /*
@@ -679,6 +861,16 @@ void isr14_handler(exception_frame_t *frame) {
     }
     serial_print("  --- end frame dump ---\n");
     serial_unlock();
+
+    /*
+     * User stack window, same shape as isr13_handler.  Only for
+     * user-mode faults.
+     */
+    if ((fault_cs & 3) == 3) {
+        serial_lock();
+        dump_user_stack_window(fault_rsp, fault_cs);
+        serial_unlock();
+    }
 
     /*
      * User-mode #PF: the fault is the process's problem, not the

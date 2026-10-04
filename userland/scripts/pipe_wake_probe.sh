@@ -18,7 +18,7 @@
 # it by hand, per open-issues.md item 7d.
 
 i=0
-while [ $i -lt 200 ]; do
+while [ $i -lt 4000 ]; do
     echo "[$i] seq"
     x=$(seq 1 3)
     i=$((i+1))

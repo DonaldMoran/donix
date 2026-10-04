@@ -128,6 +128,39 @@ void __attribute__((noreturn)) process_exit(void) {
 
     pcb_t* exiting = current_process;
 
+    /*
+     * Drop the exiting process's file references.
+     *
+     * sys_exit calls close_all_files before this function runs, but
+     * process_exit is also reached directly -- from fault_kill_current,
+     * from user_syscall_entry.asm's exit path, and from sys_execve's
+     * failure branch -- and those paths do NOT close the file table.
+     *
+     * Without this call, a pipe end inherited from a fork parent leaks
+     * its reference on every direct-path exit: pipe->readers_open and
+     * pipe->writers_open are decremented only in put_file_slot when a
+     * slot's refcount reaches zero, and pipe->refcount (which frees
+     * the pipe_t and its 4096-byte ring buffer) is likewise only
+     * decremented there.  A slot's refcount does not reach zero until
+     * every process holding it has closed it, so a child that exits
+     * without closing leaves the parent's reference as the last one,
+     * and if the parent never closes (ash's command-substitution
+     * bookkeeping does not on this path), the pipe_t and its ring
+     * buffer leak forever.
+     *
+     * pipe_wake_probe.sh creates one pipe per iteration via
+     * x=$(seq 1 3) and reaches the fault family at iteration ~1074,
+     * when the leaked ring buffers have grown into several megabytes
+     * and the heap has been forced to expand into the PMM's free
+     * pool.  This call closes the child's half deterministically and
+     * is the first half of the fix.
+     *
+     * close_all_files is idempotent: it NULLs each slot as it
+     * closes, so a call after sys_exit's own close finds an empty
+     * table and returns immediately.
+     */
+    close_all_files(exiting);
+
     {
         pcb_t* head = scheduler_ready_queue_peek_next();
         serial_lock();

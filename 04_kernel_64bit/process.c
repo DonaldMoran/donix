@@ -845,6 +845,13 @@ void process_reclaim(pcb_t* pcb) {
 
     pcb->state = PROC_STATE_UNUSED;
     pcb->pid = 0;
+    /*
+     * Clear the fault vector.  A reused PCB slot must not carry a
+     * stale fault from the previous process; without this, the
+     * next process to occupy this slot would be reaped by its
+     * parent with a signal-kill status it did not earn.
+     */
+    pcb->fault_signal = 0;
     process_count--;
 }
 
@@ -857,6 +864,9 @@ void process_destroy(pcb_t* pcb) {
     kernel_stack_slot_free(pcb);
     pcb->state = PROC_STATE_UNUSED;
     pcb->pid = 0;
+    /* See the comment in process_reclaim: a reused slot must not
+     * carry a stale fault vector. */
+    pcb->fault_signal = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) current_process = NULL;

@@ -23,6 +23,7 @@ menu() {
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-debug-log > capture.txt
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
         { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
+    # qemu-system-x86_64 -cpu max -drive file=/home/noneya/code/donix/05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -monitor none -d int -D qemu-int.log
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-kvm-single > capture.txt
 
     :  # no-op so an empty body is valid

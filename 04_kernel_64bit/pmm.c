@@ -375,7 +375,9 @@ void pmm_init(BootInfo *info) {
         serial_print_hex(kstart);
         serial_print(", 0x");
         serial_print_hex(kend);
-        serial_print(") via _kernel_end\n");
+        serial_print(") via _kernel_end, free=");
+        serial_print_dec(pmm_free_pages);
+        serial_print("\n");
         serial_unlock();
 
         for (uint64_t addr = kstart; addr < kend && addr < pmm_max_physical; addr += PAGE_SIZE) {
@@ -526,6 +528,29 @@ uint64_t pmm_alloc_page(page_type_t type) {
             pmm_free_pages--;
             pmm_next_high_page = (page > pmm_high_start_page) ? (page - 1) : pmm_high_start_page;
 
+            /*
+             * Reuse diagnostic.  The allocator does not zero the
+             * frame, and the frame carries whatever bytes its
+             * previous owner left.  If a page that was PAGE_KERNEL
+             * (i.e. .bss, including pmm_page_info itself) is now
+             * handed out as USER_DATA, that is the exact shape that
+             * puts kernel bytes into a user process.  Print the
+             * transition once per occurrence; the first such line is
+             * the one that matters.
+             */
+            page_type_t prev_type = pmm_page_info[page].type;
+            if (prev_type != PAGE_FREE && prev_type != type) {
+                serial_lock();
+                serial_print("PMM REUSE: page 0x");
+                serial_print_hex(page * PAGE_SIZE);
+                serial_print(" was ");
+                serial_print(page_type_string(prev_type));
+                serial_print(" now ");
+                serial_print(page_type_string(type));
+                serial_print("\n");
+                serial_unlock();
+            }
+
             pmm_page_info[page].type = type;
             pmm_page_info[page].ref_count = 1;
             pmm_page_info[page].owner_pid = 0;
@@ -571,6 +596,20 @@ uint64_t pmm_alloc_page(page_type_t type) {
             bitmap_set(page);
             pmm_free_pages--;
             pmm_next_low_page = (page < pmm_low_end_page) ? (page + 1) : pmm_low_end_page;
+
+            /* Same reuse diagnostic as the HIGH branch above. */
+            page_type_t prev_type = pmm_page_info[page].type;
+            if (prev_type != PAGE_FREE && prev_type != type) {
+                serial_lock();
+                serial_print("PMM REUSE: page 0x");
+                serial_print_hex(page * PAGE_SIZE);
+                serial_print(" was ");
+                serial_print(page_type_string(prev_type));
+                serial_print(" now ");
+                serial_print(page_type_string(type));
+                serial_print("\n");
+                serial_unlock();
+            }
 
             pmm_page_info[page].type = type;
             pmm_page_info[page].ref_count = 1;

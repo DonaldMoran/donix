@@ -29,6 +29,30 @@ static inline uint64_t* phys_to_virt(uint64_t phys) {
     return (uint64_t*)(HHDM_START + phys);
 }
 
+/*
+ * The physical address of a page-table entry: strip BOTH the low
+ * 12 bits (flags) and the NX bit (bit 63).
+ *
+ * ~0xFFFULL alone leaves PT_NX set.  The caller then adds HHDM_START
+ * (or passes the value to phys_to_virt), and the sum is a
+ * non-canonical address: bit 63 is set from PT_NX, HHDM_START's bit
+ * 63 is also set, the carry into bit 64 is dropped, and the result
+ * has bit 63 clear but bits 62:48 all set -- the "hole" between the
+ * user half and the kernel half.  The next load or store through
+ * that pointer faults with #GP error 0.
+ *
+ * That is the boot #GP at vmm_map_page_in_cr3+0x29A: r13 held
+ * phys_to_virt(0x8000000000306003), the byte pattern of a PDE with
+ * PT_NX set, and `mov %rcx,0x0(%r13,%rax,8)` faulted on the
+ * non-canonical target.
+ *
+ * Use this EVERYWHERE a table entry is masked to a physical
+ * address.  Do not write `entry & ~0xFFFULL` directly.
+ */
+static inline uint64_t pte_phys(uint64_t entry) {
+    return entry & ~0xFFFULL & ~PT_NX;
+}
+
 void* ensure_hhdm_mapped(uint64_t phys) {
     uint64_t virt = HHDM_START + phys;
 
@@ -133,7 +157,7 @@ int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         pdpt = phys_to_virt(new_pdpt_phys);
     } else {
         pml4[pml4_idx] |= (PT_WRITE | PT_USER);
-        pdpt = phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+        pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
     }
 
     uint64_t* pd;
@@ -145,7 +169,7 @@ int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         pd = phys_to_virt(new_pd_phys);
     } else {
         pdpt[pdpt_idx] |= (PT_WRITE | PT_USER);
-        pd = phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+        pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
     }
 
     uint64_t* pt;
@@ -157,7 +181,7 @@ int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
         pt = phys_to_virt(new_pt_phys);
     } else {
         pd[pd_idx] |= (PT_WRITE | PT_USER);
-        pt = phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+        pt = phys_to_virt(pte_phys(pd[pd_idx]));
     }
 
     uint64_t pte = phys | present_flag | write_flag | user_flag | cache_flags;
@@ -177,13 +201,13 @@ void vmm_unmap_page(uint64_t virt) {
     uint32_t pt_idx   = (virt >> 12) & 0x1FF;
 
     if (!(pml4[pml4_idx] & PT_PRESENT)) return;
-    uint64_t* pdpt = phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
 
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) return;
-    uint64_t* pd = phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
 
     if (!(pd[pd_idx] & PT_PRESENT)) return;
-    uint64_t* pt = phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
 
     pt[pt_idx] = 0;
     asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
@@ -198,16 +222,17 @@ uint64_t vmm_get_phys(uint64_t virt) {
     uint32_t pt_idx   = (virt >> 12) & 0x1FF;
 
     if (!(pml4[pml4_idx] & PT_PRESENT)) return 0;
-    uint64_t* pdpt = phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
 
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) return 0;
-    uint64_t* pd = phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
 
     if (!(pd[pd_idx] & PT_PRESENT)) return 0;
-    uint64_t* pt = phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
 
     if (!(pt[pt_idx] & PT_PRESENT)) return 0;
-    return (pt[pt_idx] & ~0xFFFULL) | (virt & 0xFFFULL);
+    /* Strip PT_NX as well as the low flag bits; see pte_phys. */
+    return (pte_phys(pt[pt_idx])) | (virt & 0xFFFULL);
 }
 
 int vmm_is_mapped(uint64_t virt) {
@@ -219,13 +244,13 @@ int vmm_is_mapped(uint64_t virt) {
     uint32_t pt_idx   = (virt >> 12) & 0x1FF;
 
     if (!(pml4[pml4_idx] & PT_PRESENT)) return 0;
-    uint64_t* pdpt = phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
 
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) return 0;
-    uint64_t* pd = phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
 
     if (!(pd[pd_idx] & PT_PRESENT)) return 0;
-    uint64_t* pt = phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
 
     if (!(pt[pt_idx] & PT_PRESENT)) return 0;
     return 1;
@@ -241,11 +266,11 @@ void vmm_dump_page_table(uint64_t virt) {
     serial_lock();
     serial_print("\n=== PAGE TABLE DUMP ===\n");
     if (!(pml4[pml4_idx] & PT_PRESENT)) { serial_unlock(); return; }
-    uint64_t* pdpt = phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) { serial_unlock(); return; }
-    uint64_t* pd = phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
     if (!(pd[pd_idx] & PT_PRESENT)) { serial_unlock(); return; }
-    uint64_t* pt = phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
 
     serial_print("  PTE Entry Found: 0x");
     serial_print_hex(pt[pt_idx]);
@@ -309,7 +334,7 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
         /* Low-half entries: deep-copy the whole hierarchy below. */
         uint64_t new_pdpt_phys = pmm_alloc_page_for_tables();
         if (!new_pdpt_phys) return 0;
-        uint64_t* src_pdpt = (uint64_t*)phys_to_virt(src_pml4e & ~0xFFFULL);
+        uint64_t* src_pdpt = (uint64_t*)phys_to_virt(pte_phys(src_pml4e));
         uint64_t* new_pdpt = (uint64_t*)phys_to_virt(new_pdpt_phys);
         memset(new_pdpt, 0, PAGE_SIZE);
 
@@ -319,7 +344,7 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
 
             uint64_t new_pd_phys = pmm_alloc_page_for_tables();
             if (!new_pd_phys) return 0;
-            uint64_t* src_pd = (uint64_t*)phys_to_virt(src_pdpte & ~0xFFFULL);
+            uint64_t* src_pd = (uint64_t*)phys_to_virt(pte_phys(src_pdpte));
             uint64_t* new_pd = (uint64_t*)phys_to_virt(new_pd_phys);
             memset(new_pd, 0, PAGE_SIZE);
 
@@ -335,7 +360,7 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
 
                 uint64_t new_pt_phys = pmm_alloc_page_for_tables();
                 if (!new_pt_phys) return 0;
-                uint64_t* src_pt = (uint64_t*)phys_to_virt(src_pde & ~0xFFFULL);
+                uint64_t* src_pt = (uint64_t*)phys_to_virt(pte_phys(src_pde));
                 uint64_t* new_pt = (uint64_t*)phys_to_virt(new_pt_phys);
 
                 for (int m = 0; m < 512; m++) {
@@ -363,10 +388,10 @@ uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
     uint32_t pt_idx   = (virt >> 12) & 0x1FF;
 
     if (!(pml4[pml4_idx] & PT_PRESENT)) return 0;
-    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pte_phys(pml4[pml4_idx]));
 
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) return 0;
-    uint64_t* pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = (uint64_t*)phys_to_virt(pte_phys(pdpt[pdpt_idx]));
 
     if (!(pd[pd_idx] & PT_PRESENT)) return 0;
 
@@ -375,15 +400,24 @@ uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
        dereference the huge page's physical base as a page-table
        pointer and return garbage. */
     if (pd[pd_idx] & 0x80) {
-        uint64_t huge_phys = pd[pd_idx] & ~0x1FFFFFULL;
+        uint64_t huge_phys = pd[pd_idx] & ~0x1FFFFFULL & ~PT_NX;
         uint64_t offset_2m = virt & 0x1FFFFFULL;
         return huge_phys + offset_2m;
     }
 
-    uint64_t* pt = (uint64_t*)phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = (uint64_t*)phys_to_virt(pte_phys(pd[pd_idx]));
 
     if (!(pt[pt_idx] & PT_PRESENT)) return 0;
-    return (pt[pt_idx] & ~0xFFFULL) | (virt & 0xFFFULL);
+    /*
+     * Mask BOTH the low 12 bits (flags) and the NX bit (bit 63).
+     * ~0xFFFULL alone leaves PT_NX set, and callers add the result
+     * to HHDM_START; with bit 63 set the sum is non-canonical and
+     * the next load through HHDM faults with #GP error 0.  This was
+     * latent until sys_mmap began honoring PROT_EXEC and setting
+     * PT_NX on anonymous mappings -- see the PROT_EXEC comment in
+     * user_syscall.c.  Any PTE with NX set reaches here now.
+     */
+    return pte_phys(pt[pt_idx]) | (virt & 0xFFFULL);
 }
 
 int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -422,7 +456,7 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
         pdpt = (uint64_t*)phys_to_virt(new_pdpt_phys);
     } else {
         pml4[pml4_idx] |= (PT_WRITE | PT_USER);
-        pdpt = (uint64_t*)phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+        pdpt = (uint64_t*)phys_to_virt(pte_phys(pml4[pml4_idx]));
     }
 
     uint64_t* pd;
@@ -443,7 +477,7 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
         pd = (uint64_t*)phys_to_virt(new_pd_phys);
     } else {
         pdpt[pdpt_idx] |= (PT_WRITE | PT_USER);
-        pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+        pd = (uint64_t*)phys_to_virt(pte_phys(pdpt[pdpt_idx]));
     }
 
     /* If the PDE is a 2 MB huge page (PS bit set), split it into
@@ -453,7 +487,7 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
        physical base as a page-table pointer and write the new PTE
        into memory that isn't a page table.  Splits are on-demand. */
     if (pd[pd_idx] & 0x80) {
-        uint64_t huge_phys  = pd[pd_idx] & ~0x1FFFFFULL;
+        uint64_t huge_phys  = pd[pd_idx] & ~0x1FFFFFULL & ~PT_NX;
         uint64_t huge_flags = pd[pd_idx] & 0xFFF;
 
         uint64_t new_pt_phys = pmm_alloc_page_for_tables();
@@ -509,9 +543,30 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
         }
         uint64_t* split_pt = (uint64_t*)phys_to_virt(new_pt_phys);
 
+        /*
+         * Split the 2 MB huge page into 512 4 KB PTEs.  The 512
+         * PTEs are marked NX; the PDE that points at them is NOT.
+         *
+         * Why not on the PDE: a PDE's NX bit propagates to every
+         * page below it.  Setting NX on the PDE made the caller's
+         * own page non-executable -- the caller writes an executable
+         * PTE for the one page it was asked to map, but the CPU
+         * walks the PDE first and refuses the fetch before it ever
+         * sees the PTE.  That was the musl_sh boot #PF at
+         * RIP=CR2=0x4010A6 with error 0x15: the ELF's .text page
+         * was NX at the PDE level despite the loader asking for an
+         * executable mapping.
+         *
+         * With NX on the PTEs only, the 511 pages the caller did
+         * NOT touch are non-executable, and the caller's own page
+         * is whatever the caller's subsequent PTE write asks for --
+         * because that write overwrites the whole PTE, clearing NX
+         * if the caller wanted an executable page.
+         */
         uint64_t carry = huge_flags & (PT_PRESENT | PT_WRITE | PT_USER);
+        uint64_t pte_carry = carry | PT_NX;
         for (int m = 0; m < 512; m++) {
-            split_pt[m] = (huge_phys + (uint64_t)m * 0x1000) | carry;
+            split_pt[m] = (huge_phys + (uint64_t)m * 0x1000) | pte_carry;
         }
         pd[pd_idx] = new_pt_phys | carry;
 
@@ -543,7 +598,7 @@ int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t fla
         pt = (uint64_t*)phys_to_virt(new_pt_phys);
     } else {
         pd[pd_idx] |= (PT_WRITE | PT_USER);
-        pt = (uint64_t*)phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+        pt = (uint64_t*)phys_to_virt(pte_phys(pd[pd_idx]));
     }
 
     uint64_t pte = phys | present_flag | write_flag | user_flag | cache_flags;
@@ -567,13 +622,13 @@ void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt) {
     uint32_t pt_idx   = (virt >> 12) & 0x1FF;
 
     if (!(pml4[pml4_idx] & PT_PRESENT)) return;
-    uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4[pml4_idx] & ~0xFFFULL);
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pte_phys(pml4[pml4_idx]));
 
     if (!(pdpt[pdpt_idx] & PT_PRESENT)) return;
-    uint64_t* pd = (uint64_t*)phys_to_virt(pdpt[pdpt_idx] & ~0xFFFULL);
+    uint64_t* pd = (uint64_t*)phys_to_virt(pte_phys(pdpt[pdpt_idx]));
 
     if (!(pd[pd_idx] & PT_PRESENT)) return;
-    uint64_t* pt = (uint64_t*)phys_to_virt(pd[pd_idx] & ~0xFFFULL);
+    uint64_t* pt = (uint64_t*)phys_to_virt(pte_phys(pd[pd_idx]));
 
     pt[pt_idx] = 0;
 

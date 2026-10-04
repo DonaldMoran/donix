@@ -154,6 +154,27 @@ typedef struct pcb {
      * see docs/open-issues.md.
      */
     char cwd[PROC_CWD_MAX];
+
+    /*
+     * Fault vector that killed this process, or 0 if it exited
+     * normally.
+     *
+     * Written by fault_kill_current on the user-mode fault path.
+     * Read by sys_wait4, which encodes a nonzero value as a
+     * signal-kill wait status instead of the shifted exit status,
+     * so the parent can tell a fault from a clean exit.  Without
+     * this field, a faulted child exits with status 0 --
+     * indistinguishable from a clean exit -- and a shell cannot
+     * tell that its command was killed by the kernel.
+     *
+     * APPENDED AT THE END so no offset that context_switch.asm
+     * reads (which stops at block_kind, offset 0x158) moves.
+     * Same rule as the cwd field above.
+     *
+     * Cleared by process_reclaim so a reused PCB slot does not
+     * carry a stale fault from the previous process.
+     */
+    int fault_signal;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)
@@ -245,5 +266,19 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child);
  */
 pcb_t* process_get_kernel_shell(void);
 void   process_set_kernel_shell(pcb_t* shell);
+
+/*
+ * Drop every file reference a process holds, freeing each slot when
+ * its refcount reaches zero.  Defined in user_syscall.c; called from
+ * sys_exit (which already has the syscall context) and from
+ * process_exit (which needs the same teardown on paths that do not
+ * route through sys_exit -- fault_kill_current, the asm exit path,
+ * and sys_execve's failure branch).
+ *
+ * Idempotent: a second call on the same PCB walks an all-NULL table
+ * and does nothing.  That is what makes the unconditional call in
+ * process_exit safe.
+ */
+void close_all_files(pcb_t* proc);
 
 #endif

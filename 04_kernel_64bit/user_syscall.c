@@ -1953,7 +1953,21 @@ void user_syscall_init_console_fds(struct pcb* pcb) {
     }
 }
 
-static void close_all_files(pcb_t* proc) {
+/*
+ * Drop every file reference a process holds.
+ *
+ * NULLs each slot after closing it, so a second call on the same
+ * PCB finds an empty table and returns immediately -- idempotent by
+ * construction.  That is what makes it safe to call from
+ * process_exit unconditionally, even on the two paths (sys_exit and
+ * exit_group) that already called it.
+ *
+ * Not static: process_exit calls it on the paths that reach it
+ * without going through sys_exit (fault_kill_current,
+ * user_syscall_entry.asm's direct jmp, sys_execve's failure branch).
+ * The declaration is in include/process.h.
+ */
+void close_all_files(pcb_t* proc) {
     if (!proc) return;
     for (int i = 0; i < MAX_PROCESS_FILES; i++) {
         file_slot_t* slot = (file_slot_t*)proc->file_table[i];
@@ -4886,7 +4900,27 @@ long sys_wait4(long pid, int* user_status, int options) {
 
         if (zombie) {
             long reaped = (long)zombie->pid;
-            int status = (zombie->exit_status & 0xff) << 8;
+            int status;
+
+            /*
+             * If the child was killed by a fault (fault_kill_current
+             * recorded a vector in zombie->fault_signal), report a
+             * signal-kill wait status: the low byte is the signal
+             * number, and WIFSIGNALED(status) is true.  Otherwise
+             * report the normal shifted exit status.
+             *
+             * Before this, every faulted child exited with status 0,
+             * indistinguishable from a clean exit, and a shell could
+             * not tell that its command had been killed by the kernel.
+             * See docs/open-issues.md, "user-mode fault produces a
+             * silent kill with a status-0 exit."
+             */
+            if (zombie->fault_signal != 0) {
+                status = zombie->fault_signal & 0x7f;
+            } else {
+                status = (zombie->exit_status & 0xff) << 8;
+            }
+
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
@@ -6844,6 +6878,15 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
 #define MMAP_BASE 0x8010000000ULL
 #define MMAP_END  0x8010400000ULL   /* 4 MB window, per exec_free_and_unmap_user_pages */
 
+/*
+ * Linux x86_64 PROT_* bits (from uapi/asm-generic/mman-common.h).
+ * PROT_EXEC is the only one that changes the page-table flags:
+ * without it, the mapping is NX.  The other three bits are accepted
+ * and ignored -- donix has one permission level for user pages, and
+ * a read-only mapping is not enforced.
+ */
+#define PROT_EXEC 0x4
+
 /* Find `rounded` bytes of free VA space in the mmap window.
  * Returns 0 on failure. */
 static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
@@ -6884,7 +6927,6 @@ static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
 
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
-    (void)prot;
     (void)offset;
 
     if (length == 0) return -(long)EINVAL_;
@@ -6922,7 +6964,29 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         void* hhdm = (void*)(HHDM_START + phys);
         for (uint64_t j = 0; j < 4096 / 8; j++) ((uint64_t*)hhdm)[j] = 0ULL;
 
+        /*
+         * Honor PROT_EXEC.  Every anonymous mapping was previously
+         * mapped PT_PRESENT | PT_WRITE | PT_USER with no PT_NX, so
+         * every mmap window page was executable.  That turned a
+         * stray jump into the window into a silent fetch-then-run
+         * (a fault inside the window on whatever the fetched bytes
+         * first dereference) instead of an immediate #PF at the
+         * jump itself.  The 7e family -- fault RIP in the mmap
+         * window, CR2 somewhere else entirely -- is exactly that
+         * shape.  With PT_NX set, the stray jump faults at its own
+         * RIP with error 0x15 (present + user + instruction fetch),
+         * which is the reading the corruption wants.
+         *
+         * PROT_READ, PROT_WRITE, and PROT_NONE are accepted and
+         * ignored: donix has no user page-permission model beyond
+         * "user" and "not user", and enforcing read-only would break
+         * musl's mallocng (which writes to every mapping it makes).
+         */
         uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
+        if (!(prot & PROT_EXEC)) {
+            map_flags |= PT_NX;
+        }
+
         if (vmm_map_page_in_cr3(self->cr3, v, phys, map_flags) != 0) {
             /*
              * A page-table allocation failed.  `phys` is not yet in
