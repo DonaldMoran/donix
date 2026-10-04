@@ -81,6 +81,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/mmap_stress.elf \
 	$(USERLAND_BIN)/exec_churn.elf \
 	$(USERLAND_BIN)/churn_helper.elf \
+	$(USERLAND_BIN)/sha512_probe.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -193,6 +194,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/mmap_stress.elf"    MMAP_STRESS ; \
 	mcopy_one "$(USERLAND_BIN)/exec_churn.elf"      EXEC_CHURN ; \
 	mcopy_one "$(USERLAND_BIN)/churn_helper.elf"    CHURN_HELPER ; \
+	mcopy_one "$(USERLAND_BIN)/sha512_probe.elf"    SHA512_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
 	@echo "--- staging /root/scripts/ from $(USERLAND_SCRIPTS) ---"

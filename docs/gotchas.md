@@ -1,3 +1,114 @@
+## A test's expected value is a claim, like any other
+
+*Session 52 (`test.sh` row 4, the `sha512sum` row), commit
+`b9f78f4`.  Not a kernel bug and not an applet bug -- a wrong
+constant in the harness, inherited from the session-51 handoff,
+that cost a session of diagnosis before anyone checked it.*
+
+`test.sh` asserted that `printf ABC | sha512sum` must produce
+
+    ddaf35a1...4ca49f
+
+and reported `FAIL sha512sum ABC` when the applet produced
+
+    397118fd...dc119
+
+The row was right about the output and wrong about the answer.
+`ddaf35a1...` is the SHA-512 of lowercase **`abc`** -- the FIPS
+180-4 test vector for the three lowercase letters -- not of the
+three bytes `0x41 0x42 0x43` the row feeds it.  `397118fd...` is
+the correct SHA-512 of `ABC`.
+
+**The wrong value was in the handoff.**  Session 51 wrote item 7c
+as "`sha512sum` computes a WRONG digest for `ABC` … the correct
+SHA-512 of `ABC` is `ddaf35a1…`," and the session-52 work read
+that sentence and started diagnosing.  Every reproducer confirmed
+the *symptom* the handoff described -- wrong digest, deterministic,
+through a pipe, through a file, not intermittent -- because the
+symptom was real.  The digest *was* different from the one the
+harness expected.  The mistake was treating "different from the
+harness's expected value" as "wrong," when the harness's expected
+value was the thing that had never been checked.
+
+**What the session did before it checked the constant.**  It read
+`sha512_begin`, `sha512_hash`, `sha512_end`, and
+`sha512_process_block128` against FIPS 180-4 (all correct); read
+the busybox dispatch, the `HASH_*` macros, the read loop, the swap
+macros, and the rotation functions (all correct); built a
+first-party SHA-512 (correct); checked the file bytes with
+`hexdump -C` (correct); compared the pipe path against the file
+path (identical); and proposed two fixes -- an SSE-state theory and
+a `-mno-sse` CFLAGS change to the userland Makefile -- of which
+the second was committed and did not fix anything, because there
+was nothing to fix.
+
+**The constant was settled in one command**, on the fedora host,
+once anyone asked what the *correct* digest of `ABC` is:
+
+    echo -n abc | sha512sum   # ddaf35a1...4ca49f
+    echo -n ABC | sha512sum   # 397118fd...dc119
+
+The lowercase line is the value the harness expected.  The test
+had been comparing `ABC`'s digest against `abc`'s digest for the
+life of the row.
+
+**The rule.**
+
+> **A test's expected value is a claim, and it is the claim the
+> test is least likely to check.**  When a test reports a
+> mismatch, there are two things it could be wrong about: the code
+> under test, and the value it expected.  Establish the expected
+> value against a known-good source *before* concluding anything
+> about the code.  A wrong expected value and a real defect
+> produce the same output -- `FAIL` -- and the session that treats
+> one as the other spends its time reading correct code.
+
+**The tell.**  A failure that is **deterministic**, **specific**,
+and **stable across every input path** is more often a wrong
+constant than a wrong algorithm.  A real bug in a hash function
+tends to be wrong for a *range* of inputs, or to be
+length-sensitive, or to change with rebuilds.  This one was wrong
+for exactly the two inputs that are case-pairs of each other
+(`ABC`/`abc`), right for every other input tested, and identical
+through pipe, file, and redirect -- which is exactly the shape a
+wrong reference value produces, because a reference value is a
+single point of comparison and the "bug" is wherever that point
+falls.
+
+**The specific FIPS-180-4 trap, for the record.**  The canonical
+short test vectors for SHA-512 are `abc` (three lowercase
+letters) and the 56-byte
+`abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq`.  There
+is **no** standard test vector for uppercase `ABC`.  A test that
+feeds `ABC` and asserts the `abc` digest has mistaken "a familiar
+digest that appears in the spec" for "the digest of my input."
+Any implementation must be checked against the *input it was
+given*, not against a digest that is familiar.
+
+**Where this shape recurs.**  Same family as "A wrong constant
+propagated because it was consistent with itself" (session 39) and
+"A consumer inferred from behavior is not a consumer" (session
+40): a value that was plausible, appeared in a place that made it
+feel authoritative (here, a handoff written by the previous
+session), and was never checked against the source that defines
+truth (the FIPS vector for the actual bytes).  The PIT case was a
+frequency copied from a comment; the `unlinkat` case a causal
+claim inferred from behavior; this one a hash constant inherited
+from a doc.  In every case the fix was to go to the source of
+truth -- `grep` for the argument to `pit_init`, `grep` for the
+symbol in busybox, **`sha512sum` on a host that is known correct**
+-- and in every case a plausible story made the check feel
+unnecessary.
+
+**A related note.**  The wrong constant was in the *handoff*, and
+the handoff's own rule -- "a commit message is a claim, not a
+fact; read the diff, not the subject" -- applies to handoff prose
+as much as to commit messages.  An item written as "X computes a
+wrong digest, and the correct value is Y" is two claims: that X is
+wrong, and that Y is right.  The session read the first claim,
+believed the second, and spent its time on X.  The check that
+would have ended it in one command was on Y.
+
 ## A function that has never run is correct by inspection only
 
 *Session 49 (the `process_create` failure-path cleanup), commits
