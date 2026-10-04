@@ -208,6 +208,84 @@
    before it is guessed at.  It is not the same fault as 7a and
    must not be folded into 7a's writeup.
 
+7c. **`sha512sum` computes a wrong digest — deterministic.**
+   `printf ABC | sha512sum` produces
+
+       397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119
+
+   The correct SHA-512 of the three bytes `ABC` is
+
+       ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
+
+   **Every run, every time, at the prompt and in a script, through
+   a plain pipe.**  Not intermittent.  `md5sum`, `sha1sum`, and
+   `sha256sum` all produce their correct digests for the same three
+   bytes through the same pipe on the same boot — only the 512-bit
+   one is wrong.
+
+   **An applet bug, not a kernel bug and not a shell bug.**  The
+   reproducer is `printf ABC | sha512sum` at the interactive
+   prompt: no `sh -c`, no command substitution, no script.  The
+   shell and the pipe are excluded by that.
+
+   **Suspect block size.**  SHA-512 uses 128-byte blocks where
+   SHA-1/SHA-256 use 64, and only SHA-512 is wrong.  A second
+   suspect is the length field (SHA-512 uses a 128-bit length).
+   The next session should read `third_party/busybox`'s SHA-512
+   implementation *as a first-party reading, not an edit* — the
+   vendored tree is gitignored and rebuilt, so a fix goes in
+   `configs/` (disable `CONFIG_SHA512SUM`) or waits for a
+   first-party reproduction, not in a `third_party/` patch.
+
+   Found by `test.sh` row 4.  The row stays in the harness with the
+   correct expected value so the bug is visible every run.
+
+7d. **A chain of command substitutions can lose a wake — racy.**
+   A shell running many `x=$(command)` rows will eventually block
+   forever on one of them.  The shell sits in `PROC_STATE_BLOCKED`,
+   the scheduler finds no runnable process, and prints
+   `EXIT-FALLBACK: switching to idle`.  From the console, the
+   machine looks frozen: keystrokes go into the keyboard buffer and
+   nothing consumes them.  **The only recovery is a reboot.**
+
+   **Confirmed racy by a controlled experiment.**  The **same
+   image, no rebuild between runs** ran to row 54 on one boot and
+   hung at row 29 on the next.  If it were image- or layout-
+   dependent, the same image would behave the same way.  It does
+   not; it is timing.
+
+   **Seven runs, seven different hang rows:**
+
+   | Run | Hung at | Row |
+   |---|---|---|
+   | 1 | `id -u` | 24 |
+   | 2 | `seq` | 13 |
+   | 3 | `hostid` | 39 |
+   | 4 | `pidof` | 38 |
+   | 5 | `nohup` | 40 |
+   | 6 | `crc32` | 29 |
+   | 7 | `find -maxdepth` | 55 |
+
+   `nohup` hung on run 5 and passed on run 6, which is the clearest
+   single piece of evidence that the applet is not the cause.
+
+   **A kernel bug in the wait/pipe wake path.**  The same family as
+   the `put_file_slot` pipe-wake warning above.  Two things have to
+   happen when a `$( )` child exits: the shell's read of the child's
+   output pipe must get EOF, and the shell's `wait4` must reap the
+   child.  If either wake is lost, the shell blocks with a zombie
+   child and nothing else runnable.  The next session should read
+   `sys_wait4` and `process_wake_parent_if_waiting` together with
+   `sys_read`'s `FILE_KIND_PIPE` case, looking for the window
+   between the child's exit and the parent's transition to
+   `BLOCKED`.
+
+   **Reproducer:** boot, then `sh /root/scripts/test.sh`.  The
+   harness prints `[N] run  <name>` before every row, so the last
+   line in the capture names the row.  A *smaller* reproducer —
+   `i=0; while [ $i -lt 50 ]; do x=$(seq 1 3); i=$((i+1)); done` —
+   has not yet been run.
+
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
    committed to FAT.  The correct frame is therefore **Unix
@@ -235,6 +313,36 @@
    targets, `realpath` correctness, `tar`/`unzip` link restoration,
    and the quiet assumptions (`/bin/sh -> busybox`) that many
    configure scripts and build systems make.
+
+9. **No privilege model: uid/gid are 0 for every process.**
+   donix has no privilege model — no per-process uid/euid split,
+   no setuid bit (FAT has no mode bits to hold one), no `chown`,
+   and no way to become root.  In that world 0 is the honest
+   answer: everything runs as root, and a program that checks "am
+   I root" gets yes.  The identity syscalls are all consistent:
+
+       getuid   (102) -> 0
+       getgid   (104) -> 0
+       geteuid  (107) -> 0     (was a fixed 1000 before session 51)
+       getegid  (108) -> 0
+       getgroups(115) -> 0 groups
+
+   `/etc/passwd` and `/etc/group` each carry one `root` entry so
+   the applets that resolve a number to a name (`id -un`, `whoami`,
+   `ps`'s USER column, `groups`) print `root` instead of a bare
+   number or an error.  Before session 51, `geteuid` returned 1000
+   and the other four were missing, so `id` printed a mix of one
+   real value and three errno values.
+
+   **This is TEMPORARY and it is the value that changes when a
+   privilege model lands.**  That session adds `setuid`/`seteuid`
+   (105/117), a setuid-root marker on a FAT-hostile filesystem
+   (probably a magic marker in a file, the same shape as the
+   symlink design in item 8), a `sudoers` equivalent, and then
+   changes these five to return the unprivileged default (1000)
+   with root as an escalation.  Getting a `/usr/bin/sudo` working
+   needs all of that; the goal of the 0 value now is to let software
+   install and run, not to model privilege.
 
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
@@ -366,6 +474,19 @@ small syscall from `g_ticks`, like `clock_gettime`.
   added a second use for `exec_churn`:** it is the test that
   exercises `process_free_clone` on the process-exit path, so run
   it when changing `process_reclaim` or `process_destroy`.
+
+- **`test.sh` is a new harness (session 51), staged at
+  `/root/scripts/test.sh`.**  It runs ~58 non-interactive applet
+  rows, asserts known values where there is one, and prints
+  `[N] run  <name>` before every row so a hang names its own row.
+  Run it with `sh /root/scripts/test.sh`.  It is **not** a canary
+  row: it takes minutes, it fails `sha512sum` deterministically
+  (item 7c), and it can hang on the lost wakeup (item 7d).  Run it
+  by hand when changing the applet config or the pipe/wait paths,
+  and expect either a hang or a `FAIL sha512sum` on every run until
+  those two items are fixed.  The harness found both of them, so
+  neither a hang nor the `sha512sum` failure is a sign the harness
+  is broken.
 
 - **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
   `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.
