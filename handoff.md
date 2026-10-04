@@ -3,14 +3,16 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-03 (session 51: two applet batches
-enabled, the standard FAT directory tree built, `/etc/passwd` and
-`/etc/group` staged, and the first-party harness `test.sh` written
-and run.  The harness found two bugs with reproducers -- a
-deterministic wrong `sha512sum` digest and a racy lost wakeup in a
-chain of command substitutions -- plus one corrected test
-expectation.  **Next: `sha512sum` (item 7c), which is deterministic
-and therefore debuggable.**)
+**Last updated:** 2026-10-04 (session 52: a wrong constant in the
+harness.  `test.sh`'s `sha512sum` row expected the SHA-512 of
+lowercase `abc` for the three bytes `ABC`, so the row failed
+forever and a session was spent reading correct sha512 code.  The
+row is corrected, item 7c is **retracted**, and the one real
+finding from the chase is filed as **item 10**: `CR4.OSFXSR` is
+set but the kernel saves no XMM state.  **Next: pick a real
+target -- item 10 is filed and large; items 7a/7b/7e are the
+intermittent family and need boots; the small independent items
+are in "If you would rather do something small and clean."**)
 
 **Repo state -- run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -21,44 +23,37 @@ lands, so this file does not carry one:
     git tag --list 'v*' | tail -1   # last milestone
     git tag --list '2026*'          # live scratch tags
 
-> **The session's real result is a harness, and the bugs it
-> found.**  `test.sh` (staged at `/root/scripts/test.sh`, source at
-> `userland/musl/tests/test.sh`) runs each enabled applet through a
-> command substitution and prints `[N] run  <name>` **before** every
-> row, so a hang names its own row.  Six runs of the same script
-> without that trace would have left "it hung somewhere" as the
-> whole record.
+> **The session's real result is a correction, and the lesson is
+> about this file.**  Session 51 filed item 7c as "`sha512sum`
+> computes a WRONG digest for `ABC`", quoting the expected value
+> `ddaf35a1…` and the produced value `397118fd…`.  Session 52
+> read that sentence, believed the expected value, and spent the
+> session reading `sha512_begin`/`hash`/`end`/
+> `sha512_process_block128`, the applet's dispatch and read loop,
+> the swap macros, and `rotr64` — all correct — before anyone
+> checked the constant.  `ddaf35a1…` is the FIPS 180-4 vector for
+> lowercase `abc`; `397118fd…` is the correct SHA-512 of the
+> three bytes `0x41 0x42 0x43`.  **The row had been comparing
+> `ABC`'s digest against `abc`'s digest.**
 >
-> It found:
+> Settled by one command on the fedora host:
 >
-> - **`sha512sum` computes a WRONG digest for `ABC`.
->   Deterministic.**  `printf ABC | sha512sum` produces
->   `397118fd...` every time, at the interactive prompt and in a
->   script, through a plain pipe.  `md5sum`/`sha1sum`/`sha256sum`
->   are all correct on the same input.  **An applet bug** --
->   `open-issues.md` item 7c.  Suspect block size.
-> - **A chain of command substitutions can lose a wake.  Racy.**
->   The shell blocks, the scheduler falls to `EXIT-FALLBACK`, and
->   no process reads the keyboard; only a reboot recovers.
->   **Confirmed racy by a controlled experiment:** the same image,
->   no rebuild between runs, ran to row 54 on one boot and hung at
->   row 29 on the next.  Seven runs, seven different hang rows.
->   **A kernel bug** in the wait/pipe wake path -- `open-issues.md`
->   item 7d.
+>     echo -n abc | sha512sum   # ddaf35a1...4ca49f
+>     echo -n ABC | sha512sum   # 397118fd...dc119
 >
-> Neither is a candidate for a quick fix; both are recorded with
-> reproducers.  See NEXT SESSION.
+> Four producers agree on both values: the busybox applet on
+> donix, `userland/musl/tests/sha512_probe.c` on donix, the same
+> implementation on the fedora host, and `sha512sum` on the fedora
+> host.
 >
-> **A note on docs edits, learned the hard way in session 51.**
-> `docs/session-log.md` is ~1600 lines with non-ASCII characters
-> (em-dashes).  Returning the **whole file** for an edit re-encodes
-> every one of them and shows up as a large deletion count in
-> `git diff --stat`.  For an edit to a large file with non-ASCII
-> content: **insert a block, do not return the whole file.**  A
-> copy-block insertion at one anchor leaves the existing bytes
-> alone.  **Check `git diff --stat` before committing: a docs
-> insertion should show zero deletions** (a *replacement* shows
-> both, and that is correct for a replacement).
+> **The rule this file must carry forward: a handoff's item text
+> is a claim, like a commit message.**  Item 7c stated two things
+> — that `sha512sum` was wrong, and that `ddaf35a1…` was the
+> correct value for `ABC`.  The session read the first, believed
+> the second, and spent its time on the first.  When the next
+> session reads an item here, and the item quotes an expected
+> value, **check the value against a known-good source before
+> acting on the claim it supports.**
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
@@ -71,11 +66,12 @@ exits fixed, the exit-path page-table leak closed, and one dead
 `f_stat_with_retry` block deleted.  **No new subsystem in
 `v0.6.12`.**
 
-**Session 51 is untagged work on `dev`, after `v0.6.12`.**  Five
-commits: the item-7a instrument, the gzip fix, the applet batch,
-the image tree + harness, and a session-log rewrite.  Two docs
-commits ride untagged.  No `v*` bump; the banner still reads
-`v0.6.12`.
+**Sessions 51 and 52 are untagged work on `dev`, after `v0.6.12`.**
+Session 51: five commits -- the item-7a instrument, the gzip fix,
+two applet batches, the image tree and harness, and a session-log
+rewrite.  Session 52: three commits -- the `sha512sum` correction
+and item-7c retraction, the gotcha, and open-issues item 10.  No
+`v*` bump; the banner still reads `v0.6.12`.
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** -- they exist while
@@ -86,36 +82,24 @@ message carries the narrative.  Once a scratch tag is dropped it
 resolves to nothing; do not cite one as if it were a stable
 reference.
 
-**Scratch tags are annotated.**  The annotation is the fuller
-per-commit summary; at a milestone bump the annotations seed the
-final milestone narrative.  This is why each step gets a tag even
-when no `v*` tag is imminent.
-
-**Scratch tags are also state.**  Which ones are live is
-`git tag --list '2026*'`; this file does not list them.
-
-**Four older tags are present and are not ours.**  `git tag` also
-shows `Useo64Sysret_usermode_return`, `elfload-baseline`,
-`restore_userland_shell_memory_refactor`, and `ring3_sysret_stable`
--- pre-convention restore points, older than the `YYYYMMDD-*`
-scheme.  They are not `2026*` scratch tags and not `v*` milestones.
-**Do not drop them as part of a session cleanup**; they are not
-this or any recent session's to delete.  Leave them alone.
-
 **A plain commit can exist with no tag.**  Session 45's `run:` fix
-is one.  Session 51's two docs commits are the same -- docs-only,
-no tag.  Such commits ride along on `dev` until the next `v*` bump.
-Do not invent a tag for one, and do not be surprised by a commit
-with no tag.
+is one.  Sessions 51's and 52's docs commits are the same --
+docs-only, no tag.  **All three of session 52's commits are
+untagged.**  Such commits ride along on `dev` until the next `v*`
+bump.  Do not invent a tag for one, and do not be surprised by a
+commit with no tag.
 
-**Note on commit messages:** a commit message is a claim, not a
-fact.  Read the diff, not the subject.  Two instances to remember.
-Session 49's commit `20261003-process-create-cleanup` says "correct
-by inspection; UNEXERCISED" -- honest when written, and now
-**superseded for three of its four exits** by session 50's
-`20261003-fail-inject`; exit 3 is still untested and its commit
-says so.  And session 45's Fix B (`157627c`, later reverted)
-claimed to close the boot-time `#PF`; it did not.
+**Note on commit messages, and now on this file too:** a commit
+message is a claim, not a fact.  Read the diff, not the subject.
+**This file's item text is the same kind of claim** -- session 52
+exists because session 51's item 7c was believed.  Two instances
+to remember from earlier sessions.  Session 49's commit
+`20261003-process-create-cleanup` says "correct by inspection;
+UNEXERCISED" -- honest when written, and now **superseded for
+three of its four exits** by session 50's `20261003-fail-inject`;
+exit 3 is still untested and its commit says so.  And session 45's
+Fix B (`157627c`, later reverted) claimed to close the boot-time
+`#PF`; it did not.
 
 ---
 
@@ -135,6 +119,12 @@ block starts with `git status` (or `git log`) so the working tree
 is known *before* a command runs.  This is a rule because it was
 learned: a `git commit` was once written against an assumed state
 and landed wrong.  Ask for the status, then give the block.
+
+**Check the directory, too.**  Session 52 learned this: a block
+without a `cd` was pasted at `/tmp`, and every path resolved
+wrong.  Start every command block with `cd /home/noneya/code/donix
+|| exit 1` and a `pwd`.  The state check does not catch a wrong
+directory; `cd ... || exit 1` does.
 
 **A command block is one paste.**  `git add`, `git status`,
 `git commit`, and `git tag` belong in **one** block, with the
@@ -159,55 +149,55 @@ that is how a commit and its tag get separated.
   **A whole-file return for a large file with non-ASCII content
   re-encodes every non-ASCII character and shows up as a large
   deletion count in `git diff --stat`.**  This was learned in
-  session 51: a whole-file return of `docs/session-log.md` produced
-  `252 insertions(+), 115 deletions(-)` for what should have been a
-  ~130-line insertion.  The fix is a copy-block insertion that
-  touches only the new lines.  **Check `git diff --stat` before
-  committing: a docs insertion should show zero deletions.**  A
-  full *replacement* of a section correctly shows both insertions
-  and deletions; that is the difference.
+  session 51.  The fix is a copy-block insertion that touches only
+  the new lines.  **Check `git diff --stat` before committing: a
+  docs insertion should show zero deletions.**  A full
+  *replacement* of a section correctly shows both insertions and
+  deletions; that is the difference.  Session 52 inserted into
+  `gotchas.md`, `open-issues.md`, and `session-log.md`, and each
+  insertion showed insertions only -- the check was run each time.
 
 **Ask for source you do not have.**  The assistant does not have
 direct file access.  Before patching a file whose current contents
 it has not seen in this session, it must **ask for that file**.
 Never guess at a file's contents, never patch from memory of an
 earlier version, never assume a file is unchanged.  This is how
-stale patches and reverted work have been avoided.
+stale patches and reverted work have been avoided.  Session 52
+asked for and was given `test.sh`, `open-issues.md`,
+`gotchas.md`, `session-log.md`, `userland/musl/Makefile`, and
+`05_boot_kernel64/Makefile` before writing into any of them.
 
-**When editing a large file, quote the bytes.**  Session 44 added
-this the hard way.  For an edit inside a big file, the instruction
-must **quote the exact text being replaced and the exact text that
-replaces it**, both copied from output the other side just pasted.
-Do not describe an edit as "the block above" or "after line N" when
-N has not been seen.  Four build failures in session 44 came from
-edits described from memory rather than quoted from the file -- the
-fix each time was to read the current bytes and quote them.  A
-whole-half or whole-file return is the safe form; a one-line
-insertion into a 6500-line file is the form that breaks.
+**When editing a large file, quote the bytes.**  For an edit inside
+a big file, the instruction must **quote the exact text being
+replaced and the exact text that replaces it**, both copied from
+output the other side just pasted.  Do not describe an edit as
+"the block above" or "after line N" when N has not been seen.
 
 **A redirection binds to the last command in an `&&` chain.**
-Session 45 added this.  `a && b && c && d > file` sends only `d`'s
-output to `file`; `a`, `b`, and `c` write to the terminal.  The
-`run` script's build line used this form, so every capture it
-produced was missing the front of the build -- including whether the
-kernel was rebuilt at all.  Half a session was spent comparing
-binaries whose build log had been silently discarded.  When the
-whole chain's output matters, wrap it:
-`{ a && b && c && d ; } 2>&1 | tee file`.  See `docs/gotchas.md`.
+`a && b && c && d > file` sends only `d`'s output to `file`; `a`,
+`b`, and `c` write to the terminal.  When the whole chain's output
+matters, wrap it: `{ a && b && c && d ; } 2>&1 | tee file`.  See
+`docs/gotchas.md`.
 
-**A capture file is one run.  Truncate, do not append.**  Session
-51 used `>>` once for `capture.txt`; two runs landed in one file
-and briefly read as one long run.  `>` per run.
+**A capture file is one run.  Truncate, do not append.**  `>` per
+run.
 
-**Do not edit `third_party/`.**  Session 47 added this.  The
-vendored sources there are gitignored and rebuilt by the toolchain,
-so an edit is invisible to the repo and vanishes on the next build.
-When a diagnostic needs to see inside a third-party applet -- a
-`printf` in busybox, say -- the right instrument is a **first-party
-test that reproduces the applet's sequence** (e.g. `proc_walk` for
-`procps_scan`, or `test.sh` for the applet set), or a **trace in
-our own kernel**, not a patch to `third_party/`.  Both are
-committable; the patch is not.
+**A build flag change does not trigger a rebuild unless the
+Makefile is a prerequisite.**  Session 52 changed the userland
+CFLAGS and `make` printed `Nothing to be done for 'all'` twice,
+because the flag is not a prerequisite of the `.elf` targets.  The
+`userland/musl/Makefile` now has `Makefile` as a prerequisite of
+both `%.elf` rules; a future flag change rebuilds on the next
+`make`.  When a build "does nothing" after a flag change, `make
+clean` first, or check the prerequisite list.
+
+**Do not edit `third_party/`.**  The vendored sources there are
+gitignored and rebuilt by the toolchain, so an edit is invisible to
+the repo and vanishes on the next build.  When a diagnostic needs
+to see inside a third-party applet, the right instrument is a
+**first-party test** that reproduces the applet's sequence, or a
+**trace in our own kernel**, not a patch to `third_party/`.  Both
+are committable; the patch is not.
 
 **The push / merge / tag sequence** (the project's own order,
 used for every `v*` bump):
@@ -235,15 +225,13 @@ banner commit is named `kmain: bump the shell banner to vX.Y.Z`.
 The tag is **annotated** (`-a -F -`) -- the annotation is the
 milestone narrative, and it is what a future reader sees first.
 The merge is `--no-ff`, so `main` keeps a real merge commit for
-each version (`Merge dev into main for v0.6.12`, etc.).
+each version.
 
-**A version is not necessarily a milestone.**  `v0.6.10` is a tail
-on `v0.6.9` with no new subsystem.  When that happens, the tag
-annotation and the session-log row should *say so*, so a future
-reader does not hunt for a milestone narrative that is not there.
-**`v0.6.12` is a correctness milestone, not a feature one** -- the
-annotation should say so plainly.  Session 51 is the same shape:
-five commits, no new subsystem, no `v*` yet.
+**A version is not necessarily a milestone.**  When that happens,
+the tag annotation and the session-log row should *say so*.
+**`v0.6.12` is a correctness milestone, not a feature one.**
+Sessions 51 and 52 are the same shape: no new subsystem, no `v*`
+yet.
 
 ---
 
@@ -278,138 +266,80 @@ tag lives, and never referenced by this file.  If one exists, it is
 safe to reset or delete.  Do not port from a scratch workspace into
 the real tree without a build and test in the real tree.
 
+**Run command blocks from the repository root.**  Session 52 ran a
+block from `/tmp` and every path resolved wrong; the block now
+starts with `cd /home/noneya/code/donix || exit 1`.
+
 ---
 
-## Where we are -- session 51, after `v0.6.12`
+## Where we are -- session 52, after `v0.6.12`
 
-**Five commits on `dev`, four scratch-tagged, two docs commits
-untagged.**
+**Three commits on `dev`, all untagged, no scratch tags.**
 
-### The item-7a instrument (`20261003-vmm-map-diag`)
+### Item 7c is retracted (`b9f78f4`)
 
-`vmm_map_page_in_cr3` has **four** page-table allocation sites.
-The huge-page split's own failure already halts loudly
-(`VMM: FATAL page-table alloc failed; cannot split huge page`) and
-is unchanged.  The other **three** were bare `if (!new_*_phys)
-return -1;` -- PDPT, PD, and the final PT *after* the split block.
-The commit makes each print one line before returning `-1`:
+The harness expected the SHA-512 of lowercase `abc` for the three
+bytes `ABC`.  The expected value was wrong.  `sha512sum` is
+correct.  The row is corrected, the "KNOWN BUGS" header entry and
+the "EXPECTED TO FAIL" comment are gone, and
+`userland/musl/tests/sha512_probe.c` is in the tree as the
+independent implementation that settled it.
 
-    VMM: map failed site=PDPT virt=0x... cr3=0x... free=NNN
-    VMM: map failed site=PD   virt=0x... cr3=0x... free=NNN
-    VMM: map failed site=PT   virt=0x... cr3=0x... free=NNN
+### Item 10: `CR4.OSFXSR` without an XMM save (`4f183b2`)
 
-**The PT site is the one to be careful about.**  It shares the
-pointer name `new_pt_phys` with the split's already-loud block, so
-a scan for `if (!new_*_phys) return -1;` finds two at a glance and
-the third only by reading past the split.
+The kernel sets CR4.OSFXSR (bit 16) at `kmain.c:37-40`, which
+tells the CPU that the kernel saves SSE state on context switch.
+It does not: no `fxsave`/`fxrstor`/`xsave` anywhere in
+`04_kernel_64bit/`, and `context_switch.asm` saves no XMM
+registers.  Userland compiled by `musl-gcc.sh` can emit SSE --
+before the session's CFLAGS change, `sha512_probe.elf` had 543 XMM
+instructions and `busybox.elf` 485.
 
-**The `free` field** is what separates item 7a's two candidates --
-a healthy count with `site=PDPT`/`site=PD` means the child's clone
-was missing that table (a clone-correctness fix); a near-zero
-count means genuine exhaustion (an allocator fix).
+The session added `-mno-sse -mno-sse2 -mno-avx -mno-mmx` to the
+userland CFLAGS as a **stopgap**, not a fix.  The fix is
+kernel-side `FXSAVE`/`FXRSTOR` on the switch and interrupt paths.
+No test currently fails because of this; it is latent.
 
-**The diagnostic is failure-branch only and did not fire.**  The
-item-7a `#PF` did not reproduce.  The session-48 result: keep the
-instrument, wait.
+### The gotcha (`5b2245b`)
 
-### The gzip fix (`20261003-gzip-ioctl`)
+`gotchas.md` gained "a test's expected value is a claim, like any
+other."  Tell: a failure that is deterministic, specific, and
+identical across every input path is more often a wrong reference
+value than a wrong algorithm.
 
-`sys_ioctl`'s `TCGETS`, `TIOCGWINSZ`, and the `TCSETS*`/
-`TIOCSWINSZ` ignore-case each tested the fd **number** --
-`if (fd != 0 && fd != 1 && fd != 2) return -ENOTTY;` -- not what
-the fd *is*.  fd 0 can be a regular file: `gunzip FILE` puts FILE
-on fd 0 and then asks `isatty(0)`, and busybox's bbunzip guard
-fired on a named file, so `gzip FILE` failed without `-f`.
+### The intermittent family, condensed
 
-The fix is `fd_is_console(fd)`: ask the file table whether the
-slot's kind is `FILE_KIND_CONSOLE`.  A file on fd 0 now gets
-`-ENOTTY`, which is the honest answer.  `gzip`/`gunzip` work
-without `-f`; `tty`/`stty`/`ash` on the console are unaffected.
+**7a** is the boot-time `#PF` at `0x400000` (session 50,
+instrumented, not fired).  **7b** is the `#GP` at `0x42F1A7`
+(session 51, unobserved).  **7e** is the intermittent `#GP`/`#PF`
+control-flow family in fork-heavy workloads (session 51, four
+captures, a cross-vector register fingerprint: `r8 = 0x415516`,
+`r9 = 0x2F2F2F2F2F2F2F2F`).
 
-**Why kernel-side and not a `third_party/` patch:** the honest test
-for "is a tty" belongs in `sys_ioctl`, and it is the same answer
-for every applet that asks.
-
-### The applet batches (`20261003-applets`, `20261003-applets-harness`)
-
-**Batch 2:** 22 applets and 9 feature flags (`cksum`, `crc32`,
-`comm`, `expand`, `unexpand`, `expr`, `fold`, `id`, `groups`,
-`logname`, `md5sum`, `sha1sum`, `sha256sum`, `nl`, `paste`,
-`printf`, `split`, `tac`, `base64`, `whoami`, `rev`, `hexdump`;
-fancy `echo`/`head`/`tail`/`sleep`, `wc` large, `find -maxdepth`/
-`-not`, `grep -A/-B/-C`, `test2`).
-
-**Batch 3:** 20 more applets (`sum`, `uuencode`/`uudecode`,
-`base32`, `sha512sum`, `sha3sum`, `shuf`, `strings`, `tree`,
-`tsort`, `nohup`, `dos2unix`/`unix2dos`, `which`, `hostid`,
-`reset`, `egrep`/`fgrep`, `pidof`, `ascii`) and 18 feature flags
-(`sort`/`split`/`find` options, ash `alias`/`getopts`/`help`/
-`$RANDOM`/`$(( ))`, tab completion, resize reflow).
-
-**The image gains the standard Unix directory shape:** `/etc`,
-`/root`, `/root/scripts`, `/home`, `/dev`, `/var`, alongside
-`/bin`, `/usr`, `/usr/bin`, `/tmp`.
-
-**`/etc/passwd` and `/etc/group`** are staged by the Makefile with
-one `root` entry each.  With them present, `id` prints
-`uid=0 gid=0`, `id -un` prints `root`, `groups` exits 0, `whoami`
-prints `root`, and `ps`'s USER column resolves the uid to a name.
-
-### The identity syscalls, and why uid/gid is 0
-
-`getuid` (102), `getgid` (104), `getegid` (108), and `getgroups`
-(115) were missing, so `id` printed three errno values and one real
-value (`euid=1000`, a fixed value chosen in session 30 to silence a
-diagnostic).  The session adds the four, all returning 0, and
-**changes `geteuid` from 1000 to 0**, so all four agree.
-
-**Why 0 and not 1000:** donix has no privilege model -- no
-per-process uid/euid split, no setuid bit (FAT has no mode bits),
-no `chown`, no way to become root.  0 is the honest answer for a
-single-user system that runs as root; 1000 would make root checks
-fail with no sudo to fix them.  **TEMPORARY.**  `open-issues.md`
-item 9.
-
-### The harness, and the two bugs it found
-
-`userland/musl/tests/test.sh`, staged at `/root/scripts/test.sh`.
-It runs each enabled applet through a command substitution,
-asserts known values, prints `[N] run  <name>` before each row,
-and prints `DONE (N rows)` at the end.  The trace is the design
-point: a hang names its own row.
-
-**`sha512sum` computes a wrong digest** -- deterministic, every
-run, at the prompt and in a script, through a plain pipe.  The
-other three checksums are correct on the same input.  **An applet
-bug** -- `open-issues.md` item 7c.
-
-**A chain of command substitutions can lose a wake** -- racy;
-same image, no rebuild, ran to row 54 on one boot and hung at row
-29 on the next.  Seven runs, seven different hang rows.  **A
-kernel bug** in the wait/pipe wake path -- `open-issues.md` item
-7d.
-
-**A test-expectation error, corrected:** `sleep 0.1` fails because
-`FEATURE_FANCY_SLEEP` is off, so busybox `sleep` accepts integers
-only.  The row is now `sleep 1`.
+**Four faults in one family are unobserved, not fixed:** session
+45's virtual-1 `#PF`, session 50's `0x400000` `#PF` (7a), session
+51's `#GP` at `0x42F1A7` (7b), and session 51's `#PF` at
+`CR2=0x44` / `RIP=0x419FD9` / error `0x5`.  All are intermittent
+and layout-dependent.  Diagnostics in place: `isr14_handler`
+prints the four page types of every `#PF` walk; the item-7a sites
+print `site`/`virt`/`cr3`/`free`; `isr13` and `isr14` both dump
+the register frame.  **Standing caution:** do not filter
+`vmm_clone_page_table`'s leaf copy on `PT_USER` -- session 45
+found it breaks the kernel's own identity map.
 
 ### The two older milestones, condensed
 
 **The pathname dispatch seam (`v0.6.11`, session 44).**
 `resolve_at` returns a backend tag from a path's first component;
-FAT / DEV / PROC are selected by it.  No VFS.  Its consumers:
-`/dev/null`, `/proc/self/status`, `/dev/console` +
-`/proc/self/fd/N`.  Full narrative in `ROADMAP.md`.
+FAT / DEV / PROC are selected by it.  No VFS.
 
 **`/proc` per-pid and `ps` (`v0.6.11`, session 47).**  `/proc` is a
-listable directory; `ps` and `pstree` work.  The bug worth
-remembering: `procps_scan` stats `/proc/<pid>/` **with a trailing
-slash** and skips the entry when that fails.  Full narrative in
-`ROADMAP.md`; the lesson is in `gotchas.md`.
+listable directory; `ps` and `pstree` work.  The lesson is in
+`gotchas.md`.
 
 **The PMM zone-scan fix (`v0.6.11`, session 48).**  The
 intermittent boot-time `#PF` at `0x400000` was `pmm_alloc_page`'s
-one-directional scan, not item 7.  `pmm_scan_zone` now wraps.
+one-directional scan, not item 7.
 
 ### Sessions 49 and 50 -- the failure-path work
 
@@ -420,88 +350,34 @@ page-table leak.  Session 50 added the fault-injection hooks
 and the `create_fail` selftest row, so **three of `process_create`'s
 four failure exits now run** -- exit 3 is still by inspection.
 
-### Session 45 -- the one thing it left
-
-Session 45 attempted the item-7 fix three ways and reverted all
-three.  Its **fault is the surviving artifact**: a user-mode `#PF`
-at virtual 1 (`CR2 = RIP = 0x1`, error `0x15`, `pte = 0x3` present
-/ write / **no user**, phys 1, every page of the walk `PAGE_TABLE`),
-observed once and **not seen since**.  **Disposition:
-instrumented, not fixed.**  `isr14_handler` prints the four page
-types of every `#PF` walk, permanently.  Its one kept commit is the
-`run` script's build-capture fix (`6cfb0e6`), untagged on `dev`.
-
 ---
 
-## NEXT SESSION -- `sha512sum` (item 7c), which is deterministic
+## NEXT SESSION -- pick a real target
 
-**Pick the deterministic bug first.**  The intermittent family has
-no reproducer; `sha512sum` has one and it fails *every time*.  A
-bug that fails on demand is debuggable; a bug that appears once a
-month is not.
+**Item 7c is retracted.  There is no `sha512sum` bug.**  The
+recommendation that opened session 52 was built on a wrong
+constant in this file, and the first thing the next session should
+internalize is the rule above: **an item here that quotes an
+expected value is a claim -- check the value before acting on it.**
 
-### The target: item 7c, `sha512sum`
+### The candidates, in the order the handoff would pick them
 
-**What is known exactly:**
+1. **Item 10, the SSE/`CR4.OSFXSR` gap.**  Filed this session.
+   Large: it is a kernel feature, `FXSAVE`/`FXRSTOR` on the switch
+   and interrupt paths.  Not a one-session fix if done carefully,
+   but it is the one *known* correctness gap and it has no
+   reproducer to chase -- the code either saves XMM state or it
+   does not.
 
-    printf ABC | sha512sum
-    -> 397118fdac8d83ad98813c50759c85b8c47565d8268bf10da483153b747a74743a58a90e85aa9f705ce6984ffc128db567489817e4092d050d8a1cc596ddc119  -
+2. **Items 7a / 7b / 7e, the intermittent family.**  Fresher, and
+   7e is the best-instrumented (a cross-vector register
+   fingerprint, four captures).  Intermittent; needs boots.  If
+   you take 7e, **start from the fingerprint, not the fault
+   addresses** -- the four faulting `RIP`s are downstream of one
+   corruption, and the shared `r8`/`r9` pair is the narrow end.
 
-The correct SHA-512 of `ABC` is
-
-    ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f
-
-`md5sum`, `sha1sum`, and `sha256sum` are all correct on the same
-three bytes through the same pipe.  Only the 512-bit one is wrong.
-
-**Two things to do first, and neither is a code change:**
-
-1. **Find the input that produces `397118fd...`.**  It is the hash
-   of *something*; feed candidate inputs until one matches.  Likely
-   candidates: `ABC\n`, `ABC `, ` ABC`, a doubled byte, a
-   four-byte input.  When one matches, the bug is named -- the
-   applet is hashing that, not `ABC`.
-2. **Read busybox's SHA-512 implementation** (`third_party/` --
-   read, do not edit).  SHA-512 uses 128-byte blocks where SHA-1/
-   256 use 64; a block-size or length-field bug would explain why
-   only the 512-bit one is wrong.
-
-**If it is an applet bug and not fixable here:** the fix is either
-a first-party reproduction that isolates the block handling, or
-disabling `CONFIG_SHA512SUM` in `configs/busybox.config` with the
-reason recorded.  **Do not patch `third_party/`** -- it is
-gitignored and rebuilt.
-
-**Read first:** `configs/busybox.config` (the `SHA512SUM` line),
-`userland/musl/tests/test.sh` (row 4 is the assertion), and
-`docs/open-issues.md` item 7c.
-
-### Second target, if you want the harder one: item 7d
-
-**The lost command-substitution wake.**  Racy, but there is a
-reproducer *shape*: a loop of `x=$(seq 1 3)`.  Run this and see how
-many iterations it takes to hang:
-
-    i=0; while [ $i -lt 50 ]; do x=$(seq 1 3); i=$((i+1)); done; echo loopdone
-
-If it hangs within 50, you have a tiny reproducer and the target is
-`s`ys_wait4` and `process_wake_parent_if_waiting` together with
-`sys_read`'s `FILE_KIND_PIPE` case -- the window between the
-child's exit and the parent's transition to `BLOCKED`.  If it does
-**not** hang, the trigger needs the longer script, and the harness
-stays the reproducer.
-
-**Read first:** `sys_wait4`, `process_wake_parent_if_waiting`,
-`sys_read`'s pipe branch, and `docs/open-issues.md` item 7d.
-
-### Do not
-
-Do not re-open item 7 (closed, `v0.6.12`) or the session-48 zone
-scan (fixed, `v0.6.11`).  Do not re-litigate the fault-injection
-design.  Do not chase the intermittent family (7a, 7b) -- they
-have no reproducer and every session that tried produced a
-"did not fire" result.  **Do not drop the four older non-`2026*`
-tags.**  One change at a time.  Do not edit `third_party/`.
+3. **The small independent items** (below).  Each is a short,
+   patterned change with an obvious test.
 
 ### If you would rather do something small and clean
 
@@ -510,26 +386,29 @@ existing `sys_clock_gettime` (228).  It unlocks busybox `ps -l` /
 `ps -e` (`PS_LONG`, `PS_TIME`), which currently hit
 `Unknown syscall: 99`.  Small, patterned, independent.
 
-**Exit 3 of `process_create`** -- the one untested failure exit.  A
-`pmm_debug_fail_after(n, type)` hook would reach it.  The commit
-must say what it adds and what it still does not reach.
+**`open("/proc/<pid>", O_DIRECTORY)`** -- the "complete" half of
+session 47's fix.  The `PROC_DIR_SENTINEL` mechanism exists.
 
-### Candidates after that, none blocking
+**`/dev` as a listable directory** -- `ls /dev` fails.  Same
+directory shape `/proc` got.  Prerequisite for `/dev/tty` and
+`/dev/urandom`.
 
-- **`open("/proc/<pid>", O_DIRECTORY)`** -- the "complete" half of
-  session 47's fix.  The `PROC_DIR_SENTINEL` mechanism exists.
-- **`/dev` as a listable directory** -- `ls /dev` fails.  Same
-  directory shape `/proc` got.  Prerequisite for `/dev/tty` and
-  `/dev/urandom`.  **Note: the image now has a real `/dev`
-  directory on disk, which makes `ls /dev` succeed but list
-  nothing; the synthesized device entries are still the work.**
-- **`CONFIG_FEATURE_FANCY_SLEEP=y`** -- makes `sleep 0.1` work.
-  Small, and it would let the harness row go back to the fractional
-  form if that is wanted.
-- **More applets from the "still-off" table** -- the zero-syscall
-  ones.
-- **Symlinks** (`open-issues.md` item 8) -- larger; design recorded,
-  the seam exists to hide the encoding.
+**`CONFIG_FEATURE_FANCY_SLEEP=y`** -- makes `sleep 0.1` work.
+Small.
+
+**More applets from the "still-off" table** -- the zero-syscall
+ones.
+
+**Symlinks** (`open-issues.md` item 8) -- larger; design recorded.
+
+### Do not
+
+Do not re-open item 7 (closed, `v0.6.12`) or the session-48 zone
+scan (fixed, `v0.6.11`).  Do not re-litigate the fault-injection
+design.  Do not chase the intermittent family (7a, 7b) without a
+reproducer -- every session that tried produced a "did not fire"
+result.  **Do not drop the four older non-`2026*` tags.**  One
+change at a time.  Do not edit `third_party/`.
 
 ---
 
@@ -537,7 +416,7 @@ must say what it adds and what it still does not reach.
 
 **Enabled and working:** `ps`, `pstree`, `stty`, `tty`
 (prints `/dev/console`), `gzip`, `gunzip`, plus everything in
-batches 2 and 3 (see the applet list under "State on disk").
+batches 2 and 3.  `sha512sum` **works** -- item 7c was a test bug.
 
 ### The rule
 
@@ -550,41 +429,34 @@ cannot do its job (a `chmod` on a filesystem with no permissions)
 is worse than a missing one: it makes the applet lie.
 
 **A `/proc` consumer can stat a path it never opens.**  Session
-47's lesson: `procps_scan` stats `/proc/<pid>/` (trailing slash)
-under `PSSCAN_UIDGID` and skips the entry when it fails, before
-reading any file.  Every per-pid *file* can exist and the applet
-still prints nothing.  See `gotchas.md`.
+47's lesson.  See `gotchas.md`.
 
 **A real applet finds real bugs.**  Session 51's `gzip` found the
-`isatty` bug, and `test.sh` found `sha512sum` and the lost wakeup.
-Enabling an applet is a test, and running it is the assertion.
-The session-44 comment had *asserted* `isatty` correct; running
-gzip *tested* it.
+`isatty` bug.  **Session 52 is the counter-example: a real applet
+found a wrong test.**  Both are valuable.  The rule is: when a
+test and an applet disagree, find out which is right, and do not
+assume the test is.
 
-**Do not edit `third_party/`.**  When a diagnostic needs to see
-inside an applet, write a first-party test that reproduces its
-sequence, or trace our own kernel.  Both are committable.
+**Do not edit `third_party/`.**
 
 ### A note on `stty`
 
 `stty` runs and prints a plausible state.  **It cannot change the
-terminal:** the kernel console has no termios.  The applet reads
-and reports; it cannot write.  Not a defect -- a limit.
+terminal:** the kernel console has no termios.  Not a defect -- a
+limit.
 
 ### What each still-off applet needs
 
-Each row is a **cost estimate, not a prohibition**.  The rule is
-**know what you are signing up for** before you enable.
+Each row is a **cost estimate, not a prohibition**.
 
 | Config | Applet | Needs |
 |---|---|---|
-| `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous `mmap`); deliberate |
+| `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous); deliberate |
 | `CONFIG_CHMOD` | `chmod` | `chmod`/`fchmodat`; FAT has no permissions |
 | `CONFIG_CHOWN` | `chown` | `chown`/`fchownat`; FAT has no ownership |
-| `CONFIG_LN` | `ln` | `link`/`symlink`; FAT has no links |
-| `CONFIG_LINK` | `link` | same |
+| `CONFIG_LN` / `LINK` | `ln` / `link` | `link`/`symlink`; FAT has no links |
 | `CONFIG_MOUNT`/`UMOUNT` | `mount`/`umount` | `mount` (165); no VFS |
-| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | `halt`/`poweroff`/`reboot` | signal delivery (item 5); no init, no ACPI |
+| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | | signal delivery (item 5); no init, no ACPI |
 | `CONFIG_TAR`/`UNZIP`/`CPIO`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
 | `CONFIG_AWK` | `awk` | large; needs `FEATURE_AWK_LIBM` |
 | `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control; `/dev/tty` does not exist |
@@ -602,8 +474,7 @@ Each row is a **cost estimate, not a prohibition**.  The rule is
 28/28 on the clean boot; `selftest` 18/18.
 
 `exec_churn` has two uses: it exercises the process-exit page-table
-teardown (`process_free_clone` via `process_reclaim` /
-`process_destroy`), and it is a 24-round ELF-load stress.
+teardown, and it is a 24-round ELF-load stress.
 
 **The canary is a program: `canary`.**
 
@@ -617,6 +488,7 @@ teardown (`process_free_clone` via `process_reclaim` /
     at_step1 at_step2 envp_step1 musl_exec2 fcntl_lowfd
     readlink_errno proc_status proc_fd proc_dir proc_stat
     proc_walk proc_walk_fds mmap_stress exec_churn
+    sha512_probe
 
 **Pipe regression suite:**
 
@@ -625,71 +497,55 @@ teardown (`process_free_clone` via `process_reclaim` /
 Run these when changing `sys_read`/`sys_write`/`sys_close`/
 `put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
 
-**New harness (session 51):**
+**The harness:**
 
     test.sh        # ~58 applet rows, staged at /root/scripts/test.sh
 
-**It is not a canary.**  It takes minutes, it fails `sha512sum`
-every run (item 7c), and it can hang (item 7d).  Run it by hand:
+**It is not a canary.**  It takes minutes.  **It is expected to
+pass now** -- item 7c is retracted and the row is corrected.  It
+can still hang on the lost-wakeup race (item 7d is fixed, but the
+harness exercises more than one path), so a hang is a finding, not
+a known state.
 
     sh /root/scripts/test.sh
 
-Expect either a hang or `FAIL sha512sum ABC` on every run until 7c
-and 7d are fixed.  Neither is a sign the harness is broken.
-
 **New ELFs must be added to both `USERLAND_ELFS` and the
 `mcopy_one` chain in `05_boot_kernel64/Makefile`; `test.sh` is
-staged by a plain `mcopy` to `/root/scripts/`, not the
-`mcopy_one` chain.**  The image now stages **48 files plus the two
-`/etc` entries and the script**.
+staged by the directory rule, not a per-file list.**  The image
+stages 49 files plus the two `/etc` entries and the scripts.
 
 **Do NOT add a bare `sh` row.**  There is no `/bin/sh`.
 
 **Expected noise:** no `Unknown syscall:` lines; no `[fd]` lines;
 no `[a|b|c]` debug line.  The `FB: mapped N pages ...` line is
-expected.  The `sys_open: f_open FAIL path=etc/passwd` lines from
-`id`/`whoami`/`ps` are expected -- `/etc/passwd` now exists, so
-they should be gone; if they appear, something regressed in the
-staging.  `sys_execve: f_open FAIL` lines no longer appear.
-
-**Session 51's own noise:** the three `VMM: map failed site=...`
-lines appear only on a `vmm_map_page_in_cr3` allocation failure.
-If one appears, capture the whole line and treat it as an item-7a
-reproduction.
+expected.  `WW:` lines appear on wake-path activity (item 7d's
+trace, kept as a diagnostic); they are not noise, they are the
+item-7d instrument.
 
 ---
 
 ## Open issues (top 5; full list in `docs/open-issues.md`)
 
-1. **`open-issues.md` item 7c: `sha512sum` computes a wrong
-   digest.**  Deterministic.  The next session's target.
-2. **`open-issues.md` item 7d: a chain of command substitutions
-   can lose a wake.**  Racy; kernel wait/pipe path.
-3. **`open-issues.md` item 9: no privilege model.**  uid/gid are 0;
-   the session that adds one changes all five identity syscalls.
+1. **`open-issues.md` item 7e: the intermittent `#GP`/`#PF`
+   control-flow family.**  Best-instrumented of the intermittent
+   faults; start from the register fingerprint.
+2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM
+   save.**  Found session 52; latent; the fix is a kernel feature.
+3. **`open-issues.md` item 9: no privilege model.**  uid/gid are
+   0; the session that adds one changes all five identity
+   syscalls.
 4. **`-EPIPE` is delivered without `SIGPIPE`.**  Needs signal
-   delivery -- the same subsystem `reboot`/`halt`/`poweroff` need.
+   delivery.
 5. **`sys_gettimeofday` (99) is not implemented**, so `ps -l` is
    off.  Small.
 
-**Item 7 is closed** (session 49, shipped in `v0.6.12`).  The list
-keeps its numbering; **item 7a** is the boot-time `#PF` at
-`0x400000` (session 50, instrumented, not fired); **item 7b** is
-the `#GP` at `0x42F1A7` (session 51, unobserved); **item 7c** is
-the `sha512sum` wrong digest (session 51, deterministic); **item
-7d** is the lost command-substitution wake (session 51, racy).
-Item 8 is symlinks; item 9 is the privilege model.
-
-**Four faults in one family are unobserved, not fixed:** session
-45's virtual-1 `#PF`, session 50's `0x400000` `#PF` (7a), session
-51's `#GP` at `0x42F1A7` (7b), and session 51's `#PF` at
-`CR2=0x44` / `RIP=0x419FD9` / error `0x5` (a near-null *data read*
-in busybox, not yet item-numbered).  All are intermittent and
-layout-dependent.  Diagnostics in place: `isr14_handler` prints
-the four page types of every `#PF` walk; the item-7a sites print
-`site`/`virt`/`cr3`/`free`.  **Standing caution:** do not filter
-`vmm_clone_page_table`'s leaf copy on `PT_USER` -- session 45
-found it breaks the kernel's own identity map.
+**Item 7 is closed** (session 49, shipped in `v0.6.12`).  **Item
+7c is retracted** (session 52 -- it was a test bug).  **Item 7d is
+fixed** (session 52, the scheduler fix `86ffc7c` and the kept
+`WW:` trace `c143cae`).  **Item 7a** is the boot-time `#PF` at
+`0x400000`; **7b** is the `#GP` at `0x42F1A7`; **7e** is the
+control-flow family; **item 8** is symlinks; **item 9** is the
+privilege model; **item 10** is the SSE/CR4 gap.
 
 ---
 
@@ -704,42 +560,29 @@ found it breaks the kernel's own identity map.
     /usr/bin     the donix-native ELFs (apps + tests), staged BARE
     /tmp         empty
     /etc         passwd, group
-    /root        scripts/test.sh
+    /root        scripts/test.sh, scripts/shatest.sh (deleted), scripts/pipe_wake_probe.sh
     /home        empty
     /dev         empty (a real FAT directory; the device entries
                  are synthesized by the seam, not stored here)
     /var         empty
 
 - `configs/busybox.config` -- tracked canonical busybox config.
-  Enabled applets: `cat`, `cp`, `cut`, `echo`, `env`, `false`,
-  `find`, `head`, `ls`, `mkdir`, `mv`, `od`, `printenv`, `pwd`,
-  `rm`, `rmdir`, `seq`, `sort`, `stat`, `tail`, `tee`, `test`,
-  `touch`, `tr`, `true`, `uname`, `uniq`, `wc`, `yes`, `cmp`,
-  `grep`, `sed`, `vi`, `clear`, `basename`, `dirname`, `unlink`,
-  `ttysize`, `tty`, `arch`, `mktemp`, `sleep`, `usleep`,
-  `truncate`, `realpath`, `stty`, `ps`, `pstree`, `gzip`,
-  `gunzip`, `id`, `groups`, `logname`, `whoami`, `md5sum`,
-  `sha1sum`, `sha256sum`, `sha512sum`, `sha3sum`, `cksum`,
-  `crc32`, `sum`, `base64`, `base32`, `uuencode`, `uudecode`,
-  `comm`, `expand`, `unexpand`, `expr`, `fold`, `nl`, `paste`,
-  `printf`, `split`, `tac`, `rev`, `hexdump`, `shuf`, `strings`,
-  `tree`, `tsort`, `nohup`, `dos2unix`, `unix2dos`, `which`,
-  `hostid`, `reset`, `egrep`, `fgrep`, `pidof`, `ascii`, plus
-  `ash`.  **`sha512sum` is enabled but computes a wrong digest --
-  item 7c.**
+  **`sha512sum` is enabled and correct.**
 - `userland/musl/` -- tracked musl userland (`apps/`, `tests/`).
-  `build/` gitignored.  Includes `tests/test.sh` (session 51).
+  `build/` gitignored.  **`tests/sha512_probe.c` is new in session
+  52.**  The Makefile's `CFLAGS` carries the `-mno-sse*` stopgap
+  and both `%.elf` rules have `Makefile` as a prerequisite.
+- `userland/scripts/` -- tracked shell scripts staged to
+  `/root/scripts/`.  `shatest.sh` was deleted in session 52.
 - `04_kernel_64bit/fonts/ter-u18n.psf` -- tracked font source.
 - `third_party/{busybox,busybox-install,musl-src,musl-install}/`
   -- gitignored; rebuild with `./toolchain/install_musl.sh`.
   **Do not edit these.**
 - `toolchain/{install_musl.sh,musl-gcc.sh}` -- tracked.
-- `PFcapture.txt` -- the session-45 fault capture.  Gitignored;
-  `ls` it, `git status` will not show it.
-- `DFAULT.txt` -- the session-48 double-fault capture.  Gitignored.
-- `capture.txt` -- session 51's captures.  Gitignored.  **Truncate
-  per run; do not append (`>>`) -- two runs in one file read as
-  one run.**
+  **`musl-gcc.sh` invokes the host gcc with the musl specs file;
+  it does not restrict the ISA.**  See item 10.
+- `PFcapture.txt`, `DFAULT.txt`, `capture.txt` -- gitignored
+  captures.
 - `run` -- tracked; the build-and-capture fix lives here.
 
 Kernel sources: `04_kernel_64bit/`.
@@ -749,30 +592,23 @@ Kernel sources: `04_kernel_64bit/`.
 ## Where things live
 
 Not needed to start a session; ask for a file when the current task
-needs it.  Paths relative to the tree root
-(`/home/noneya/code/donix/`).
+needs it.  Paths relative to the tree root.
 
-- `docs/strategy.md` -- Phase A/B plan, rules, files-not-to-touch,
-  tagging convention, git hygiene, recovery.
-- `docs/gotchas.md` -- every bug writeup, by subsystem.  **Session
-  51 added no gotcha** -- the encoding lesson is in this file's
-  Working style; the harness findings are open issues.  Session 49
-  added two entries; sessions 48, 47, 46, 45 each added one.
-- `docs/session-log.md` -- commit tables and per-test canary notes.
-  Session 51's section is at the top; then 50's, 49's, 48's, 47's,
-  46's, and 44's.  Session 44's section is **misplaced** (after
-  session 34).  There is no session-45 section.
+- `docs/strategy.md` -- Phase A/B plan, rules, tagging convention,
+  git hygiene, recovery.
+- `docs/gotchas.md` -- every bug writeup, by subsystem, newest
+  first.  **Session 52 added "a test's expected value is a
+  claim".**
+- `docs/session-log.md` -- commit tables and per-test canary notes,
+  newest first.  Session 52's section is at the top.
 - `docs/open-issues.md` -- full open-issues list.  Items 7a, 7b,
-  7c, 7d in the gap where item 7 was; item 8 symlinks; item 9 the
-  privilege model.  The "Test-design notes" section at the bottom
-  is **misplaced** (it is instructions, not issues) and is flagged
-  for a move to this file's canary section.
+  7e, 8, 9, 10; item 7c is retracted in place.
 - `docs/migration-history.md`, `docs/dons-os-history.md` --
   historical narrative.
 - `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md` -- the first two
   frozen at `v0.6.0`; `LLD_BUG_REPORT.md` current.
-- `ROADMAP.md` -- future work only.  Session 51 has no `ROADMAP.md`
-  section -- it is not a milestone.
+- `ROADMAP.md` -- future work only.  Session 52 has no
+  `ROADMAP.md` section.
 - `README.md` -- reviewed at the `v0.6.11` bump; **review it at the
   next `v*` bump.**
 - `run` -- tracked; the build-and-capture fix lives here.
@@ -790,16 +626,19 @@ errno, and `/dev/null`; `v0.6.11` the pathname dispatch seam,
 `/proc` per-pid and `ps`, and the PMM zone-scan fix; **`v0.6.12` a
 correctness milestone** -- item 7's silent `vmm_map_page*` returns
 closed, `process_create`'s failure exits fixed, the exit-path
-page-table leak closed.  **Session 51** enabled two applet batches
-(42 applets and 27 feature flags), built the standard FAT directory
-tree with `/etc/passwd` and `/etc/group`, fixed `isatty` so `gzip`
-works without `-f`, added the four missing identity syscalls, and
-wrote the first-party harness `test.sh` -- which found a
-**deterministic** wrong `sha512sum` digest (item 7c) and a
-**racy** lost command-substitution wake (item 7d).  **The
-recommended next session is item 7c, the `sha512sum` bug**, because
-it is deterministic and therefore debuggable.  See NEXT SESSION.
-One change at a time.**
+page-table leak closed.  **Session 51** enabled two applet batches,
+built the standard FAT directory tree, fixed `isatty`, added the
+four missing identity syscalls, and wrote `test.sh` -- which
+reported a wrong `sha512sum` digest.  **Session 52** found that
+report was itself wrong: the harness expected the SHA-512 of
+lowercase `abc` for the bytes `ABC`.  **Item 7c is retracted;
+`sha512sum` is correct.**  The chase turned up a real latent bug
+along the way -- `CR4.OSFXSR` is set but the kernel saves no XMM
+state -- now filed as item 10.  **The recommended next session is
+a real target: item 10 (the SSE gap), item 7e (the best-
+instrumented intermittent fault, start from the fingerprint), or
+one of the small independent items.**  See NEXT SESSION.  One
+change at a time.**
 
 ---
 
@@ -835,4 +674,6 @@ inspection only.**  Session 51's two: **a whole-file return for a
 large file with non-ASCII content re-encodes the file -- insert a
 block and check `git diff --stat`**; and **a test that cannot say
 where it stopped cannot say much -- print the row marker *before*
-the row runs.**
+the row runs.**  Session 52's: **a test's expected value is a
+claim -- check it against a known-good source before you check the
+code.**  **This file's item text is the same kind of claim.**
