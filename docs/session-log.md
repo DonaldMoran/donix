@@ -1,3 +1,120 @@
+## Session 53 — the zombie leak, the wired sysret diagnostic, and four falsified mechanisms
+
+Two code commits and three docs commits on `dev`, all untagged.
+**Not a milestone and not a feature.**  A reproducible resource
+leak was found and filed, a declared-but-dark diagnostic was
+wired, and a test row that asserted an option the applet does not
+have was corrected.
+
+| Commit | What |
+|---|---|
+| `96153e6` | kernel: wire the `g_last_sysret` diagnostic — the asm stores `rcx`/`r11` before `sysret`, and `isr13`/`isr14` print them when `fault_rip < 0x1000`.  Item 7e's two captures are exactly that signature and the instrument was never connected |
+| `d2ad311` | test.sh: the `find -not` row uses the POSIX `!` (`-not` is gated behind `ENABLE_DESKTOP`, which `CONFIG_DESKTOP=n` does not enable); `ran`'s failure path no longer forks |
+| (docs) | open-issues item 11 (the zombie leak) and the 7e update; gotchas "a diagnostic that is declared but never wired"; this log |
+
+A temporary PCB dump added to `process.c` answered its question
+and was reverted — it is recorded in item 11, not kept in the
+tree.
+
+### Item 11 — `pipe_wake_probe.sh` exhausts the PCB pool with zombies
+
+Running `./pipe_wake_probe.sh` past ~107 iterations exhausts the
+32-slot PCB pool.  The dump at exhaustion (a temporary diagnostic
+in `get_free_pcb`) showed **28 of the 32 slots in
+`PROC_STATE_ZOMBIE`**, every one a child of the script's shell,
+every one named `busybox`.
+
+The `WW:` trace shows the transition exactly.  For the first ~90
+iterations:
+
+    WW: child=NNN parent=810 drop=c state=1
+
+The parent was not `BLOCKED` when the child exited, so the child
+was reaped on the parent's next `wait4` — clean.  From ~iteration
+95:
+
+    WW: child=NNN parent=810 drop=d kind=2
+
+The parent *was* `BLOCKED`, on `BLOCK_KIND_PIPE_READ`
+(`kind=2`).  `process_wake_parent_if_waiting` wakes only a parent
+blocked on `BLOCK_KIND_WAITPID`, so a pipe-blocked parent is
+correctly not woken by a child's exit — and the child's zombie is
+then never reaped.  Every iteration after that leaks one PCB.
+
+The candidate mechanism is the lost pipe-EOF wake: the subshell
+exits, its write end closes, the reader should see EOF, and if
+that wake is lost the reader stays blocked and the zombie is
+never reaped.  Same shape as the existing "also open" entry about
+`put_file_slot`'s pipe wake coupling.  The place to read is
+`put_file_slot`'s `FILE_KIND_PIPE` case in `user_syscall.c`
+(~1895-1910).  Filed as item 11.  Not yet shown to be 7e.
+
+### Item 7e — a second capture, and the diagnostic that was never wired
+
+A `#PF` at `CR2 = RIP = 0x9`, error `0x15`, fingerprint present,
+fired on a **passing** `test.sh` run (`57 passed, 0 failed`).  With
+the earlier `RIP = 0x1` dump, 7e is now two instruction-fetch
+faults at tiny addresses.
+
+That is the exact signature the `g_last_sysret_rcx` comment in
+`user_syscall_entry.asm` names — and the globals the comment
+describes were never written and never read.  Commit `96153e6`
+wires them.  On the next 7e fault the sysret target will be in
+the dump.
+
+The fork path was also read and cleared: the stack copy covers
+all 16 pages, `process_fork_copy_frame`'s offsets match
+`context_switch.asm` and `PUSH_ALL_GPRS` slot-for-slot, and
+`exec_alloc_user_stack` is correct.  None of them is the bug.
+
+### `find -not` was an `ENABLE_DESKTOP` gate, not a donix bug
+
+The row `find / -maxdepth 1 -name busybox -not -path /tmp` failed
+every run with `find: unrecognized: -not`.  `CONFIG_FEATURE_FIND_NOT=y`
+in both configs, the object was fresh, the binary was fresh — and
+the row still failed.  The cause is in the source: `-not` sits
+inside an `#if ENABLE_DESKTOP` block in `findutils/find.c`,
+alongside `-and`, `-or`, and `-wholename`.  This build sets
+`CONFIG_DESKTOP=n`, so `-not` is not compiled in even though
+`FEATURE_FIND_NOT=y` is — that flag controls the POSIX `!`
+operator.  `d2ad311` uses `!`, which passes.
+
+### Four mechanisms proposed and falsified in one session
+
+Each was plausible, each read off a trace line or an arithmetic
+pattern, each killed by reading the code:
+
+- **the stack copy skips the top page** — false; the loop covers
+  all 16 pages;
+- **the `rcx` slot in the fork frame is wrong** — false; the
+  layout matches `context_switch.asm` and `PUSH_ALL_GPRS`
+  slot-for-slot;
+- **`drop=d kind=2` is the leak** — false; it is a correctly
+  declined wake, and the leak is the *zombies* it leaves;
+- **the busybox build was stale** — false four ways (config,
+  object, archive, include); the applet was never the problem.
+
+**The lesson, stated plainly.**  Every falsified mechanism was a
+fix proposed before the function containing the bug had been
+read.  The greps that killed each one cost seconds; the proposals
+cost build cycles.  A *mechanism* read off a trace is a claim, and
+the source is what settles it.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| `canary` | **15 passed, 0 failed** |
+| `canary --full` | **28 passed, 0 failed** |
+| `test.sh` | **57 passed, 0 failed** (was 56/1) |
+| `pipe_wake_probe.sh` | runs to `loopdone` on the first boot; exhausts the pool on the second, which is the item 11 reproducer |
+
+No `VMM: map failed` line.  No `PMM: WARNING - Double free`.  The
+one 7e fault in the test.sh run was absorbed by
+`isr14_handler`'s kill-and-continue path, which is why the run
+still reported `57 passed`.
+
+
 ## Session 52 — a wrong constant in the harness, and a latent kernel bug found while chasing it
 
 Three commits on `dev`, all untagged, unpushed.  **Not a milestone
