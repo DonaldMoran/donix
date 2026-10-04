@@ -4891,6 +4891,12 @@ long sys_wait4(long pid, int* user_status, int options) {
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
 
+        serial_print("WW: wait4 self=");
+        serial_print_dec(self->pid);
+        serial_print(" target=");
+        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print(" blocking\n");
+        
         /*
          * Late re-scan.  A child may have exited between the scan above
          * and this point: we were preemptible, and the child could have
@@ -4919,7 +4925,14 @@ long sys_wait4(long pid, int* user_status, int options) {
                 continue;
             }
         }
-
+        serial_print("WW: wait4 self=");
+        serial_print_dec(self->pid);
+        serial_print(" target=");
+        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print(" yielding state=");
+        serial_print_dec((uint64_t)self->state);
+        serial_print("\n");
+        
         process_yield();
     }
 }

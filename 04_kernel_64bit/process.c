@@ -640,19 +640,65 @@ void process_wake_all_blocked(void) {
  * queue), or NULL if the parent was not blocked on this child.
  */
 pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
-    if (!child || child->parent_pid == 0) return NULL;
+    uint64_t cpid = child ? child->pid : 0;
+    uint64_t ppid = child ? child->parent_pid : 0;
+
+    if (!child || child->parent_pid == 0) {
+        serial_print("WW: child=");
+        serial_print_dec(cpid);
+        serial_print(" drop=a no_parent\n");
+        return NULL;
+    }
 
     pcb_t* parent = process_find_by_pid(child->parent_pid);
-    if (!parent) return NULL;
-    if (parent->state != PROC_STATE_BLOCKED) return NULL;
-    if (parent->block_kind != BLOCK_KIND_WAITPID) return NULL;
+    if (!parent) {
+        serial_print("WW: child=");
+        serial_print_dec(cpid);
+        serial_print(" parent=");
+        serial_print_dec(ppid);
+        serial_print(" drop=b no_pcb\n");
+        return NULL;
+    }
+    if (parent->state != PROC_STATE_BLOCKED) {
+        serial_print("WW: child=");
+        serial_print_dec(cpid);
+        serial_print(" parent=");
+        serial_print_dec(parent->pid);
+        serial_print(" drop=c state=");
+        serial_print_dec((uint64_t)parent->state);
+        serial_print("\n");
+        return NULL;
+    }
+    if (parent->block_kind != BLOCK_KIND_WAITPID) {
+        serial_print("WW: child=");
+        serial_print_dec(cpid);
+        serial_print(" parent=");
+        serial_print_dec(parent->pid);
+        serial_print(" drop=d kind=");
+        serial_print_dec(parent->block_kind);
+        serial_print("\n");
+        return NULL;
+    }
 
     /* Match: parent->wait_pid == child->pid, or == (uint64_t)-1
        (wait for any child). */
     if (parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
+        serial_print("WW: child=");
+        serial_print_dec(cpid);
+        serial_print(" parent=");
+        serial_print_dec(parent->pid);
+        serial_print(" drop=e wait=");
+        serial_print_dec(parent->wait_pid);
+        serial_print("\n");
         return NULL;
     }
+
+    serial_print("WW: child=");
+    serial_print_dec(cpid);
+    serial_print(" parent=");
+    serial_print_dec(parent->pid);
+    serial_print(" wake=ok\n");
 
     parent->state = PROC_STATE_READY;
     parent->block_kind = BLOCK_KIND_NONE;
