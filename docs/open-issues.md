@@ -286,6 +286,79 @@
    `i=0; while [ $i -lt 50 ]; do x=$(seq 1 3); i=$((i+1)); done` —
    has not yet been run.
 
+
+7e. **An intermittent `#GP`/`#PF` control-flow family in fork-heavy
+   workloads.**  Four captures in one session: three `#GP` and one
+   `#PF`, at three different faulting addresses, all in a busybox
+   `NOEXEC` applet's forked child.  None of them is the same fault
+   address twice; all of them are the CPU executing or reading at an
+   address that is not busybox text and is not a mapped data page.
+
+   The faulting `RIP`s, in order:
+
+   | capture | vector | `RIP` | `CR2` | notes |
+   |---|---|---|---|---|
+   | 1 | `#PF` | `0x0000008010000985` | `0x0000008083206710` | before the frame dump existed |
+   | 2 | `#GP` | `0x00000080000FB700` | — | `r12 = r13 = 0x80100009B0` |
+   | 3 | `#GP` | `0x0400000000000000` | — | `r14/r13/r12 = 1/2/3` |
+   | 4 | `#PF` | `0x0000000000000000` | `0x0000000000000000` | after the `#PF` frame dump landed |
+
+   **The fingerprint.**  Two captures, on different fault vectors,
+   hold the same two values in the same two registers:
+
+       r8 = 0x0000000000415516            (a busybox text address)
+       r9 = 0x2F2F2F2F2F2F2F2F            (eight '/' bytes)
+
+   `0x2F2F2F2F2F2F2F2F` is the ASCII `/` character repeated eight
+   times.  `r8` holds a legitimate text address.  Both appeared in
+   capture 2 (`#GP`) and again in capture 4 (`#PF`), in the same
+   slots.  That is not random corruption: a specific code path loads
+   those two values into `r8` and `r9` and then transfers control to
+   something derived from them.  The four `RIP`s are downstream of
+   the same corruption, not four separate bugs.
+
+   **Where it appears.**  Every capture was taken while running
+   `test.sh` or `pipe_wake_probe.sh`, in a `NOEXEC` busybox applet
+   (`seq`, `cut`, `base32`), in the applet's forked child.  A clean
+   `canary --full` run does not produce it; a 200-iteration
+   `pipe_wake_probe.sh` run does not reliably produce it; a
+   `test.sh` run produces it within the first dozen rows on most
+   boots.  It is intermittent and layout-dependent, the same way
+   7a and 7b are, but it has now produced four captures with a
+   shared register fingerprint, so it is narrower than 7a or 7b.
+
+   **Not 7d.**  The `WW:` wake trace is clean in all four captures;
+   the wait/pipe wake path is not implicated.  The fault is in user
+   code, after a fork, and the shell does exactly what the 7d fix
+   makes it do (wakes, reaps, continues).  The two families are
+   separate.
+
+   **Not the fork brk eager-copy fix.**  That fix closed a real
+   coverage gap -- `sys_brk` could grow `brk_virt` past the 1 MB
+   window the copy walked -- and the family still reproduces after
+   it.  The brk fix is correct on its own; it is not the cause of
+   7e and not the cure.
+
+   **Where to look next.**  Start from the two fingerprint values,
+   not from the fault addresses.  `0x415516` is a busybox text
+   address; a `call` return address lands there.  `0x2F2F2F2F2F2F2F2F`
+   is a buffer of `/`s; busybox path handling (`concat_path_file`,
+   `bb_ask_noecho`, `xchdir`'s parents) builds such buffers.  The
+   likely shape is a structure or a buffer whose field should hold a
+   function pointer or a return address and instead holds a pointer
+   into a `/`-filled buffer, in a code path that only runs when the
+   applet is forked (a `NOEXEC` child, not an `exec`'d fresh binary).
+
+   **Instrument in place.**  `isr14_handler` now prints the same
+   48-slot raw frame dump as `isr13_handler`, in `PUSH_ALL_GPRS`
+   order.  A future `#PF` and a future `#GP` are comparable
+   slot-for-slot.
+
+   **Unobserved, not fixed.**  The standing rule: an intermittent
+   fault that has not been reproduced under control is not closed.
+   Four captures and a register fingerprint is a narrowing, not a
+   fix.
+
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
    committed to FAT.  The correct frame is therefore **Unix
