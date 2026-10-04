@@ -8,6 +8,12 @@
 #include "include/user_msr.h"
 #include "include/pmm.h"
 
+/* Written by user_syscall_entry.asm immediately before sysret.  Read
+ * here when a fault lands at RIP < 0x1000 in user mode, which is the
+ * signature of a corrupted sysret target. */
+extern volatile uint64_t g_last_sysret_rcx;
+extern volatile uint64_t g_last_sysret_r11;
+
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
 #define PIC2_CMD  0xA0
@@ -498,6 +504,11 @@ void isr13_handler(exception_frame_t *frame) {
     }
 
     serial_lock();
+    if (fault_rip < 0x1000) {
+        serial_print("  *** RIP < 0x1000: corrupted sysret target? ***\n");
+        serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
+        serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+    }
     serial_print("  --- raw frame dump ---\n");
     for (int i = 0; i < 48; i++) {
         serial_print("    [");
@@ -549,6 +560,11 @@ void isr14_handler(exception_frame_t *frame) {
         uint64_t idx_pt   = (fault_addr >> 12) & 0x1FF;
 
         serial_lock();
+        if (fault_rip < 0x1000) {
+            serial_print("  *** RIP < 0x1000: corrupted sysret target? ***\n");
+            serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
+            serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+        }
         serial_print("  CR3               : 0x"); serial_print_hex(cr3); serial_print("\n");
         serial_print("  Walk indices: pml4=");
         serial_print_dec(idx_pml4);

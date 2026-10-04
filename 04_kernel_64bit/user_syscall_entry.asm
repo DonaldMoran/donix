@@ -154,6 +154,15 @@ user_syscall_entry:
     ; with no intermediate GPR.
     mov rsp, [rsp - 72]
 
+    ; Diagnostic: record what we are about to sysret to.  A fault that
+    ; lands at RIP < 0x1000 in user mode is the signature of a
+    ; corrupted sysret target; the exception handlers print these
+    ; globals for that case.  rcx and r11 are set, rsp is not: at this
+    ; point every GPR holds a user value and there is no scratch
+    ; register free to stage the read.
+    mov [rel g_last_sysret_rcx], rcx
+    mov [rel g_last_sysret_r11], r11
+
     o64 sysret
 
 .handle_exit:
