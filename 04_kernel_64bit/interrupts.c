@@ -632,6 +632,39 @@ void isr14_handler(exception_frame_t *frame) {
     }
 
     /*
+     * Register dump.  Same shape as isr13_handler's frame dump, so a
+     * #PF and a #GP captured on the same build can be compared slot
+     * for slot.  PUSH_ALL_GPRS pushes in this order, from the top of
+     * the frame down (see isr.asm):
+     *
+     *     raw[0]  = r15     raw[8]  = rbp
+     *     raw[1]  = r14     raw[9]  = rdi
+     *     raw[2]  = r13     raw[10] = rsi
+     *     raw[3]  = r12     raw[11] = rdx
+     *     raw[4]  = r11     raw[12] = rcx
+     *     raw[5]  = r10     raw[13] = rbx
+     *     raw[6]  = r9      raw[14] = rax
+     *     raw[7]  = r8
+     *     raw[15] = error_code   raw[18] = rflags
+     *     raw[16] = rip          raw[19] = rsp
+     *     raw[17] = cs           raw[20] = ss
+     *
+     * Printed BEFORE fault_kill_current, because killing the process
+     * discards the frame this reads from.
+     */
+    serial_lock();
+    serial_print("  --- raw frame dump ---\n");
+    for (int i = 0; i < 48; i++) {
+        serial_print("    [");
+        serial_print_dec(i);
+        serial_print("] 0x");
+        serial_print_hex(raw[i]);
+        serial_print("\n");
+    }
+    serial_print("  --- end frame dump ---\n");
+    serial_unlock();
+
+    /*
      * User-mode #PF: the fault is the process's problem, not the
      * kernel's.  Print the diagnostic above (already done), then kill
      * the faulting process and let the scheduler resume the shell.
