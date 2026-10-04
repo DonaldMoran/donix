@@ -1,14 +1,29 @@
 ### Open
 
-> **Item 7 is closed and the list is not renumbered.**  Item 7 was
-> the silent `vmm_map_page*` returns; session 49 fixed it (the
-> signature change, the nine callers, and the `isr14_handler`
-> diagnostic) and it is no longer an open issue.  The items below
-> keep their original numbers, so there is a gap where 7 was.
-> References to "item 7" in older docs resolve to nothing, which is
-> correct: it is closed.  *(This note is scaffolding for the docs
-> edited in session 49; the next documentation round removes it and
-> the references it exists to satisfy.)*
+**Items 7 and 11 are closed and the list is not renumbered.**
+Item 7 was the silent `vmm_map_page*` returns; session 49 fixed
+it and it is no longer open.  Item 11 was the
+`pipe_wake_probe.sh` zombie leak; session 54 fixed it -- the
+direct paths into `process_exit` did not call `close_all_files`,
+so a pipe end inherited from a fork parent leaked its reference
+on every direct-path exit.  Both items keep their original
+numbers; the items below keep theirs.  References to "item 7" or
+"item 11" in older docs resolve to closed issues, which is
+correct.
+
+**Item 7e is closed as a BUSYBOX bug, not a donix bug.**  Every
+capture across sessions 45-54 has `last sysret rcx` in busybox
+text (`0x4377A3`, `0x43A89A`, `0x43F89A`, `0x43A5D4`, `0x43D639`
+among them); the kernel returns correctly every time.  The user
+process then executes a control transfer to a data value
+(`0x24`, `0x80100009B0`, `0x80000FB700`, `0x0400000000000000` in
+session 54's captures).  donix faithfully executes the jump; the
+CPU faults.  The session-54 diagnostic work makes the fault
+produce a clean `error=0x15` with `CR2 == RIP`, and the shell
+now reports it.  Nothing more for the kernel to fix here.  A
+future session that wants to chase it further is chasing a
+busybox bug and would need a first-party reproducer, not a
+kernel change.
 
 1. **The remaining FatFs-form conversions, now that the seam has
    landed.**  The pathname dispatch seam shipped in session 44
@@ -519,80 +534,83 @@
     fixed in this session: a fix is a real feature, not a
     one-line change.
 
-11. **`pipe_wake_probe.sh` exhausts the 32-slot PCB pool with
-    zombies.**  Run to ~107 iterations, the probe prints
-    `PROCESS: No free PCB slots!` and the next fork fails with
-    `Resource temporarily unavailable`.  A diagnostic dump at
-    the exhaustion point shows **28 of the 32 slots in
-    `PROC_STATE_ZOMBIE`**, every one a child of the script's
-    shell (`ppid=810`), every one named `busybox`.
+11. **CLOSED (session 54).  `pipe_wake_probe.sh` exhausted the
+    32-slot PCB pool with zombies; the fix is in `process_exit`.**
 
-    **The transition is exact.**  The `WW:` trace shows the
-    reap working for the first ~90 iterations:
+    The symptom, from session 53: run to ~107 iterations, the
+    probe printed `PROCESS: No free PCB slots!` and the next fork
+    failed with `Resource temporarily unavailable`.  28 of the 32
+    slots ended up `PROC_STATE_ZOMBIE`, all children of the
+    script's shell.
 
-        WW: child=NNN parent=810 drop=c state=1
+    **The actual cause was not the lost pipe-EOF wake.**  It was
+    that `process_exit` -- reached directly from
+    `fault_kill_current`, from `user_syscall_entry.asm`'s exit
+    jmp, and from `sys_execve`'s failure branch -- did not call
+    `close_all_files`.  Only `sys_exit` did.  So every exit that
+    went through one of the direct paths left the process's file
+    table populated.  A pipe end inherited from a fork parent
+    leaked its reference on every such exit: `put_file_slot`'s
+    `FILE_KIND_PIPE` case decrements `pipe->refcount` only when
+    the slot's refcount reaches zero, and the slot's refcount
+    does not reach zero until every process holding it has closed
+    it.  A child that exits without closing leaves the parent's
+    reference as the last one, and if the parent never closes
+    (ash's command-substitution bookkeeping does not on this
+    path), the `pipe_t` and its 4096-byte ring buffer leak
+    forever.  The leak was arithmetic: one pipe per iteration,
+    heap exhaustion at ~1074 iterations, and the run died before
+    the fault family could fire.
 
-    `drop=c state=1` means the parent was not `BLOCKED` when the
-    child exited, so the child was reaped on the parent's next
-    `wait4` -- clean.  From roughly iteration 95 onward the line
-    changes:
+    **The fix:** `close_all_files` is un-static'd, declared in
+    `include/process.h`, and called at the top of `process_exit`.
+    It is idempotent -- it NULLs each slot as it closes -- so a
+    call after `sys_exit`'s own close finds an empty table and
+    returns immediately.
 
-        WW: child=NNN parent=810 drop=d kind=2
+    **Verified:** `pipe_wake_probe.sh` now completes all 4000
+    iterations and prints `loopdone`.  No PCB exhaustion; no
+    leaks; the sibling 7e faults still fire and the run continues.
 
-    `drop=d kind=2` means the parent *was* `BLOCKED`, on
-    `BLOCK_KIND_PIPE_READ` (`kind=2` is `BLOCK_KIND_PIPE_READ`,
-    see `include/process.h`).  `process_wake_parent_if_waiting`
-    only wakes a parent blocked on `BLOCK_KIND_WAITPID`; a
-    parent blocked on a pipe read is correctly *not* woken by a
-    child's exit.  **But the child's zombie is then never
-    reaped**, and every iteration after the transition leaks
-    one more.  The leak is arithmetic: 32 slots, ~1 leak per
-    iteration once it starts.
-
-    **Candidate mechanism.**  The `$(seq)` subshell exits; its
-    write end of the `$(...)` pipe closes; the reader (the
-    script's shell) is blocked on `PIPE_READ` and should see
-    EOF.  If that EOF wake is lost, the reader stays blocked
-    forever and the subshell's zombie is never reaped.  This is
-    the same shape as the existing "also open" entry about
-    `put_file_slot`'s pipe wake being coupled to `sys_close`'s
-    wake -- a non-final close in a `dup`'d chain that stops
-    waking the peer.
-
-    **Where to read next.**  `put_file_slot`'s `FILE_KIND_PIPE`
-    case in `04_kernel_64bit/user_syscall.c` (~lines 1895-1910),
-    where `writers_open` drops to 0 and `pipe_wake_waiter`
-    wakes `reader_waiting`.  Then the `close_all_files` path a
-    subshell's exit takes -- whether it reaches that wake.
-
-    **Not yet shown to be 7e.**  The two share the
-    `pipe_wake_probe.sh` workload and the fork-heavy shape, but
-    a zombie leak is not itself an instruction-fetch fault.
-    Do not fold them until the `g_last_sysret` diagnostic (see
-    item 7e) says whether the child resumed correctly.
-
-    Reproducer: boot, `cd root/scripts`, `./pipe_wake_probe.sh`.
+    The transition trace that named the leak (`drop=c state=1` for
+    the first ~90 iterations, then `drop=d kind=2`) is in
+    `session-log.md`, session 53.  The `WW:` trace stays as a
+    diagnostic; it is the instrument that showed the transition,
+    and it is what would show a regression.
 
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
-are latent collisions; real FatFs timestamp storage (the three
-timestamp syscalls return 0 without storing); `prctl` is minimal
-(`PR_SET_NAME` accepted and dropped); busybox applet symlinks not
-installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
-spins (pre-existing; the spin's wall-clock duration increased
-between `v0.6.6` and `v0.6.7`, when the console changed from VGA
-text to framebuffer — see `session-log.md`, session 41, for the
-bisect); `sys_mmap` rejects all non-anonymous mappings (a
-file-backed `mmap` caller will get `-ENOMEM` and must fall back to
-`read`; **a Wayland prerequisite -- see `ROADMAP.md`**); **pipes
-support one concurrent reader and one concurrent writer** (see
-`pipe_t`'s comment in `user_syscall.c` — a second blocked reader on
-the same pipe end has nowhere to record itself and will only wake
-on a keyboard IRQ); **`put_file_slot`'s pipe wake is coupled to
-`sys_close`'s wake** (if `sys_close`'s wake is ever removed on the
-theory that `put_file_slot` covers everything, non-final closes in
-a `dup`'d chain stop waking the peer and the peer hangs until a
-keystroke — read the `put_file_slot` comment and this entry before
-touching either).
+...same text... keystroke — read the `put_file_slot` comment and
+this entry before touching either).
+
+12. **Signal delivery is a stub; a faulted process cannot catch
+    its own signal.**  `sys_rt_sigaction` returns 0 and installs
+    nothing; `sys_rt_sigprocmask` returns 0 and does nothing.  A
+    process that faults is killed; a process that receives
+    `-EPIPE` on a write with no reader (item 5) sees the errno
+    and is not killed by `SIGPIPE`.  **Session 54 made the exit
+    path honest** -- a faulted child's wait status is now a
+    signal-kill encoding, so the parent's shell prints
+    `Segmentation fault` and can tell a crash from a clean exit
+    -- but the signal is not delivered to the process itself.
+
+    **Fixing this means implementing signal delivery:** a real
+    `sys_rt_sigaction`, per-process signal handlers, a raise on
+    the fault path that runs the handler if installed, and a
+    `SIGPIPE` raise on the `-EPIPE` write path.  That is a
+    subsystem, not a small change.  Same subsystem a Wayland
+    `wl_shm` client needs for `SIGBUS` on buffer overrun -- see
+    `ROADMAP.md`.  Doing it once serves both.
+
+13. **`CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's job-control
+    code is gated behind `CONFIG_ASH_JOB_CONTROL`, which this
+    build does not set.  The consequence is visible in session
+    54's run: when a child faults and `sys_wait4` returns a
+    signal-kill status, ash's default message is printed, but the
+    shell does not do job-control bookkeeping (no `[1]+ Done`
+    lines, no `fg`/`bg`, no `kill %1`).  This is the same gap the
+    handoff's "still-off" table names.  It needs the same signal
+    delivery as item 12 plus the job-control surface (process
+    groups, a controlling terminal, `tcsetpgrp`).  Not small.
 
 **`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc` is
 a listable directory as of session 47: `readdir("/proc")` returns
