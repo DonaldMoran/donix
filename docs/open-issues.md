@@ -416,6 +416,34 @@
    needs all of that; the goal of the 0 value now is to let software
    install and run, not to model privilege.
 
+10. **`CR4.OSFXSR` is set, but the kernel saves no SSE state.**
+    Userland compiled by `toolchain/musl-gcc.sh` can emit SSE: gcc
+    16.2.1 auto-vectorizes 64-bit byte-shuffles, and before this
+    session's CFLAGS change `sha512_probe.elf` carried 543 XMM
+    instructions and `busybox.elf` 485.  The kernel is built with
+    `-mno-sse -mno-sse2 -mno-avx -mno-mmx` and contains no
+    `fxsave`/`fxrstor`/`xsave` anywhere; `context_switch.asm`
+    saves no XMM registers.  But `kmain.c` sets CR4.OSFXSR (bit
+    16), which tells the CPU that the kernel *does* save SSE
+    state.  So a user process that uses an XMM register can have
+    it clobbered across a context switch or an interrupt.
+
+    Found in session 52 while investigating the (retracted) item
+    7c.  The session added `-mno-sse -mno-sse2 -mno-avx -mno-mmx`
+    to the userland CFLAGS as a **stopgap**: it makes the userland
+    ABI match what the kernel actually preserves, so no userland
+    binary emits SSE and the corruption cannot happen.  It is not
+    a fix.  The real fix is for the kernel to save and restore
+    XMM state (FXSAVE/FXRSTOR, or XSAVE/XRSTOR) on context switch
+    and on the interrupt path, and then to remove the
+    `-mno-sse*` flags from the userland build.
+
+    No test currently fails because of this; the corruption is
+    latent, and the surface is *any* 64-bit computation that gcc
+    chooses to vectorize.  That is why it is filed rather than
+    fixed in this session: a fix is a real feature, not a
+    one-line change.
+
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
 timestamp syscalls return 0 without storing); `prctl` is minimal
