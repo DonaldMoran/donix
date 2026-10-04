@@ -1,3 +1,127 @@
+## A halt in a fault handler is a diagnostic that does not run
+
+*Session 54 (`isr14_handler`'s `#PF` walk), commit `93a98ae`.  A
+fault handler that halts on an intermediate page-table miss skips
+the register and stack dumps -- which are the only diagnostics that
+name the fault.*
+
+The `#PF` walk in `isr14_handler` prints each page-table level and
+then, if an intermediate level is not present, did this:
+
+    if (!(pdpte & 1)) {
+        serial_print("  PDPTE NOT PRESENT - stopping walk\n");
+        while (1) __asm__ volatile("hlt");
+    }
+
+For a #PF, a missing intermediate is **normal** -- the whole point
+of the fault is that the address is not mapped.  The walk printed
+"PDPTE NOT PRESENT" and halted, never reaching the 48-slot
+register dump or the user stack window that the handler prints
+below the walk.
+
+Every 7e capture before session 54 was missing the register dump
+and stack window for exactly this reason.  The walk for
+`CR2 = 0x8083206710` stopped at the PDPTE and the kernel halted,
+so the data the session was actually looking for -- what the
+CPU was executing, what was on the stack -- was never printed.
+
+**The fix.**  Each "not present" case sets `walk_incomplete`, prints
+the level's value, and does `goto walk_done`.  The register dump
+and the stack window run after.  The process is still killed; the
+kernel keeps running; the diagnostic prints.
+
+**The rule.**  A `while (1) hlt` in a fault handler is a diagnostic
+that does not run.  If the state the handler found is what the
+handler was written to explain -- "the address is not mapped" for a
+#PF, "the segment is invalid" for a #GP -- then halting on it is
+halting on the answer.  Print the diagnostic, mark the walk
+incomplete, and continue.
+
+**The tell.**  A fault handler whose output stops at a message that
+reads as "the thing I was checking is not there" and does not
+continue to the register or memory dump.  If the handler has
+diagnostic code below the halt, it will never run.  Every `hlt` in
+a fault handler is a diagnostic below it that does not execute.
+
+**Where this shape recurs.**  Same family as "A case in a switch
+is not reached if an earlier guard refuses the input" (session 44):
+a diagnostic that is present and correct and never reached.  The
+switch case was blocked by a guard above it; this is a dump blocked
+by a halt above it.  Both produce a function that looks like it
+reports the fault and behaves as if the report were absent.
+
+
+## An exit path that does not close the file table leaks a reference per exit
+
+*Session 54 (`process_exit`'s missing `close_all_files`), commit
+`93a98ae`.  The zombie leak that killed `pipe_wake_probe.sh` at
+~1074 iterations was not a lost wake -- it was a missing call on
+three of the four paths into `process_exit`.*
+
+`pipe_wake_probe.sh` exhausts the 32-slot PCB pool with zombies
+past ~107 iterations.  The `WW:` trace names the transition
+(`drop=c state=1` for the first ~90 iterations, then `drop=d
+kind=2`), and the natural read is "the lost pipe-EOF wake."  That
+read is wrong.  The wake is not lost; the leak is a *missing
+close*.
+
+**The four paths into `process_exit`:**
+
+| Path | Calls `close_all_files`? |
+|---|---|
+| `sys_exit` (`exit` and `exit_group`) | yes |
+| `fault_kill_current` | **no** |
+| `user_syscall_entry.asm`'s exit jmp | **no** |
+| `sys_execve`'s failure branch | **no** |
+
+Three of four.  A child that faults, or that exits via the asm
+fast path, or whose `execve` fails after teardown, **leaves its
+file table populated.**  Each slot's refcount stays elevated by
+one reference, permanently.
+
+**Why it matters for pipes specifically.**  `put_file_slot`'s
+`FILE_KIND_PIPE` case decrements `pipe->refcount` only when the
+slot's own refcount reaches zero.  A slot's refcount is bumped by
+`sys_fork` (the child inherits the parent's file table) and
+dropped by `close_all_files` or `sys_close`.  If a child exits
+without closing, its inherited reference never drops, the parent
+holds the only remaining reference, and if the parent -- busybox
+ash's command-substitution bookkeeping -- does not close on this
+path either, the `pipe_t` and its 4096-byte ring buffer leak
+forever.  One pipe per iteration, heap exhaustion, run dies before
+the workload reaches its own fault.
+
+**The fix.**  `close_all_files` is un-static'd, declared in
+`include/process.h`, and called at the top of `process_exit`
+before any of the four paths' work.  It is idempotent (NULLs each
+slot as it closes), so the two paths that already closed find an
+empty table and return immediately.
+
+**The rule.**  Every PCB slot reuse must drop the file table.  The
+easy way to ensure that is to put the drop in the *teardown*, not
+in each of the entry points.  A function with multiple callers
+that each need to do the same cleanup should do that cleanup
+itself, on its first line, not rely on the callers remembering.
+
+**The tell.**  A resource that leaks at a low rate per iteration
+of a fork-heavy workload, with a heap or counter that grows
+monotonically across a run.  In this instance the tell was the
+iteration at which the run died: 1074, then 2438, then 4000
+across the three fixes of the session -- the leak moved first,
+then the fault, then the workload finished.  A leak that
+disappears when a *different* change lands is worth a look at the
+interaction: here, closing the file table at exit removed the
+heap pressure that was masking the fault family.
+
+**Where this shape recurs.**  Same family as "A comment that names
+its callers goes stale the moment a new caller appears" (session
+49): a cleanup path was written for one caller, and a later caller
+was added without the cleanup.  The fix in both is to make the
+cleanup live where every caller reaches it -- in the function
+being called, not in the callers' code.  The comment about the
+callers was also stale; the code was correct for one caller and
+wrong for four.
+
 ## A diagnostic that is declared but never wired is not a diagnostic
 
 *Session 53 (the `g_last_sysret_*` globals in
