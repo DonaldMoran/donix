@@ -106,12 +106,28 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr 2>/dev/null || true
 	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin 2>/dev/null || true
 	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/etc 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/root 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/root/scripts 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/home 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/dev 2>/dev/null || true
+	@mmd -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/var 2>/dev/null || true
 	@for f in ../test-files/*; do \
 	    if [ -f "$$f" ]; then \
 	        echo "mcopy $$f"; \
 	        mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) "$$f" ::/ ; \
 	    fi \
 	done
+	@echo "--- staging /etc/passwd and /etc/group ---"
+	@printf 'root:x:0:0:root:/root:/bin/sh\n' > /tmp/donix-passwd
+	@printf 'root:x:0:\n' > /tmp/donix-group
+	@mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	    /tmp/donix-passwd ::/etc/passwd
+	@mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	    /tmp/donix-group ::/etc/group
+	@rm -f /tmp/donix-passwd /tmp/donix-group
+	@echo "  /etc/passwd: root:x:0:0:root:/root:/bin/sh"
+	@echo "  /etc/group:  root:x:0:"
 	@mcopy_one() { \
 	    local src="$$1"; local dst="$$2"; \
 	    if [ -f "$$src" ]; then \
@@ -170,6 +186,16 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/churn_helper.elf"    CHURN_HELPER ; \
 	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
 
+	@echo "--- staging /root/scripts/test.sh ---"
+	@if [ -f "$(USERLAND_DIR)/tests/test.sh" ]; then \
+	    echo "mcopy $(USERLAND_DIR)/tests/test.sh -> ::/root/scripts/test.sh"; \
+	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	        "$(USERLAND_DIR)/tests/test.sh" "::/root/scripts/test.sh" ; \
+	else \
+	    echo "ERROR: $(USERLAND_DIR)/tests/test.sh missing"; \
+	    exit 1; \
+	fi
+
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
@@ -188,6 +214,10 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/usr/bin || true
 	@echo "--- /tmp contents ---"
 	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/tmp || true
+	@echo "--- /etc contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/etc || true
+	@echo "--- /root/scripts contents ---"
+	@mdir -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) ::/root/scripts || true
 	@echo "--- verifying FAT boot sector at LBA $(SINGLE_DRIVE_LBA) ---"
 	@dd if=hdd-single.img bs=512 skip=$(SINGLE_DRIVE_LBA) count=1 2>/dev/null | \
 	    xxd | head -2
