@@ -367,33 +367,71 @@
    order.  A future `#PF` and a future `#GP` are comparable
    slot-for-slot.
 
-   **What is in the tree now (session 52).**  `capture.txt` holds
-   **one** 7e fault: a `#PF` at `CR2 = RIP = 0x1`, error `0x15`
-   -- a fifth shape, not one of the four the table lists.
+   **What is in the tree now (session 53).**  Two 7e captures
+   exist, both from `test.sh` runs, both `#PF`, both error
+   `0x15` (present + user + **instruction fetch**):
+
+   | capture | `CR2` | `RIP` | fingerprint present? |
+   |---|---|---|---|
+   | a | `0x1` | `0x1` | yes (`r8`/`r9` at slots 7/6) |
+   | b | `0x9` | `0x9` | yes (`r8`/`r9` at slots 7/6) |
+
+   Capture (b) fired on a **passing** run -- `test.sh` reached
+   `57 passed, 0 failed`, and the `#PF` landed between the
+   `strings` row and the `tree` row.  The process was killed by
+   `isr14_handler`'s `if (error_code & 4) fault_kill_current(0x0E)`
+   path, which is why the harness continued.
+
    `PFcapture.txt` is **item 7a** (`CR2 = RIP = 0x400000`, error
    `0x14`, in `musl_sh`'s ELF load), not 7e; it must not be
-   reached for as a 7e capture.  Session 52 ran
-   `sh /root/scripts/test.sh` twice and
-   `./pipe_wake_probe.sh` once (200 iterations, clean `loopdone`);
-   **none produced a 7e fault.**  The "within the first dozen rows
-   on most boots" line above is therefore not currently
-   reproducible, and a session that waits for 7e during a harness
-   run may wait a long time.
+   reached for as a 7e capture.
 
-   The one dump that does exist **supports** the "where to look
-   next" hypothesis rather than contradicting it: `r8` holds
-   `0x415516`, a busybox text address; `r9` holds `/` repeated
-   eight times; the faulting `RIP` is `0x1`.  That is control
-   transferred through a slot that should have held a code pointer
-   and held something that resolved to `0x1`.
+   **Both dumps are instruction-fetch faults at tiny addresses**
+   (`0x1`, `0x9`).  That is the exact signature the
+   `g_last_sysret_rcx` comment in
+   `04_kernel_64bit/user_syscall_entry.asm` names: *"a fault
+   landing at RIP < 0x1000 in user mode, which is the signature
+   of a corrupted sysret target."*
 
-   **Unobserved, not fixed.**  The standing rule: an intermittent
-   fault that has not been reproduced under control is not closed.
-   One on-disk capture and a verified register fingerprint is a
-   narrowing, not a fix.  The next real move is a **targeted
-   first-party reproducer** -- a test that forks a `NOEXEC` busybox
-   child and drives the fork-path the hypothesis names -- not
-   another harness run.
+   **The instrument for that signature exists and was never
+   wired.**  `user_syscall_entry.asm` declares
+   `g_last_sysret_rcx`, `g_last_sysret_r11`, and
+   `g_last_sysret_rsp` (lines 31-36).  Nothing wrote them and
+   nothing read them: the diagnostic was designed, declared, and
+   left unconnected.  **Commit `96153e6` wires it** -- the asm
+   stores `rcx`/`r11` before `sysret`, and `isr13_handler` /
+   `isr14_handler` print them when `frame->rip < 0x1000`.
+
+   On the next 7e fault: if `g_last_sysret_rcx` reads `1`/`9`,
+   the `sysret` target was already corrupt and the bug is in the
+   frame the exit path reads.  If it reads a sane busybox text
+   address, the `sysret` theory is dead and the corruption is
+   post-resume.
+
+   **The fork path is cleared.**  Session 53 read and verified:
+
+   - `sys_fork`'s `EAGER_COPY_REGION(user_stack_virt,
+     user_stack_top)` -- walks all 16 stack pages including the
+     one containing `user_stack_top` (`0x80000FFFE0` sits
+     inside `0x80000FF000..0x80000FFFFF`);
+   - `process_fork_copy_frame`'s 20-slot frame layout against
+     `context_switch.asm`'s restore path and `PUSH_ALL_GPRS`'s
+     slot order -- they match slot-for-slot;
+   - `exec_alloc_user_stack`'s `user_stack_top` computation --
+     `(0x8000100000 - 32) & ~0xF`, inside the last page.
+
+   None of these is the bug.  Do not re-read them.
+
+   **Possibly related, not yet joined:** item 11 -- the
+   `pipe_wake_probe.sh` zombie leak.  It shares the workload and
+   the fork-heavy shape.  Do not fold them until the
+   `g_last_sysret` diagnostic says whether the child resumed
+   with a corrupt `RIP`.
+
+   **Unobserved, not fixed.**  Two dumps with a shared
+   fingerprint and a matching fault signature is a narrowing,
+   not a fix.  The next real move is a boot that catches 7e
+   with the `g_last_sysret` wiring in place.
 
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
@@ -480,6 +518,60 @@
     chooses to vectorize.  That is why it is filed rather than
     fixed in this session: a fix is a real feature, not a
     one-line change.
+
+11. **`pipe_wake_probe.sh` exhausts the 32-slot PCB pool with
+    zombies.**  Run to ~107 iterations, the probe prints
+    `PROCESS: No free PCB slots!` and the next fork fails with
+    `Resource temporarily unavailable`.  A diagnostic dump at
+    the exhaustion point shows **28 of the 32 slots in
+    `PROC_STATE_ZOMBIE`**, every one a child of the script's
+    shell (`ppid=810`), every one named `busybox`.
+
+    **The transition is exact.**  The `WW:` trace shows the
+    reap working for the first ~90 iterations:
+
+        WW: child=NNN parent=810 drop=c state=1
+
+    `drop=c state=1` means the parent was not `BLOCKED` when the
+    child exited, so the child was reaped on the parent's next
+    `wait4` -- clean.  From roughly iteration 95 onward the line
+    changes:
+
+        WW: child=NNN parent=810 drop=d kind=2
+
+    `drop=d kind=2` means the parent *was* `BLOCKED`, on
+    `BLOCK_KIND_PIPE_READ` (`kind=2` is `BLOCK_KIND_PIPE_READ`,
+    see `include/process.h`).  `process_wake_parent_if_waiting`
+    only wakes a parent blocked on `BLOCK_KIND_WAITPID`; a
+    parent blocked on a pipe read is correctly *not* woken by a
+    child's exit.  **But the child's zombie is then never
+    reaped**, and every iteration after the transition leaks
+    one more.  The leak is arithmetic: 32 slots, ~1 leak per
+    iteration once it starts.
+
+    **Candidate mechanism.**  The `$(seq)` subshell exits; its
+    write end of the `$(...)` pipe closes; the reader (the
+    script's shell) is blocked on `PIPE_READ` and should see
+    EOF.  If that EOF wake is lost, the reader stays blocked
+    forever and the subshell's zombie is never reaped.  This is
+    the same shape as the existing "also open" entry about
+    `put_file_slot`'s pipe wake being coupled to `sys_close`'s
+    wake -- a non-final close in a `dup`'d chain that stops
+    waking the peer.
+
+    **Where to read next.**  `put_file_slot`'s `FILE_KIND_PIPE`
+    case in `04_kernel_64bit/user_syscall.c` (~lines 1895-1910),
+    where `writers_open` drops to 0 and `pipe_wake_waiter`
+    wakes `reader_waiting`.  Then the `close_all_files` path a
+    subshell's exit takes -- whether it reaches that wake.
+
+    **Not yet shown to be 7e.**  The two share the
+    `pipe_wake_probe.sh` workload and the fork-heavy shape, but
+    a zombie leak is not itself an instruction-fetch fault.
+    Do not fold them until the `g_last_sysret` diagnostic (see
+    item 7e) says whether the child resumed correctly.
+
+    Reproducer: boot, `cd root/scripts`, `./pipe_wake_probe.sh`.
 
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
 are latent collisions; real FatFs timestamp storage (the three
