@@ -1,3 +1,60 @@
+## A diagnostic that is declared but never wired is not a diagnostic
+
+*Session 53 (the `g_last_sysret_*` globals in
+`04_kernel_64bit/user_syscall_entry.asm`).  A fault signature was
+identified, an instrument was designed and declared for it, and
+the instrument was never connected -- so two captures of exactly
+the fault it was built to explain sat unread.*
+
+`user_syscall_entry.asm` declares three globals with a comment
+that names the fault precisely:
+
+    ; Last values passed to sysret. Diagnostic only: the exception
+    ; handler reads these if a fault lands at RIP < 0x1000 in user
+    ; mode, which is the signature of a corrupted sysret target.
+    global g_last_sysret_rcx
+    global g_last_sysret_r11
+    global g_last_sysret_rsp
+
+Then nothing writes them: the `o64 sysret` site does not store to
+them.  And nothing reads them: `grep -rn g_last_sysret
+04_kernel_64bit/interrupts.c 04_kernel_64bit/include/` returns
+nothing.
+
+Item 7e has two captures, both `#PF` with error `0x15`
+(present + user + **instruction fetch**) at `RIP = CR2 = 0x1`
+and `RIP = CR2 = 0x9`.  Both are `RIP < 0x1000` in user mode --
+the exact signature the comment names.  **The instrument existed
+for both of them and was never turned on.**
+
+**The rule.**  A diagnostic has two halves: the thing that
+records, and the thing that reports.  Declaring the globals and
+commenting the intent is neither.  A diagnostic that is not
+written and read is indistinguishable from no diagnostic at all
+-- and worse, because its presence in the source *reads* as
+coverage.  A grep for the name returns the declaration, which
+looks like the feature exists.
+
+**The tell.**  A diagnostic global with a comment and no
+`grep`-visible writer, or no `grep`-visible reader.  Both halves
+are one command each:
+
+    grep -rn 'g_last_sysret' 04_kernel_64bit/    # declaration only? bug.
+
+If the grep returns declarations and no stores, the recorder is
+missing.  If it returns no reads from a handler, the reporter is
+missing.  Either way the instrument is dark.
+
+**Where this shape recurs.**  Same family as "A function that has
+never run is correct by inspection only" (session 49): that entry
+is about a *fix* that exists and was never exercised; this one is
+about an *instrument* that exists and was never connected.  Both
+are artifacts that read as done and are not.  The check differs:
+session 49's fix could only be confirmed by a run that reached the
+path; this one is confirmed by a grep for the writer and the
+reader, before any run.
+
+
 ## A test's expected value is a claim, like any other
 
 *Session 52 (`test.sh` row 4, the `sha512sum` row), commit
