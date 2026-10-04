@@ -68,7 +68,14 @@ check() {
 # ran NAME CMD...
 #
 # Runs CMD, reports pass/fail on its exit status alone.  On failure
-# the exit code and the command's output are printed, indented.
+# the exit code and the command's output are printed.
+#
+# Session 52: the failure path used to indent with
+#     echo "$out" | while read -r line; do echo "       $line"; done
+# That pipeline forks a subshell, and the subshell's exit can lose
+# its wake -- the shell blocks in wait4 forever with no runnable
+# process, and the scheduler falls to idle.  This is item 7d in a
+# second location.  The failure path below does not fork.
 ran() {
     name="$1"; shift
     trace "$name"
@@ -78,7 +85,7 @@ ran() {
         ok "$name"
     else
         bad "$name (exit $st)"
-        echo "$out" | while read -r line; do echo "       $line"; done
+        printf '%s\n' "$out"
     fi
 }
 
@@ -206,9 +213,16 @@ ran "sleep"    sleep 1
 
 # ------------------------------------------------------------------
 # find flags
+#
+# -not is a GNU spelling, and busybox gates it behind
+# ENABLE_DESKTOP in findutils/find.c -- it sits inside an
+# `#if ENABLE_DESKTOP` block alongside -and, -or, and -wholename.
+# This build sets CONFIG_DESKTOP=n, so -not is not compiled in even
+# though CONFIG_FEATURE_FIND_NOT=y.  FEATURE_FIND_NOT controls the
+# POSIX `!` operator, which is what the row uses.  Session 52.
 # ------------------------------------------------------------------
 ran "find -maxdepth" find / -maxdepth 1 -type d
-ran "find -not"      find / -maxdepth 1 -name busybox -not -path /tmp
+ran "find -not"      find / -maxdepth 1 -name busybox ! -path /tmp
 ran "find -empty"    find / -maxdepth 1 -empty -type d
 
 echo "---"
