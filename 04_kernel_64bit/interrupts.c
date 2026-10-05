@@ -800,7 +800,7 @@ void isr14_handler(exception_frame_t *frame) {
             serial_lock();
             serial_print("  pte               : 0x"); serial_print_hex(pte); serial_print("\n");
             if (pte & 1) {
-                uint64_t phys = (pte & ~0xFFFULL) | (fault_addr & 0xFFF);
+                uint64_t phys = pte_phys(pte) | (fault_addr & 0xFFF);
                 serial_print("  PTE PRESENT, phys 0x"); serial_print_hex(phys); serial_print("\n");
                 if (pte & 0x80) {
                     serial_print("  *** PTE HAS PS BIT SET (reserved in a PTE!) ***\n");

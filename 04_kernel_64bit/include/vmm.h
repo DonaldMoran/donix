@@ -13,6 +13,22 @@
 
 #define RECURSIVE_PML4_INDEX 510
 
+/*
+ * Mask a page-table entry down to its physical address.
+ *
+ * The NX bit lives at bit 63.  A raw `entry & ~0xFFFULL` leaves it
+ * set, producing a "physical" address with bit 63 set, which is
+ * non-canonical and faults when dereferenced through the HHDM.  Use
+ * this everywhere an entry is masked to a physical address; do not
+ * write `entry & ~0xFFFULL` directly.
+ *
+ * Moved here from vmm.c so exception handlers (interrupts.c) can use
+ * it too.  interrupts.c already includes vmm.h.
+ */
+static inline uint64_t pte_phys(uint64_t entry) {
+    return entry & ~0xFFFULL & ~PT_NX;
+}
+
 void vmm_init(BootInfo* info);
 void* ensure_hhdm_mapped(uint64_t phys);
 int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);

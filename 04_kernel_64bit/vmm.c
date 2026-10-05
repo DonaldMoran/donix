@@ -49,9 +49,9 @@ static inline uint64_t* phys_to_virt(uint64_t phys) {
  * Use this EVERYWHERE a table entry is masked to a physical
  * address.  Do not write `entry & ~0xFFFULL` directly.
  */
-static inline uint64_t pte_phys(uint64_t entry) {
-    return entry & ~0xFFFULL & ~PT_NX;
-}
+/* pte_phys is now defined in include/vmm.h (as static inline) so
+ * interrupts.c can use it.  Do not re-add a definition here; the
+ * linker will reject the duplicate. */
 
 void* ensure_hhdm_mapped(uint64_t phys) {
     uint64_t virt = HHDM_START + phys;
