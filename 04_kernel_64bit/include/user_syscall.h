@@ -29,7 +29,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t arg0, uint64_t arg1,
  * Implemented in user_syscall.c, which owns file_slot_t.
  */
 void user_syscall_init_console_fds(struct pcb* pcb);
-
+void user_syscall_clear_file_table(struct pcb* pcb);
 // void syscall_init(void);
 
 #endif

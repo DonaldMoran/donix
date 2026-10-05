@@ -1978,6 +1978,38 @@ void close_all_files(pcb_t* proc) {
 }
 
 /*
+ * Drop every file reference in a PCB's file_table[] and leave the
+ * table empty.
+ *
+ * This is close_all_files with one difference: close_all_files is
+ * called on a process that is exiting, so it can assume the table
+ * is the process's own.  This one is called from sys_fork on a
+ * freshly created child, immediately before the child inherits
+ * the parent's fd table.
+ *
+ * WHY IT EXISTS.  process_create calls
+ * user_syscall_init_console_fds, which installs three console
+ * sentinels in fd 0/1/2.  sys_fork then overwrites fd 0/1/2 with
+ * the parent's slots.  Before this helper existed, the child's own
+ * three sentinels were never freed: three kmalloc'd file_slot_t
+ * per fork, 240 bytes per fork with the heap header, which is the
+ * 0xF0 heap creep item 7e tracked down to sys_fork.
+ *
+ * Not static: sys_fork calls it, and sys_fork is in this file but
+ * the call site reads more clearly as a named operation than as an
+ * inline loop.  The declaration is in include/user_syscall.h.
+ */
+void user_syscall_clear_file_table(pcb_t* pcb) {
+    if (!pcb) return;
+    for (int i = 0; i < MAX_PROCESS_FILES; i++) {
+        file_slot_t* slot = (file_slot_t*)pcb->file_table[i];
+        if (!slot) continue;
+        put_file_slot(slot);
+        pcb->file_table[i] = NULL;
+    }
+}
+
+/*
 * open(2) must return the LOWEST free fd, including 0, 1, and
 * 2 when they are free.  This is Linux/POSIX semantics and
 * real programs depend on it.  busybox `uniq FILE` does:
@@ -7545,6 +7577,24 @@ long sys_fork(void) {
      * fds 0, 1, 2 are included: the parent may have dup2'd a file
      * onto them, and the child must see the same redirection.
      */
+     
+    /*
+     * Drop the three console sentinels process_create installed.
+     *
+     * process_create -> user_syscall_init_console_fds puts a
+     * kmalloc'd console slot in fd 0, 1, and 2.  Fork inherits the
+     * parent's fds, so those three slots are about to be
+     * overwritten by the loop below.  Without this free they leak,
+     * three per fork, 240 bytes per fork -- the 0xF0 heap creep
+     * item 7e tracked down to sys_fork.
+     *
+     * The loop that follows copies every fd the parent has,
+     * including 0/1/2; the parent's sentinels (or whatever the
+     * parent dup2'd onto 0/1/2) arrive there with refcounts
+     * bumped.  The child's own sentinels are gone by then.
+     */
+    user_syscall_clear_file_table(child);     
+     
     for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
         file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
         if (!_slot) continue;
