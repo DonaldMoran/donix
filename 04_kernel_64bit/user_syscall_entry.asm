@@ -105,7 +105,25 @@ user_syscall_entry:
     
     add rsp, 8                      ; discard stacked arg5
 
-    cmp rbx, 60
+    ; Both exit(2) and exit_group(2) terminate the calling process.
+    ; rbx holds the raw syscall number saved before the C call.
+    ;
+    ; SYS_EXIT is 60 and SYS_EXIT_GROUP is 231.  musl routes both
+    ; exit() and _exit() through exit_group, so a musl program that
+    ; wants to die issues 231, not 60.  Before this fix, only 60 was
+    ; checked: an exit_group call fell through to the normal sysret
+    ; path, and the process -- which had already asked to be
+    ; terminated -- was resumed in user mode.  It re-issued the exit
+    ; syscall (this time 60) and died on the second attempt.  That
+    ; window is where the 7e fault was observed: a process that had
+    ; "exited" continued to execute user code, and a later ret in
+    ; that code popped a corrupted stack slot and jumped to it.
+    ;
+    ; Routing 231 to .handle_exit closes the window.  See
+    ; docs/open-issues.md item 7e.
+    cmp rbx, 60                     ; SYS_EXIT
+    je .handle_exit
+    cmp rbx, 231                    ; SYS_EXIT_GROUP
     je .handle_exit
 
     ; Restore the extra saved GPRs.  The syscall ABI clobbers only
