@@ -499,6 +499,73 @@ void isr0_handler(exception_frame_t *frame) {
     while (1) __asm__ volatile("hlt");
 }
 
+/*
+ * #UD — invalid opcode.  Same frame shape as isr13_handler: the stub
+ * pushes a fake 0 error word so raw[EXC_OFF_ERROR_CODE] reads 0 and
+ * raw[EXC_OFF_RIP/CS/RSP] align identically to a vector that does
+ * push an error word.  error_code is therefore NOT meaningful here;
+ * do not branch on it.
+ *
+ * User-mode faults are killed with vector 0x06, which
+ * fault_kill_current maps to SIGILL.  Kernel-mode faults halt.
+ */
+void isr6_handler(exception_frame_t *frame) {
+    if (g_expect_fault == 0x06) fault_kill_current(0x06);
+
+    uint64_t *raw = (uint64_t *)frame;
+    uint64_t fault_rip  = raw[EXC_OFF_RIP];
+    uint64_t fault_cs   = raw[EXC_OFF_CS];
+    uint64_t fault_rsp  = raw[EXC_OFF_RSP];
+
+    serial_lock();
+    serial_print("\n=== INVALID OPCODE (#UD) ===\n");
+    serial_print("  Faulting RIP : 0x"); serial_print_hex(fault_rip);  serial_print("\n");
+    serial_print("  Code Seg (CS): 0x"); serial_print_hex(fault_cs);   serial_print("\n");
+    serial_print("  Stack (RSP)  : 0x"); serial_print_hex(fault_rsp);  serial_print("\n");
+    serial_unlock();
+
+    vga_print("\n=== INVALID OPCODE (#UD) ===\n");
+    vga_print("  Faulting RIP : 0x"); vga_print_hex_cur(fault_rip);  vga_print("\n");
+    vga_print("  Code Seg (CS): 0x"); vga_print_hex_cur(fault_cs);   vga_print("\n");
+    vga_print("  Stack (RSP)  : 0x"); vga_print_hex_cur(fault_rsp);  vga_print("\n");
+
+    {
+        extern pcb_t* process_get_current(void);
+        pcb_t* cur = process_get_current();
+        if (cur) {
+            serial_lock();
+            serial_print("  Current PID : "); serial_print_dec(cur->pid); serial_print("\n");
+            serial_print("  Name        : "); serial_print(cur->name); serial_print("\n");
+            serial_print("  entry_point : 0x"); serial_print_hex(cur->entry_point); serial_print("\n");
+            serial_print("  saved rsp   : 0x"); serial_print_hex(cur->rsp); serial_print("\n");
+            serial_print("  saved rip   : 0x"); serial_print_hex(cur->rip); serial_print("\n");
+            serial_unlock();
+        } else {
+            serial_print("  Current PID : (null)\n");
+        }
+    }
+
+    serial_lock();
+    serial_print("  --- raw frame dump ---\n");
+    for (int i = 0; i < 48; i++) {
+        serial_print("    [");
+        serial_print_dec(i);
+        serial_print("] 0x");
+        serial_print_hex(raw[i]);
+        serial_print("\n");
+    }
+    serial_print("  --- end frame dump ---\n");
+    serial_unlock();
+
+    if ((fault_cs & 3) == 3) {
+        serial_lock();
+        dump_user_stack_window(fault_rsp, fault_cs);
+        serial_unlock();
+        fault_kill_current(0x06);
+    }
+    while (1) __asm__ volatile("hlt");
+}
+
 void isr1_handler(void) {
     vga_print("\n*** DEBUG EXCEPTION (#DB) ***\n");
     while (1) __asm__ volatile("hlt");

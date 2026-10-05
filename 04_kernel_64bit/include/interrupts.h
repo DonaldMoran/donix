@@ -78,6 +78,7 @@ extern volatile int g_fault_observed;
 void fault_kill_current(int vec) __attribute__((noreturn));
 
 void isr0_handler(exception_frame_t *frame);
+void isr6_handler(exception_frame_t *frame);
 void isr8_handler(exception_frame_t *frame);
 void isr13_handler(exception_frame_t *frame);
 void isr14_handler(exception_frame_t *frame);

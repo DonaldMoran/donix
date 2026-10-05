@@ -7,6 +7,7 @@ struct idt_ptr   idt_descriptor;
 
 extern void isr0_stub(void);
 extern void isr1_stub(void);
+extern void isr6_stub(void);
 extern void isr8_stub(void);
 extern void isr13_stub(void);
 extern void isr14_stub(void);
@@ -41,7 +42,7 @@ static void set_idt_entry(int vec, uint64_t handler, uint8_t ist) {
 
 void idt_init(void) {
     /*
-     * Install all 256 gates.  Vectors 0, 1, 8, 13, 14, 32, 33 have
+     * Install all 256 gates.  Vectors 0, 1, 6, 8, 13, 14, 32, 33 have
      * dedicated stubs (see isr.asm) with special frame handling.  All
      * other vectors use isr_default_*, which push a dummy error code
      * (or not, depending on whether the CPU pushes one), push the
@@ -58,6 +59,7 @@ void idt_init(void) {
         switch (vec) {
             case 0:  handler = (uint64_t)isr0_stub;  break;
             case 1:  handler = (uint64_t)isr1_stub;  break;
+            case 6:  handler = (uint64_t)isr6_stub;  break;
             case 8:
                 handler = (uint64_t)isr8_stub;
                 /* IST1 is reserved for #DF. The CPU switches to

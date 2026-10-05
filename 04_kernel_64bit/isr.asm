@@ -2,6 +2,7 @@
 
 global isr0_stub
 global isr1_stub
+global isr6_stub
 global isr8_stub
 global isr13_stub
 global isr14_stub
@@ -11,6 +12,7 @@ global irq1_stub
 
 extern isr0_handler
 extern isr1_handler
+extern isr6_handler
 extern isr8_handler
 extern isr14_handler
 
@@ -138,6 +140,22 @@ isr1_stub:
     call isr1_handler
     POP_ALL_GPRS
     add rsp, 8
+    iretq
+
+; #UD — invalid opcode (no CPU error code).
+;
+; Mirrors isr1_stub (the other no-error-code user exception): push a
+; fake error word so the C handler sees the same frame layout as
+; isr13/isr14, then drop it on the way out.  Do NOT mirror isr13_stub
+; here — #UD pushes no error code, so isr13's layout would misalign
+; every accessor (raw[EXC_OFF_ERROR_CODE] would read the RIP, etc.).
+isr6_stub:
+    push 0
+    PUSH_ALL_GPRS
+    mov rdi, rsp
+    call isr6_handler
+    POP_ALL_GPRS
+    add rsp, 8              ; drop fake error code
     iretq
 
 ; #DF — double fault (CPU pushes an error code, always 0)
