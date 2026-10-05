@@ -11,19 +11,46 @@ numbers; the items below keep theirs.  References to "item 7" or
 "item 11" in older docs resolve to closed issues, which is
 correct.
 
-**Item 7e is closed as a BUSYBOX bug, not a donix bug.**  Every
-capture across sessions 45-54 has `last sysret rcx` in busybox
-text (`0x4377A3`, `0x43A89A`, `0x43F89A`, `0x43A5D4`, `0x43D639`
-among them); the kernel returns correctly every time.  The user
-process then executes a control transfer to a data value
-(`0x24`, `0x80100009B0`, `0x80000FB700`, `0x0400000000000000` in
-session 54's captures).  donix faithfully executes the jump; the
-CPU faults.  The session-54 diagnostic work makes the fault
-produce a clean `error=0x15` with `CR2 == RIP`, and the shell
-now reports it.  Nothing more for the kernel to fix here.  A
-future session that wants to chase it further is chasing a
-busybox bug and would need a first-party reproducer, not a
-kernel change.
+**Item 7e is a family, and its heap-corruption face is now
+fixed; its busybox control-transfer face remains a suspicion.**
+Session 54 wrote "closed as a BUSYBOX bug" and that overstated
+what the evidence supported.  What the evidence supports is:
+
+  - **The heap-corruption face is diagnosed and fixed.**  After
+    long debugging, the mechanism behind the `movq %rbx,
+    0x2c35(%rip)` displacement corruption (`CR2 =
+    0xFFFFFFFFE4A01F38`) is known: `sys_fork` overwrote the
+    child's three console sentinels without freeing them, leaking
+    0xF0 per fork until `kmalloc` returned a block overlapping a
+    live allocation.  Fixed in session 55 by
+    `user_syscall_clear_file_table`, called from `sys_fork`
+    (commit `2fc7fde`, scratch tag
+    `20261005-fork-sentinel-leak`).
+
+  - **The busybox control-transfer face remains a suspicion with
+    no proof.**  Every capture across sessions 45-54 has `last
+    sysret rcx` in busybox text; the kernel returns correctly
+    every time; the user process then transfers control to a
+    data value.  That is consistent with a busybox bug, and it
+    is consistent with an interaction between busybox and
+    donix that the project has not isolated.  The project
+    suspects ash, and has no proof.
+
+  - **`pipe7e` is the first non-ash data point.**  A C program
+    doing the `x=$(cmd)` syscall shape -- pipe, fork, dup2 the
+    write end to stdout, execve a helper, read to EOF, wait4 --
+    with no shell in the loop.  Two runs of 50000 iterations
+    each on one boot, both `PIPE7E-ALL-PASS`.  A non-ash program
+    doing the same syscall shape did not transfer control to a
+    data value in 100000 iterations.  That is consistent with
+    the busybox control-transfer face being ash-specific; it
+    does not prove it.
+
+Item 7e **stays open**.  A future session that wants to close
+the control-transfer face further needs a first-party
+reproducer that fires, or a kernel-side trace of the transfer.
+The heap-corruption half is done; see `gotchas.md`, "A fork
+that overwrites a child's file table leaks per fork."
 
 1. **The remaining FatFs-form conversions, now that the seam has
    landed.**  The pathname dispatch seam shipped in session 44
@@ -307,6 +334,16 @@ kernel change.
    `NOEXEC` applet's forked child.  None of them is the same fault
    address twice; all of them are the CPU executing or reading at an
    address that is not busybox text and is not a mapped data page.
+
+   **Session 55 status.**  This entry's original framing was
+   "a busybox bug" and that framing is corrected above: the
+   heap-corruption face of 7e is now diagnosed and fixed; this
+   longer entry records the busybox control-transfer face, which
+   remains a suspicion.  The table below is history, not a
+   live hunt.  `pipe7e` (commit `2fc7fde`, staged as
+   `/usr/bin/PIPE7E` with `/usr/bin/PIPE7E_HELPER`) is the first
+   non-ash data point on the control-transfer question; it
+   passes 100000 iterations across two runs on one boot.
 
    The faulting `RIP`s, in order:
 

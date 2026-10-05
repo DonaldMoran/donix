@@ -1,3 +1,61 @@
+## A fork that overwrites a child's file table leaks per fork
+
+*Session 55 (`sys_fork`'s inherited fds), commit `2fc7fde`, scratch
+tag `20261005-fork-sentinel-leak`.  The sibling of session 54's
+exit-path leak: a slot's refcount was bumped by the inherit, and
+the child's own slot was overwritten without a drop.*
+
+Item 7e's heap-corruption face is this leak.  `process_create`
+calls `user_syscall_init_console_fds`, which installs three
+console sentinels in the child's `file_table[0..2]`.  `sys_fork`
+then copies the parent's file table over the child's, overwriting
+fd 0, 1, and 2 without freeing the child's own three slots.
+
+**The arithmetic.**  Three `kmalloc(sizeof(file_slot_t))` payloads
+at 32 bytes each, plus three 48-byte heap headers, is 240 bytes =
+**0xF0 per fork**.  The leak compounds: over ~4800 iterations of a
+fork-heavy reproducer, `kmalloc(12800)` eventually returns a block
+overlapping a live allocation, and the corruption lands on the
+four-byte displacement of a `movq %rbx, 0x2c35(%rip)` in the
+helper, faulting at `CR2 = 0xFFFFFFFFE4A01F38`.
+
+**The fix.**  `user_syscall_clear_file_table`, a
+`close_all_files` with a different call site: it drops every slot
+in a PCB's `file_table[]` and leaves the table empty.  `sys_fork`
+calls it on the child immediately before the fd-inheritance loop.
+The loop that follows still copies every fd the parent has,
+including 0/1/2; the parent's slots arrive there with refcounts
+bumped.  The child's own sentinels are freed by then.
+
+**The rule.**  This is the same shape as "An exit path that does
+not close the file table leaks a reference per exit" (session 54),
+from the other direction.  That one was a teardown that did not
+drop the table; this one is an **inherit** that did not drop the
+table before overwriting it.  In both cases the fix is to put the
+drop where the table is about to be replaced -- in `process_exit`
+for the exit path, at the head of the fd-copy loop for the fork
+path -- not to rely on the entries that are being written over
+having been freed somewhere else.
+
+**The tell.**  A per-iteration heap creep whose size is a clean
+multiple of an allocation's payload plus the heap header, and
+whose fault, when it arrives, lands on a **four-byte displacement**
+of a live instruction rather than on a page boundary.  Both are
+the signature of "a live allocation got overwritten by a
+later one" rather than "the allocator ran out."  In this instance
+the fixed code ran 100000 fork/execve cycles across two runs on
+one boot with no fault; the unfixed clone faulted at iteration
+4827 of the first run.
+
+**Where this shape recurs.**  Same family as session 54's
+exit-path entry.  Both are "a resource's ownership was handed to
+a new container without the old container being told."  The
+`pipe_t` refcount in the exit case and the `file_slot_t` refcount
+here are the same mechanism: a count that is decremented by one
+path and never reaches zero.  The check is the same: for every
+place a table is *written*, ask what the old contents' refcounts
+are, and whether anything will drop them.
+
 ## A halt in a fault handler is a diagnostic that does not run
 
 *Session 54 (`isr14_handler`'s `#PF` walk), commit `93a98ae`.  A

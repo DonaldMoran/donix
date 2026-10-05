@@ -1,3 +1,118 @@
+## Session 55 — the fork-path sentinel leak, and item 7e's heap-corruption face closed
+
+One code commit on `dev`, scratch-tagged
+`20261005-fork-sentinel-leak`; three docs commits to follow.
+**Not a milestone** -- a correctness session.  Item 7e's
+heap-corruption face is diagnosed and fixed; its busybox
+control-transfer face is corrected from "closed" to "a suspicion
+with no proof" and gets its first non-ash data point.
+
+| Tag | What |
+|---|---|
+| `20261005-fork-sentinel-leak` | `user_syscall_clear_file_table`, called from `sys_fork`; `pipe7e.c` and `pipe7e_helper.c` as the acceptance test |
+
+### The leak
+
+`sys_fork` copied the parent's file table over the child's,
+overwriting fd 0, 1, and 2 without freeing the child's own three
+console sentinels -- the slots `process_create` installed via
+`user_syscall_init_console_fds`.  Three `kmalloc`'d
+`file_slot_t` at 32 bytes each, plus three heap headers, is
+**240 bytes = 0xF0 per fork**.  The leak compounds: over ~4800
+iterations of a fork-heavy reproducer, `kmalloc(12800)`
+eventually returned a block overlapping a live allocation, and
+the corruption landed on the four-byte displacement of a
+`movq %rbx, 0x2c35(%rip)` in the helper, faulting at `CR2 =
+0xFFFFFFFFE4A01F38`.
+
+### The fix
+
+Two parts, both in `04_kernel_64bit/`:
+
+- **`user_syscall_clear_file_table`**, a `close_all_files` with a
+  different call site: it drops every slot in a PCB's
+  `file_table[]` and leaves the table empty.  Defined in
+  `user_syscall.c`, declared in `include/user_syscall.h`.
+- **`sys_fork` calls it** on the child immediately before the
+  fd-inheritance loop.  The loop that follows still copies
+  every fd the parent has, including 0/1/2; the parent's slots
+  arrive there with refcounts bumped.
+
+### The acceptance test
+
+`userland/musl/tests/pipe7e.c` is the `x=$(cmd)` shape written
+in C with no shell in the loop: pipe, fork, dup2 the write end
+to stdout, execve a helper, read the pipe to EOF, wait4.  The
+helper is `userland/musl/tests/pipe7e_helper.c`, staged as
+`/usr/bin/PIPE7E_HELPER`; it writes two bytes and exits 0.  The
+test prints a marker `[pipe7e] iter N` before every 1000th
+iteration -- the session-51 rule -- and checks each child's
+`wait4` status.
+
+**Two runs of 50000 iterations each on one boot, both
+`PIPE7E-ALL-PASS`.**  The second run is the stronger signal: it
+starts from a heap that has already survived the first 50000
+fork/execve cycles.  The unfixed clone faulted at iteration
+4827 of the first run.
+
+### Item 7e stays open, and its session-54 text is corrected
+
+Session 54 wrote item 7e as "closed as a BUSYBOX bug, not a
+donix bug."  That overstated what the evidence supported, and
+`open-issues.md` is edited in place to say so.  What the
+evidence supports:
+
+- **The heap-corruption face is diagnosed and fixed** -- this
+  session's work.
+- **The busybox control-transfer face remains a suspicion with
+  no proof.**  Every capture has `last sysret rcx` in busybox
+  text and a subsequent transfer to a data value; the kernel
+  returns correctly every time.  That is consistent with an ash
+  bug and with an ash/donix interaction the project has not
+  isolated.
+- **`pipe7e` is the first non-ash data point.**  A non-ash
+  program doing the same syscall shape did not transfer control
+  to a data value in 100000 iterations.  Consistent with the
+  ash-specific reading; not proof.
+
+### `pipe7e`'s trace
+
+The two runs print ~150000 lines of serial output because the
+`sys_execve` line, the `EXIT:` line, and the session-53 `WW:`
+trace all fire per iteration.  Expected, not a defect.  If a
+future session wants to shrink the trace, the `WW:` lines are
+the ones to gate; the `sys_execve` and `EXIT` lines are
+informative in their own right.
+
+### What this session did *not* change
+
+- The session-53 `g_last_sysret` diagnostic is not touched and
+  did not fire on either run -- no `fault_rip < 0x1000` events
+  occurred.
+- The NX/non-canonical family from session 54 is not touched.
+- Item 10 (the SSE gap), item 12 (signal delivery), and item 13
+  (ash job control) remain open and are unaffected.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| Boot to shell prompt | OK |
+| `pipe7e` first run | **50000 iterations, `PIPE7E-ALL-PASS`** |
+| `pipe7e` second run, same boot | **50000 iterations, `PIPE7E-ALL-PASS`** |
+| Kernel `#PF`, `#GP`, `#DF`, hang | none |
+| Heap-exhaustion signature (`CR2 = 0xFFFFFFFFE4A01F38`) | not observed |
+
+The image stages two new ELFs: `PIPE7E` and `PIPE7E_HELPER`.
+Both added to `USERLAND_ELFS` and the `mcopy_one` chain in
+`05_boot_kernel64/Makefile`.  The Makefile change is one
+`git diff --stat` line.
+
+**Scratch tag kept:** `20261005-fork-sentinel-leak`, local, not
+pushed.  It is to be dropped before the next `v*` milestone.
+
+---
+
 ## Session 54 — the zombie leak closed, the NX/non-canonical address family fixed, and user faults made honest
 
 One commit on `dev`, scratch-tagged, unpushed.  **Not a
