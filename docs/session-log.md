@@ -86,12 +86,52 @@ informative in their own right.
 
 ### What this session did *not* change
 
-- The session-53 `g_last_sysret` diagnostic is not touched and
-  did not fire on either run -- no `fault_rip < 0x1000` events
-  occurred.
+- The session-53 `g_last_sysret` diagnostic is not touched by
+  this session's code commit.  It did not fire during either
+  `pipe7e` run (no `fault_rip < 0x1000` events), and it
+  **did** fire on a subsequent `pipe_wake_probe.sh` run: eight
+  `#PF` captures, all with the diagnostic live, all in
+  busybox ash's `seq` applet child.  See the addendum below.
 - The NX/non-canonical family from session 54 is not touched.
 - Item 10 (the SSE gap), item 12 (signal delivery), and item 13
   (ash job control) remain open and are unaffected.
+
+### Addendum -- the busybox control-transfer face, captured
+
+A `pipe_wake_probe.sh` run after the code commit produced eight
+`#PF` captures, all in the same boot that includes `2fc7fde`.
+They are **not** the leak: `pipe_wake_probe.sh` completed all
+4000 iterations with `loopdone`, which is the fix working.
+They are the busybox control-transfer face of item 7e, visible
+now without the leak's heap pressure underneath them.
+
+Eight faults, six distinct (two exact repeats).  Three shapes:
+
+| shape | `RIP` | `CR2` | error | note |
+|---|---|---|---|---|
+| fetch, tiny address | `0x1`, `0x9` | same as `RIP` | `0x15` | register fingerprint present |
+| read, mmap window | `0x8010000985` | `0x8083206710` | `0x4` | PDPTE not present |
+| read, user stack | `0x80000FB6B6` | `0x80000F` | `0x5` | PDE is the bootloader 2 MB page |
+
+Every capture carries the `*** corrupted control target ***`
+line -- the session-53 wiring.  `last sysret rcx` values are
+`0x43A5D4`, `0x43F89A`, `0x43B1B7`, all real ash `.text`.  The
+fingerprint (`r8 = 0x415516`, `r9 = 0x2F2F2F2F2F2F2F2F`) is
+present in every tiny-address fault, matching the item-7e entry.
+
+**The mechanism is not identified.**  What the captures rule
+out is now more than what they point to: the leak is not the
+cause (fixed, run completes), the sysret target is not corrupt
+(the values are real ash text), and the fault is not a single
+instruction.  The next session's first move is to disassemble
+around `0x415516` and `0x43F89A` in busybox and find what writes
+the fingerprint registers.  `open-issues.md` item 7e carries the
+full framing; `handoff.md` carries the captures.
+
+Faults were **fewer than prior runs on this image, by
+impression** -- no before-count was kept, so the reduction is
+not a number.
+
 
 ### Verification
 

@@ -27,14 +27,19 @@ what the evidence supported.  What the evidence supports is:
     (commit `2fc7fde`, scratch tag
     `20261005-fork-sentinel-leak`).
 
-  - **The busybox control-transfer face remains a suspicion with
-    no proof.**  Every capture across sessions 45-54 has `last
-    sysret rcx` in busybox text; the kernel returns correctly
-    every time; the user process then transfers control to a
-    data value.  That is consistent with a busybox bug, and it
-    is consistent with an interaction between busybox and
-    donix that the project has not isolated.  The project
-    suspects ash, and has no proof.
+  - **The busybox control-transfer face is a reproducible
+    family, not a suspicion.**  Eight captures with the
+    session-53 `g_last_sysret` diagnostic live confirm the
+    kernel returns correctly every time (`last sysret rcx` is
+    real ash text), and confirm the process then transfers
+    control to a data value or reads from a corrupted address.
+    The register fingerprint is stable across every capture.
+    What the project does **not** have is the mechanism: which
+    instruction in ash (or in a musl structure ash is reading)
+    fills those registers with those values, and where.
+    "Suspicion with no proof" understated it; the correct
+    statement is "a reproducible family with no identified
+    mechanism."
 
   - **`pipe7e` is the first non-ash data point.**  A C program
     doing the `x=$(cmd)` syscall shape -- pipe, fork, dup2 the
@@ -45,6 +50,35 @@ what the evidence supported.  What the evidence supports is:
     data value in 100000 iterations.  That is consistent with
     the busybox control-transfer face being ash-specific; it
     does not prove it.
+
+  - **The busybox control-transfer face now has eight captures
+    with the session-53 `g_last_sysret` diagnostic live, all
+    on one `pipe_wake_probe.sh` run past iteration 3269, all in
+    busybox ash's `seq` applet child.**  Eight `#PF`s, six
+    distinct (two exact repeats).  Three shapes: `RIP = CR2 =
+    0x1`/`0x9`, error `0x15` (instruction fetch at a tiny
+    address); `RIP = 0x8010000985` / `CR2 = 0x8083206710`,
+    error `0x4` (read in the mmap window, PDPTE not present);
+    and `RIP = 0x80000FB6B6` / `CR2 = 0x80000F`, error `0x5`
+    (read on the user stack, PDE is the bootloader's 2 MB
+    page).  Every capture carries the `*** corrupted control
+    target ***` line -- the wiring is live and firing.  Every
+    `last sysret rcx` is real ash text (`0x43A5D4`,
+    `0x43F89A`, `0x43B1B7`); the kernel stored them correctly.
+    The register fingerprint the longer entry records
+    (`r8 = 0x415516`, `r9 = 0x2F2F2F2F2F2F2F2F`) is present in
+    every tiny-address fault.  **The mechanism is not
+    identified.**  The face is a family with a stable
+    fingerprint, not a single bad jump.  See the longer entry
+    and `handoff.md` for the raw dumps.
+
+  - **The captures are on the patched kernel.**  This run's
+    boot includes commit `2fc7fde`, so the eight faults are
+    **not** the fork-sentinel leak -- that face is fixed and
+    `pipe_wake_probe.sh` completes all 4000 iterations with
+    `loopdone`.  The faults are the busybox control-transfer
+    family, unchanged, now visible without the leak's heap
+    pressure on top of them.
 
 Item 7e **stays open**.  A future session that wants to close
 the control-transfer face further needs a first-party
