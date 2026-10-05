@@ -379,6 +379,155 @@ that overwrites a child's file table leaks per fork."
    non-ash data point on the control-transfer question; it
    passes 100000 iterations across two runs on one boot.
 
+   **Session 56 status.**  Three kernel fixes committed and
+   verified; the remaining 7e faults are localized to user space.
+
+   - **Three fixes landed on `dev` this session, all tagged
+     `20261005-*`.**  None of them is the busybox control-transfer
+     mechanism itself; each is a real bug found on the path to
+     looking for it, and each is committed on its own:
+
+     - `20261005-isr14-phys-mask` (commit `72279b7`).
+       `isr14_handler`'s diagnostic print computed the physical
+       address as `(pte & ~0xFFFULL) | (fault_addr & 0xFFF)`,
+       which left the NX bit (bit 63) set and produced a
+       non-canonical "physical address" in the `PTE PRESENT, phys`
+       line.  Fixed by moving the existing `pte_phys` helper (which
+       masks `~0xFFF` *and* `~PT_NX`) from `vmm.c` into `vmm.h` as
+       `static inline` and using it here.  `interrupts.c` already
+       includes `vmm.h`.
+
+     - `20261005-vector6-ud-handler` (commit `81db58c`).  Vector 6
+       (`#UD`) fell through to `isr_default_handler`, which printed
+       `*** UNHANDLED INTERRUPT: vector 6 ***` and halted — no
+       register dump, no user stack window.  Added `isr6_stub` in
+       `isr.asm` (mirrors `isr1_stub`, the other no-error-code user
+       exception: pushes a fake 0 so the frame layout matches
+       `isr13`/`isr14`), `isr6_handler` in `interrupts.c` (full
+       diagnostic — banner, PID/name, register dump, stack window),
+       and registered it in `idt.c`.
+
+     - `20261005-exit-group-terminates` (commit `036ed4c`).
+       `user_syscall_entry.asm`'s post-`syscall_dispatch` check
+       tested `rbx == 60` (`SYS_EXIT`) only.  `SYS_EXIT_GROUP` is
+       231, and **musl routes both `exit()` and `_exit()` through
+       it** — a musl process wanting to die issues 231, not 60.  A
+       process calling `exit_group` was `sysret`'d back to user
+       mode instead of being terminated, re-issued the exit
+       syscall (this time 60), and died on the second attempt.
+       **That window is where one 7e control-transfer shape was
+       observed**, though the fix is a real bug regardless of
+       whether it is the sole cause.  Fixed by extending the asm
+       check to `cmp rbx, 60 / je .handle_exit / cmp rbx, 231 /
+       je .handle_exit`.
+
+   - **The `exit_group` fix verified at runtime on the real
+     project.**  Before: `pipe_wake_probe.sh` faults killed the
+     shell and the run stopped.  After: the same workload reaches
+     `loopdone` (all 4000 iterations) while surviving four `#PF`s
+     — the shell no longer dies from the `exit_group` window.
+
+   - **Two hypotheses falsified this session.**
+
+     - **elf.c NX-at-entry is not present in this build.**  A
+       temporary diagnostic printed `covered_by_PT_LOAD` for every
+       ELF loaded during a full boot: **`1` for every one**, and no
+       `*** PTE HAS NX BIT SET ***` fault fired anywhere.  The
+       split-then-write ordering in `vmm_map_page_in_cr3` (split
+       installs `pte_carry | PT_NX`; the caller's subsequent
+       `pt[pt_idx] = pte` overwrites the requested page with the
+       caller's flags, clearing NX) is correct for every page the
+       PT_LOAD loop maps.  No fix applied.
+
+     - **The `dump_user_stack_window` read is correct.**
+       `vmm_get_phys_from_cr3` returns
+       `pte_phys(pt[pt_idx]) | (virt & 0xFFFULL)` — full physical
+       address including the byte offset.  The window's read
+       `*(HHDM_START + slot_phys)` is therefore correct.  The
+       corrupted values it prints are real, not a reading
+       artifact.
+
+   - **Fork frame is correct at every fork.**  ~4800 forks across
+     multiple runs, zero mismatches in the invariant check
+     (`p_rip == child_rip`, `child_rsp == frame_base`,
+     `slot78 == p_rip`, `slot90 == p_rsp`, `slot98 == 0x2B`).  The
+     child's resume frame is not the bug; the corruption is
+     post-fork.
+
+   - **The remaining faults are user-space.**  Post-fix fault
+     windows (full raw frame dump and 81-slot stack window from
+     `rsp-0x40` to `rsp+0x200`): `Faulting RIP` = `0x1`, `0x9`, or
+     `0x8010000985` (mmap window); error code `0x15` (present +
+     user + instruction fetch) for the tiny-address shape, `0x4`
+     for the mmap-window shape.  The slot at `[rsp-0x8]` — what
+     the faulting `ret` popped — holds exactly the faulting `RIP`.
+     Surrounding slots hold legitimate busybox text addresses
+     (`0x41A03F`, `0x41B566`, `0x41BFDC`, `0x41C00E`, `0x41DCA6`)
+     interspersed with small ints (`0x24`, `0x1`, `0x2`) at a
+     regular stride.
+
+     **Two candidate mechanisms, both user-space (busybox or
+     musl), neither kernel-side:**
+
+     1. A stack-pointer imbalance in busybox — some function
+        returns with RSP off by 8 or 40 bytes, so the `ret` pops a
+        value that was never meant to be a return address.
+
+     2. A struct layout mismatch — a struct whose fields alternate
+        `{pointer, int, pointer, int, ...}` is read with the wrong
+        stride, so a `long`-sized read picks up an int field where
+        a pointer belongs.
+
+     The regular `text, smallint, text, smallint` pattern in the
+     window is consistent with either.  **Not resolvable from the
+     kernel side.**  Next-session work is busybox-side: disassemble
+     the busybox ELF around the text addresses in the fault windows
+     to identify the functions, and trace the stack shape at the
+     `ret`.
+
+   - **A separate fault is a user null deref, not 7e.**  One fault
+     at iteration ~251: `RIP = 0x419FD9` (a **valid** busybox text
+     address), `CR2 = 0x44`, error code `0x5` (present + user +
+     read).  The page-table walk resolved VA `0x44` to `pte = 0x3`
+     — present + write, **`PT_USER` clear** — i.e. a supervisor
+     identity-mapping page.  The user-mode read correctly faulted.
+     The kernel handling is right; the user program read
+     `*(ptr + 0x44)` with `ptr = 0`.  **Not a kernel bug, not
+     7e.**
+
+   - **What is *not* in the tree now.**  The instrumentation used
+     this session (widened `dump_user_stack_window` from
+     `rsp-0x40..rsp+0x40` to `rsp-0x40..rsp+0x200`; per-process
+     `dbg_entry_rsp/rip` and `dbg_sysret_rcx/r11` fields in
+     `pcb_t` with a snapshot at the top of `syscall_dispatch`;
+     `g_last_entry_rsp` and `g_last_entry_rip` globals written at
+     syscall entry; a `FORKFRAME` print at the end of
+     `process_fork_copy_frame`) was **not committed**.  It was
+     debug-only scratch, applied on top of the three fix commits,
+     used to gather data, then discarded.  A future session that
+     needs it can re-apply it from the description above.  The
+     fix commits are pure — each touches only the files its fix
+     requires.
+
+   - **Two mechanisms of the shared diagnostic that were caught
+     mid-session and corrected.**
+
+     - The `g_last_sysret_*`/`g_last_entry_*` globals are
+       **system-wide**, updated by every process's syscall.  In a
+       multiprocess workload, the fault handler reading them can
+       get another process's values.  The per-process `pcb_t`
+       fields were added specifically to bypass this — the
+       snapshot happens in `syscall_dispatch` for
+       `process_get_current()`.  Caveat: the exit-side snapshot is
+       **one syscall behind**, because the asm epilogue writes
+       `g_last_sysret_*` *after* `syscall_dispatch` returns.
+
+     - The asm's `cmp rbx, 60` check is load-bearing *only*
+       because `sys_exit` returns (its `noreturn` chain is not
+       honored through `syscall_dispatch`'s `return 0`).  This is
+       why the `exit_group` fix had to go in the asm, not in the C
+       dispatcher.
+
    The faulting `RIP`s, in order:
 
    | capture | vector | `RIP` | `CR2` | notes |
