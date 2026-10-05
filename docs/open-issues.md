@@ -453,6 +453,79 @@ that overwrites a child's file table leaks per fork."
    order.  A future `#PF` and a future `#GP` are comparable
    slot-for-slot.
 
+   **Session 55 narrowing (post-capture).**  The session-55 capture
+   gave eight `#PF`s with `g_last_sysret` live; the two addresses
+   that had only been guessed at were then named:
+
+   - **`0x43F89A` is in musl's `__post_Fork`, not busybox.**  The
+     `third_party/busybox/busybox_unstripped.map` lookup puts
+     `0x43F89A` 22 bytes into `__post_Fork` (`_Fork.o`) -- the
+     child-side of `fork`, immediately after it issues
+     `set_tid_address` (syscall 218) and reads `%fs:0x0`.  The
+     disassembly at `0x43F89A` is `movq $0x0, 0x98(%rdx)` (a
+     `struct pthread` field store through the TLS base), and the
+     next instruction is `mov %eax, 0x30(%rdx)` (the `set_tid_address`
+     return stored into the same struct).  The old "last sysret
+     rcx in busybox .text" reading was wrong about the file; it
+     is musl, not busybox.
+
+   - **`0x415516` is a musl pointer-walk loop**, not a path
+     handler: `mov (%rsi),%rsi ; inc %rsi ; jmp 0x40e960`.  `r9 =
+     0x2F2F2F2F2F2F2F2F` (eight `/` bytes) is not a literal in the
+     binary -- `grep -c '////////' busybox.elf` is 0 -- so it is
+     built at runtime, by `concat_path_file` or `simplify_path`.
+
+   - **The fault RIP is a small integer, and it matches a pid.**
+     `0x1` and `0x9` are the same values the kernel returns from
+     `sys_set_tid_address` and that `__post_Fork` stores into the
+     child's `struct pthread`.  That is the strongest hint: a
+     control transfer to a pid is consistent with a return address
+     overwritten by the `set_tid_address` result.
+
+   **Two mechanisms were proposed and falsified this session, both
+   by reading source and neither by a boot.**  Recording them so
+   the next session does not re-derive them:
+
+   - **`%rdx` clobbered across the syscall return.**  False.
+     `user_syscall_entry.asm` explicitly `push rdx` / `pop rdx`
+     around `syscall_dispatch`, on every path.  The comment above
+     the save block even names this exact scenario.
+
+   - **`g_syscall_stack_top` is a single global not updated on
+     context switch, so the child runs its first syscall on the
+     parent's kernel stack.**  False.  `grep -rn
+     'g_syscall_stack_top\|tss_set_syscall_stack' 04_kernel_64bit/`
+     shows the global is written on **four** scheduler/interrupt
+     paths -- `scheduler.c:224`, `scheduler.c:310`,
+     `scheduler.c:371`, `interrupts.c:424` -- plus `process.c:104`
+     for the idle process.  Every incoming process's
+     `kernel_stack_top` is in the global before it runs in ring 3.
+
+   **What remains, and the two instruments to settle it.**  The
+   child's fork-copy frame is the one piece of evidence not yet
+   seen.  `process_fork_copy_frame` matches `context_switch.asm`'s
+   `.pop_frame` slot-for-slot (both read the same 20 slots in the
+   same order), and `user_syscall_entry.asm` saves and restores
+   `%rdx` correctly; so if the frame on the child's kernel stack
+   differs from the frame `process_fork_copy_frame` built, the bug
+   is between those two points.  Either instrument below answers
+   it, and either is a `git checkout`'s distance from the current
+   tree:
+
+   - **A -- print the frame `process_fork_copy_frame` builds.**
+     One `serial_print` per slot for the 20 slots it writes, tagged
+     with the child's pid.  What the kernel *builds*.
+
+   - **B -- print the frame `context_switch.asm` reads.**  In
+     `.pop_frame`, once per switch, when the incoming frame's CS is
+     `0x33`: print the 20 slots, tagged with the incoming pid.
+     What the kernel *reads*.
+
+   If A and B agree, the frame is not the bug and the search moves
+   downstream of `iretq`.  If they disagree, the corruption is in
+   between, and the disagreement names the offset.
+
+
    **What is in the tree now (session 53).**  Two 7e captures
    exist, both from `test.sh` runs, both `#PF`, both error
    `0x15` (present + user + **instruction fetch**):
