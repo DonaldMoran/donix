@@ -1,3 +1,121 @@
+## Session 58 — the `fault_rip` walk, the ELF loader fix, and a diagnostic that perturbs the race
+
+Three code commits on `dev`, scratch-tagged
+`20261005-elf-pf-x-and-page0-guard`,
+`20261005-sys-mmap-exec-print`, and
+`20261005-pipe7e-stdio-probe`; a docs commit to follow.  **Not a
+milestone** -- a session that produced a walk correction, one
+real correctness fix, one diagnostic, one probe falsification,
+and a `#GP` capture that points at `setjmp`/`longjmp`.  No `v*`
+bump; the banner still reads `v0.6.12`.
+
+| Tag | What |
+|---|---|
+| `20261005-elf-pf-x-and-page0-guard` | the ELF loader honors `PF_X` per segment and refuses a `PT_LOAD` at page 0 |
+| `20261005-sys-mmap-exec-print` | a print in `sys_mmap`'s NX gate, in the branch that runs only for an executable mapping |
+| `20261005-pipe7e-stdio-probe` | `pipe7e_stdio.c` -- the `x=$(cmd)` shape with `FILE *` I/O and a fault reporter; passes 20000 iterations |
+
+### The `fault_rip` walk, and what it got wrong
+
+Added a PTE-for-`fault_rip` walk to `isr14_handler` next to the
+`CR2` walk.  It fired on real captures and produced a result that
+turned out to be a misreading.
+
+For an all-zero `fault_rip` (0x1, 0x9, 0x24), the walk's
+all-zero indices descend into the KERNEL's identity map.  Page 0
+there is a present, executable-for-the-kernel mapping with
+`PT_USER` clear.  The walk read that PTE and printed
+`NX clear -- page is EXECUTABLE`.  The user fetch faults on the
+privilege bit, not on present and not on NX.  **The "every 7e
+fault RIP is on an executable page" reading was a walk artifact
+and is retracted.**
+
+Fixed by a `PT_USER` check at each level of the walk.  Verified:
+`RIP = 0x1`/`0x9`/`0x24` now print
+`RIP PTE NOT USER -- page is supervisor-only`.
+
+For the mmap-window `fault_rip` (`0x8010000985`, `0x8010000833`)
+the walk shows all four levels present and `PT_USER`, NX clear --
+so that shape is real.  But the `sys_mmap` EXEC print did not
+fire, so `mmap(PROT_EXEC)` was never called and the executable
+mmap-window page is not from `sys_mmap`.
+
+### The strongest capture: a `#GP` in the shell at a stack address
+
+    Faulting RIP : 0x00000080000FB700   (a user stack address)
+    Stack (RSP)  : 0x00000080000FB760
+    Error Code   : 0
+    Current PID  : the busybox running the script
+
+Frame fingerprint live: `r8 = 0x415516`,
+`r9 = 0x2F2F2F2F2F2F2F2F`.  User stack window:
+
+    rsp-0x08 = 0x00000080000FB700   (the faulting RIP; what a ret popped)
+    rsp+0x00 = 0x000000000041BFDC   (redirectsafe+0x2f, return from call __setjmp)
+    rsp+0x08 = 0x000000010041B347   (a text address with a stray 0x1 in the high dword)
+
+A `ret` popped a STACK address and the CPU refused to execute it.
+`redirectsafe` does `__setjmp` before `redirect`; a `jmp_buf` on
+the stack holds a saved `rsp`/`rip`.  **This points at the
+`setjmp`/`longjmp` path, and it is the strongest lead the family
+has had.**
+
+### The `elf.c` fix, and the A/B that cleared it
+
+The ELF loader's `PT_LOAD` loop mapped every segment with
+`map_flags = 0x1FULL` -- no `PT_NX` -- so `.rodata`, `.data`, and
+`.bss` were all executable.  And it had no lower bound on
+`p_vaddr`, so a `PT_LOAD` at `vaddr 0` mapped page 0.  Both
+fixed: NX unless the segment says `PF_X`, and a `PT_LOAD` whose
+`start_page` is 0 is refused.
+
+Investigated as a 7e candidate; **not the cause.**  A/B test:
+the workload completes with the fix in and with it out.  The
+variable that tracks the outcome is a diagnostic, not this fix.
+Committed as a real correctness fix on its own terms.
+
+### A diagnostic that perturbs the race
+
+Four runs:
+
+| `elf.c` fix | `fault_rip` walk | outcome |
+|---|---|---|
+| in | in | `#GP` in shell at 352 |
+| out | in | `#GP` in shell at ~1170 |
+| out | out | completed |
+| in | out | completed |
+
+**Every run with the walk in failed; every run with it out
+completed.**  The walk reads memory and prints serial output
+inside `isr14_handler`, and serial I/O on the fault path is
+slow; the extra time widens a race's window.  The walk's
+presence is not what is wrong -- the race is -- but the walk
+makes it fatal.  This is a gotcha: a diagnostic on the fault
+path is part of the system.
+
+The walk is not in the tree.  It was added, corrected, and
+reverted for the A/B test.  A future session that wants it
+should re-add it gated to known-7e `fault_rip` values, or
+narrowed to one line.
+
+### Three probes passed, three mechanisms falsified
+
+`pipe7e_stdio` runs the `x=$(cmd)` shape with the loop's I/O
+through `FILE *` and a `SIGSEGV` reporter installed.  20000
+iterations, `PIPE7E-STDIO-ALL-PASS`.  Adding a `SIGCHLD` install
+(the way ash does; the handler never runs, item 12 is a stub)
+also passes.  So the syscall shape, the stdio `FILE *` path, and
+the `SIGCHLD` disposition are each insufficient to trigger the
+family in a first-party program.
+
+### What a next session should do
+
+The `setjmp`/`longjmp` lead is the target.  A probe that does
+`setjmp` before the fork and `longjmp` in the parent, in the
+`pipe7e_stdio` loop, would exercise the `jmp_buf` machinery in a
+first-party program -- and with the `sigsegv_probe` handler
+installed, a fault there prints the process's own state.
+
 ## Session 56-57 — the NX test, the signal instrument, and five falsifications
 
 Two code commits on `dev`, scratch-tagged

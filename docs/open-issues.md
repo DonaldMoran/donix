@@ -490,15 +490,85 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
    - The PTE-for-`CR2` print in `isr14_handler`, already in the
      tree.
 
-   **What a next session can do.**  Add the PTE-for-`fault_rip`
-   print to `isr14_handler` next to the existing `CR2` walk --
-   the walk code is there and takes the same arguments.  On the
-   next real 7e capture this shows whether the executing page is
-   NX or executable.  If executable, the question is what mapped
-   it executable and jumped into it; the `PROT_EXEC` argument in
-   a `sys_mmap` call is the place to look.  If NX, the mechanism
-   is different again and the two new first-party tests are the
-   instruments to use.
+   **Session 58 -- the `fault_rip` walk, and what it found.**
+
+   The PTE-for-`fault_rip` walk was added to `isr14_handler` next
+   to the `CR2` walk.  It fired on real captures, and it found
+   three things, one of which was a bug in the walk itself.
+
+   - **The walk misread supervisor pages.**  For an all-zero
+     `fault_rip` (0x1, 0x9, 0x24) the walk's all-zero indices
+     descend into the KERNEL's identity map, whose page 0 is a
+     present, executable-for-the-kernel mapping with `PT_USER`
+     clear.  The walk read that PTE and printed
+     `NX clear -- page is EXECUTABLE`, which is true of the
+     kernel's mapping and meaningless for the user fetch: the
+     user fetch faults on the PRIVILEGE bit, not on present and
+     not on NX.  **The earlier "every 7e fault RIP is on an
+     executable page" reading was a walk artifact and is
+     retracted.**  Fixed by a `PT_USER` check at each level:
+     `RIP = 0x1`/`0x9`/`0x24` now print
+     `RIP PTE NOT USER -- page is supervisor-only`.  Verified.
+
+   - **The mmap-window fault RIP IS on a user, executable page.**
+     `RIP = 0x8010000985` and `0x8010000833` walk all four levels
+     present and `PT_USER`, with NX clear.  So that shape is
+     real: the process is executing an executable page in the
+     mmap window.  **But `sys_mmap(PROT_EXEC)` is never called** --
+     a print in `sys_mmap`'s NX-gate `else` branch (the branch
+     that runs only for an executable mapping) did not fire in
+     any run.  So the executable page in the mmap window is NOT
+     from `sys_mmap`, and its executability is unexplained by the
+     current model.
+
+   - **The strongest capture is a `#GP` in the shell, at a stack
+     address.**  `RIP = 0x80000FB700`, error 0, `Current PID` the
+     busybox running the script, the session-55 fingerprint live
+     (`r8 = 0x415516`, `r9 = 0x2F2F2F2F2F2F2F2F`), and the user
+     stack window showing `rsp-0x08 = 0x80000FB700` (the faulting
+     RIP, what a `ret` popped) with `rsp+0x00 = 0x41BFDC`
+     (`redirectsafe+0x2f`, the return from `call __setjmp`).
+     **This points at the `setjmp`/`longjmp` path**: ash's
+     `redirectsafe` does `__setjmp` before `redirect`, a `jmp_buf`
+     on the stack holds a saved `rsp`/`rip`, and the shell jumped
+     to a stack address.  This is the strongest lead the family
+     has had, and it is the next session's target.
+
+   **`elf.c` is not the cause.**  The loader mapped every segment
+   executable (`map_flags = 0x1FULL`, no NX) and had no lower
+   bound on `p_vaddr`, so a `PT_LOAD` at page 0 mapped page 0.
+   Both were fixed (commit `1b14cc9`, tag
+   `20261005-elf-pf-x-and-page0-guard`) as correctness fixes on
+   their own terms.  An A/B test this session cleared them as the
+   7e cause: the workload completes with the fix in and with it
+   out.
+
+   **Three probes passed, so three more mechanisms are
+   falsified.**  `pipe7e_stdio` runs the `x=$(cmd)` shape with
+   the loop's I/O through `FILE *` (`fdopen`/`fread`/`fclose`,
+   `fprintf`/`fflush`) and a `SIGSEGV` reporter installed, and
+   passes 20000 iterations; adding a `SIGCHLD` install (the way
+   ash does) also passes.  So the syscall shape, the stdio
+   `FILE *` path, and the `SIGCHLD` disposition are each
+   insufficient to trigger the family in a first-party program.
+
+   **A gotcha the session produced: a diagnostic on the fault
+   path changes a racy fault's outcome.**  Four A/B runs:
+   with the `fault_rip` walk in the fault path, the workload
+   fails (a `#GP` in the shell, or an early stop); with it out,
+   the workload completes.  The walk reads memory and prints
+   serial output INSIDE `isr14_handler`, and serial I/O on the
+   fault path is slow; the extra time widens the race's window.
+   The walk's presence is not what is wrong -- the race is -- but
+   the walk makes it fatal.  A next session should gate the walk
+   to known-7e `fault_rip` values, or narrow it to one line, or
+   leave it out.
+
+   **The walk is not in the tree.**  It was added, corrected,
+   and then reverted for the A/B test; it is not committed.  A
+   future session that wants it can re-add it from this
+   description, gated.  The `PTE-for-CR2` walk is unchanged and
+   still in the tree.
 
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
