@@ -193,6 +193,31 @@ typedef struct pcb {
      * handler.
      */
     uint64_t signal_handler[64];
+
+    /*
+     * Re-entry guard for the minimal signal redirect (item 7e
+     * instrument).
+     *
+     * signal_maybe_redirect points the interrupt frame at a
+     * process's installed handler and returns 1 so the caller
+     * resumes into it.  Without this field, a handler that
+     * itself faulted re-entered itself forever: the handler
+     * stayed installed, so signal_maybe_redirect returned 1 on
+     * every subsequent fault, and the process looped on a
+     * faulting handler instruction instead of being killed.
+     *
+     * Set when the redirect fires; if it is already set, the
+     * redirect returns 0 and the caller kills the process the
+     * normal way -- which is what the comment above
+     * signal_maybe_redirect has always claimed happens.
+     *
+     * APPENDED AT THE END so no offset that context_switch.asm
+     * reads (which stops at block_kind, offset 0x158) moves.
+     * Same rule as the cwd, fault_signal, and signal_handler
+     * fields above.  Cleared by process_reclaim so a reused PCB
+     * slot starts clean.
+     */
+    int in_signal_handler;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

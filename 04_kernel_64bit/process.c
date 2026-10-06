@@ -852,6 +852,16 @@ void process_reclaim(pcb_t* pcb) {
      * parent with a signal-kill status it did not earn.
      */
     pcb->fault_signal = 0;
+    /*
+     * Clear the minimal-signal state too.  signal_handler[] and
+     * in_signal_handler are per-process; a reused PCB slot must
+     * not carry the previous process's handler, nor a stale
+     * in-handler flag.  Before this, signal_handler[] was never
+     * cleared -- process.h's comment claimed it was, and it was
+     * not.
+     */
+    for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
+    pcb->in_signal_handler = 0;
     process_count--;
 }
 
@@ -867,6 +877,8 @@ void process_destroy(pcb_t* pcb) {
     /* See the comment in process_reclaim: a reused slot must not
      * carry a stale fault vector. */
     pcb->fault_signal = 0;
+    for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
+    pcb->in_signal_handler = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) current_process = NULL;

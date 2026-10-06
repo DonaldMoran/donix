@@ -670,6 +670,18 @@ static int signal_maybe_redirect(exception_frame_t *frame, int sig) {
     if (!handler) return 0;
 
     /*
+     * Re-entry guard.  A handler that itself faults must be
+     * killed, not re-entered.  Without this, the redirect fired
+     * again on the handler's own fault -- the handler stayed
+     * installed -- and the process looped on the faulting
+     * instruction.  pipe7e_sjlj_stale demonstrated it: a
+     * corrupt %rsp of 0x30 made the handler's first push fault
+     * at 0x28, and the redirect re-entered the handler forever.
+     */
+    if (self->in_signal_handler) return 0;
+    self->in_signal_handler = 1;
+
+    /*
      * Give the handler a stack below the faulting RSP, 16-aligned.
      * It is the same user stack, already mapped.  One page of
      * headroom; if the faulting RSP is near the stack bottom this
