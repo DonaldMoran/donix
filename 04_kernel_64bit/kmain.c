@@ -1076,7 +1076,7 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.12\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.13\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
         vga_print("\ndonix v0.6.13 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
