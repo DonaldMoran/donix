@@ -357,8 +357,11 @@ value.
   `v0.6.6` and earlier.  Session 41 bisected a perceived slowdown
   in `musl_wait` and found the change was in the console (VGA text
   → framebuffer), not in `fork`; see `session-log.md`, session 41.
-- **ELF loader `PT_NX` follow-up.**  Mark data/BSS/stack
-  non-executable.
+- **Stack NX.**  The user stack is still mapped without `PT_NX`
+  (`process_create`'s `USER_STACK_PAGES` block and
+  `exec_alloc_user_stack`).  The ELF loader's per-segment `PF_X` and
+  the page-0 guard shipped in session 58 (`elf.c` sets `PT_NX` for a
+  non-`PF_X` segment); what remains is the stack.
 - **`sys_brk` heap base and the mmap window.**  Fixed addresses;
   latent collisions.
 - **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `sys_rt_sigaction` is

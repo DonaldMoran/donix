@@ -346,11 +346,12 @@ not reach into `userland/musl/`; the image Makefile invokes
 ## Where to look for more
 
 - [`handoff.md`](handoff.md) - **the current state of the project.**
-  Session log, canary state, open issues, current gotchas. Updated
-  every session; this is the file to read if you want to know what
-  is true right now.
+  Canary state, open issues, current gotchas, the next-session lead.
+  Rewritten every session; this is the file to read if you want to
+  know what is true right now.
 - [`ROADMAP.md`](ROADMAP.md) - what's next. Future work only;
-  completed milestones are in the handoff's session history.
+  completed milestones are in `docs/session-log.md` and the `v*`
+  tag annotations.
 - [`docs/`](docs/) - reference material:
   - `docs/strategy.md` - Phase A/B plan, rules, tagging convention,
     git hygiene.
