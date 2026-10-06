@@ -7017,6 +7017,27 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER;
         if (!(prot & PROT_EXEC)) {
             map_flags |= PT_NX;
+        } else {
+            /*
+             * Diagnostic for item 7e: a mapping made executable.
+             *
+             * The 7e fault RIPs are on pages whose PTE has NX clear
+             * -- executable -- so something is calling mmap with
+             * PROT_EXEC.  This prints the address and prot for every
+             * such mapping.  Zero cost on a healthy boot; fires only
+             * when an executable mapping is made.
+             *
+             * If this never fires and page 0 is still executable,
+             * the mapping came from a path that is not sys_mmap --
+             * the ELF loader, sys_brk, or a fixed kernel mapping.
+             */
+            serial_print("sys_mmap: EXEC mapping at v=0x");
+            serial_print_hex(v);
+            serial_print(" prot=0x");
+            serial_print_hex((uint64_t)prot);
+            serial_print(" pid=");
+            serial_print_dec(self->pid);
+            serial_print("\n");
         }
 
         if (vmm_map_page_in_cr3(self->cr3, v, phys, map_flags) != 0) {
