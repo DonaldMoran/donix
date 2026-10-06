@@ -1741,3 +1741,103 @@ derives from (the literal's actual length), whose wrongness was
 masked because the wrong value was *close enough* to produce
 plausible output.  In every case the fix is to check the source of
 truth — here, to not have a derived value at all.
+
+## A handler on the fault path with a corrupt rsp cannot run -- guard the redirect
+
+*Session 59 (`signal_maybe_redirect`), commit `20261006-sigredirect-reentry-guard`.
+A kernel defect the first-party reproduction surfaced.*
+
+`signal_maybe_redirect` repoints an exception frame at a
+process's installed signal handler and returns 1 so the caller
+resumes into it.  The handler does not return; it is expected to
+print and `exit_group`.  What the function did **not** have was a
+re-entry guard: it returned 1 whenever a handler was installed,
+including when the fault it was handling was **inside the
+handler**.
+
+`pipe7e_sjlj_stale` reproduced it.  A stale `jmp_buf` restored a
+corrupt `%rsp` (0x30), the redirected handler's own `push` faulted
+at `0x28`, and the redirect fired again -- **the handler stayed
+installed, so the process looped on the faulting instruction
+forever**, dozens of identical `#PF`s.  The function's own comment
+claimed the opposite ("a fault inside the handler is not caught
+-- it faults again and is killed the normal way"), but nothing
+ever returned 0 while a handler was installed.
+
+**The rule.**  A redirect that resumes a faulting process into a
+handler is not idempotent.  Guard it with a per-process flag
+(`in_signal_handler`), set it when the redirect fires, and clear
+it in the teardown.  Without the guard, a fault in the handler
+is not "killed the normal way" -- it is a live-lock, and the
+machine hangs on a single misbehaving process.
+
+The same read found a second defect: `signal_handler[]` was
+**never cleared on teardown**, despite `process.h`'s comment
+claiming it was, so a reused PCB slot inherited the previous
+process's handler.  Both are fixed in the same commit, cleared in
+**both** `process_reclaim` and `process_destroy`.
+
+**Where this shape recurs.**  Same family as "A diagnostic
+declared but never wired is not a diagnostic" (session 53) and
+"put cleanup in the teardown, not each entry point" (session 54):
+a state transition that looks like it handles the failure case
+but has no path *out* of the failure, and a per-process field
+that is set but never cleared.  In every case the fix is to read
+what the code actually does on the second entry, not what the
+comment says it does.
+
+## A Python edit with a count != 1 abort check catches an ambiguous anchor and writes nothing
+
+*Session 59.  A tooling gotcha, recorded because it saved a
+session's work.*
+
+Editing a large file by describing the change in prose -- "the
+block above", "after line N", "the anchor text" -- fails silently
+when the description does not match the file exactly.  Session 45
+cost four build cycles to that; the working-style rule "quote the
+bytes" is the standing fix.
+
+The tooling complement: a `python3` edit that **asserts the
+anchor matches exactly once** before writing, and aborts with
+`count != 1` if it does not, turns a silent mis-edit into a loud
+no-op.  In session 59 it caught a real ambiguity -- an anchor
+that appeared twice in the file -- and **wrote nothing**, leaving
+the tree clean.  A plain `str.replace` would have edited both
+sites, or the wrong one, and the mistake would have surfaced as a
+mystery in a later diff.
+
+**The rule.**  For an edit into a large file, do not use a
+find-and-replace that "probably" matches.  Assert
+`count == 1` (or a known N) first, and abort without writing on
+a mismatch.  The seconds it costs are cheaper than a session
+spent bisecting a wrong edit -- and the abort is *safe*, because
+it refuses rather than guesses.
+
+## Reading the disassembly found the mechanism a dozen trace-readings had missed
+
+*Session 59.  A method gotcha, and the session's headline.*
+
+Sessions 53 through 58 falsified a dozen candidate 7e mechanisms,
+each a plausible story read off a trace, each killed by reading
+the **source**.  Session 59's method was the counter-example that
+paid off: the mechanism was found by *reading the disassembly*,
+not by reasoning from a trace.
+
+`evaltree`'s missing `globals+0x38` restore is visible in six
+instructions of `objdump` output -- `mov 0x38(%rbx),%rdx` to save,
+`lea 0x38(%rsp),%rdi` to install, `call __setjmp`, and an epilogue
+(`add $0x100,%rsp; pop ...; ret`) that never writes the field
+back.  No trace shows that.  The captures' addresses resolved to
+symbols (`0x41BFDC` = `redirectsafe+0x2f`) by arithmetic against
+the map, and the map and the disassembly each confirmed the other.
+
+**The rule.**  A trace is a claim about *what happened*; the
+source is the fact about *what the code does*.  When a family
+resists trace-reading, read the function -- the greps cost
+seconds, the wrong readings cost sessions.  This is the standing
+lesson of the whole 7e chase, stated as a gotcha so the next
+session reaches for `objdump` earlier.
+
+**The tell.**  A dozen falsified mechanisms from traces, and no
+progress.  That is the signal to stop reading traces and start
+reading code.

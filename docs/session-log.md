@@ -1,4 +1,4 @@
-## Session 59 (in progress) — the `setjmp`/`longjmp` probes, and a `#PF` at `0x1`
+## Session 59 — the `setjmp`/`longjmp` probes, and the ash mechanism found and reproduced
 
 **Session open.**  Three code commits so far on `dev`, scratch-tagged
 `20261005-pipe7e-stdio-sjlj` and
@@ -342,61 +342,36 @@ normal return -- and `third_party/` is not editable.  **7e will
 still fire in ash**; when it does it now takes two faults and a
 kill instead of live-locking the machine.
 
-### Still to do this session (updated)
+### Closing the session
 
-- The `cr3` check is **done** and came back clean; see above.
-- Next kernel-side read, still owed: `sys_fork`'s return-value
-  path -- `_Fork` passes the raw fork syscall return through
-  `__post_Fork`, and a wrong value there could set ash's
-  exception state up wrong.  `__post_Fork`'s `set_tid_address`
-  write is to `fs_base + 0x30`; if `fs_base` were wrong on one
-  path, that write lands in the user stack.
-- Then, for candidate (b): ash's `exraise`/`raise_exception`
-  (`0x415521`) `jmp_buf` management -- which `longjmp` targets a
-  `jmp_buf` whose saved `rsp` is from a frame that has returned.
+**The mechanism is identified and reproduced.**  Session 59 found it
+by reading the disassembly, not by reasoning from a trace:
+`evaltree` stores a pointer to its own stack frame's `jmp_buf` into
+`globals+0x38` and does not restore it on the normal return;
+`raise_exception` `_longjmp`s to it with no liveness check.
+`pipe7e_sjlj_stale` reproduces the shape first-party, and phase 1
+faults.
 
-### The kernel side is unread this session -- and the next move
+**A real kernel defect surfaced and is fixed.**  `signal_maybe_redirect`
+had no re-entry guard, so a handler that faulted re-entered itself
+forever; `pipe7e_sjlj_stale` demonstrated the loop.  Fixed in
+`745616a` with `in_signal_handler` and clears in `process_reclaim`
+and `process_destroy`.  A second defect found in the same read:
+`signal_handler[]` was never cleared on teardown.
 
-**Every read above is userland-side.**  The trail leads there
-because the captures' addresses are musl/ash text and the stack
-windows are ash frames, and because session 57 already falsified
-the kernel-side candidates (the sysret target, the fork frame
-copy, the FS base).  But the kernel is the other half, and it has
-not been read this session.
+**The kernel-side checks are done and clean.**
+`dump_user_stack_window` reads through the faulting process's own
+`cr3`, before the kill -- the stack window is a real read, not
+session 58's artifact repeated.  `sys_fork`'s return-value and
+`fs_base` path is correct; the fork path is exhausted.
 
-**The next move is a kernel-side read, and it is a check on the
-reading itself, not a new theory.**  `isr14_handler`'s
-`dump_user_stack_window` reads the user stack **from the kernel**,
-through a `cr3`.  If it reads through the **wrong address space**
-(the parent's, or a stale one), the window it prints is not the
-faulting process's stack -- and the `0x1` at `rsp-0x08`, the
-whole reading, is an artifact.  **This is the same class of bug
-as session 58's `fault_rip` walk**, which descended through the
-kernel's identity map and printed a confident wrong verdict for a
-whole session.
+**7e stays open.**  The mechanism is ash's, and `third_party/` is
+not editable.  7e will still fire in ash; it now takes two faults
+and a kill instead of live-locking the machine.
 
-**So the order is: confirm the window was read through the
-faulting process's `cr3`, before designing anything on top of
-it.**  Only after that does the `setjmp`-return-value probe (or
-the `jmploc`-management read) make sense.
-
-Also owed, kernel-side, after the `cr3` check: whether the fork
-path writes a small value (a pid/tid, `0x1`) into the user stack
-at an offset that could land where a return address lives --
-`__post_Fork` writes `%eax` (the `set_tid_address` return) to
-`fs_base + 0x30`, and if `fs_base` were wrong on one path that
-write lands in the stack.
-
-### Still to do this session
-
-- The docs commit is held open until session close; this section
-  is appended to.
-- The walk-perturbation retraction is a **separate** matter and is
-  not in this section.
-- Next candidate: a `setjmp`-return-value probe (the `0x1` is a
-  plausible `longjmp` return landing where a return address is
-  expected), or `UNWIND_DEPTH` deeper, or the signal-handler
-  `longjmp` read.
+**The session-60 lead** is item 12, signal delivery -- the subsystem
+that would let ash catch the fault and continue, which is the only
+donix-side path to making 7e stop costing whole runs.
 
 ## Session 58 — the `fault_rip` walk, the ELF loader fix, and a diagnostic that perturbs the race
 
