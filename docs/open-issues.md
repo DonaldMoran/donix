@@ -11,15 +11,17 @@ numbers; the items below keep theirs.  References to "item 7" or
 "item 11" in older docs resolve to closed issues, which is
 correct.
 
-**Item 7e is a family, and its heap-corruption face is now
-fixed; its busybox control-transfer face remains a suspicion.**
-Session 54 wrote "closed as a BUSYBOX bug" and that overstated
-what the evidence supported.  What the evidence supports is:
+**Item 7e is a family.  Its heap-corruption face is fixed.  Its
+control-transfer face is a reproducible family that is NOT
+fork-specific, NOT NX-on-the-mmap-window, and NOT in the kernel's
+sysret path.  The mechanism is not identified.**  Session 54 wrote
+"closed as a BUSYBOX bug"; session 55 corrected that to "a
+suspicion"; session 57's work narrows it further and falsifies
+five candidate mechanisms.  What the evidence supports is:
 
-  - **The heap-corruption face is diagnosed and fixed.**  After
-    long debugging, the mechanism behind the `movq %rbx,
-    0x2c35(%rip)` displacement corruption (`CR2 =
-    0xFFFFFFFFE4A01F38`) is known: `sys_fork` overwrote the
+  - **The heap-corruption face is diagnosed and fixed.**  The
+    `movq %rbx, 0x2c35(%rip)` displacement corruption
+    (`CR2 = 0xFFFFFFFFE4A01F38`) was `sys_fork` overwriting the
     child's three console sentinels without freeing them, leaking
     0xF0 per fork until `kmalloc` returned a block overlapping a
     live allocation.  Fixed in session 55 by
@@ -27,64 +29,129 @@ what the evidence supported.  What the evidence supports is:
     (commit `2fc7fde`, scratch tag
     `20261005-fork-sentinel-leak`).
 
-  - **The busybox control-transfer face is a reproducible
-    family, not a suspicion.**  Eight captures with the
-    session-53 `g_last_sysret` diagnostic live confirm the
-    kernel returns correctly every time (`last sysret rcx` is
-    real ash text), and confirm the process then transfers
-    control to a data value or reads from a corrupted address.
-    The register fingerprint is stable across every capture.
-    What the project does **not** have is the mechanism: which
-    instruction in ash (or in a musl structure ash is reading)
-    fills those registers with those values, and where.
-    "Suspicion with no proof" understated it; the correct
-    statement is "a reproducible family with no identified
-    mechanism."
+  - **The control-transfer face is NOT fork-specific.**  A
+    `CONFIG_FEATURE_SH_NOFORK=y` run of the same workload
+    reproduces the family.  The "in fork-heavy workloads" framing
+    in this item's title is a description of where the family has
+    been *observed*, not a claim about the mechanism: on the
+    standard config every applet forks, so every fault is in a
+    forked child by construction.  The `NOFORK` run puts a small
+    fork in that: the family survives, at a lower count (4 faults
+    vs 7), with the same mmap-window-execution shape.  One boot
+    is not a rate measurement, but it is a clean falsification
+    of fork-specificity.
 
-  - **`pipe7e` is the first non-ash data point.**  A C program
-    doing the `x=$(cmd)` syscall shape -- pipe, fork, dup2 the
-    write end to stdout, execve a helper, read to EOF, wait4 --
-    with no shell in the loop.  Two runs of 50000 iterations
-    each on one boot, both `PIPE7E-ALL-PASS`.  A non-ash program
-    doing the same syscall shape did not transfer control to a
-    data value in 100000 iterations.  That is consistent with
-    the busybox control-transfer face being ash-specific; it
-    does not prove it.
+  - **The control-transfer face is NOT "NX is broken on the mmap
+    window."**  `sys_mmap`'s `PT_NX` gate is enforced end-to-end,
+    proven by a new first-party test `mmap_nx` (commit `6aae96c`,
+    scratch tag `20261005-mmap-nx-test`, staged as `/usr/bin/MMAP_NX`).
+    The test maps one page `PROT_READ|PROT_WRITE`, plants two nops
+    and a `ret`, and calls it.  The call faults with error `0x15`
+    (present + user + instruction fetch) and `isr14_handler`'s own
+    walk prints `*** PTE HAS NX BIT SET ***` for the faulting PTE.
+    Bit 63 is set.  A mapping made without `PROT_EXEC` cannot be
+    executed on this kernel.
 
-  - **The busybox control-transfer face now has eight captures
-    with the session-53 `g_last_sysret` diagnostic live, all
-    on one `pipe_wake_probe.sh` run past iteration 3269, all in
-    busybox ash's `seq` applet child.**  Eight `#PF`s, six
-    distinct (two exact repeats).  Three shapes: `RIP = CR2 =
-    0x1`/`0x9`, error `0x15` (instruction fetch at a tiny
-    address); `RIP = 0x8010000985` / `CR2 = 0x8083206710`,
-    error `0x4` (read in the mmap window, PDPTE not present);
-    and `RIP = 0x80000FB6B6` / `CR2 = 0x80000F`, error `0x5`
-    (read on the user stack, PDE is the bootloader's 2 MB
-    page).  Every capture carries the `*** corrupted control
-    target ***` line -- the wiring is live and firing.  Every
-    `last sysret rcx` is real ash text (`0x43A5D4`,
-    `0x43F89A`, `0x43B1B7`); the kernel stored them correctly.
-    The register fingerprint the longer entry records
-    (`r8 = 0x415516`, `r9 = 0x2F2F2F2F2F2F2F2F`) is present in
-    every tiny-address fault.  **The mechanism is not
-    identified.**  The face is a family with a stable
-    fingerprint, not a single bad jump.  See the longer entry
-    and `handoff.md` for the raw dumps.
+    **Consequence:** the 7e fault RIPs that land in the mmap
+    window (`0x8010000833`, `0x8010000822`, `0x8010000985` across
+    the captures) cannot be executing a page `sys_mmap` handed out
+    read-write.  They execute on pages mapped executable by some
+    path that does not go through `sys_mmap`'s `prot` check --
+    most likely a `sys_mmap` call whose `prot` argument carried
+    `PROT_EXEC` from corrupted state.  The next instrument is to
+    print the PTE for `fault_rip` in `isr14_handler`, in addition
+    to the PTE for `CR2` it already prints, so a real 7e capture
+    shows whether the executing page is executable and by what.
 
-  - **The captures are on the patched kernel.**  This run's
-    boot includes commit `2fc7fde`, so the eight faults are
-    **not** the fork-sentinel leak -- that face is fixed and
-    `pipe_wake_probe.sh` completes all 4000 iterations with
-    `loopdone`.  The faults are the busybox control-transfer
-    family, unchanged, now visible without the leak's heap
-    pressure on top of them.
+  - **The `last sysret` target is correct and unchanging.**  The
+    asm stores `rcx`/`r11` before `sysret` and nothing between the
+    store and the `sysret` touches either register.  Across the
+    session-57 captures the `last sysret rcx` values are musl text
+    addresses in syscall-issuing functions -- `__post_Fork`
+    (`0x43F89A`), `__stdio_write` (`0x43B447`), and one in the
+    `__lockfile`/`__unlock` neighborhood -- and in each case the
+    `sysret` returns to the correct place.  The fault is
+    *downstream* of a correct return.  The "sysret target
+    corrupted between the store and the sysret" hypothesis is
+    falsified.
 
-Item 7e **stays open**.  A future session that wants to close
-the control-transfer face further needs a first-party
-reproducer that fires, or a kernel-side trace of the transfer.
-The heap-corruption half is done; see `gotchas.md`, "A fork
-that overwrites a child's file table leaks per fork."
+  - **The control-transfer face is on a return from a musl
+    stdio / locking syscall.**  The `last sysret rcx` values name
+    the function the process was in when it last entered the
+    kernel, and they cluster on `__stdio_write` (the `writev`
+    syscall) and the `__lockfile`/`__unlock` lock protocol.  That
+    is consistent with the fault being on the path after an
+    ordinary stdio write returns, not on the fork path and not on
+    a signal-return path (there is no signal subsystem to return
+    from; item 12 is a stub).
+
+  - **`pipe7e` remains the first non-ash data point.**  A C
+    program doing the `x=$(cmd)` syscall shape -- pipe, fork,
+    dup2 the write end to stdout, execve a helper, read to EOF,
+    wait4 -- with no shell in the loop.  Two runs of 50000
+    iterations each on one boot, both `PIPE7E-ALL-PASS`.  A
+    non-ash program doing the same syscall shape did not transfer
+    control to a data value in 100000 iterations.  That is
+    consistent with the face being ash-specific *in its trigger*;
+    it does not prove it, and the `NOFORK` result says the trigger
+    is not the fork.
+
+  - **A first-party instrument now lets a process catch its own
+    fault and print its own state.**  `sigsegv_probe` (commit
+    tagged `20261005-sigsegv-redirect-instrument`, staged as
+    `/usr/bin/SIGSEGV_PROBE`) installs a `SIGSEGV` handler via a
+    minimal `sys_rt_sigaction`, faults, and the kernel redirects
+    into the handler, which prints `rsp`, `rbp`, and a stack
+    window, then exits.  Its window and the kernel's
+    `dump_user_stack_window` agree slot for slot -- two
+    independent reads of the same memory.  **This is the
+    instrument the 7e chase has been missing**: a first-party
+    reproducer can now print the faulting process's own view from
+    inside the fault, instead of the kernel reconstructing it.
+    NOT item 12: no masks, no `SA_*` flags, no `oldact`, no
+    queueing, no cross-process delivery, no restorer; the handler
+    does not return.
+
+  - **Five candidate mechanisms were falsified this session, all
+    by reading source.**  Recorded so the next session does not
+    re-derive them:
+
+    1. **Kernel FS base wrong on fork.**  `pcb_t` has a
+       per-process `fs_base`; the scheduler saves/restores it on
+       four paths (`scheduler.c:278-279`, `315-316`, `378-379`,
+       `interrupts.c:439-440`); `sys_fork` copies it
+       (`user_syscall.c:7526`); `arch_prctl` writes both the MSR
+       and the pcb.  Correct.
+    2. **TLS page collides with the user stack.**
+       `TP_ADJ(p) == p` on x86_64 (`pthread_impl.h:121`), so the
+       FS base points at the `struct pthread` itself, in `.bss`
+       or the mmap window -- never the stack.  `__post_Fork`'s
+       write to `fs_base + 0x30` lands in the `struct pthread`,
+       as intended.  Impossible.
+    3. **`__post_Fork` writes the pid to a wrong offset.**
+       Follows from (2): `0x30` is `tid`, the correct field.
+       Correct.
+    4. **`freejob` in `forkchild`'s `curjob` walk is a
+       use-after-free.**  `jobtab` is a static array; `freejob`
+       (`ash.c:4042`) frees only the job's *contents*
+       (`ps_cmd`, `ps` if not `&ps0`), clears `used`, and calls
+       `set_curjob(jp, CUR_DELETE)`, which unlinks but does not
+       free.  The loop `for (jp = curjob; jp; jp = jp->prev_job)
+       freejob(jp);` reads `prev_job` of a still-valid `jobtab`
+       slot.  Safe.
+    5. **`sysret` target corrupted between the store and the
+       `sysret`.**  Falsified above: the asm stores `rcx`/`r11`
+       and nothing touches them before `sysret`; the stored value
+       *is* the target.
+
+Item 7e **stays open**.  The heap-corruption half is done; the
+control-transfer half is a reproducible family on pages mapped
+executable by an unidentified path, with the last syscall before
+the fault in musl's stdio/lock machinery, and the sysret target
+correct.  The two instruments a next session can use are in the
+tree: the PTE-for-`fault_rip` print (not yet added), and the
+`sigsegv_probe` handler (added).  See `session-log.md`, session
+55-57, for the raw dumps and the falsification list.
 
 1. **The remaining FatFs-form conversions, now that the seam has
    landed.**  The pathname dispatch seam shipped in session 44
@@ -361,385 +428,77 @@ that overwrites a child's file table leaks per fork."
    `i=0; while [ $i -lt 50 ]; do x=$(seq 1 3); i=$((i+1)); done` —
    has not yet been run.
 
+7e. **An intermittent `#GP`/`#PF` control-flow family -- NOT
+   fork-specific, NOT NX, mechanism unidentified.**  See the
+   summary block at the top of this file for the session-57
+   findings; this longer entry records the history and the
+   falsification list.
 
-7e. **An intermittent `#GP`/`#PF` control-flow family in fork-heavy
-   workloads.**  Four captures in one session: three `#GP` and one
-   `#PF`, at three different faulting addresses, all in a busybox
-   `NOEXEC` applet's forked child.  None of them is the same fault
-   address twice; all of them are the CPU executing or reading at an
-   address that is not busybox text and is not a mapped data page.
+   **What the family is.**  The CPU executes or reads at an
+   address that is neither busybox text nor a mapped data page.
+   Across all captures the `last sysret rcx` is a real musl text
+   address, the sysret returns correctly, and the fault is
+   downstream.  Error codes: `0x15` (present + user + instruction
+   fetch) for tiny-address shapes; `0x4` or `0x5` for mmap-window
+   or stack shapes.  The register fingerprint
+   (`r8 = 0x415516`, `r9 = 0x2F2F2F2F2F2F2F2F`) is present in
+   every tiny-address fault.
 
-   **Session 55 status.**  This entry's original framing was
-   "a busybox bug" and that framing is corrected above: the
-   heap-corruption face of 7e is now diagnosed and fixed; this
-   longer entry records the busybox control-transfer face, which
-   remains a suspicion.  The table below is history, not a
-   live hunt.  `pipe7e` (commit `2fc7fde`, staged as
-   `/usr/bin/PIPE7E` with `/usr/bin/PIPE7E_HELPER`) is the first
-   non-ash data point on the control-transfer question; it
-   passes 100000 iterations across two runs on one boot.
+   **Where it appears.**  `test.sh` or `pipe_wake_probe.sh`, in a
+   busybox applet child (`seq`, `cut`, `base32`).  A clean
+   `canary --full` does not produce it.  It is intermittent and
+   layout-dependent, but the count and shape are stable enough
+   that two full captures are reproducible.
 
-   **Session 56 status.**  Three kernel fixes committed and
-   verified; the remaining 7e faults are localized to user space.
+   **Superseded history (kept because the falsifications point
+   here, not because a future session should re-read it).**
 
-   - **Three fixes landed on `dev` this session, all tagged
-     `20261005-*`.**  None of them is the busybox control-transfer
-     mechanism itself; each is a real bug found on the path to
-     looking for it, and each is committed on its own:
+   The following blocks recorded earlier sessions' hypotheses.
+   **All of them were superseded or falsified.**  They are kept
+   because the shape of what was tried is useful context, not
+   because any of them is a live lead.
 
-     - `20261005-isr14-phys-mask` (commit `72279b7`).
-       `isr14_handler`'s diagnostic print computed the physical
-       address as `(pte & ~0xFFFULL) | (fault_addr & 0xFFF)`,
-       which left the NX bit (bit 63) set and produced a
-       non-canonical "physical address" in the `PTE PRESENT, phys`
-       line.  Fixed by moving the existing `pte_phys` helper (which
-       masks `~0xFFF` *and* `~PT_NX`) from `vmm.c` into `vmm.h` as
-       `static inline` and using it here.  `interrupts.c` already
-       includes `vmm.h`.
+   - *Session 55's `__post_Fork` / `0x415516` narrowing.*
+     `0x43F89A` is `__post_Fork+0x27` in musl; `0x415516` is
+     `pstrcmp1`, a two-instruction `strcmp` wrapper.  The
+     session-55 reading was that the fault RIP's small integer
+     matched a pid stored by `__post_Fork`.  **Superseded**: the
+     session-57 captures show the `last sysret rcx` varies
+     (`__post_Fork`, `__stdio_write`, `__lockfile` neighborhood),
+     the sysret returns correctly in every case, and the
+     `fs_base + 0x30` write goes to `struct pthread` in `.bss` or
+     the mmap window -- not the stack.  The pid-in-a-return-slot
+     story is not the mechanism.
+   - *The two-instrument A/B for the fork frame.*  Proposed in
+     session 54, cleared in session 56: ~4800 forks, zero
+     invariant mismatches; `process_fork_copy_frame` matches
+     `context_switch.asm`'s restore path slot for slot.  The
+     child's frame is not the bug; the corruption is post-fork.
+   - *The four-capture table and the "Where to look next"
+     paragraph from sessions 53-55.*  Superseded by the
+     session-57 findings; the four captures are not reproducible
+     from what is on disk (capture files are truncated per run).
 
-     - `20261005-vector6-ud-handler` (commit `81db58c`).  Vector 6
-       (`#UD`) fell through to `isr_default_handler`, which printed
-       `*** UNHANDLED INTERRUPT: vector 6 ***` and halted — no
-       register dump, no user stack window.  Added `isr6_stub` in
-       `isr.asm` (mirrors `isr1_stub`, the other no-error-code user
-       exception: pushes a fake 0 so the frame layout matches
-       `isr13`/`isr14`), `isr6_handler` in `interrupts.c` (full
-       diagnostic — banner, PID/name, register dump, stack window),
-       and registered it in `idt.c`.
+   **What the tree has now.**  Two first-party tests and one
+   instrument:
 
-     - `20261005-exit-group-terminates` (commit `036ed4c`).
-       `user_syscall_entry.asm`'s post-`syscall_dispatch` check
-       tested `rbx == 60` (`SYS_EXIT`) only.  `SYS_EXIT_GROUP` is
-       231, and **musl routes both `exit()` and `_exit()` through
-       it** — a musl process wanting to die issues 231, not 60.  A
-       process calling `exit_group` was `sysret`'d back to user
-       mode instead of being terminated, re-issued the exit
-       syscall (this time 60), and died on the second attempt.
-       **That window is where one 7e control-transfer shape was
-       observed**, though the fix is a real bug regardless of
-       whether it is the sole cause.  Fixed by extending the asm
-       check to `cmp rbx, 60 / je .handle_exit / cmp rbx, 231 /
-       je .handle_exit`.
+   - `mmap_nx` (`/usr/bin/MMAP_NX`) -- proves `sys_mmap`'s
+     `PT_NX` gate is enforced.  See the summary block above.
+   - `sigsegv_probe` (`/usr/bin/SIGSEGV_PROBE`) -- lets a
+     first-party process catch its own fault and print its own
+     state.  See the summary block above.
+   - The PTE-for-`CR2` print in `isr14_handler`, already in the
+     tree.
 
-   - **The `exit_group` fix verified at runtime on the real
-     project.**  Before: `pipe_wake_probe.sh` faults killed the
-     shell and the run stopped.  After: the same workload reaches
-     `loopdone` (all 4000 iterations) while surviving four `#PF`s
-     — the shell no longer dies from the `exit_group` window.
-
-   - **Two hypotheses falsified this session.**
-
-     - **elf.c NX-at-entry is not present in this build.**  A
-       temporary diagnostic printed `covered_by_PT_LOAD` for every
-       ELF loaded during a full boot: **`1` for every one**, and no
-       `*** PTE HAS NX BIT SET ***` fault fired anywhere.  The
-       split-then-write ordering in `vmm_map_page_in_cr3` (split
-       installs `pte_carry | PT_NX`; the caller's subsequent
-       `pt[pt_idx] = pte` overwrites the requested page with the
-       caller's flags, clearing NX) is correct for every page the
-       PT_LOAD loop maps.  No fix applied.
-
-     - **The `dump_user_stack_window` read is correct.**
-       `vmm_get_phys_from_cr3` returns
-       `pte_phys(pt[pt_idx]) | (virt & 0xFFFULL)` — full physical
-       address including the byte offset.  The window's read
-       `*(HHDM_START + slot_phys)` is therefore correct.  The
-       corrupted values it prints are real, not a reading
-       artifact.
-
-   - **Fork frame is correct at every fork.**  ~4800 forks across
-     multiple runs, zero mismatches in the invariant check
-     (`p_rip == child_rip`, `child_rsp == frame_base`,
-     `slot78 == p_rip`, `slot90 == p_rsp`, `slot98 == 0x2B`).  The
-     child's resume frame is not the bug; the corruption is
-     post-fork.
-
-   - **The remaining faults are user-space.**  Post-fix fault
-     windows (full raw frame dump and 81-slot stack window from
-     `rsp-0x40` to `rsp+0x200`): `Faulting RIP` = `0x1`, `0x9`, or
-     `0x8010000985` (mmap window); error code `0x15` (present +
-     user + instruction fetch) for the tiny-address shape, `0x4`
-     for the mmap-window shape.  The slot at `[rsp-0x8]` — what
-     the faulting `ret` popped — holds exactly the faulting `RIP`.
-     Surrounding slots hold legitimate busybox text addresses
-     (`0x41A03F`, `0x41B566`, `0x41BFDC`, `0x41C00E`, `0x41DCA6`)
-     interspersed with small ints (`0x24`, `0x1`, `0x2`) at a
-     regular stride.
-
-     **Two candidate mechanisms, both user-space (busybox or
-     musl), neither kernel-side:**
-
-     1. A stack-pointer imbalance in busybox — some function
-        returns with RSP off by 8 or 40 bytes, so the `ret` pops a
-        value that was never meant to be a return address.
-
-     2. A struct layout mismatch — a struct whose fields alternate
-        `{pointer, int, pointer, int, ...}` is read with the wrong
-        stride, so a `long`-sized read picks up an int field where
-        a pointer belongs.
-
-     The regular `text, smallint, text, smallint` pattern in the
-     window is consistent with either.  **Not resolvable from the
-     kernel side.**  Next-session work is busybox-side: disassemble
-     the busybox ELF around the text addresses in the fault windows
-     to identify the functions, and trace the stack shape at the
-     `ret`.
-
-   - **A separate fault is a user null deref, not 7e.**  One fault
-     at iteration ~251: `RIP = 0x419FD9` (a **valid** busybox text
-     address), `CR2 = 0x44`, error code `0x5` (present + user +
-     read).  The page-table walk resolved VA `0x44` to `pte = 0x3`
-     — present + write, **`PT_USER` clear** — i.e. a supervisor
-     identity-mapping page.  The user-mode read correctly faulted.
-     The kernel handling is right; the user program read
-     `*(ptr + 0x44)` with `ptr = 0`.  **Not a kernel bug, not
-     7e.**
-
-   - **What is *not* in the tree now.**  The instrumentation used
-     this session (widened `dump_user_stack_window` from
-     `rsp-0x40..rsp+0x40` to `rsp-0x40..rsp+0x200`; per-process
-     `dbg_entry_rsp/rip` and `dbg_sysret_rcx/r11` fields in
-     `pcb_t` with a snapshot at the top of `syscall_dispatch`;
-     `g_last_entry_rsp` and `g_last_entry_rip` globals written at
-     syscall entry; a `FORKFRAME` print at the end of
-     `process_fork_copy_frame`) was **not committed**.  It was
-     debug-only scratch, applied on top of the three fix commits,
-     used to gather data, then discarded.  A future session that
-     needs it can re-apply it from the description above.  The
-     fix commits are pure — each touches only the files its fix
-     requires.
-
-   - **Two mechanisms of the shared diagnostic that were caught
-     mid-session and corrected.**
-
-     - The `g_last_sysret_*`/`g_last_entry_*` globals are
-       **system-wide**, updated by every process's syscall.  In a
-       multiprocess workload, the fault handler reading them can
-       get another process's values.  The per-process `pcb_t`
-       fields were added specifically to bypass this — the
-       snapshot happens in `syscall_dispatch` for
-       `process_get_current()`.  Caveat: the exit-side snapshot is
-       **one syscall behind**, because the asm epilogue writes
-       `g_last_sysret_*` *after* `syscall_dispatch` returns.
-
-     - The asm's `cmp rbx, 60` check is load-bearing *only*
-       because `sys_exit` returns (its `noreturn` chain is not
-       honored through `syscall_dispatch`'s `return 0`).  This is
-       why the `exit_group` fix had to go in the asm, not in the C
-       dispatcher.
-
-   The faulting `RIP`s, in order:
-
-   | capture | vector | `RIP` | `CR2` | notes |
-   |---|---|---|---|---|
-   | 1 | `#PF` | `0x0000008010000985` | `0x0000008083206710` | before the frame dump existed |
-   | 2 | `#GP` | `0x00000080000FB700` | — | `r12 = r13 = 0x80100009B0` |
-   | 3 | `#GP` | `0x0400000000000000` | — | `r14/r13/r12 = 1/2/3` |
-   | 4 | `#PF` | `0x0000000000000000` | `0x0000000000000000` | after the `#PF` frame dump landed |
-
-   **The fingerprint.**  One capture on disk holds these two values
-   in these two registers:
-
-       r8 = 0x0000000000415516            (a busybox text address)
-       r9 = 0x2F2F2F2F2F2F2F2F            (eight '/' bytes)
-
-   `0x2F2F2F2F2F2F2F2F` is the ASCII `/` character repeated eight
-   times.  `r8` holds a legitimate text address.  In the raw frame
-   dump they sit at **slot 7 (`r8`) and slot 6 (`r9`)**.  That
-   mapping was checked in session 52 against `PUSH_ALL_GPRS` in
-   `04_kernel_64bit/isr.asm` (which pushes `r15` first, `rax`
-   last, so the dump prints in reverse push order) and against the
-   `offset 0x28: r10` comment in `04_kernel_64bit/interrupts.c`
-   (slot 5 = `r10`).  It is not an inference.  A specific code
-   path loads those two values into `r8` and `r9` and then
-   transfers control to something derived from them; the faulting
-   `RIP`s are downstream of the same corruption, not separate
-   bugs.
-
-   The entry above describes four captures.  **Only one 7e capture
-   is in the tree today** -- `capture.txt`, the `#PF` at
-   `CR2 = RIP = 0x1`, error `0x15`, which is a shape the table
-   above does not list.  The four-capture table is not reproducible
-   from what is on disk; the earlier captures were almost certainly
-   overwritten (capture files are truncated per run, per
-   `handoff.md`).  Treat the table as history, not as evidence a
-   future session can re-read.
-
-   **Where it appears.**  Every capture was taken while running
-   `test.sh` or `pipe_wake_probe.sh`, in a `NOEXEC` busybox applet
-   (`seq`, `cut`, `base32`), in the applet's forked child.  A clean
-   `canary --full` run does not produce it; a 200-iteration
-   `pipe_wake_probe.sh` run does not reliably produce it; a
-   `test.sh` run produces it within the first dozen rows on most
-   boots.  It is intermittent and layout-dependent, the same way
-   7a and 7b are, but it has now produced four captures with a
-   shared register fingerprint, so it is narrower than 7a or 7b.
-
-   **Not 7d.**  The `WW:` wake trace is clean in all four captures;
-   the wait/pipe wake path is not implicated.  The fault is in user
-   code, after a fork, and the shell does exactly what the 7d fix
-   makes it do (wakes, reaps, continues).  The two families are
-   separate.
-
-   **Not the fork brk eager-copy fix.**  That fix closed a real
-   coverage gap -- `sys_brk` could grow `brk_virt` past the 1 MB
-   window the copy walked -- and the family still reproduces after
-   it.  The brk fix is correct on its own; it is not the cause of
-   7e and not the cure.
-
-   **Where to look next.**  Start from the two fingerprint values,
-   not from the fault addresses.  `0x415516` is a busybox text
-   address; a `call` return address lands there.  `0x2F2F2F2F2F2F2F2F`
-   is a buffer of `/`s; busybox path handling (`concat_path_file`,
-   `bb_ask_noecho`, `xchdir`'s parents) builds such buffers.  The
-   likely shape is a structure or a buffer whose field should hold a
-   function pointer or a return address and instead holds a pointer
-   into a `/`-filled buffer, in a code path that only runs when the
-   applet is forked (a `NOEXEC` child, not an `exec`'d fresh binary).
-
-   **Instrument in place.**  `isr14_handler` now prints the same
-   48-slot raw frame dump as `isr13_handler`, in `PUSH_ALL_GPRS`
-   order.  A future `#PF` and a future `#GP` are comparable
-   slot-for-slot.
-
-   **Session 55 narrowing (post-capture).**  The session-55 capture
-   gave eight `#PF`s with `g_last_sysret` live; the two addresses
-   that had only been guessed at were then named:
-
-   - **`0x43F89A` is in musl's `__post_Fork`, not busybox.**  The
-     `third_party/busybox/busybox_unstripped.map` lookup puts
-     `0x43F89A` 22 bytes into `__post_Fork` (`_Fork.o`) -- the
-     child-side of `fork`, immediately after it issues
-     `set_tid_address` (syscall 218) and reads `%fs:0x0`.  The
-     disassembly at `0x43F89A` is `movq $0x0, 0x98(%rdx)` (a
-     `struct pthread` field store through the TLS base), and the
-     next instruction is `mov %eax, 0x30(%rdx)` (the `set_tid_address`
-     return stored into the same struct).  The old "last sysret
-     rcx in busybox .text" reading was wrong about the file; it
-     is musl, not busybox.
-
-   - **`0x415516` is a musl pointer-walk loop**, not a path
-     handler: `mov (%rsi),%rsi ; inc %rsi ; jmp 0x40e960`.  `r9 =
-     0x2F2F2F2F2F2F2F2F` (eight `/` bytes) is not a literal in the
-     binary -- `grep -c '////////' busybox.elf` is 0 -- so it is
-     built at runtime, by `concat_path_file` or `simplify_path`.
-
-   - **The fault RIP is a small integer, and it matches a pid.**
-     `0x1` and `0x9` are the same values the kernel returns from
-     `sys_set_tid_address` and that `__post_Fork` stores into the
-     child's `struct pthread`.  That is the strongest hint: a
-     control transfer to a pid is consistent with a return address
-     overwritten by the `set_tid_address` result.
-
-   **Two mechanisms were proposed and falsified this session, both
-   by reading source and neither by a boot.**  Recording them so
-   the next session does not re-derive them:
-
-   - **`%rdx` clobbered across the syscall return.**  False.
-     `user_syscall_entry.asm` explicitly `push rdx` / `pop rdx`
-     around `syscall_dispatch`, on every path.  The comment above
-     the save block even names this exact scenario.
-
-   - **`g_syscall_stack_top` is a single global not updated on
-     context switch, so the child runs its first syscall on the
-     parent's kernel stack.**  False.  `grep -rn
-     'g_syscall_stack_top\|tss_set_syscall_stack' 04_kernel_64bit/`
-     shows the global is written on **four** scheduler/interrupt
-     paths -- `scheduler.c:224`, `scheduler.c:310`,
-     `scheduler.c:371`, `interrupts.c:424` -- plus `process.c:104`
-     for the idle process.  Every incoming process's
-     `kernel_stack_top` is in the global before it runs in ring 3.
-
-   **What remains, and the two instruments to settle it.**  The
-   child's fork-copy frame is the one piece of evidence not yet
-   seen.  `process_fork_copy_frame` matches `context_switch.asm`'s
-   `.pop_frame` slot-for-slot (both read the same 20 slots in the
-   same order), and `user_syscall_entry.asm` saves and restores
-   `%rdx` correctly; so if the frame on the child's kernel stack
-   differs from the frame `process_fork_copy_frame` built, the bug
-   is between those two points.  Either instrument below answers
-   it, and either is a `git checkout`'s distance from the current
-   tree:
-
-   - **A -- print the frame `process_fork_copy_frame` builds.**
-     One `serial_print` per slot for the 20 slots it writes, tagged
-     with the child's pid.  What the kernel *builds*.
-
-   - **B -- print the frame `context_switch.asm` reads.**  In
-     `.pop_frame`, once per switch, when the incoming frame's CS is
-     `0x33`: print the 20 slots, tagged with the incoming pid.
-     What the kernel *reads*.
-
-   If A and B agree, the frame is not the bug and the search moves
-   downstream of `iretq`.  If they disagree, the corruption is in
-   between, and the disagreement names the offset.
-
-
-   **What is in the tree now (session 53).**  Two 7e captures
-   exist, both from `test.sh` runs, both `#PF`, both error
-   `0x15` (present + user + **instruction fetch**):
-
-   | capture | `CR2` | `RIP` | fingerprint present? |
-   |---|---|---|---|
-   | a | `0x1` | `0x1` | yes (`r8`/`r9` at slots 7/6) |
-   | b | `0x9` | `0x9` | yes (`r8`/`r9` at slots 7/6) |
-
-   Capture (b) fired on a **passing** run -- `test.sh` reached
-   `57 passed, 0 failed`, and the `#PF` landed between the
-   `strings` row and the `tree` row.  The process was killed by
-   `isr14_handler`'s `if (error_code & 4) fault_kill_current(0x0E)`
-   path, which is why the harness continued.
-
-   `PFcapture.txt` is **item 7a** (`CR2 = RIP = 0x400000`, error
-   `0x14`, in `musl_sh`'s ELF load), not 7e; it must not be
-   reached for as a 7e capture.
-
-   **Both dumps are instruction-fetch faults at tiny addresses**
-   (`0x1`, `0x9`).  That is the exact signature the
-   `g_last_sysret_rcx` comment in
-   `04_kernel_64bit/user_syscall_entry.asm` names: *"a fault
-   landing at RIP < 0x1000 in user mode, which is the signature
-   of a corrupted sysret target."*
-
-   **The instrument for that signature exists and was never
-   wired.**  `user_syscall_entry.asm` declares
-   `g_last_sysret_rcx`, `g_last_sysret_r11`, and
-   `g_last_sysret_rsp` (lines 31-36).  Nothing wrote them and
-   nothing read them: the diagnostic was designed, declared, and
-   left unconnected.  **Commit `96153e6` wires it** -- the asm
-   stores `rcx`/`r11` before `sysret`, and `isr13_handler` /
-   `isr14_handler` print them when `frame->rip < 0x1000`.
-
-   On the next 7e fault: if `g_last_sysret_rcx` reads `1`/`9`,
-   the `sysret` target was already corrupt and the bug is in the
-   frame the exit path reads.  If it reads a sane busybox text
-   address, the `sysret` theory is dead and the corruption is
-   post-resume.
-
-   **The fork path is cleared.**  Session 53 read and verified:
-
-   - `sys_fork`'s `EAGER_COPY_REGION(user_stack_virt,
-     user_stack_top)` -- walks all 16 stack pages including the
-     one containing `user_stack_top` (`0x80000FFFE0` sits
-     inside `0x80000FF000..0x80000FFFFF`);
-   - `process_fork_copy_frame`'s 20-slot frame layout against
-     `context_switch.asm`'s restore path and `PUSH_ALL_GPRS`'s
-     slot order -- they match slot-for-slot;
-   - `exec_alloc_user_stack`'s `user_stack_top` computation --
-     `(0x8000100000 - 32) & ~0xF`, inside the last page.
-
-   None of these is the bug.  Do not re-read them.
-
-   **Possibly related, not yet joined:** item 11 -- the
-   `pipe_wake_probe.sh` zombie leak.  It shares the workload and
-   the fork-heavy shape.  Do not fold them until the
-   `g_last_sysret` diagnostic says whether the child resumed
-   with a corrupt `RIP`.
-
-   **Unobserved, not fixed.**  Two dumps with a shared
-   fingerprint and a matching fault signature is a narrowing,
-   not a fix.  The next real move is a boot that catches 7e
-   with the `g_last_sysret` wiring in place.
+   **What a next session can do.**  Add the PTE-for-`fault_rip`
+   print to `isr14_handler` next to the existing `CR2` walk --
+   the walk code is there and takes the same arguments.  On the
+   next real 7e capture this shows whether the executing page is
+   NX or executable.  If executable, the question is what mapped
+   it executable and jumped into it; the `PROT_EXEC` argument in
+   a `sys_mmap` call is the place to look.  If NX, the mechanism
+   is different again and the two new first-party tests are the
+   instruments to use.
 
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
@@ -886,13 +645,24 @@ this entry before touching either).
     `Segmentation fault` and can tell a crash from a clean exit
     -- but the signal is not delivered to the process itself.
 
+    **Session 57 added a minimal instrument, NOT this subsystem.**
+    A first-party process can now install a `SIGSEGV` handler,
+    fault, and run it (see the summary block at the top of this
+    file).  The handler does not return; there is no
+    `rt_sigreturn`, no masks, no `SA_*` flags, no `oldact`, no
+    queued signals, no cross-process delivery.  Item 12 remains
+    open and remains the largest item on the list.  What the
+    instrument gives is a way for a first-party reproducer to see
+    its own state at a fault, which is what 7e has needed.
+
     **Fixing this means implementing signal delivery:** a real
     `sys_rt_sigaction`, per-process signal handlers, a raise on
-    the fault path that runs the handler if installed, and a
-    `SIGPIPE` raise on the `-EPIPE` write path.  That is a
-    subsystem, not a small change.  Same subsystem a Wayland
-    `wl_shm` client needs for `SIGBUS` on buffer overrun -- see
-    `ROADMAP.md`.  Doing it once serves both.
+    the fault path that runs the handler if installed, an
+    `rt_sigreturn` that restores the frame after the handler
+    returns, and a `SIGPIPE` raise on the `-EPIPE` write path.
+    That is a subsystem, not a small change.  Same subsystem a
+    Wayland `wl_shm` client needs for `SIGBUS` on buffer
+    overrun -- see `ROADMAP.md`.  Doing it once serves both.
 
 13. **`CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's job-control
     code is gated behind `CONFIG_ASH_JOB_CONTROL`, which this
@@ -1020,13 +790,27 @@ small syscall from `g_ticks`, like `clock_gettime`.
   rows, asserts known values where there is one, and prints
   `[N] run  <name>` before every row so a hang names its own row.
   Run it with `sh /root/scripts/test.sh`.  It is **not** a canary
-  row: it takes minutes, it fails `sha512sum` deterministically
-  (item 7c), and it can hang on the lost wakeup (item 7d).  Run it
-  by hand when changing the applet config or the pipe/wait paths,
-  and expect either a hang or a `FAIL sha512sum` on every run until
-  those two items are fixed.  The harness found both of them, so
-  neither a hang nor the `sha512sum` failure is a sign the harness
-  is broken.
+  row: it takes minutes and it can hang on the lost wakeup (item
+  7d).  Run it by hand when changing the applet config or the
+  pipe/wait paths.  The harness found both the `sha512sum`
+  expected-value bug (item 7c, retracted) and the lost-wakeup hang
+  (item 7d), so neither is a sign the harness is broken.
+
+- **`mmap_nx` (session 57).**  Maps one page
+  `PROT_READ|PROT_WRITE`, plants a `ret`, and calls it.  On this
+  kernel the call faults with error `0x15` and the kernel prints
+  `*** PTE HAS NX BIT SET ***`.  Run it when changing `sys_mmap`,
+  the `PROT_*` handling, `vmm_map_page_in_cr3`'s leaf-PTE
+  construction, or the huge-page split path.  Staged as
+  `/usr/bin/MMAP_NX`.
+
+- **`sigsegv_probe` (session 57).**  Installs a `SIGSEGV` handler
+  via a minimal `sys_rt_sigaction`, dereferences NULL, and the
+  kernel redirects into the handler, which prints `rsp`, `rbp`,
+  and a stack window, then exits.  The handler does **not** return
+  -- there is no `rt_sigreturn`.  Run it when changing
+  `sys_rt_sigaction`, `isr13_handler`, `isr14_handler`, or
+  `signal_maybe_redirect`.  Staged as `/usr/bin/SIGSEGV_PROBE`.
 
 - **`at_step1` sections, as of session 41.**  Sections 1–7 exercise
   `resolve_at` via dirfd, `fstatat` flags, and `AT_EMPTY_PATH`.

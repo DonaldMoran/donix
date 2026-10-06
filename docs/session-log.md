@@ -1,3 +1,112 @@
+## Session 56-57 — the NX test, the signal instrument, and five falsifications
+
+Two code commits on `dev`, scratch-tagged
+`20261005-mmap-nx-test` and
+`20261005-sigsegv-redirect-instrument`; one docs commit to
+follow.  **Not a milestone** -- a correctness session that
+produced a positive result (NX works), five falsifications, and
+one working debug instrument.  No `v*` bump; the banner still
+reads `v0.6.12`.
+
+| Tag | What |
+|---|---|
+| `20261005-mmap-nx-test` | `userland/musl/tests/mmap_nx.c` -- a first-party proof that `sys_mmap`'s `PT_NX` gate reaches the leaf PTE |
+| `20261005-sigsegv-redirect-instrument` | `signal_handler[64]` on `pcb_t`, a real `sys_rt_sigaction`, `signal_maybe_redirect` in `interrupts.c`, and `sigsegv_probe.c` -- a process can catch its own fault and print its own state |
+
+### The `NOFORK` experiment
+
+A throwaway run with `CONFIG_FEATURE_SH_NOFORK=y`, reverted
+without a commit, tested whether item 7e's control-transfer face
+is fork-specific.  It is not: the family reproduces with `NOFORK`
+on, at a lower count (4 faults vs 7), with the same
+mmap-window-execution shape.  One boot is not a rate measurement,
+but it is a clean falsification of the "in fork-heavy workloads"
+framing -- which was a description of where the family was
+observed, not a claim about its mechanism, because on the
+standard config every applet forks.
+
+### `mmap_nx`: NX is enforced end-to-end
+
+`sys_mmap` sets `PT_NX` when `PROT_EXEC` is absent (a session-54
+fix).  `mmap_nx` proves it reaches the leaf PTE: the test maps
+one page `PROT_READ|PROT_WRITE`, plants two nops and a `ret`, and
+calls it.  The call faults with error `0x15` (present + user +
+instruction fetch) and `isr14_handler`'s walk prints
+`*** PTE HAS NX BIT SET ***` for the PTE
+(`0x8000000007E47067`).  **Consequence for 7e:** the fault RIPs
+in the mmap window execute on pages mapped executable by some
+path that does not go through `sys_mmap`'s `prot` check -- most
+likely a `sys_mmap` call whose `prot` carried `PROT_EXEC` from
+corrupted state.
+
+### `sigsegv_probe`: a process can catch its own fault
+
+A minimal `sys_rt_sigaction` stores a handler in `pcb_t`.
+`signal_maybe_redirect`, called from `isr13_handler` and
+`isr14_handler` before `fault_kill_current`, rewrites the
+interrupt frame's `RIP` and `RSP` so the stub's
+`POP_ALL_GPRS`/`iretq` resumes at the handler.  The handler runs
+on the faulting stack; its own `rsp`/`rbp` reads are the faulting
+frame's, and its stack window matches the kernel's
+`dump_user_stack_window` for the same fault **slot for slot** --
+two independent reads of the same memory.  The handler does not
+return; it prints and calls `exit_group`.  **NOT item 12:** no
+`rt_sigreturn`, no masks, no `SA_*` flags, no `oldact`, no
+queueing, no cross-process delivery.
+
+Two bugs found and fixed while building it, both of which
+produced a patch that looked right:
+
+- `exception_frame_t`'s named fields (`error_code`, `rip`,
+  `cs`, ...) describe the CPU-pushed frame.  The pointer an
+  exception handler receives is the base of the GPR block, which
+  sits `EXC_OFF_ERROR_CODE` (15) slots below the CPU frame.
+  Reading `frame->cs` reads a GPR slot, not the CS, so the ring
+  check `(cs & 3) == 3` always failed and the redirect silently
+  never fired.  Fix: use `raw[EXC_OFF_*]`, as the existing
+  handlers already do.
+- The first version moved the handler's stack a page below the
+  fault, so the window it printed read fresh zeros.  Fix: leave
+  the handler on the faulting stack.
+
+### Five falsifications
+
+Each was proposed from a fault window or a trace, each died
+against source.  Recorded so a future session does not
+re-derive them:
+
+1. **Kernel FS base wrong on fork.**  Correct: `pcb_t.fs_base`,
+   saved/restored on four scheduler/interrupt paths, copied by
+   `sys_fork`, written by `arch_prctl`.
+2. **TLS page collides with the user stack.**  Impossible:
+   `TP_ADJ(p) == p` on x86_64, so the FS base points at the
+   `struct pthread` in `.bss` or the mmap window.
+3. **`__post_Fork` writes the pid to a wrong offset.**  Correct:
+   `0x30` is `struct pthread->tid`.
+4. **`freejob` in `forkchild`'s `curjob` walk is a
+   use-after-free.**  Safe: `jobtab` is static, `freejob` frees
+   only contents, `set_curjob` unlinks but does not free.
+5. **`sysret` target corrupted between the store and the
+   `sysret`.**  Falsified: the asm stores `rcx`/`r11` and
+   nothing touches them before `sysret`; the stored value *is*
+   the target.
+
+The `last sysret rcx` values across the session-57 captures are
+musl text addresses in syscall-issuing functions
+(`__post_Fork`, `__stdio_write`, the `__lockfile`/`__unlock`
+neighborhood), and in every case the `sysret` returns correctly.
+The fault is downstream of a correct return, on a return from an
+ordinary stdio/locking syscall.
+
+### The carry-back
+
+The instrument was built and verified in a scratch tree
+(`/home/noneya/code/testme`), then carried to the real tree as a
+patch: `git apply --check` before `git apply`, `git diff --stat`
+before commit, and the tree was rebuilt and both tests rerun
+here.  Same result.  One change per commit, one scratch tag per
+commit.
+
 ## Session 55 — the fork-path sentinel leak, and item 7e's heap-corruption face closed
 
 One code commit on `dev`, scratch-tagged
