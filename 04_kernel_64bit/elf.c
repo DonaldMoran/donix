@@ -99,6 +99,29 @@ uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data) {
         uint64_t start_page = vaddr & ~0xFFFULL;
         uint64_t end_page   = (vaddr + memsz + 0xFFF) & ~0xFFFULL;
 
+        /*
+         * A PT_LOAD that names page 0 is not a legitimate user
+         * mapping in this kernel: the ELF image loads at 0x400000,
+         * the stack at 0x8000000000, the heap at 0x8000200000, and
+         * the mmap window at 0x8010000000.  Page 0 is never any of
+         * them.
+         *
+         * Mapping it is what turns a stray control transfer to a
+         * small integer (0x1, 0x9, 0x24) into a silent fetch-and-run
+         * of page 0's zeros instead of an immediate #PF.  That is
+         * the item-7e "RIP = CR2 = 0x1, error 0x15, PTE NX clear"
+         * shape: the CPU fetches 0x1, page 0 is present and
+         * executable, so the fetch succeeds.  Skip the segment.
+         *
+         * The print is deliberately not silent: if a binary in the
+         * tree really has a PT_LOAD at vaddr 0, that is itself a
+         * finding, and a healthy boot should never print this.
+         */
+        if (start_page == 0) {
+            serial_print("ELF: refusing PT_LOAD at vaddr=0 (item 7e guard)\n");
+            continue;
+        }
+
         for (uint64_t virt = start_page; virt < end_page; virt += 4096) {
             uint64_t phys = pmm_alloc_page(PAGE_USER_DATA);
             if (!phys) {
@@ -106,7 +129,31 @@ uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data) {
                 return 0;
             }
 
-            uint64_t map_flags = 0x1FULL;
+            /*
+             * Honor the segment's execute permission.
+             *
+             * Before this, map_flags was a bare 0x1F with no NX bit,
+             * so EVERY PT_LOAD segment was mapped executable --
+             * .rodata, .data, and .bss included.  A stray control
+             * transfer into any of them then ran instead of
+             * faulting, which is the "RIP in the mmap window / in
+             * data, NX clear" shape item 7e records.
+             *
+             * Now: NX unless the segment says PF_X.  This matches
+             * what sys_mmap does for its own mappings, and it means
+             * a jump into non-code lands on a non-executable page
+             * and faults at its own RIP instead of running whatever
+             * bytes are there.
+             *
+             * The 0x18 bits are PT_PWT | PT_PCD (cache-disable for
+             * this mapping); they were in the original 0x1F and are
+             * kept unchanged.
+             */
+            uint64_t map_flags = PT_PRESENT | PT_WRITE | PT_USER | 0x18ULL;
+            if (!(phdr[i].p_flags & PF_X)) {
+                map_flags |= PT_NX;
+            }
+
             if (vmm_map_page_in_cr3(pcb->cr3, virt, phys, map_flags) != 0) {
                 /*
                  * A page-table allocation failed while mapping this
