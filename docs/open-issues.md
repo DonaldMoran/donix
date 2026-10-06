@@ -531,8 +531,14 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
      **This points at the `setjmp`/`longjmp` path**: ash's
      `redirectsafe` does `__setjmp` before `redirect`, a `jmp_buf`
      on the stack holds a saved `rsp`/`rip`, and the shell jumped
-     to a stack address.  This is the strongest lead the family
-     has had, and it is the next session's target.
+     to a stack address.  This was the strongest lead the family
+     had.  **Session 59 tested it with two first-party probes and
+     both passed** -- see the session-59 block below -- so the
+     lead is narrowed, not closed: the `setjmp`/`longjmp`
+     *instruction path* and the heap-`jmp_buf` + nested-`longjmp`
+     *structure* at depth 2 are each insufficient.  Still untested:
+     `UNWIND_DEPTH` deeper than 2, a `longjmp` out of a signal
+     handler, and multiple/nested `jmp_buf`s.
 
    **`elf.c` is not the cause.**  The loader mapped every segment
    executable (`map_flags = 0x1FULL`, no NX) and had no lower
@@ -569,6 +575,199 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
    future session that wants it can re-add it from this
    description, gated.  The `PTE-for-CR2` walk is unchanged and
    still in the tree.
+
+   **Session 59 -- the `setjmp`/`longjmp` probes, and a `#PF` at
+   `0x1`.**
+
+   Two first-party probes tested the session-58 lead, both built
+   on `pipe7e_stdio` and both committed.  **Both passed 20000
+   iterations, so both falsify a mechanism:**
+
+   - `pipe7e_stdio_sjlj` (tag `20261005-pipe7e-stdio-sjlj`) --
+     `setjmp` once per iteration before the fork, `longjmp` every
+     iteration, on the hot path.  `PIPE7E-STDIO-SJLJ-ALL-PASS`.
+     **The `setjmp`/`longjmp` instruction path is falsified as a
+     7e trigger in a first-party program.**
+   - `pipe7e_stdio_heapjmp` (tag `20261005-pipe7e-stdio-heapjmp`)
+     -- `jmp_buf` in a `malloc`'d struct (ash's `struct jmploc`
+     shape), `setjmp` in a nested function, `longjmp` from a
+     deeper callee unwinding `UNWIND_DEPTH` (2) frames.
+     `PIPE7E-STDIO-HEAPJMP-ALL-PASS`.  **The heap-`jmp_buf` +
+     nested-`longjmp` structure at depth 2 is falsified.**
+
+   **Still NOT tested:** `UNWIND_DEPTH` deeper than 2; a
+   `longjmp` taken out of a signal handler (the probe's handler
+   `exit_group`s -- there is no `rt_sigreturn`, item 12); and
+   multiple/nested `jmp_buf`s.  Named so a future session does
+   not re-run these two.
+
+   **A `pipe_wake_probe.sh` run reproduced the family twice and
+   completed.**  A separate run (`canary --full`, then the
+   4000-iteration `pipe_wake_probe.sh`) hit the family twice and
+   finished with `loopdone`.  Two `Segmentation fault` lines,
+   each after a `#PF` block, and the run continued past both.
+
+   The two `#PF` blocks are **byte-identical to each other**:
+
+       CR2 (Bad Address) : 0x0000000000000001
+       Faulting RIP      : 0x0000000000000001
+       Raw Error Code    : 0x0000000000000015   (present+user+fetch)
+       RSP               : 0x00000080000FB6F8
+       last sysret rcx   : 0x000000000043F89A   (a real musl text address)
+       CR3               : 0x0000000000334000
+       pte               : 0x0000000000000003
+       *** corrupted control target ***
+
+   The user stack window shows **`0x1` at `rsp-0x08`** -- where a
+   `ret`'s popped value sits -- with a text address (`0x43F901`)
+   at `rsp-0x18`.  The session-55 fingerprint is present
+   (`raw[6] = 0x2F2F2F2F2F2F2F2F`, `raw[7] = 0x415516`).
+
+   Three things are new: the **corruption value is `0x1`**, the
+   smallest and cleanest the family has produced, sitting where
+   a return address should be -- and `1` is exactly what
+   `setjmp`/`longjmp` returns on the `longjmp` path.  The **two
+   blocks are identical** (same CR2/RIP/error/RSP/CR3/PTE, same
+   48-slot frame, same stack window), so the shape reproduces
+   deterministically in one boot.  And **the run completed**
+   (`loopdone`), so the family is real and absorbed, not fatal.
+
+   **What this says about the lead.**  The family fired twice in
+   the shell-driven `x=$(cmd)` shape with real `seq` children
+   and ash's own I/O and exception machinery.  Both first-party
+   probes passed 20000 iterations clean.  The difference is not
+   the `setjmp` shape, which both probes exercised; it is
+   **ash's real code**.  That makes further first-party
+   `setjmp` reimplementations less likely to reproduce it, and
+   the `setjmp`-return-value probe (the `0x1` is a plausible
+   `longjmp` return landing where a return address is expected)
+   the closer next step.
+
+   The capture is preserved outside the tree at
+   `../capture.pipe_wake_probe.2x-pf-0x1.txt` (sha512
+   `03e13e61...e5a275`).
+
+   **Session 59 also read the capture's addresses in the busybox
+   binary** (read-only; nothing written under `third_party/`).
+   Five facts, all from source:
+
+   - **`r8 = 0x415516` is `pstrcmp+0x8`** -- a function pointer,
+     a context marker, not a corrupt datum.  The 'fingerprint' is
+     ash's own code pointer; the same code runs every time.
+   - **`last sysret rcx = 0x43F89A` is `__post_Fork+0x27`**, the
+     `set_tid_address` syscall site (`eax = 0xDA`), not the fork
+     syscall.  The fork syscall is in `_Fork` at `0x43F91F`.
+   - **`0x43F901` is the return address of `call __unlock`** in
+     `__post_Fork`'s tail -- a legitimate musl return address.
+   - **`0x41BFDC` is `redirectsafe+0x2f`, the return from `call
+     __setjmp`** -- confirmed to the byte
+     (`0x41BFAD + 0x2F = 0x41BFDC`).  The `jmp_buf` is at
+     `redirectsafe`'s `rsp+0x28`.
+   - **`__setjmp`/`_longjmp` are the standard musl x86_64 pair
+     and are correct.**  `__setjmp` saves the caller's `rsp` at
+     `buf+0x30` and the return address at `buf+0x38`; `_longjmp`
+     restores `%rsp` from `buf+0x30` and `jmp *buf+0x38`.  **The
+     `0x1` is `_longjmp(buf, 1)`'s return value** (`xor`/`cmp`/
+     `adc` yields 1), and both `_longjmp` sites in `redirectsafe`
+     and `evaltree` pass `1`.  Not corruption.
+
+   **Eliminated:** `setjmp`/`longjmp` are not the bug.  On an
+   intact `jmp_buf` a `longjmp` lands exactly at the `setjmp`
+   call site with the caller's `rsp`.
+
+   **Left, both narrow and neither proven:** (a) the `jmp_buf`
+   was corrupted before `_longjmp` ran -- `_longjmp` reads
+   `buf+0x30`/`buf+0x38` straight from memory, and ash's `jmp_buf`
+   lives in a heap `struct jmploc`; or (b) the `jmp_buf` is
+   intact but stale -- an outer handler's whose saved `rsp` is
+   from a frame that has since returned.
+
+   **The next move is a kernel-side read, and it is a check on
+   the reading itself, not a new theory.**  Every read above is
+   userland-side; the kernel has not been read this session.
+   `isr14_handler`'s `dump_user_stack_window` reads the user stack
+   from the kernel through a `cr3`.  If it reads through the
+   **wrong address space** (the parent's, or a stale one), the
+   printed window is not the faulting process's stack and the
+   `0x1` at `rsp-0x08` is an artifact -- **the same class of bug
+   as session 58's `fault_rip` walk**, which read the wrong thing
+   and printed a confident wrong verdict for a whole session.
+   Confirm the window was read through the faulting process's
+   `cr3` before designing anything on top of it.
+
+   **That check was done, and it came back clean.**
+   `interrupts.c`'s `dump_user_stack_window` walks
+   `vmm_get_phys_from_cr3(self->cr3, slot_va)` -- the faulting
+   process's own `cr3` from the PCB, not the current `cr3` and
+   not the kernel's -- and reads through the HHDM direct map.
+   It runs **before** `fault_kill_current`, so the address space
+   is live.  The `(fault_cs & 3) == 3` gate excludes kernel-mode
+   faults, and a user-mode fault is running the process whose
+   `cr3` is loaded.  **The stack window is a real read.**  The
+   `0x1` at `rsp-0x08` is not an artifact -- this is not session
+   58's `fault_rip`-walk mistake one layer down.
+
+   **Consequence for the two candidates:** neither is eliminated,
+   but the read strengthens **(b) stale `jmp_buf`** over (a)
+   corrupted `jmp_buf`.  The `0x1` is `_longjmp(buf, 1)`'s return
+   value, and it sits where a `ret` popped it, among small
+   locals (`0x9`, `0x60`) rather than at a call boundary -- the
+   shape of a `longjmp` that restored a `%rsp` from a frame that
+   has since returned.  **(b) is the primary candidate.**  The
+   next kernel-side read is `sys_fork`'s return-value path; the
+   next userland read is ash's `exraise`/`raise_exception`
+   `jmp_buf` management.
+
+   **The `sys_fork` return-value / `fs_base` read was done, and
+   it is clean.**  The child resumes with `%rax = 0`
+   (`process_fork_copy_frame` sets `f[0x70/8] = 0`, 'rax: fork()
+   returns 0 in the child'); the parent gets
+   `return (long)child->pid`.  `child->fs_base = parent->fs_base`
+   is copied **before** `scheduler_ready_queue_add(child)`, so
+   the child cannot run with a stale FS base; `sys_arch_prctl`
+   writes both the MSR and the PCB.  Nothing on this path writes
+   a small value into the user stack.  **The fork path is
+   exhausted.**
+
+   **So candidate (b) stale `jmp_buf` is the only live
+   mechanism.**  The next read is ash's `jmp_buf` management --
+   `exraise`, `raise_exception` (`0x415521`), and the stack of
+   `struct jmploc`s: whether a `longjmp` can target an outer
+   handler's `jmp_buf` whose saved `rsp` is from a frame that has
+   gone away.
+
+   **Session 59 found the mechanism, by reading, and reproduced
+   it.**  `evaltree` stores a pointer to its **own stack frame's
+   `jmp_buf`** into `globals+0x38` (`0x41C403`) and restores it
+   **only on the `longjmp`-return path**, not on the normal
+   return.  Neither `evaltree`'s epilogue, `popstackmark`
+   (`0x415A86`), `dotrap` (`0x41C782`), nor `int_on` (`0x41561F`)
+   writes `globals+0x38` -- all four read.  `raise_exception`
+   (`0x415521`) then `_longjmp`s to that global with no liveness
+   check, and `_longjmp` restores a stale `%rsp` from the
+   returned frame.
+
+   **First-party reproduction:** `pipe7e_sjlj_stale` (commit
+   `745616a`, staged as `/usr/bin/PIPE7E_SJLJ_STALE`) mirrors the
+   shape -- inner `setjmp` into a stack-local buffer, `&that`
+   stored globally, return without restore, then `longjmp` to the
+   global.  **Phase 1 faulted** on this layout.  Fault #1:
+   `RIP = 0x80000FBDBF` (a user stack address), `RSP = 0x34`,
+   error `0x5`.  Fault #2: the handler on the garbage stack,
+   `RIP = 0x400640`, `CR2 = 0x28`, error `0x7`.
+
+   **A real kernel defect surfaced:** `signal_maybe_redirect`
+   had no re-entry guard, so a handler that faults **looped**
+   (dozens of identical `#PF`s).  Fixed in the same commit with
+   `in_signal_handler` and clears in `process_reclaim` /
+   `process_destroy`.  Also found: `signal_handler[]` was never
+   cleared on teardown despite the comment.
+
+   **What is closed and what is not.**  The **loop** is closed.
+   The **mechanism** is ash's -- no restore of `globals+0x38`
+   on `evaltree`'s normal return -- and `third_party/` is not
+   editable.  **7e stays open**: it will still fire in ash, now
+   taking two faults and a kill instead of live-locking.
 
 8. **Symlinks: recorded design, not scheduled — and now
    buildable.**  FAT16 has no native symlink storage, and donix is
