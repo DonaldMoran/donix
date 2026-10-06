@@ -175,6 +175,24 @@ typedef struct pcb {
      * carry a stale fault from the previous process.
      */
     int fault_signal;
+
+    /*
+     * Minimal signal delivery — debug instrument for item 7e.
+     *
+     * NOT the signal subsystem (open-issues item 12).  Stores one
+     * handler per signal so a first-party test can catch its own
+     * SIGSEGV, print state from inside the faulting process, and
+     * exit.  The handler does not return: it prints and calls
+     * exit_group.  No restorer, no masks, no SA_* flags, no
+     * queueing, no cross-process delivery, no default-action table.
+     *
+     * APPENDED AT THE END so no offset that context_switch.asm
+     * reads (which stops at block_kind, offset 0x158) moves.  Same
+     * rule as the cwd and fault_signal fields above.  Cleared by
+     * process_reclaim so a reused PCB slot does not carry a stale
+     * handler.
+     */
+    uint64_t signal_handler[64];
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

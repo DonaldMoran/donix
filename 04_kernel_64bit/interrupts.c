@@ -629,6 +629,71 @@ void isr8_handler(exception_frame_t *frame) {
     while (1) __asm__ volatile("hlt");
 }
 
+/*
+ * signal_maybe_redirect — debug instrument for item 7e.
+ *
+ * If the faulting process has a handler installed for `sig`, point
+ * the interrupt frame at it and return 1.  The caller returns
+ * without killing; the stub's POP_ALL_GPRS / iretq resumes at the
+ * handler.
+ *
+ * Returns 0 if no handler is installed; the caller kills the
+ * process the normal way.
+ *
+ * The handler does NOT return.  It is expected to print and then
+ * exit_group.  There is no rt_sigreturn and no saved frame: the
+ * redirect runs the handler once, on the fault path, and the
+ * process dies from inside it.
+ *
+ * NOT the signal subsystem.  No masks, no queueing, no
+ * cross-process delivery, and a fault inside the handler is not
+ * caught — it faults again and is killed the normal way.
+ */
+static int signal_maybe_redirect(exception_frame_t *frame, int sig) {
+    /*
+     * The frame the exception stub passes is the base of the GPR
+     * block, NOT the CPU frame.  exception_frame_t's named fields
+     * (error_code, rip, cs, ...) describe the CPU-pushed part,
+     * which sits EXC_OFF_ERROR_CODE slots ABOVE this pointer.
+     * Reading frame->cs here reads a GPR slot, not the CS.  Use
+     * raw[EXC_OFF_*] exactly as isr13_handler / isr14_handler do.
+     */
+    uint64_t *raw = (uint64_t *)frame;
+
+    if ((raw[EXC_OFF_CS] & 3) != 3) return 0;
+
+    extern pcb_t* process_get_current(void);
+    pcb_t *self = process_get_current();
+    if (!self) return 0;
+
+    uint64_t handler = self->signal_handler[sig];
+    if (!handler) return 0;
+
+    /*
+     * Give the handler a stack below the faulting RSP, 16-aligned.
+     * It is the same user stack, already mapped.  One page of
+     * headroom; if the faulting RSP is near the stack bottom this
+     * walks into an unmapped page and the handler faults again --
+     * which kills the process the normal way, not a hang.
+     */
+    /* Leave the handler on the SAME stack as the fault, so its
+     * own rsp/rbp reads are the faulting frame's rsp/rbp and
+     * the window it prints is the frame that faulted.  A
+     * one-shot reporter can clobber the live frame: nothing
+     * after it needs those values. */
+    uint64_t new_rsp = raw[EXC_OFF_RSP] & ~0xFULL;
+
+    /* Point the interrupt frame at the handler.  raw[EXC_OFF_RIP]
+     * and raw[EXC_OFF_RSP] are what POP_ALL_GPRS / iretq resume
+     * from.  The handler does not need the signal number, so no
+     * GPR slot is set. */
+    (void)sig;
+    raw[EXC_OFF_RIP] = handler;
+    raw[EXC_OFF_RSP] = new_rsp;
+
+    return 1;
+}
+
 void isr13_handler(exception_frame_t *frame) {
     if (g_expect_fault == 0x0D) fault_kill_current(0x0D);
 
@@ -729,6 +794,7 @@ void isr13_handler(exception_frame_t *frame) {
     }
 
     if ((fault_cs & 3) == 3) {
+        if (signal_maybe_redirect(frame, 4)) return;    /* SIGILL */
         fault_kill_current(0x0D);
     }
     while (1) __asm__ volatile("hlt");
@@ -952,6 +1018,7 @@ void isr14_handler(exception_frame_t *frame) {
      * earlier in the function and never reaches this point.
      */
     if (error_code & 4) {
+        if (signal_maybe_redirect(frame, 11)) return;   /* SIGSEGV */
         fault_kill_current(0x0E);
     }
 

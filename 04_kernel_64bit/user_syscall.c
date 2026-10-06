@@ -7157,7 +7157,36 @@ long sys_mprotect(void* addr, size_t len, int prot) {
  */
 long sys_rt_sigaction(int signum, const void* act, void* oldact,
                       size_t sigsetsize) {
-    (void)signum; (void)act; (void)oldact; (void)sigsetsize;
+    (void)sigsetsize;
+
+    /*
+     * Minimal rt_sigaction — debug instrument for item 7e.
+     * See the pcb_t comment in process.h.
+     *
+     * `act` points at a struct the TEST defines, not at musl's
+     * struct sigaction.  Layout, x86_64, 8-byte aligned:
+     *
+     *     [0]  uint64_t handler
+     *     [8]  uint64_t flags       (ignored)
+     *
+     * A handler of 0 (SIG_DFL) or 1 (SIG_IGN) is stored as 0 and
+     * means "no handler" to the fault path.  `oldact` is ignored.
+     *
+     * For the real subsystem (masks, SA_* flags, oldact, queued
+     * signals) see open-issues item 12.  This is not it.
+     */
+    if (signum < 0 || signum >= 64) return -(long)EINVAL_;
+    pcb_t *self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    if (!act) return 0;
+
+    const uint64_t *a = (const uint64_t *)act;
+    uint64_t handler = a[0];
+    if (handler == 1) handler = 0;   /* SIG_IGN -> no handler */
+
+    self->signal_handler[signum] = handler;
+    (void)oldact;
     return 0;
 }
 
