@@ -52,3 +52,10 @@ boot*.txt
 # FatFs workaround backup (from the f_unlink debugging)
 04_kernel_64bit/fatfs/ff.cold
 third_party/
+.fat_config_single
+.fat_config_dual
+
+# Test scratch and FAT_CONFIG stamp files.
+.backup-*
+run.bak.*
+.fat_config_*

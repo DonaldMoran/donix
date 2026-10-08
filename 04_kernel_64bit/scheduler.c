@@ -2,6 +2,7 @@
 #include "include/serial.h"
 #include "include/vga.h"
 #include "include/user_msr.h"
+#include "include/trace.h"
 
 #define KERNEL_BASE 0xFFFFFFFF80000000ULL
 
@@ -164,6 +165,7 @@ void __attribute__((noreturn)) process_exit(void) {
     {
         pcb_t* head = scheduler_ready_queue_peek_next();
         serial_lock();
+        #if TRACE_EXIT
         serial_print("EXIT: pid=");
         serial_print_dec(exiting->pid);
         serial_print(" state=");
@@ -174,6 +176,7 @@ void __attribute__((noreturn)) process_exit(void) {
         if (head) serial_print_dec(head->pid);
         else serial_print("(empty)");
         serial_print("\n");
+        #endif
         serial_unlock();
     }
 
@@ -260,11 +263,13 @@ void __attribute__((noreturn)) process_exit(void) {
          */
         if (idle) {
             serial_lock();
+            #if TRACE_EXIT
             serial_print("EXIT-FALLBACK: switching to idle, exiting pid=");
             serial_print_dec(exiting->pid);
             serial_print(" name=");
             serial_print(exiting->name);
             serial_print("\n");
+            #endif
             serial_unlock();
 
             current_process = idle;

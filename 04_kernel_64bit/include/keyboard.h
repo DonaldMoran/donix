@@ -25,4 +25,11 @@ void keyboard_buffer_flush(void);
 
 char scancode_to_ascii(uint8_t sc, int shift, int caps, int ctrl);
 
+
+/* Multiplexed input: PS/2 ring first, then UART RX.
+ * Every shell and syscall input read should use this.  The
+ * non-muxed kbd_buffer_get is retained for IRQ-context code
+ * that must not touch the UART. */
+int  kbd_buffer_get_mux(char *c);
+
 #endif

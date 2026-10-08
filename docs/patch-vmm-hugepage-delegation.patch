@@ -1,0 +1,289 @@
+diff --git a/04_kernel_64bit/vmm.c b/04_kernel_64bit/vmm.c
+index a42db8d..9c44370 100755
+--- a/04_kernel_64bit/vmm.c
++++ b/04_kernel_64bit/vmm.c
+@@ -140,129 +140,97 @@ void vmm_init(BootInfo* info) {
+ }
+ 
+ int vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
+-    phys &= ~0xFFFULL;
+-
+-    uint64_t user_flag    = (flags & PT_USER) ? PT_USER : 0;
+-    uint64_t write_flag   = (flags & PT_WRITE) ? PT_WRITE : 0;
+-    uint64_t present_flag = PT_PRESENT;
+-    uint64_t nx_flag      = (flags & PT_NX) ? PT_NX : 0;
+-    uint64_t cache_flags  = flags & (PAGE_PCD | PAGE_PWT);
+-
+-    uint64_t* pml4 = get_pml4_virt();
+-
+-    uint32_t pml4_idx = (virt >> 39) & 0x1FF;
+-    uint32_t pdpt_idx = (virt >> 30) & 0x1FF;
+-    uint32_t pd_idx   = (virt >> 21) & 0x1FF;
+-    uint32_t pt_idx   = (virt >> 12) & 0x1FF;
+-
+-    uint64_t dir_flags = PT_PRESENT | PT_WRITE | PT_USER | cache_flags;
+-
+-    uint64_t* pdpt;
+-    if (!(pml4[pml4_idx] & PT_PRESENT)) {
+-        uint64_t new_pdpt_phys = pmm_alloc_page_for_tables();
+-        if (!new_pdpt_phys) return -1;
+-        memset(phys_to_virt(new_pdpt_phys), 0, PAGE_SIZE);
+-        pml4[pml4_idx] = new_pdpt_phys | dir_flags;
+-        pdpt = phys_to_virt(new_pdpt_phys);
+-    } else {
+-        pml4[pml4_idx] |= (PT_WRITE | PT_USER);
+-        pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
+-    }
+-
+-    uint64_t* pd;
+-    if (!(pdpt[pdpt_idx] & PT_PRESENT)) {
+-        uint64_t new_pd_phys = pmm_alloc_page_for_tables();
+-        if (!new_pd_phys) return -1;
+-        memset(phys_to_virt(new_pd_phys), 0, PAGE_SIZE);
+-        pdpt[pdpt_idx] = new_pd_phys | dir_flags;
+-        pd = phys_to_virt(new_pd_phys);
+-    } else {
+-        pdpt[pdpt_idx] |= (PT_WRITE | PT_USER);
+-        pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+-    }
+-
+-    uint64_t* pt;
+-    if (!(pd[pd_idx] & PT_PRESENT)) {
+-        uint64_t new_pt_phys = pmm_alloc_page_for_tables();
+-        if (!new_pt_phys) return -1;
+-        memset(phys_to_virt(new_pt_phys), 0, PAGE_SIZE);
+-        pd[pd_idx] = new_pt_phys | dir_flags;
+-        pt = phys_to_virt(new_pt_phys);
+-    } else {
+-        pd[pd_idx] |= (PT_WRITE | PT_USER);
+-        pt = phys_to_virt(pte_phys(pd[pd_idx]));
+-    }
+-
+-    uint64_t pte = phys | present_flag | write_flag | user_flag | cache_flags;
+-    if (nx_flag) pte |= PT_NX;
+-
+-    pt[pt_idx] = pte;
+-    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+-    return 0;
++    /*
++     * Delegate to vmm_map_page_in_cr3 with the current CR3.
++     *
++     * This function used to carry its own copy of the walk, driven
++     * by get_pml4_virt().  That copy did not handle 2 MB huge pages
++     * -- it treated a huge PDE as a page-table pointer and wrote
++     * the new PTE into physical memory that was not a page table.
++     * vmm_map_page_in_cr3 has the split (the PS-bit case, allocate
++     * a fresh PT, fill 512 PTEs, replace the PDE).
++     *
++     * One map implementation, with the huge-page case, used by
++     * every caller.  Existing callers (vmm_init's identity-map
++     * loop, ensure_hhdm_mapped) run after paging is enabled, so
++     * the current CR3 is a valid page-table root.
++     */
++    uint64_t cr3;
++    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
++    return vmm_map_page_in_cr3(cr3, virt, phys, flags);
+ }
+ 
+ void vmm_unmap_page(uint64_t virt) {
+-    uint64_t* pml4 = get_pml4_virt();
+-
+-    uint32_t pml4_idx = (virt >> 39) & 0x1FF;
+-    uint32_t pdpt_idx = (virt >> 30) & 0x1FF;
+-    uint32_t pd_idx   = (virt >> 21) & 0x1FF;
+-    uint32_t pt_idx   = (virt >> 12) & 0x1FF;
+-
+-    if (!(pml4[pml4_idx] & PT_PRESENT)) return;
+-    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
+-
+-    if (!(pdpt[pdpt_idx] & PT_PRESENT)) return;
+-    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+-
+-    if (!(pd[pd_idx] & PT_PRESENT)) return;
+-    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
+-
+-    pt[pt_idx] = 0;
+-    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
++    /*
++     * Delegate to vmm_unmap_page_in_cr3 with the current CR3.
++     *
++     * Same reason as vmm_map_page: this function used to carry its
++     * own walk, without the huge-page case.  If the PDE covering
++     * `virt` is a 2 MB huge page, the old walk wrote the zero into
++     * the huge page's physical base as if that base were a
++     * page-table pointer -- corrupting memory that was not a page
++     * table.
++     *
++     * vmm_unmap_page_in_cr3 now has the split (allocate a fresh PT,
++     * fill 512 PTEs, replace the PDE, then unmap the one page).
++     * That is the single unmap implementation used by every caller.
++     */
++    uint64_t cr3;
++    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
++    vmm_unmap_page_in_cr3(cr3, virt);
+ }
+ 
+ uint64_t vmm_get_phys(uint64_t virt) {
+-    uint64_t* pml4 = get_pml4_virt();
+-
+-    uint32_t pml4_idx = (virt >> 39) & 0x1FF;
+-    uint32_t pdpt_idx = (virt >> 30) & 0x1FF;
+-    uint32_t pd_idx   = (virt >> 21) & 0x1FF;
+-    uint32_t pt_idx   = (virt >> 12) & 0x1FF;
+-
+-    if (!(pml4[pml4_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
+-
+-    if (!(pdpt[pdpt_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+-
+-    if (!(pd[pd_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
+-
+-    if (!(pt[pt_idx] & PT_PRESENT)) return 0;
+-    /* Strip PT_NX as well as the low flag bits; see pte_phys. */
+-    return (pte_phys(pt[pt_idx])) | (virt & 0xFFFULL);
++    /*
++     * Delegate to vmm_get_phys_from_cr3 against the current CR3.
++     *
++     * This function used to carry its own copy of the walk, driven
++     * by get_pml4_virt().  It did not handle 2 MB huge pages -- and
++     * neither did its sibling in intent until vmm_get_phys_from_cr3
++     * grew the PS-bit case.  Two walks, one of which understood
++     * huge pages: any caller that happened to walk a virtual
++     * address covered by a 2 MB page got a garbage physical address
++     * back, because the PDE was dereferenced as a page-table
++     * pointer.
++     *
++     * That latent bug is why this is now a delegation, not a second
++     * implementation.  One walk, with the huge-page case, used by
++     * every caller.  For a kernel address the current CR3 and the
++     * bootinfo PML4 see the same higher-half mappings, so existing
++     * callers (heap.c's prior-page probe, process.c's kernel-stack
++     * phys) get the same answer they did before.  For a user
++     * address, the current CR3 is the one that has the mapping.
++     *
++     * Both existing callers run after vmm_init, so CR3 is a valid
++     * kernel page-table root when this is called.  If a caller ever
++     * needs this before paging is enabled, it must not use this
++     * function -- use the raw phys_to_virt walk directly.
++     */
++    uint64_t cr3;
++    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
++    return vmm_get_phys_from_cr3(cr3, virt);
+ }
+ 
+ int vmm_is_mapped(uint64_t virt) {
+-    uint64_t* pml4 = get_pml4_virt();
+-
+-    uint32_t pml4_idx = (virt >> 39) & 0x1FF;
+-    uint32_t pdpt_idx = (virt >> 30) & 0x1FF;
+-    uint32_t pd_idx   = (virt >> 21) & 0x1FF;
+-    uint32_t pt_idx   = (virt >> 12) & 0x1FF;
+-
+-    if (!(pml4[pml4_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pdpt = phys_to_virt(pte_phys(pml4[pml4_idx]));
+-
+-    if (!(pdpt[pdpt_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+-
+-    if (!(pd[pd_idx] & PT_PRESENT)) return 0;
+-    uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
+-
+-    if (!(pt[pt_idx] & PT_PRESENT)) return 0;
+-    return 1;
++    /*
++     * Delegate to vmm_get_phys_from_cr3 with the current CR3.
++     *
++     * This function used to carry its own walk, without the
++     * huge-page case.  For an address covered by a 2 MB huge PDE,
++     * the old walk dereferenced the huge page's physical base as a
++     * page-table pointer and read a garbage PTE.  The wrong answer
++     * -- most likely 0, "not mapped" -- is worse than a wrong
++     * return value: ensure_hhdm_mapped uses the result to decide
++     * whether to call vmm_map_page, and a false "not mapped" turns
++     * into an unnecessary map that used to corrupt memory.
++     *
++     * vmm_get_phys_from_cr3 returns 0 for not-present and a
++     * (physical | offset) for present; a nonzero result means the
++     * page is mapped, huge or not.
++     */
++    uint64_t cr3;
++    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
++    return vmm_get_phys_from_cr3(cr3, virt) != 0;
+ }
+ 
+ void vmm_dump_page_table(uint64_t virt) {
+@@ -279,6 +247,17 @@ void vmm_dump_page_table(uint64_t virt) {
+     if (!(pdpt[pdpt_idx] & PT_PRESENT)) { serial_unlock(); return; }
+     uint64_t* pd = phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+     if (!(pd[pd_idx] & PT_PRESENT)) { serial_unlock(); return; }
++
++    /* 2 MB huge page: do not dereference the huge base as a
++       page-table pointer.  Print the PDE and stop. */
++    if (pd[pd_idx] & 0x80) {
++        serial_print("  2 MB huge PDE: 0x");
++        serial_print_hex(pd[pd_idx]);
++        serial_print("\n");
++        serial_unlock();
++        return;
++    }
++
+     uint64_t* pt = phys_to_virt(pte_phys(pd[pd_idx]));
+ 
+     serial_print("  PTE Entry Found: 0x");
+@@ -637,6 +616,54 @@ void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt) {
+     uint64_t* pd = (uint64_t*)phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+ 
+     if (!(pd[pd_idx] & PT_PRESENT)) return;
++
++    /* If the PDE is a 2 MB huge page (PS bit set), split it into
++       512 4 KB PTEs before unmapping one page -- the same pattern
++       as vmm_map_page_in_cr3's split.  Without it, the walk below
++       would treat the huge page's physical base as a page-table
++       pointer and write the zero into memory that is not a page
++       table.
++
++       The unmapping is for ONE 4 KB page.  After the split, the
++       other 511 pages of the former huge page are still mapped and
++       their PTEs are unchanged from the split.  That matches what
++       a partial unmap of a huge mapping should do. */
++    if (pd[pd_idx] & 0x80) {
++        uint64_t huge_phys  = pd[pd_idx] & ~0x1FFFFFULL & ~PT_NX;
++        uint64_t huge_flags = pd[pd_idx] & 0xFFF;
++
++        uint64_t new_pt_phys = pmm_alloc_page_for_tables();
++        if (!new_pt_phys) {
++            /* Cannot split.  Refuse to unmap rather than corrupt:
++               halting is loud and safe; the alternative is a write
++               to arbitrary physical memory. */
++            serial_print("VMM: FATAL unmap-page-table alloc failed\n");
++            serial_print("VMM:   virt=0x"); serial_print_hex(virt);
++            serial_print(" cr3=0x");        serial_print_hex(cr3);
++            serial_print(" pde=0x");        serial_print_hex(pd[pd_idx]);
++            serial_print("\n");
++            serial_print("VMM:   halting; unmap was NOT performed\n");
++            while (1) __asm__ volatile("hlt");
++        }
++        uint64_t* split_pt = (uint64_t*)phys_to_virt(new_pt_phys);
++
++        uint64_t carry = huge_flags & (PT_PRESENT | PT_WRITE | PT_USER);
++        uint64_t pte_carry = carry | PT_NX;
++        for (int m = 0; m < 512; m++) {
++            split_pt[m] = (huge_phys + (uint64_t)m * 0x1000) | pte_carry;
++        }
++        pd[pd_idx] = new_pt_phys | carry;
++
++        uint64_t active_cr3_split;
++        asm volatile("mov %%cr3, %0" : "=r"(active_cr3_split));
++        if ((active_cr3_split & ~0xFFFULL) == (cr3 & ~0xFFFULL)) {
++            uint64_t base = virt & ~0x1FFFFFULL;
++            for (uint64_t a = base; a < base + 0x200000; a += 0x1000) {
++                asm volatile("invlpg (%0)" : : "r"(a) : "memory");
++            }
++        }
++    }
++
+     uint64_t* pt = (uint64_t*)phys_to_virt(pte_phys(pd[pd_idx]));
+ 
+     pt[pt_idx] = 0;

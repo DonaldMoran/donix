@@ -285,6 +285,31 @@ uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
     g_ticks++;
     vga_cursor_tick();
+
+    /*
+     * Wake any process blocked on console input.
+     *
+     * Without this, a process blocked in sys_read or sys_poll on
+     * fd 0 only wakes when the PS/2 keyboard IRQ fires (irq1's
+     * handler calls process_wake_all_blocked).  On a headless
+     * boot with -serial stdio, there is no PS/2 traffic, so a
+     * process blocked in poll(0, ..., -1) sits in hlt forever
+     * even after a UART byte arrives -- the UART is polled, not
+     * interrupt-driven, so nothing tells the blocked process to
+     * re-check.
+     *
+     * The timer fires at 100 Hz, so this gives the blocked
+     * process a chance to re-check console_has_data() (which
+     * includes serial_rx_available) every 10 ms.  That is the
+     * latency cost of not having a UART RX interrupt; it is
+     * imperceptible for terminal input.
+     *
+     * process_wake_all_blocked skips processes whose block_kind
+     * is not BLOCK_KIND_NONE, so waitpid-blocked processes and
+     * the kernel shell are unaffected.  It is safe to call from
+     * IRQ context -- the PS/2 handler already does.
+     */
+    process_wake_all_blocked();
     #define SCHED_QUANTUM 2
 
     pcb_t* current = process_get_current();

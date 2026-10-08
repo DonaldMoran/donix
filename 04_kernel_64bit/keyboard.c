@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "include/keyboard.h"
+#include "include/serial.h"
 
 #define KBD_BUFFER_SIZE 128
 
@@ -192,6 +193,34 @@ int kbd_buffer_get(char *c) {
         return 0; /* empty */
     *c = kbd_buffer[kbd_tail];
     kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
+    return 1;
+}
+
+/*
+ * Multiplexed input: try the PS/2 ring first, then the UART.
+ *
+ * The PS/2 path is unchanged; every existing caller of kbd_buffer_get
+ * continues to work.  This function is what the shell and the syscall
+ * layer use so that a headless boot (-serial stdio) is interactive.
+ *
+ * The UART is polled, not interrupt-driven.  At terminal input rates
+ * (a few hundred bytes/sec at most) the LSR read costs less than the
+ * IRQ handling would, and it means the caller chooses when to look.
+ *
+ * Serial bytes are not pushed into the ring here.  If we pushed them,
+ * they would be indistinguishable from PS/2 input and would survive
+ * across a mode switch, which is not what we want.  Reading on demand
+ * keeps the two sources independent.
+ */
+int kbd_buffer_get_mux(char *c) {
+    if (kbd_buffer_get(c)) {
+        return 1;
+    }
+    int ch = serial_rx_poll();
+    if (ch < 0) {
+        return 0;
+    }
+    *c = (char)ch;
     return 1;
 }
 

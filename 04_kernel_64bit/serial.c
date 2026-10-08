@@ -70,6 +70,19 @@ void serial_init(void) {
 }
 
 void serial_putc(char c) {
+    /*
+     * Emit CR before LF.  A serial console is a "raw" device: the
+     * terminal it feeds may be in any mode, and the telnet NVT
+     * protocol explicitly requires a carriage return before a line
+     * feed ("\r\n").  On -serial stdio the extra \r is harmless
+     * (every terminal emulator treats \r\n as one newline); on
+     * -serial telnet: it is what makes multi-line output line up
+     * instead of stairstepping.
+     */
+    if (c == '\n') {
+        while ((inb(0x3F8 + 5) & 0x20) == 0);
+        outb(0x3F8, '\r');
+    }
     while ((inb(0x3F8 + 5) & 0x20) == 0);
     outb(0x3F8, c);
 }
@@ -120,4 +133,40 @@ void serial_print_dec(uint64_t value) {
         serial_putc(buf[i]);
     }
     serial_unlock();
+}
+
+/*
+ * Non-blocking UART receive.
+ *
+ * Returns the next byte from the RX FIFO, or -1 if none is available.
+ * This is the RX half of -serial stdio; without it, keystrokes sent
+ * by the terminal reach the emulated UART but are never read by the
+ * guest, so headless boots appear unresponsive.
+ *
+ * The Line Status Register (LSR, offset +5) bit 0 (Data Ready) is the
+ * only signal we need.  No interrupts are required; polling is enough
+ * at shell-input rates and avoids taking an IRQ in the middle of
+ * whatever the kernel is doing.
+ *
+ * Loopback is NOT enabled (MCR bit 4 is clear), so the bytes we read
+ * here come from the terminal, not from our own serial_putc output.
+ */
+int serial_rx_poll(void) {
+    if ((inb(0x3F8 + 5) & 0x01) == 0) {
+        return -1;
+    }
+    return (int)(unsigned char)inb(0x3F8);
+}
+
+/*
+ * Non-consuming readiness check for the UART.
+ *
+ * Returns 1 if a byte is waiting in the RX FIFO, 0 otherwise.
+ * Unlike serial_rx_poll(), this does NOT read the byte -- it only
+ * inspects the Line Status Register's Data Ready bit.  sys_poll
+ * needs this to report POLLIN without consuming the byte that
+ * read(2) is about to fetch.
+ */
+int serial_rx_available(void) {
+    return (inb(0x3F8 + 5) & 0x01) != 0;
 }

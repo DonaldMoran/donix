@@ -8,6 +8,7 @@
 #include "include/user_space.h"
 #include "include/elf.h"
 #include "include/user_syscall.h"
+#include "include/trace.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -644,22 +645,27 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
     uint64_t ppid = child ? child->parent_pid : 0;
 
     if (!child || child->parent_pid == 0) {
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" drop=a no_parent\n");
+        #endif
         return NULL;
     }
 
     pcb_t* parent = process_find_by_pid(child->parent_pid);
     if (!parent) {
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
         serial_print_dec(ppid);
         serial_print(" drop=b no_pcb\n");
+        #endif
         return NULL;
     }
     if (parent->state != PROC_STATE_BLOCKED) {
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -667,9 +673,11 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=c state=");
         serial_print_dec((uint64_t)parent->state);
         serial_print("\n");
+        #endif
         return NULL;
     }
     if (parent->block_kind != BLOCK_KIND_WAITPID) {
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -677,6 +685,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=d kind=");
         serial_print_dec(parent->block_kind);
         serial_print("\n");
+        #endif
         return NULL;
     }
 
@@ -684,6 +693,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
        (wait for any child). */
     if (parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -691,14 +701,17 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=e wait=");
         serial_print_dec(parent->wait_pid);
         serial_print("\n");
+        #endif
         return NULL;
     }
 
+    #if TRACE_WAKE
     serial_print("WW: child=");
     serial_print_dec(cpid);
     serial_print(" parent=");
     serial_print_dec(parent->pid);
     serial_print(" wake=ok\n");
+    #endif
 
     parent->state = PROC_STATE_READY;
     parent->block_kind = BLOCK_KIND_NONE;

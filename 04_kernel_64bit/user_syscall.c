@@ -14,6 +14,7 @@
 #include "include/user_space.h"
 #include "ff.h"
 #include "interrupts.h"
+#include "include/trace.h"
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -2690,11 +2691,13 @@ static long open_resolved(const char* in_path, int flags, int backend) {
             return fd;
         }
         kfree(dir_obj);
+        #if TRACE_OPEN
         serial_print("sys_open: f_opendir FAIL path=");
         serial_print(dir_path);
         serial_print(" dr=");
         serial_print_dec(dr);
         serial_print("\n");
+        #endif
         kfree(slot);
         self->file_table[fd] = NULL;
         return fatfs_errno(dr);
@@ -2752,6 +2755,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
         }
     }
 
+    #if TRACE_OPEN
     serial_print("sys_open: f_open FAIL path=");
     serial_print(local_path);
     serial_print(" flags=0x");
@@ -2761,6 +2765,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
     serial_print(" r=");
     serial_print_dec(r);
     serial_print("\n");
+    #endif
 
     kfree(file_obj);
     kfree(slot);
@@ -4345,7 +4350,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     /* ---- 1. Copy the path string. ---- */
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: bad path pointer\n");
+        #endif
         __asm__ volatile("sti");
         return -(long)EFAULT_;
     }
@@ -4426,11 +4433,13 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
 
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_open(");
         serial_print(path);
         serial_print(") -> ");
         serial_print_dec(fr);
         serial_print("\n");
+        #endif
         __asm__ volatile("sti");
         return fatfs_errno(fr);
     }
@@ -4439,7 +4448,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     UINT got = 0;
     fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_read header failed\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4497,23 +4508,29 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -(long)ENOEXEC;
     }
     if (file_size > 4ULL * 1024 * 1024) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: file too large\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
     }
     uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
     if (!elf_buf) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: kmalloc failed for ");
         serial_print_dec((uint64_t)file_size);
         serial_print(" bytes\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOMEM_;
     }
     fr = f_lseek(&file, 0);
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: rewind failed\n");
+        #endif
         kfree(elf_buf); f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4525,9 +4542,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         if (want > 4096) want = 4096;
         fr = f_read(&file, elf_buf + total, want, &br);
         if (fr != FR_OK) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: read failed at offset ");
             serial_print_dec(total);
             serial_print("\n");
+            #endif
             kfree(elf_buf); f_close(&file);
             __asm__ volatile("sti");
             return -(long)EIO_;
@@ -4537,7 +4556,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
     f_close(&file);
     if (total != file_size) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: short read of file body\n");
+        #endif
         kfree(elf_buf);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4564,9 +4585,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (safe_copy_from_user(&user_str_va,
                                     (const char**)user_argv + argc,
                                     sizeof(user_str_va)) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] pointer\n");
+                #endif
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -4575,9 +4598,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (copy_user_string(argv_scratch[argc], EXEC_MAX_ARG_LEN,
                                  (const char*)user_str_va) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] string\n");
+                #endif
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -4599,7 +4624,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         envp_scratch = (char (*)[EXEC_MAX_ARG_LEN])
             kmalloc((size_t)EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN);
         if (!envp_scratch) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: kmalloc failed for envp snapshot\n");
+            #endif
             kfree(elf_buf);
             __asm__ volatile("sti");
             return -(long)ENOMEM_;
@@ -4610,9 +4637,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (safe_copy_from_user(&user_str_va,
                                     (const char**)user_envp + envc,
                                     sizeof(user_str_va)) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad envp[");
                 serial_print_dec(envc);
                 serial_print("] pointer\n");
+                #endif
                 kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
@@ -4622,9 +4651,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (copy_user_string(envp_scratch[envc], EXEC_MAX_ARG_LEN,
                                  (const char*)user_str_va) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad envp[");
                 serial_print_dec(envc);
                 serial_print("] string\n");
+                #endif
                 kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
@@ -4664,7 +4695,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     uint64_t entry = elf_load_into_process(self, elf_buf);
     kfree(elf_buf);
     if (entry == 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: elf_load_into_process failed\n");
+        #endif
         __asm__ volatile("sti");
         sys_exit(-1);
         return -1;  /* unreachable */
@@ -4672,7 +4705,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     uint64_t new_user_stack_top = exec_alloc_user_stack(self);
     if (new_user_stack_top == 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: user stack alloc failed\n");
+        #endif
         __asm__ volatile("sti");
         sys_exit(-1);
         return -1;  /* unreachable */
@@ -4731,7 +4766,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             slen++;
 
             if (cursor + slen > argv_region_top) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: argv region overflow\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4741,9 +4778,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
                                       argv_scratch[i], slen) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: failed to write argv[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4759,7 +4798,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             slen++;
 
             if (cursor + slen > argv_region_top) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: envp region overflow\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4769,9 +4810,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
                                       envp_scratch[i], slen) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: failed to write envp[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4796,7 +4839,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         if (safe_copy_to_user_cr3(self->cr3, (void*)array_base,
                                   array_data, array_bytes) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write argv array\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4814,7 +4859,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         if (safe_copy_to_user_cr3(self->cr3, (void*)envp_array_base,
                                   envp_data, envp_bytes) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write envp array\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4831,7 +4878,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
                                   &argc_slot, sizeof(argc_slot)) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write argc\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4974,11 +5023,13 @@ long sys_wait4(long pid, int* user_status, int options) {
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
 
+        #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
         serial_print_dec(target == (uint64_t)-1 ? 0 : target);
         serial_print(" blocking\n");
+        #endif
         
         /*
          * Late re-scan.  A child may have exited between the scan above
@@ -5008,6 +5059,7 @@ long sys_wait4(long pid, int* user_status, int options) {
                 continue;
             }
         }
+        #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
@@ -5015,6 +5067,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         serial_print(" yielding state=");
         serial_print_dec((uint64_t)self->state);
         serial_print("\n");
+        #endif
         
         process_yield();
     }
@@ -5559,7 +5612,7 @@ long sys_read(int fd, void* buf, size_t count) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
         while (bytes_read < count) {
             __asm__ volatile("cli");
-            if (kbd_buffer_get(&c)) {
+            if (kbd_buffer_get_mux(&c)) {
                 __asm__ volatile("sti");
                 if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
                 else return -(long)EFAULT_;
@@ -6524,6 +6577,26 @@ typedef struct {
  * indefinitely; sixteen is generous and still bounded. */
 #define POLL_MAX_NFDS 16
 
+/*
+ * Console readability: PS/2 ring OR UART RX FIFO.
+ *
+ * Under -display none the PS/2 path never fires -- QEMU does
+ * not translate stdin to scancodes without a display window --
+ * so a poll that only checks kbd_buffer_has_data() blocks
+ * forever.  This is what busybox ash does at the prompt:
+ * poll(0, 1, -1), reported as SYS: num=7 in the dispatcher
+ * trace, never returns and no keystroke is ever seen.
+ *
+ * serial_rx_available() is non-consuming: it inspects the UART
+ * Line Status Register's Data Ready bit without reading the
+ * byte.  The subsequent read(2) still sees the byte through
+ * serial_rx_poll() via kbd_buffer_get_mux().
+ */
+static int console_has_data(void) {
+    if (kbd_buffer_has_data()) return 1;
+    return serial_rx_available();
+}
+
 long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
     kernel_pollfd_t* user_fds = (kernel_pollfd_t*)user_fds_arg;
 
@@ -6590,7 +6663,7 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                 pcb_t* self = process_get_current();
                 for (;;) {
                     __asm__ volatile("cli");
-                    if (kbd_buffer_has_data()) {
+                    if (console_has_data()) {
                         __asm__ volatile("sti");
                         break;
                     }
@@ -6622,7 +6695,7 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                 }
             }
 
-            if (kbd_buffer_has_data()) {
+            if (console_has_data()) {
                 revents |= POLLIN_;
                 ready++;
             }

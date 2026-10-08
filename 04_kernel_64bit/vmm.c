@@ -19,10 +19,19 @@ uint64_t vmm_max_physical = 0;
 static BootInfo* vmm_bootinfo = NULL;
 
 static uint64_t* get_pml4_virt(void) {
-    if (vmm_bootinfo && vmm_bootinfo->pml4_virt) {
-        return (uint64_t*)vmm_bootinfo->pml4_virt;
-    }
-    return (uint64_t*)0xFFFFFF7FBFDFE000ULL;
+    /*
+     * Reach the PML4 through the HHDM, like every other page-table
+     * pointer in this file.  This used to read bootinfo->pml4_virt,
+     * which stage2.asm wrote as 0xFFFFFF7FBFDFE000.  That address is
+     * not the recursive base for PML4 index 510 (which is
+     * 0xFFFFFF0000000000).  It only worked because all four of its
+     * page-table indices are 510, and pml4[510] is the recursive
+     * self-reference, so the walk terminated at a present entry that
+     * points back at the PML4.  One-entry reads/writes landed on the
+     * right bytes; any array walk over the table would not have.
+     * pml4_addr through phys_to_virt() is the correct form.
+     */
+    return (uint64_t*)(HHDM_START + vmm_bootinfo->pml4_addr);
 }
 
 static inline uint64_t* phys_to_virt(uint64_t phys) {

@@ -12,7 +12,7 @@
 
 # Disk layout configuration; propagated to sub-makes.
 #   FAT_CONFIG=dual (default) or FAT_CONFIG=single
-FAT_CONFIG ?= dual
+FAT_CONFIG ?= single
 
 # -------------------------
 # Default: build everything
@@ -59,7 +59,11 @@ kernel64:
 # Build the kernel with the selected FAT config, then package it.
 bootkernel64:
 	$(MAKE) -C 04_kernel_64bit FAT_CONFIG=$(FAT_CONFIG)
-	$(MAKE) -C 05_boot_kernel64
+ifeq ($(FAT_CONFIG),single)
+	$(MAKE) -C 05_boot_kernel64 hdd-single.img
+else
+	$(MAKE) -C 05_boot_kernel64 hdd.img
+endif
 
 # ---- QEMU run targets ----
 runkernel64:
@@ -105,6 +109,7 @@ debugkernel64:
 # Clean everything
 # -------------------------
 clean:
+	rm -f 04_kernel_64bit/.fat_config_single 04_kernel_64bit/.fat_config_dual
 	$(MAKE) -C 01_boot_16bit clean
 	$(MAKE) -C 02_boot_32bit clean
 	$(MAKE) -C 03_boot_64bit clean
