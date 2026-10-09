@@ -475,6 +475,18 @@ void process_yield(void) {
             }
             next = scheduler_ready_queue_next();
             if (!next) {
+                /*
+                 * About to fall to idle.  Dump every PCB so the
+                 * capture names the state each process is in at the
+                 * moment the scheduler gave up: a shell BLOCKED in
+                 * wait4 and never woken, or a process READY and
+                 * stranded.  Those are two different bugs and the
+                 * dump is what tells them apart.  Diagnostic only.
+                 */
+                serial_lock();
+                serial_print("YIELD-TO-IDLE: queue empty, pool state:\n");
+                process_dump_all();
+                serial_unlock();
                 next = process_find_by_pid(1);
                 if (!next) return;
             }
