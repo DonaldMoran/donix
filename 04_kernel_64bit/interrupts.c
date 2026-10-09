@@ -837,7 +837,42 @@ void isr13_handler(exception_frame_t *frame) {
         serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
         serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
         serial_print("  g_user_rsp_save : 0x"); serial_print_hex(g_user_rsp_save); serial_print("\n");
-            serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
+        serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
+        /*
+         * 7e fault-time page read.  Walk the faulting process's own
+         * cr3 for g_user_rsp_save and for the slot a `ret` would pop
+         * there (g_user_rsp_save - 8), print the physical page each
+         * resolves to and the 8 bytes at each.  The fork instrument
+         * recorded the child's c_phys for the page backing the
+         * fork-time user RSP.  If the walk here gives the same
+         * physical page, the child kept its copy and a writer put
+         * 0xFFFFFFFF in the slot.  If it gives a different page, the
+         * mapping changed.  If the walk returns 0, the address is
+         * unmapped at fault time.  Diagnostic only.
+         */
+        {
+            pcb_t *_c = process_get_current();
+            if (_c) {
+                uint64_t _rsp_page  = g_user_rsp_save & ~0xFFFULL;
+                uint64_t _rsp_off   = g_user_rsp_save & 0xFFFULL;
+                uint64_t _slot_page = (g_user_rsp_save - 8) & ~0xFFFULL;
+                uint64_t _slot_off  = (g_user_rsp_save - 8) & 0xFFFULL;
+                uint64_t _rsp_phys  = vmm_get_phys_from_cr3(_c->cr3, _rsp_page);
+                uint64_t _slot_phys = vmm_get_phys_from_cr3(_c->cr3, _slot_page);
+                uint64_t _rsp_val   = 0, _slot_val = 0;
+                if (_rsp_phys)  _rsp_val  = *(uint64_t*)(HHDM_START + _rsp_phys  + _rsp_off);
+                if (_slot_phys) _slot_val = *(uint64_t*)(HHDM_START + _slot_phys + _slot_off);
+                serial_print("  7e-rsp  : rsp_page_phys=0x"); serial_print_hex(_rsp_phys);
+                serial_print(" rsp_val=0x");                 serial_print_hex(_rsp_val);
+                serial_print(" slot_page_phys=0x");           serial_print_hex(_slot_phys);
+                serial_print(" slot_val=0x");                 serial_print_hex(_slot_val);
+                serial_print("\n");
+                serial_print("  7e-cur  : pid=");  serial_print_dec(_c->pid);
+                serial_print(" cr3=0x");           serial_print_hex(_c->cr3);
+                serial_print(" rsp_virt=0x");      serial_print_hex(g_user_rsp_save);
+                serial_print("\n");
+            }
+        }
     }
     serial_print("  --- raw frame dump ---\n");
     for (int i = 0; i < 48; i++) {
