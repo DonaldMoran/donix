@@ -22,7 +22,7 @@ menu() {
     # changed. So we skip the explicit second build here.
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-debug-log > capture.txt
     # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
-    #    { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
+    # { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
     # qemu-system-x86_64 -cpu max -drive file=/home/noneya/code/donix/05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -monitor none -d int -D qemu-int.log
 
     # Active: KVM + host CPU, headless, single-drive, live tee to capture.txt.
@@ -30,8 +30,8 @@ menu() {
     # SDL was the source of the slowness on this host, not KVM).  The
     # -no-reboot -no-shutdown pair freezes QEMU at a fault for reading,
     # instead of rebooting or exiting.
-    { make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor none -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
-
+    # { make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor none -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
+    { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
     :  # no-op so an empty body is valid
 }
 
