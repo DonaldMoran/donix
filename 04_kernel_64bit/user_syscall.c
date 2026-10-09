@@ -5050,6 +5050,26 @@ long sys_wait4(long pid, int* user_status, int options) {
             return 0;
         }
 
+        /*
+         * Critical section: the block-store, the late re-scan, and
+         * the decision to yield must be atomic with respect to the
+         * waker.  A child that exits between the scan above and the
+         * yield calls process_wake_parent_if_waiting, which sees
+         * state == BLOCKED and re-adds us to the ready queue while
+         * we are still running.  The late re-scan below narrows
+         * that window but does not close it -- the re-scan is
+         * itself preemptible.  P1 caught the pair in the same tick
+         * (site=1 and site=2, tick 5383).  cli closes it: no tick
+         * can fire between the store and the yield, so the waker
+         * cannot run at all until process_yield, and by then the
+         * state is consistent.
+         *
+         * process_yield must run with interrupts ON; it does its
+         * own cli inside scheduler_switch_to.  The saved flags are
+         * restored before the yield, not after.
+         */
+        uint64_t saved_flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
@@ -5088,9 +5108,13 @@ long sys_wait4(long pid, int* user_status, int options) {
                 self->state = PROC_STATE_RUNNING;
                 self->block_kind = BLOCK_KIND_NONE;
                 self->wait_pid = 0;
+                __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
                 continue;
             }
         }
+        /* End of the critical section.  The state is BLOCKED and the
+         * waker has not run; restore interrupts before yielding. */
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
         #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
