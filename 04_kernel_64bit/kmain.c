@@ -23,6 +23,7 @@
 #include "include/fat_config.h"
 #include "ff.h"
 #include "include/trace.h"
+#include "include/race_probe.h"
 
 extern void pit_init(uint32_t freq);
 extern unsigned char test_program[];
@@ -1240,6 +1241,13 @@ static void handle_command(const char *cmd) {
             if (p1) process_destroy(p1);
             if (p2) process_destroy(p2);
         }
+        vga_print("> ");
+    } else if (strcmp(cmd, "racedump") == 0) {
+#if RACE_PROBE_ANY
+        race_probe_dump();
+#else
+        vga_print("race probes disabled\n");
+#endif
         vga_print("> ");
     } else if (strcmp(cmd, "gdtdump") == 0) {
         gdt_dump(); vga_print("> ");

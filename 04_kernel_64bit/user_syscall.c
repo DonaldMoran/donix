@@ -15,6 +15,7 @@
 #include "ff.h"
 #include "interrupts.h"
 #include "include/trace.h"
+#include "include/race_probe.h"
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -5052,6 +5053,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
+        RACE_P1_BLOCK(self->pid, BLOCK_KIND_WAITPID);
 
         #if TRACE_WAIT
         serial_print("WW: wait4 self=");
