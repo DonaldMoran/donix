@@ -25,6 +25,21 @@ void scheduler_ready_queue_add(pcb_t* process) {
     if (!process) return;
 
     /*
+     * Idle (pid 1) is never on the ready queue.  It is reached by
+     * process_find_by_pid(1) in the scheduler's fallback, and
+     * process.c:111 removes it at init.  Several callers guard the
+     * pid themselves, but several do not -- process_create adds
+     * every new PCB including idle, and process_wake_all_blocked
+     * runs every tick and re-adds every READY process.  A stray
+     * idle on the queue makes scheduler_ready_queue_next() return
+     * it every tick, so the empty-queue branch never runs and the
+     * CPU stays in kernel_idle_loop with next never NULL -- the
+     * shape the timer dump could not see.  Guard here, once, for
+     * every caller.
+     */
+    if (process->pid == 1) return;
+
+    /*
      * Idempotency guard.  See scheduler_ready_queue_contains for
      * the failure mode.  A process that is already on the queue
      * must not be linked in again: the second link overwrites its
