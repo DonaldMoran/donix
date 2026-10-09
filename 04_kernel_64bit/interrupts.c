@@ -444,6 +444,26 @@ timer_preempt_handler(uint64_t stack_pointer) {
         extern pcb_t* scheduler_ready_queue_next(void);
         pcb_t* next = scheduler_ready_queue_next();
         if (!next) {
+            /*
+             * One-shot pool dump.  The idle state is reached here, in
+             * the timer path -- NOT through process_yield, which is
+             * where the earlier dump went (and never fired).  The
+             * monitor shows the CPU in kernel_idle_loop with the
+             * ready queue empty; this prints every PCB state the
+             * first time the timer finds nothing to run, so the
+             * capture names whether the shell is BLOCKED (lost wake)
+             * or stranded in another state.  One-shot: prints once
+             * and goes quiet, so the capture is not flooded on every
+             * idle tick.  Diagnostic only.
+             */
+            static int _7e_dumped = 0;
+            if (!_7e_dumped) {
+                _7e_dumped = 1;
+                serial_lock();
+                serial_print("TIMER-NO-NEXT: queue empty, pool state:\n");
+                process_dump_all();
+                serial_unlock();
+            }
             if (current->pid == 1) {
                 current->timeslice_ticks = 0;
                 return stack_pointer;
