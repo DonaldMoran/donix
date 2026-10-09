@@ -229,7 +229,23 @@ void __attribute__((noreturn)) process_exit(void) {
         for (int _i = 0; _i < MAX_PROCESSES; _i++) {
             pcb_t* _p = process_get_pcb(_i);
             if (!_p) continue;
-            if (_p->state != PROC_STATE_READY) continue;
+            /*
+             * Re-add READY or stranded-RUNNING.  A process in state
+             * RUNNING is, by the scheduler's invariant, the one on
+             * the CPU -- current_process.  Any OTHER process left in
+             * RUNNING is stale: it was switched away from without a
+             * requeue, and every requeue guard (which tests state ==
+             * RUNNING) treats it as current and skips it.  Nothing
+             * reschedules it.  That is the state the YIELD-TO-IDLE
+             * dump showed: pid 4 pipe7e RUNNING, off the queue, with
+             * its PIPE7E_HELPER child ZOMBIE and unreaped, and the
+             * shell BLOCKED in wait4 -- the child cannot reap, the
+             * shell cannot wake.  Item 7d.
+             */
+            if (_p == current_process) continue;
+            if (_p->pid == 1) continue;   /* idle is never queued */
+            if (_p->state != PROC_STATE_READY &&
+                _p->state != PROC_STATE_RUNNING) continue;
             if (scheduler_ready_queue_contains(_p)) continue;
             scheduler_ready_queue_add(_p);
         }
@@ -487,7 +503,16 @@ void process_yield(void) {
             for (int _i = 0; _i < MAX_PROCESSES; _i++) {
                 pcb_t* _p = process_get_pcb(_i);
                 if (!_p) continue;
-                if (_p->state != PROC_STATE_READY) continue;
+                /*
+                 * Re-add READY or stranded-RUNNING.  See the same
+                 * scan in process_exit for the full note.  A
+                 * RUNNING process that is not current_process is
+                 * stale and must be requeued.  Item 7d.
+                 */
+                if (_p == current_process) continue;
+                if (_p->pid == 1) continue;   /* idle is never queued */
+                if (_p->state != PROC_STATE_READY &&
+                    _p->state != PROC_STATE_RUNNING) continue;
                 if (scheduler_ready_queue_contains(_p)) continue;
                 scheduler_ready_queue_add(_p);
             }
