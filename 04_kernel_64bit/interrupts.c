@@ -411,7 +411,32 @@ timer_preempt_handler(uint64_t stack_pointer) {
             current->rcx = frame->rcx; current->rbx = frame->rbx;
             current->rax = frame->rax;
             current->rip = frame->rip;
+            /*
+             * Two fields, two consumers:
+             *
+             * pcb->user_rsp is the USER stack pointer, read by
+             * context_switch.asm's user-preempted save path
+             * (it pushes it into the resume frame's RSP slot).
+             *
+             * pcb->rsp is the KERNEL resume-frame base, which
+             * irq0_stub pops with POP_ALL_GPRS and iretqs from
+             * when timer_preempt_handler returns next->rsp.
+             * Without this write, a process last saved in user
+             * mode has a STALE pcb->rsp, and the next resume
+             * through irq0_stub pops a stale frame and #GPs in
+             * kernel mode with error 0x1FF0.
+             *
+             * session-61 wrote only user_rsp here, on the
+             * theory that pcb->rsp meant "kernel frame" and
+             * therefore should not be written from a user-mode
+             * preemption.  That is the wrong half: the
+             * preemption frame IS the kernel resume frame --
+             * irq0_stub's own pushed frame -- and both fields
+             * are read, by different paths, so both must be
+             * written.
+             */
             current->user_rsp = stack_pointer;
+            current->rsp      = stack_pointer;
         }
 
         // Pick next task.
