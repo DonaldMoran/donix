@@ -495,6 +495,54 @@ timer_preempt_handler(uint64_t stack_pointer) {
             scheduler_ready_queue_add(current);
         }
 
+        /*
+         * Queue-contents dump.  Bounded to 8 prints.  The two
+         * empty-queue dumps (TIMER-NO-NEXT, YIELD-TO-IDLE) only fire
+         * when the ready queue is empty, and two runs with the pid-1
+         * guard produced neither -- so at the stop the queue is NOT
+         * empty, and some entry keeps it non-empty.  Print the pid
+         * we are switching to, the current pid, and every pid on the
+         * ready queue, so the entry that is never dispatched is named
+         * directly.  Diagnostic only.  Item 7d.
+         */
+        {
+            static int _7e_qdumps = 0;
+            if (_7e_qdumps < 8) {
+                _7e_qdumps++;
+                serial_lock();
+                serial_print("7e-queue #");
+                serial_print_dec((uint64_t)_7e_qdumps);
+                serial_print(" cur=");
+                serial_print_dec(current->pid);
+                serial_print(" cur_state=");
+                serial_print_dec((uint64_t)current->state);
+                serial_print(" next=");
+                serial_print_dec(next->pid);
+                serial_print(" next_state=");
+                serial_print_dec((uint64_t)next->state);
+                serial_print(" q=:");
+                {
+                    extern pcb_t* scheduler_ready_queue_peek_next(void);
+                    /* Walk the queue by pcb->next from the head.  The
+                       head is exposed through scheduler_ready_queue_next()
+                       only by popping, so read the link chain directly
+                       from `next` when it is the head, else from the
+                       global.  To keep this simple and non-destructive,
+                       print the queue through the public peek. */
+                    pcb_t* _h = scheduler_ready_queue_peek_next();
+                    int _guard = 0;
+                    while (_h && _guard < 40) {
+                        serial_print(" ");
+                        serial_print_dec(_h->pid);
+                        _h = _h->next;
+                        _guard++;
+                    }
+                }
+                serial_print("\n");
+                serial_unlock();
+            }
+        }
+
         next->state = PROC_STATE_RUNNING;
         scheduler_set_current(next);
 
