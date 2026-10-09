@@ -3,6 +3,7 @@
 #include "include/vga.h"
 #include "include/user_msr.h"
 #include "include/trace.h"
+#include "include/race_probe.h"
 
 #define KERNEL_BASE 0xFFFFFFFF80000000ULL
 
@@ -20,6 +21,7 @@ pcb_t* scheduler_ready_queue_peek_next(void) {
 }
 
 void scheduler_ready_queue_add(pcb_t* process) {
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD);
     if (!process) return;
 
     /*
@@ -48,6 +50,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE);
     if (!process) return;
 
     /* Defensive: if the process has no prev and no next and is not
@@ -75,6 +78,7 @@ void scheduler_ready_queue_remove(pcb_t* process) {
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_NEXT);
     if (!ready_queue_head) return NULL;
 
     pcb_t* next = ready_queue_head;
@@ -218,6 +222,21 @@ void __attribute__((noreturn)) process_exit(void) {
              user shell is the terminal interactive console; there is
              no kernel shell to fall back to by design. */
         scheduler_reset();
+
+        /* Same stranded-READY recovery as process_yield: a READY
+         * process off the queue must be re-added before deciding
+         * the queue is genuinely empty. */
+        for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+            pcb_t* _p = process_get_pcb(_i);
+            if (!_p) continue;
+            if (_p->state != PROC_STATE_READY) continue;
+            if (scheduler_ready_queue_contains(_p)) continue;
+            scheduler_ready_queue_add(_p);
+        }
+        pcb_t* _n = scheduler_ready_queue_next();
+        if (_n) {
+            scheduler_switch_to(_n);
+        }
 
         extern void tss_set_kernel_stack(uint64_t stack);
         extern void tss_set_syscall_stack(uint64_t stack);
@@ -433,8 +452,32 @@ void process_yield(void) {
             scheduler_ready_queue_add(current_process);
             next = current_process;
         } else {
-            next = process_find_by_pid(1);
-            if (!next) return;
+            /*
+             * The ready queue is empty and the current process is
+             * not runnable.  Before falling to idle, scan the pool
+             * for any process that is READY but not on the ready
+             * queue.  That is the item-7d lost-process shape: a
+             * peer wake set state = READY, but a requeue guard
+             * (which tests state == RUNNING) later skipped it, so
+             * it ended up READY and off the queue.  Falling to
+             * idle with a READY process stranded is the hang the
+             * pool dump showed: helper pid 0x251 state=READY, on
+             * no queue, CPU in kernel_idle_loop.  Re-add every
+             * such process so the scheduler can run it.  This scan
+             * runs only when the queue is otherwise empty; it is
+             * 32 pool entries and it is off the hot path. */
+            for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+                pcb_t* _p = process_get_pcb(_i);
+                if (!_p) continue;
+                if (_p->state != PROC_STATE_READY) continue;
+                if (scheduler_ready_queue_contains(_p)) continue;
+                scheduler_ready_queue_add(_p);
+            }
+            next = scheduler_ready_queue_next();
+            if (!next) {
+                next = process_find_by_pid(1);
+                if (!next) return;
+            }
         }
     }
 

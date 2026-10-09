@@ -602,7 +602,10 @@ void process_wake_all_blocked(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (&pcb_pool[i] == g_kernel_shell_pcb) continue;
         if (pcb_pool[i].state != PROC_STATE_BLOCKED) continue;
-        if (pcb_pool[i].block_kind != BLOCK_KIND_NONE) continue;
+        if (pcb_pool[i].block_kind != BLOCK_KIND_NONE) {
+            RACE_P11_TICK_SKIP(pcb_pool[i].pid, pcb_pool[i].block_kind);
+            continue;
+        }
 
         /*
          * Skip if already on the ready queue.
@@ -646,6 +649,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
     uint64_t ppid = child ? child->parent_pid : 0;
 
     if (!child || child->parent_pid == 0) {
+        RACE_P11_WAKE_TRY(cpid, 0, 1, 0, 0, 0);
         #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
@@ -656,6 +660,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
 
     pcb_t* parent = process_find_by_pid(child->parent_pid);
     if (!parent) {
+        RACE_P11_WAKE_TRY(cpid, ppid, 2, 0, 0, 0);
         #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
@@ -666,6 +671,8 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         return NULL;
     }
     if (parent->state != PROC_STATE_BLOCKED) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 3, parent->state,
+                          parent->block_kind, parent->wait_pid);
         #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
@@ -678,6 +685,8 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         return NULL;
     }
     if (parent->block_kind != BLOCK_KIND_WAITPID) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 4, parent->state,
+                          parent->block_kind, parent->wait_pid);
         #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
@@ -694,6 +703,8 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
        (wait for any child). */
     if (parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 5, parent->state,
+                          parent->block_kind, parent->wait_pid);
         #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
@@ -715,6 +726,8 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
     #endif
 
     RACE_P1_WAKE(parent->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAKE_PARENT);
+    RACE_P11_WAKE_TRY(cpid, parent->pid, 0, parent->state,
+                      parent->block_kind, parent->wait_pid);
     parent->state = PROC_STATE_READY;
     parent->block_kind = BLOCK_KIND_NONE;
     parent->wait_pid = 0;

@@ -17,6 +17,14 @@
 #include "include/trace.h"
 #include "include/race_probe.h"
 
+/* Last syscall number that entered syscall_dispatch.  Read by the
+ * fault handlers when a corrupted control target is reported, so
+ * the syscall that was in flight when the fault fired is known.
+ * Reset only by being overwritten by the next syscall. */
+volatile uint64_t g_last_syscall_num = (uint64_t)-1;
+volatile uint64_t g_pipe_stamp_counter = 0;
+volatile uint64_t g_last_fs_base = 0;
+
 typedef struct file_slot_s {
     uint32_t kind;
     uint32_t refcount;
@@ -405,6 +413,12 @@ typedef struct pipe_s {
      */
     struct pcb* reader_waiting;
     struct pcb* writer_waiting;
+
+    /* Unique stamp written at creation.  Used by the P13 probe to
+     * detect a pipe_t that was freed and reallocated at the same
+     * address while a reader or writer was still blocked on it.
+     * Appended at the end so no existing offset moves. */
+    uint64_t stamp;
 } pipe_t;
 
 /* Set to 1 for one build to trace the fd lifecycle of ash's
@@ -1766,6 +1780,26 @@ static void put_pipe_ref(pipe_t* pipe) {
         pipe->refcount--;
         return;
     }
+    /* Do NOT free while either end is still open.  The
+     * refcount field counts live ENDS, but a close ordering
+     * across fork can drop it to 0 while an fd still holds an
+     * end -- the parent's read fd is open and the read-end slot
+     * has not been put, yet the write-end put already took
+     * refcount 2 to 1 and this call sees 1.  The open-end
+     * counts are the authoritative "is anyone still using this
+     * pipe" test.  Freeing here while readers_open or
+     * writers_open is nonzero is the lifetime bug the P13
+     * stamp probe proved: the freed pipe_t's address is reused
+     * by the next sys_pipe, and the pending close lands on the
+     * wrong object. */
+    if (pipe->readers_open > 0 || pipe->writers_open > 0) {
+        if (pipe->refcount > 0) pipe->refcount--;
+        return;
+    }
+    race_record(24, 0, (uint64_t)pipe,
+                ((uint64_t)pipe->readers_open << 32) |
+                (uint64_t)pipe->writers_open,
+                RACE_SITE_PIPE_FREE, 81);
     if (pipe->buf) kfree(pipe->buf);
     kfree(pipe);
 }
@@ -1817,6 +1851,30 @@ static void pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
 
 static void put_file_slot(file_slot_t* slot) {
     if (!slot) return;
+    /* Record EVERY put_file_slot call on a pipe slot, before the
+     * early return, with the slot pointer, its refcount, its end
+     * flag, and the calling pid.  A slot that is put twice for a
+     * single fd reference shows as two records with the same slot
+     * pointer and refcounts 2 then 1 (or 1 then 0).  That is the
+     * double-put that drops readers_open to 0 while pipe7e still
+     * holds fd 3.  Slot 29 so it does not collide with anything. */
+    if (slot->kind == FILE_KIND_PIPE) {
+        pcb_t* _pp = process_get_current();
+        race_record(29, _pp ? _pp->pid : 0,
+                    (uint64_t)slot,
+                    ((uint64_t)slot->refcount << 32) |
+                    ((uint64_t)slot->end << 16) |
+                    ((uint64_t)slot->kind),
+                    RACE_SITE_PIPE_CLOSE, 60);
+    }
+    if (slot->kind == FILE_KIND_PIPE && slot->refcount > 1) {
+        race_p12_calls++;
+        race_p12_refcount_gt1++;
+        race_record(12, (uint64_t)slot->end,
+                    (uint64_t)slot->refcount,
+                    (uint64_t)slot->obj,
+                    RACE_SITE_PIPE_CLOSE, 1);
+    }
     if (slot->refcount > 1) {
         slot->refcount--;
         return;
@@ -1896,8 +1954,43 @@ static void put_file_slot(file_slot_t* slot) {
          * intermediate close in a dup'd chain.
          */
         pipe_t* pipe = (pipe_t*)slot->obj;
+        if (slot->end != PIPE_END_READ &&
+            slot->end != PIPE_END_WRITE) {
+            /* A pipe slot whose end flag is neither READ nor
+             * WRITE.  This is a slot whose end was clobbered by
+             * a reuse of its memory (see alloc_file_slot's end
+             * initialization and the DIR/PROC end = 0 writes).
+             * Do not guess which end this was: do not decrement
+             * either count, do not wake, and do not call
+             * put_pipe_ref -- freeing on a wrong guess strands
+             * the real reader.  Record it and fall through to
+             * freeing only the slot, leaving the pipe alive.
+             * A leak here is survivable; a lost wakeup is not. */
+            pcb_t* _bad = process_get_current();
+            race_record(30, _bad ? _bad->pid : 0,
+                        (uint64_t)slot,
+                        (uint64_t)slot->end,
+                        RACE_SITE_PIPE_CLOSE, 59);
+            kfree(slot);
+            return;
+        }
+        {
+            uint64_t _rb = (uint64_t)slot->refcount;
+            uint64_t _wb = (slot->end == PIPE_END_WRITE)
+                            ? (uint64_t)pipe->writers_open : 0;
+            uint64_t _wa = (slot->end == PIPE_END_WRITE)
+                            ? (uint64_t)pipe->reader_waiting : 0;
+            RACE_P12_SLOT((uint64_t)slot->end, _rb, 0, _wb, _wb, _wa);
+        }
         if (slot->end == PIPE_END_READ) {
             if (pipe->readers_open > 0) pipe->readers_open--;
+            {
+                pcb_t* _sc = process_get_current();
+                RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
+                               ((uint64_t)pipe->readers_open << 32) |
+                               (uint64_t)pipe->writers_open,
+                               RACE_SITE_CLOSE_READ);
+            }
             if (pipe->readers_open == 0 && pipe->writer_waiting) {
                 pipe_wake_waiter(pipe->writer_waiting,
                                  BLOCK_KIND_PIPE_WRITE);
@@ -1905,13 +1998,63 @@ static void put_file_slot(file_slot_t* slot) {
             }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
+            {
+                pcb_t* _sc = process_get_current();
+                RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
+                               ((uint64_t)pipe->readers_open << 32) |
+                               (uint64_t)pipe->writers_open,
+                               RACE_SITE_CLOSE_WRITE);
+            }
             if (pipe->writers_open == 0 && pipe->reader_waiting) {
+                RACE_P13_EVENT((uint64_t)pipe, 0, 0,
+                               RACE_SITE_WRITE_WAKE);
                 pipe_wake_waiter(pipe->reader_waiting,
                                  BLOCK_KIND_PIPE_READ);
                 pipe->reader_waiting = NULL;
+            } else if (pipe->writers_open == 0 &&
+                       (uint64_t)pipe == race_p13_watch_pipe) {
+                /* Lost close: writers_open hit 0 and there was no
+                 * reader waiter.  Record the pipe id (a), the
+                 * reader_waiting value at this moment (b), and the
+                 * pid of the process doing the close, so the ring
+                 * shows both this event and the reader's block
+                 * site, and we can compare their `a` values.  If
+                 * they differ, the read end and write end point
+                 * at different pipe_t objects. */
+                pcb_t* _self_close = process_get_current();
+                race_record(20,
+                            _self_close ? _self_close->pid : 0,
+                            (uint64_t)pipe,
+                            (uint64_t)pipe->reader_waiting,
+                            RACE_SITE_CLOSE_WRITE, 99);
+                race_record(21,
+                            _self_close ? _self_close->pid : 0,
+                            (uint64_t)pipe,
+                            pipe->stamp,
+                            RACE_SITE_CLOSE_WRITE, 98);
+                race_p13_wake_lost++;
             }
         }
-        put_pipe_ref(pipe);
+        /* Only drop the pipe's end-ref when BOTH ends have no
+         * open fds left.  The decrement above took one open-end
+         * count to 0; if the other is still nonzero, the pipe is
+         * still in use by a blocked or active peer and must not
+         * be freed.  When the second close arrives it runs this
+         * same branch and reaches the free at last. */
+        {
+            pcb_t* _self_g = process_get_current();
+            race_record(28, _self_g ? _self_g->pid : 0,
+                        (uint64_t)pipe,
+                        ((uint64_t)pipe->readers_open << 32) |
+                        (uint64_t)pipe->writers_open,
+                        RACE_SITE_CLOSE_WRITE,
+                        (uint64_t)slot->end);
+        }
+        if (pipe->readers_open == 0 && pipe->writers_open == 0) {
+            put_pipe_ref(pipe);
+        } else if (pipe->refcount > 0) {
+            pipe->refcount--;
+        }
     }
     kfree(slot);
 }
@@ -2060,6 +2203,7 @@ static int alloc_file_slot(file_slot_t** out_slot) {
     if (!slot) return -1;
     slot->kind     = 0;
     slot->refcount = 1;
+    slot->end      = 0;
     slot->obj      = NULL;
     slot->dir_path = NULL;
     self->file_table[fd] = slot;
@@ -2288,6 +2432,8 @@ long sys_pipe(int* user_pipefd) {
 
     pipe->buf = (uint8_t*)kmalloc(PIPE_DEFAULT_CAPACITY);
     if (!pipe->buf) {
+        race_record(24, self->pid, (uint64_t)pipe, 0xFFFFFFFF,
+                    RACE_SITE_PIPE_FREE, 82);
         kfree(pipe);
         return -(long)ENOMEM_;
     }
@@ -2300,6 +2446,11 @@ long sys_pipe(int* user_pipefd) {
     pipe->writers_open = 0;   /* set to 1 when the write end allocates */
     pipe->reader_waiting = NULL;
     pipe->writer_waiting = NULL;
+    pipe->stamp = ++g_pipe_stamp_counter;
+    race_record(23, self->pid, (uint64_t)pipe, pipe->stamp,
+                RACE_SITE_PIPE_CREATE, 80);
+    RACE_P13_EVENT((uint64_t)pipe, self->pid, pipe->stamp,
+                   RACE_SITE_PIPE_CREATE);
 
     /* 2. The two ends. */
     file_slot_t* rslot = NULL;
@@ -5074,6 +5225,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
         RACE_P1_BLOCK(self->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAIT4_BLOCK);
+        RACE_P11_BLOCK(self->pid, target);
 
         #if TRACE_WAIT
         serial_print("WW: wait4 self=");
@@ -5312,7 +5464,11 @@ long sys_write(int fd, const void* buf, size_t count) {
         pipe->used += (uint32_t)done;
 
         /* Bytes are in the ring: wake a waiting reader, if any. */
+        RACE_P13_EVENT((uint64_t)pipe, self->pid, (uint64_t)done,
+                       RACE_SITE_WRITE_PUT);
         if (pipe->reader_waiting) {
+            RACE_P13_EVENT((uint64_t)pipe, self->pid, 0,
+                           RACE_SITE_WRITE_WAKE);
             pipe_wake_waiter(pipe->reader_waiting, BLOCK_KIND_PIPE_READ);
             pipe->reader_waiting = NULL;
         }
@@ -5725,6 +5881,10 @@ long sys_read(int fd, void* buf, size_t count) {
 
         for (;;) {
             __asm__ volatile("cli");
+            RACE_P13_EVENT((uint64_t)pipe, self->pid,
+                           ((uint64_t)pipe->used << 32) |
+                           (uint64_t)pipe->writers_open,
+                           RACE_SITE_READ_CHECK);
             if (pipe->used > 0) {
                 __asm__ volatile("sti");
                 break;
@@ -5741,6 +5901,8 @@ long sys_read(int fd, void* buf, size_t count) {
              * blocking until EVERY write-end fd is closed.
              */
             if (pipe->writers_open == 0) {
+                RACE_P13_EVENT((uint64_t)pipe, self->pid, 0,
+                               RACE_SITE_READ_EOF);
                 __asm__ volatile("sti");
                 return 0;
             }
@@ -5753,9 +5915,55 @@ long sys_read(int fd, void* buf, size_t count) {
             pipe->reader_waiting = self;
             self->state      = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_PIPE_READ;
+            RACE_P13_READER_PID((uint64_t)pipe, self->pid);
+            RACE_P13_EVENT((uint64_t)pipe, self->pid, pipe->stamp,
+                           RACE_SITE_READ_BLOCK);
+            race_record(22, self->pid, (uint64_t)pipe,
+                        pipe->stamp, RACE_SITE_READ_BLOCK, 97);
+            race_p13_saw_block++;
+
+            /* Re-check under the same cli.  The writers_open check
+             * at the top of this loop and the reader_waiting store
+             * just above are both inside this cli, but the WRITER's
+             * close path runs under its own cli in process_exit, and
+             * the two critical sections do not overlap.  If the last
+             * writer closed between the writers_open check and the
+             * reader_waiting store, the close path found
+             * reader_waiting == NULL and did not wake us.  This
+             * re-check catches that case: no writer left means EOF,
+             * not a block.  Structural close of the lost-wakeup
+             * window -- same shape as the wait4 late re-scan. */
+            if (pipe->writers_open == 0) {
+                pipe->reader_waiting = NULL;
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return 0;
+            }
 
             __asm__ volatile("sti");
             __asm__ volatile("hlt");
+            /* Woken by a peer's write or close, OR preempted by
+             * a tick.  Either way, we are running again.  Set
+             * state back to RUNNING so the scheduler's requeue
+             * guards (which test state == RUNNING) see us
+             * correctly.  If a peer wake set us READY while we
+             * were between the sti and the hlt, this is what
+             * stops us from halting as a READY process the
+             * scheduler will never requeue -- the item-7d
+             * lost-process hang.  Then loop and re-check. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Do NOT clear pipe->reader_waiting here.  This
+             * return from hlt may be a timer wake, not a peer
+             * wake; clearing the waiter on a timer wake opens a
+             * window where a concurrent close finds
+             * reader_waiting == NULL and does not wake us, and
+             * we then re-block forever.  The waker clears the
+             * field on a successful wake; the reader re-publishes
+             * it on the next block.  Leaving it set is safe:
+             * pipe_wake_waiter checks state == BLOCKED, so a
+             * stale pointer to a running process is ignored. */
         }
 
         /* Copy what is available, then wake a waiting writer. */
@@ -7089,6 +7297,15 @@ static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
     (void)offset;
+    {
+        pcb_t* _s = process_get_current();
+        race_record(26, _s ? _s->pid : 0,
+                    (uint64_t)addr,
+                    ((uint64_t)length << 32) |
+                    ((uint64_t)(prot & 0xFFFF) << 16) |
+                    ((uint64_t)(flags & 0xFFFF)),
+                    RACE_SITE_PIPE_CREATE, 71);
+    }
 
     if (length == 0) return -(long)EINVAL_;
 
@@ -7194,6 +7411,8 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         elf_add_page_to_pcb(self, phys);
     }
 
+    race_record(27, self->pid, (uint64_t)base, 0,
+                RACE_SITE_PIPE_CREATE, 72);
     return (long)base;
 }
 
@@ -7829,8 +8048,22 @@ void sys_exit(int status) {
 
 long sys_arch_prctl(int code, void* addr) {
     if (code == ARCH_SET_FS) {
-        wrmsr(0xC0000100, (uint64_t)addr);
         pcb_t* self = process_get_current();
+        /* Record every ARCH_SET_FS: the pid, the addr musl
+         * passed, and what the MSR read back after the write.
+         * This names whether the kernel mangled the value or
+         * musl passed a wrong one.  Slot 25 so it survives the
+         * ring wrap that the fast P13 events cause. */
+        wrmsr(0xC0000100, (uint64_t)addr);
+        uint32_t _lo, _hi;
+        __asm__ volatile("rdmsr" : "=a"(_lo), "=d"(_hi)
+                         : "c"(0xC0000100u));
+        uint64_t _after = ((uint64_t)_hi << 32) | (uint64_t)_lo;
+        race_record(25,
+                    self ? self->pid : 0,
+                    (uint64_t)addr,
+                    _after,
+                    RACE_SITE_PIPE_CREATE, 70);
         if (self) self->fs_base = (uint64_t)addr;
         return 0;
     }
@@ -7847,6 +8080,19 @@ static void kernel_do_reboot(void) {
 uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+    g_last_syscall_num = num;
+    /* Record the calling process's %fs base at syscall entry.
+     * Done here in C, not in the asm stub: the asm stub has no
+     * scratch register free before the pushes, and rdmsr clobbers
+     * RAX/RDX/RCX, which hold the user's live values on entry
+     * (RCX in particular is the user return RIP, and clobbering it
+     * makes sysret return to the MSR number). */
+    {
+        uint32_t _lo, _hi;
+        __asm__ volatile("rdmsr" : "=a"(_lo), "=d"(_hi)
+                         : "c"(0xC0000100u));
+        g_last_fs_base = ((uint64_t)_hi << 32) | (uint64_t)_lo;
+    }
     (void)arg3; (void)arg4; (void)arg5;
 
     switch (num) {

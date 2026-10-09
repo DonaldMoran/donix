@@ -105,6 +105,23 @@ user_syscall_entry:
     
     add rsp, 8                      ; discard stacked arg5
 
+    ; Disable interrupts for the entire syscall-return tail.
+    ; If a timer tick fires between here and sysretq, the frame
+    ; the timer saves is not the stub's PUSH_ALL_GPRS frame --
+    ; it is the mid-tail %rsp, after some registers have
+    ; already been popped.  When the scheduler resumes us,
+    ; irq0_stub's POP_ALL_GPRS pops from a location that does
+    ; not have 15 registers, and the iretq uses whatever is at
+    ; that location as its return frame.  That is the
+    ; corruption: the process resumes at a garbage RIP/RSP
+    ; that came out of the tail's popped slots.
+    ;
+    ; sysretq restores the user's RFLAGS -- and therefore IF --
+    ; from r11, which was loaded from the saved user RFLAGS.
+    ; User mode gets interrupts back; the kernel runs with
+    ; them off only across the tail.
+    cli
+
     ; Both exit(2) and exit_group(2) terminate the calling process.
     ; rbx holds the raw syscall number saved before the C call.
     ;

@@ -15,6 +15,8 @@
  * signature of a corrupted sysret target. */
 extern volatile uint64_t g_last_sysret_rcx;
 extern volatile uint64_t g_last_sysret_r11;
+extern volatile uint64_t g_last_syscall_num;
+extern volatile uint64_t g_last_fs_base;
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -797,6 +799,8 @@ void isr13_handler(exception_frame_t *frame) {
      */
     int bad_target = 0;
     if (fault_rip < 0x1000) bad_target = 1;
+    if (fault_rip == 0xFFFFFFFFULL) bad_target = 1;
+    if (fault_rip == 0xFFFFFFFFFFFFFFFFULL) bad_target = 1;
     if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
     if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
 
@@ -804,6 +808,8 @@ void isr13_handler(exception_frame_t *frame) {
         serial_print("  *** corrupted control target ***\n");
         serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
         serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+        serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+            serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
     }
     serial_print("  --- raw frame dump ---\n");
     for (int i = 0; i < 48; i++) {
@@ -879,6 +885,8 @@ void isr14_handler(exception_frame_t *frame) {
          * comment there for the three shapes. */
         int bad_target = 0;
         if (fault_rip < 0x1000) bad_target = 1;
+        if (fault_rip == 0xFFFFFFFFULL) bad_target = 1;
+        if (fault_rip == 0xFFFFFFFFFFFFFFFFULL) bad_target = 1;
         if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
         if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
 
@@ -886,6 +894,8 @@ void isr14_handler(exception_frame_t *frame) {
             serial_print("  *** corrupted control target ***\n");
             serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
             serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+            serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+            serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
         }
         serial_print("  CR3               : 0x"); serial_print_hex(cr3); serial_print("\n");
         serial_print("  Walk indices: pml4=");
