@@ -214,7 +214,7 @@ a build and test in the real tree.
 
 ---
 
-## Where we are -- after session 60
+## Where we are -- after the last tag
 
 **The 7e family is a RACE, and the tick-rate curve is the proof.**
 Same kernel, same image, same `pipe7e`, only `pit_init` varies:
@@ -341,7 +341,7 @@ the older non-`2026*` tags.  One change at a time.  Do not edit
 ## Open issues (top 6; full list in `docs/open-issues.md`)
 
 1. **`open-issues.md` item 7e: the control-transfer face.**  **It
-   is a RACE** (rate curve, session 60).  Precondition: ash's stale
+   is a RACE** (rate curve).  Precondition: ash's stale
    `jmp_buf`.  Trigger: a timing-dependent kernel window, not yet
    found.  **The lead.**
 2. **`open-issues.md` item 12: signal delivery is a stub.**  The
