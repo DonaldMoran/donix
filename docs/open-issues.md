@@ -530,6 +530,8 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
      state.  See the summary block above.
    - The PTE-for-`CR2` print in `isr14_handler`, already in the
      tree.
+   - `pipe7e_sjlj_stale` (`/usr/bin/PIPE7E_SJLJ_STALE`) --
+     reproduces the stale-`jmp_buf` shape first-party.
 
    **Session 58 -- the `fault_rip` walk, and what it found.**
 
@@ -941,8 +943,30 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
     and it is what would show a regression.
 
 Also open: `sys_brk`'s fixed `heap_base` and the 4 MB mmap window
-...same text... keystroke — read the `put_file_slot` comment and
-this entry before touching either).
+are latent collisions; real FatFs timestamp storage (the three
+timestamp syscalls return 0 without storing); `prctl` is minimal
+(`PR_SET_NAME` accepted and dropped); busybox applet symlinks not
+installed; syscall-table audit script; `musl_wait`'s WNOHANG loop
+spins (pre-existing; the spin's wall-clock duration increased
+between `v0.6.6` and `v0.6.7`, when the console changed from VGA
+text to framebuffer — see `session-log.md`, session 41, for the
+bisect); `sys_mmap` rejects all non-anonymous mappings (a
+file-backed `mmap` caller will get `-ENOMEM` and must fall back to
+`read`; **a Wayland prerequisite -- see `ROADMAP.md`**); **pipes
+support one concurrent reader and one concurrent writer** (see
+`pipe_t`'s comment in `user_syscall.c` — a second blocked reader on
+the same pipe end has nowhere to record itself and will only wake
+on a keyboard IRQ); **`put_file_slot`'s pipe wake is coupled to
+`sys_close`'s wake** (if `sys_close`'s wake is ever removed on the
+theory that `put_file_slot` covers everything, non-final closes in
+a `dup`'d chain stop waking the peer and the peer hangs until a
+keystroke — read the `put_file_slot` comment and this entry before
+touching either).
+
+*(Restored verbatim from before `476dd86`, which elided this list to
+a `...same text...` placeholder.  The list is from 2026-10-02 and
+predates `v0.6.12`; several items may be stale.  Audit it against
+current tree state before acting on any one line.)*
 
 12. **Signal delivery is a stub; a faulted process cannot catch
     its own signal.**  `sys_rt_sigaction` returns 0 and installs
