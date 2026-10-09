@@ -3,12 +3,15 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-06 (session 59 closed: the 7e mechanism
-found by reading the disassembly and reproduced first-party; a real
-kernel defect surfaced and was fixed.  The docs are updated and the
-tree is clean.  **The next act is the `v0.6.13` bump** -- banner
-commit, drop the 22 `2026*` scratch tags, push, tag, merge.  Then
-item 12, signal delivery.)
+**Last updated:** 2026-10-09 (session 60 closed: the 7e family is
+a RACE, proven by a tick-rate curve; the `testme` migration landed
+on `donix`; five race windows closed; the session-61 kernel fixes
+cherry-picked and corrected.  **No bump.**  The tree is clean and
+unpushed, and the next session works on `donix` directly.
+
+**The next act is the 7e RACE.**  Not a bump, not item 12 as the
+lead.  The instrument is the tick-rate sweep plus the P13/P12/P11
+probes.  See "Where we are" and "NEXT SESSION" below.)
 
 **Repo state -- run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -211,333 +214,145 @@ a build and test in the real tree.
 
 ---
 
-## Where we are -- after session 59
+## Where we are -- after session 60
 
-**The 7e mechanism is identified, reproduced, and the kernel defect
-it surfaced is fixed.  7e stays open because the bug is ash's.**
-The full narrative is `docs/session-log.md`, session 59, and
-`docs/open-issues.md` item 7e.  In one paragraph each:
-
-**The mechanism.**  `evaltree` stores a pointer to its own stack
-frame's `jmp_buf` into `globals+0x38` (`0x41C403`) and does not
-restore it on the normal return; its epilogue, `popstackmark`,
-`dotrap`, and `int_on` all read the field, none writes it.
-`redirectsafe` manages the same field, saving the old value on its
-own frame (`rsp+0x20`) and restoring from there -- so a stale
-`_longjmp` into a returned frame reads a dead slot.
-`raise_exception` (`0x415521`, 27 bytes) `_longjmp`s to
-`globals+0x38` with no liveness check.  A stale `%rsp` results.
-
-**The reproduction.**  `pipe7e_sjlj_stale` mirrors the shape
-first-party; phase 1 faults.  Fault #1: `RIP = 0x80000FBDBF` (a
-user stack address), `RSP = 0x34`, error `0x5`.  Fault #2: the
-handler on the garbage stack, `RIP = 0x400640`, `CR2 = 0x28`,
-error `0x7`.
-
-**The kernel defect the reproduction found.**
-`signal_maybe_redirect` had no re-entry guard, so a handler that
-itself faulted re-entered itself forever -- a live-lock.  Fixed
-with `in_signal_handler` on `pcb_t`, set when the redirect fires,
-cleared in **both** `process_reclaim` and `process_destroy`.
-`signal_handler[]` was also never cleared on teardown despite the
-comment; fixed in the same commit.
-
-**What this closes and what it does not.**  The **loop** is closed;
-7e will still fire in ash, now taking two faults and a kill
-instead of live-locking.  The bug is ash's and `third_party/` is
-not editable.  **The only donix-side path to making 7e stop
-costing whole runs is item 12** -- a real signal subsystem, so ash
-can catch the fault and continue.
-
-### Session 60 -- the rate curve, and why 7e is a RACE
-
-**Session 60 measured the tick-rate curve, and it changes the
-reading of the mechanism above.**  Same kernel, same image,
-same `pipe7e`, only `pit_init` varies:
+**The 7e family is a RACE, and the tick-rate curve is the proof.**
+Same kernel, same image, same `pipe7e`, only `pit_init` varies:
 
 | `pit_init` | result |
 |---|---|
 | 10 | `PIPE7E-ALL-PASS`, 50000 iterations |
 | 20 | progresses, `iter 1000` within minutes |
-| 30 | progresses, same result |
+| 30 | progresses |
 | 40 | **begins to fail** |
 | 100 | faults, at `iter 4` to `iter 232` across runs |
 
 **A monotone failure curve with a threshold between 30 and 40 Hz
-is the signature of a race.**  A deterministic defect -- a wrong
-offset, a missing store, a corrupted buffer written
-unconditionally -- produces the same outcome at every rate.  This
-one does not.
+is the signature of a race.**  A deterministic defect produces the
+same outcome at every rate.  This one does not.
 
-**So the mechanism above is the PRECONDITION, not the whole
-mechanism.**  `evaltree`'s missing restore is why a stale
-`jmp_buf` exists.  It does not explain why the stale buffer is
-*reached* only at the higher tick rate.  **Something else -- a
-race -- decides whether `raise_exception` longjmps to it, and
-the tick rate is what tips it.**  Both are required: the stale
-buffer must exist, and the race must deliver control into
-`raise_exception` at the wrong moment.
+**The precondition is ash's stale `jmp_buf`; the trigger is the
+race.**  `evaltree` stores a pointer to its own stack frame's
+`jmp_buf` into `globals+0x38` and does not restore it on the normal
+return; `raise_exception` `_longjmp`s to it with no liveness check.
+That is session 59's finding and it is a *deterministic* defect --
+it explains why a stale buffer exists, not why it is only *reached*
+at the higher rate.  **Both are required.**
 
-**The session-60 controls:** several other workloads that
-failed at `pit_init(100)` now pass, after the five fixes below.
-`pipe7e` moved from `iter 0`/`iter 50` to `iter 232` at 100 Hz
-before the race fires.  That is progress, not closure.
+### The fault's shape
 
-**The five fixes, committed and tagged
-`20261009-pipe-lifetime-lostwakeup`:**
+Every 7e fault produces a small integer at a return-address slot,
+where a `ret` popped it: `0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`.
+`last sysret rcx` is `__syscall_cp` (`0x400CF2`, `0x4041F8`), the
+musl cancellation wrapper on the stdio/lock path.  The value is
+`_longjmp(buf, 1)`'s return value.  `%fs` is a text address at every
+fault and all three records agree -- **the `fs_base` path is
+correct and is not the mechanism.**
 
-1. **Pipe lifetime.**  `put_pipe_ref` and `put_file_slot` gate
-   the `pipe_t` free on `readers_open == 0 && writers_open == 0`,
-   not on the ends refcount alone.  Found by the P13 stamp
-   probe: reader blocked on stamp 2, the close ran on stamp 1,
-   same address.
-2. **Stranded `READY`.**  `process_yield` and `process_exit`
-   re-add a `READY` process that is not on the ready queue
-   before falling to idle.  Found by reading the live pool with
-   `gva2gpa` + `pmemsave`: a helper `READY`, off the queue, CPU
-   in `kernel_idle_loop`.
-3. **The sysret-tail window.**  `user_syscall_entry.asm`
-   disables interrupts across the entire return tail.  Found by
-   reading the disassembly.
-4. **The `hlt`-return bug.**  The pipe reader resets state to
-   `RUNNING` after `hlt`, and does not clear `reader_waiting`
-   on a timer wake.
-5. **The invalid-`end` guard.**  `alloc_file_slot`
-   initializes `end = 0`; `put_file_slot` refuses to free a pipe
-   when a slot's `end` is neither READ nor WRITE.
+### What is fixed on `dev` (the migration and the kernel fixes)
 
-**The `%fs` measurements at the fault, and what they settled.**
-`last fs_base`, `fs_base NOW` (the MSR at the fault), and
-`pcb->fs_base` all read `0x408698` in every captured fault, and
-the per-pid `arch_prctl` record shows the faulting process
-**inherited** that value rather than setting it.  **The `fs_base`
-path is correct** (confirming the file's falsification 1); the
-value is a text address because musl set it once, early.  The
-rate curve says the `%fs` value is not the mechanism -- it is a
-constant present at every fault, at every rate.
+The `testme` migration (13 commits, tag
+`20261009-donix-migrated`) plus the session-61 kernel fixes
+(tag `20261009-session61-fixes-merged`).  The fixes that closed
+race windows, each found by a probe and verified:
 
-**The fault's shape, for the next session.**  Every 7e fault
-produces a small integer at a return-address slot, where a `ret`
-popped it: `0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`.
-`last sysret rcx` is `__syscall_cp` (`0x400CF2`, `0x4041F8`) --
-the musl cancellation wrapper, on the stdio/lock path.  The
-value is `_longjmp(buf, 1)`'s return value, and it sits where a
-return address belongs.  **A stale `jmp_buf` reaching a returned
-frame, under a race.**
+1. **Pipe lifetime.**  `put_pipe_ref` / `put_file_slot` gate the
+   free on `readers_open == 0 && writers_open == 0`.
+2. **Stranded `READY`.**  `process_yield` / `process_exit` re-add a
+   `READY` process off the queue before idling.
+3. **The sysret tail.**  `cli` across the whole return tail.
+4. **The `hlt`-return state.**  Reader resets `state = RUNNING`.
+5. **The invalid-`end` guard** on pipe slots.
+6. **The stale caller-saved register file** on block-and-resume
+   (session-61: the ring-0 save path reads 15 pcb slots, writes 6).
+7. **`pcb->rsp` / `pcb->user_rsp` split** (session-61), corrected
+   by `c8d6255` -- the user-mode save must write BOTH fields.
 
-**The next session's lead is the race, not item 12.**  Item 12
-is still the fix that would let ash *survive* the fault, and it
-remains the largest target.  But the rate curve says there is a
-kernel-side window still open, and the instrument to find it is
-the tick-rate sweep plus the P13/P12/P11 probes: run `pipe7e` at
-10 Hz and at 100 Hz and compare the counters.  **The difference
-between the two runs is the race.**
+### What is NOT fixed
 
-**Do not chase memory corruption.**  Five sessions did; the rate
-curve says race.  **Do not point at musl or busybox as the bug.**
-They are third-party and read-only; the precondition is ash's
-and that is documented.  The trigger is a timing-dependent race
-that can be found on the kernel side.  **Do not re-derive the
-`fs_base` path** -- it is correct, and session 60's measurements
-confirm it.
+**The 7e race itself.**  The fixes above closed windows; the family
+still fires at 100 Hz.  **The residual window is not yet found.**
+That is the next session's job.
 
-### The NX / non-canonical address family (session 54, unchanged)
+### What was falsified, so it is not re-walked
 
-Four fixes, one mechanism: `vmm_get_phys*` strip `PT_NX`;
-`sys_mmap` honors `PROT_EXEC`; the huge-page split sets NX on the
-512 split PTEs, not the PDE; `pte_phys` strips both.  Every walk
-site in `vmm.c` uses `pte_phys`.
-
-### The fault model (session 54, unchanged)
-
-**`isr14_handler`'s walk does not halt.**  **`fault_signal` +
-`sys_wait4`:** a faulted child's wait status is a signal-kill
-encoding; busybox ash prints `Segmentation fault`.  **`g_last_sysret`**
-is wired.  User-mode faults are diagnosed and the process killed;
-the machine lives.
+- **Memory corruption** as the cause.  Five sessions chased it; the
+  rate curve says race.  The wrong values are *symptoms* of windows.
+- **The ready-queue lock** (P8: 6028 checks, all clean).
+- **The `fs_base` path** (three values agree at `0x408698`).
+- **The wake-kind inversion, the lost-wakeup instrument, the PMM
+  double-handout** -- all zero on the probes.
+- **The two `setjmp` probes** pass; those mechanisms are falsified.
 
 ---
 
 ## NEXT SESSION
 
-**The session-60 lead is the 7e race, and the rate curve is its
-instrument.**  The tick-rate sweep (10 Hz clean, 40 Hz the
-threshold, 100 Hz fault) proves the fault is a race.  The
-precondition is ash's stale `jmp_buf`; the trigger is a
-timing-dependent window that the higher tick rate opens more
-often.  **Run `pipe7e` at 10 Hz and 100 Hz with the P13/P12/P11
-probes on, and compare the counters.**  The difference is the
-race.  See "Where we are" above.
+**The lead is the 7e RACE.**  Not item 12 as the lead; item 12
+remains the fix that lets ash *survive* the fault and is the largest
+single target, but it is not the way to find the residual window.
 
-**Item 12 -- signal delivery -- remains the largest target and
-the fix that would let ash survive the fault.**  `sys_rt_sigaction`
-is still a stub for every real signal.  Session 59's fix means
-`signal_handler[]` is per-process and cleared on teardown, and the
-redirect is guarded; what remains is the subsystem: a real
-`sys_rt_sigaction` reading the real `struct sigaction`, a raise on
-the fault path, an `rt_sigreturn` that restores the frame after the
-handler returns, a restorer trampoline, and a `SIGPIPE` raise on
-the `-EPIPE` write path.  Unblocks `kill`, ash job control, the
-Wayland `SIGBUS` path, and a real first-party `SIGSEGV` reproducer
-that **returns** from its handler.
+**The method: find the window, not the corruption.**
 
-**Item 12 is a workstream, not a commit.**  Scope it first: the
-`struct sigaction` layout, the return-path frame, the restorer
-convention, the pending/blocked sets, the raise sites, the default
-actions, and cross-process delivery.  Write the design down before
-writing code.  A half-built signal subsystem is worse than the
-current honest stub.
+1. **Run `pipe7e` at 10 Hz and at 100 Hz, with the P13/P12/P11
+   probes on, and compare the counters.**  The difference is the
+   race.  The probes are in `04_kernel_64bit/include/race_probe.h`,
+   gated by `RACE_PROBE_*`.
+2. **The fault-path read:** when it faults, read `CR2`, `RIP`,
+   `last sysret rcx`, and the three `fs_base` values.  The shape
+   names the window.
+3. **The tick rate is the instrument.**  `pit_init(10)` widens the
+   window; `pit_init(100)` fires it.  A window that moves between
+   the rates is real; one that does not is not the one.
+
+**Candidate windows the probes already point at:** the block sites
+that still do `sti; hlt` without a register save (`sys_wait4`'s
+yield path is the named gap -- it sets `BLOCKED` then calls
+`process_yield`, reaching `context_switch` by a different route);
+the `irq0_stub` resume path; the timer's `current->rsp` /
+`user_rsp` decision.  **Read the bytes, add one probe, run once.**
 
 ### The candidates, in order
 
-1. **Item 12 -- signal delivery.**  Largest; the only path to
-   making 7e stop costing runs; unblocks several.
-2. **`sys_gettimeofday` (96).**  A few lines from `g_ticks`, like
-   `sys_clock_gettime` (228).  Unlocks `ps -l`.  **Small,
-   patterned, independent.**  Note: the number is **96**, not 99;
-   the handoff carried 99 in error until session 59.
-3. **The `v0.6.13` bump.**  A whole procedure: banner commit, drop
-   the 22 `2026*` scratch tags, push, tag, merge.  **A decision,
-   not a default.**
-4. **Documenting the ash mechanism** for a third-party patch or a
-   workaround.  The donix side has no fix left for 7e.
-
-### If you would rather do something small and clean
-
-**`sys_gettimeofday` (96)** -- see above.  **`open("/proc/<pid>",
-O_DIRECTORY)`.**  **`/dev` as a listable directory.**  **More
-applets from the "still-off" table** -- the zero-syscall ones.
+1. **The residual 7e race.**  The lead.  The tick-rate sweep and
+   the probes; do not chase memory corruption.
+2. **Item 12 -- signal delivery.**  Largest; lets ash survive the
+   fault; unblocks `kill`, ash job control, the Wayland `SIGBUS`
+   path.  A workstream, not a commit -- scope it first.
+3. **`sys_gettimeofday` (96).**  Small, patterned, independent.
+   Unlocks `ps -l`.  **Note: 96, not 99.**
+4. **Documenting the ash mechanism** for a third-party patch.
 
 ### Do not
 
-Do not re-open item 7 (closed), item 11 (closed), or the session-48
-zone scan (fixed).  **Do not re-open the fork-sentinel leak.**
-**Do not re-litigate the five 7e mechanisms falsified in sessions
-56-57.**  **Do not re-open the "is the mmap window executable"
-question.**  **Do not trust a page walk's verdict without reading
-the walk.**  **Do not re-run the two `setjmp` probes to "check" --
-they pass; the mechanisms are falsified.**  Do not chase the
-intermittent family (7a, 7b) without a reproducer.  **Do not drop
-the older non-`2026*` tags.**  One change at a time.  Do not edit
+**Do not chase memory corruption** -- the rate curve says race.
+**Do not point at musl or busybox** as the culprit binary; they are
+read-only and the trigger is a kernel-side window.  **Do not
+re-derive the `fs_base` path** -- it is correct.  Do not re-open
+item 7 (closed), item 11 (closed), or the session-48 zone scan.
+Do not re-litigate the five 7e mechanisms falsified in sessions
+56-57.  Do not re-run the two `setjmp` probes to "check".  Do not
+trust a page walk's verdict without reading the walk.  Do not drop
+the older non-`2026*` tags.  One change at a time.  Do not edit
 `third_party/` -- but do read it.
-
----
-
-## Busybox enablement -- state of play
-
-**Enabled and working:** `ps`, `pstree`, `stty`, `tty`, `gzip`,
-`gunzip`, plus batches 2 and 3.  `sha512sum` **works** -- item 7c was
-a test bug.  `find -not` **works with `!`**.
-
-### The rule
-
-**Enable an applet only when the syscalls it actually calls are
-implemented -- read the applet's source, do not guess from its
-name.**  A syscall that exists but cannot do its job is worse than
-a missing one.
-
-**A real applet finds real bugs.**  Session 52 is the
-counter-example: a real applet found a wrong test.
-
-**Do not edit `third_party/`.**
-
-### What each still-off applet needs
-
-Each row is a **cost estimate, not a prohibition**.
-
-| Config | Applet | Needs |
-|---|---|---|
-| `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous) |
-| `CONFIG_CHMOD`/`CHOWN` | | FAT has no permissions/ownership |
-| `CONFIG_LN`/`LINK` | | FAT has no links |
-| `CONFIG_MOUNT`/`UMOUNT` | | no VFS |
-| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | | item 12; no init, no ACPI |
-| `CONFIG_TAR`/`UNZIP`/`CPIO`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
-| `CONFIG_AWK` | `awk` | large |
-| `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control; `/dev/tty` does not exist |
-| `CONFIG_TOP` | `top` | `ps -l`-class fields (`gettimeofday`), a redraw loop |
-| `CONFIG_KILL` | `kill` | item 12 |
-| `CONFIG_NETWORKING` | | no network stack |
-| `CONFIG_ASH_JOB_CONTROL` | | item 12; item 13 |
-| `CONFIG_FEATURE_FANCY_SLEEP` | `sleep 0.1` | nothing -- the flag itself |
-
----
-
-## Canary state
-
-**Green as of session 57's carry-back** -- `canary` 15/15,
-`canary --full` 28/28, `selftest` 18/18, `test.sh` **57 passed, 0
-failed**.
-
-**`pipe_wake_probe.sh` completion varies per boot.**  The 7e family
-and the 7d lost-wakeup are racy.  **The completion rate is not a
-regression indicator on its own.**
-
-**Session 59 verified:** `pipe7e_stdio_sjlj` passes 20000;
-`pipe7e_stdio_heapjmp` passes 20000; `pipe7e_sjlj_stale` phase 1
-faults and is killed (two faults, no loop).
-
-**Regression tests (`userland/musl/tests/`, not canary rows):**
-
-    at_step1 at_step2 envp_step1 musl_exec2 fcntl_lowfd
-    readlink_errno proc_status proc_fd proc_dir proc_stat
-    proc_walk proc_walk_fds mmap_stress exec_churn
-    sha512_probe pipe7e mmap_nx sigsegv_probe pipe7e_stdio
-    pipe7e_stdio_sjlj pipe7e_stdio_heapjmp pipe7e_sjlj_stale
-
-**Pipe regression suite:** `pipe_step1 pipe_step2 pipe_step3
-pipe_step3b`.  Run when changing `sys_read`/`sys_write`/`sys_close`/
-`put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
-
-**`pipe7e` is the item-7e acceptance test.**  **`mmap_nx`** proves
-`sys_mmap`'s `PT_NX` gate.  **`sigsegv_probe`** lets a process catch
-its own fault.  **`pipe7e_stdio`** is the `x=$(cmd)` shape with
-`FILE *`.  **`pipe7e_stdio_sjlj` / `pipe7e_stdio_heapjmp`** test the
-`setjmp` shapes and pass.  **`pipe7e_sjlj_stale`** is the
-stale-`jmp_buf` reproduction and the acceptance test for the
-`signal_maybe_redirect` re-entry guard.
-
-**Run `pipe7e_sjlj_stale` when changing `signal_maybe_redirect`,
-`isr13_handler`, `isr14_handler`, or the `pcb_t` signal fields.**
-
-**The harness:** `test.sh` (staged at `/root/scripts/test.sh`),
-~58 rows, not a canary, takes minutes, passes now.
-
-**New ELFs must be added to both `USERLAND_ELFS` and the `mcopy_one`
-chain in `05_boot_kernel64/Makefile`.**
-
-**Do NOT add a bare `sh` row.**  There is no `/bin/sh`.
-
-**Expected noise:** no `Unknown syscall:` lines; no `[fd]` lines;
-the `FB:` line is expected.  `WW:` lines are the item-7d instrument.
-**A `Segmentation fault` line is expected** -- the honest
-exit-status change.  Multiple in a `pipe_wake_probe.sh` run are the
-7e family firing, each absorbed.
 
 ---
 
 ## Open issues (top 6; full list in `docs/open-issues.md`)
 
-1. **`open-issues.md` item 7e: the control-transfer face.**  The
-   **mechanism is identified** on the ash side and reproduced; the
-   **kernel re-entry loop is fixed**.  7e stays open because the
-   stale-`jmp_buf` bug is ash's.  **No donix-side fix remains.**
+1. **`open-issues.md` item 7e: the control-transfer face.**  **It
+   is a RACE** (rate curve, session 60).  Precondition: ash's stale
+   `jmp_buf`.  Trigger: a timing-dependent kernel window, not yet
+   found.  **The lead.**
 2. **`open-issues.md` item 12: signal delivery is a stub.**  The
-   largest target; unblocks `kill`, ash job control, the Wayland
-   `SIGBUS` path, and a real `SIGSEGV` reproducer.  **The next
-   session's lead.**
+   largest single target; lets ash survive the fault.
 3. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
-   Latent; the fix is a kernel feature.
 4. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 5. **`open-issues.md` item 9: no privilege model.**
-6. **`sys_gettimeofday` (96) is not implemented**, so `ps -l` is
-   off.  Small.  **Note: 96, not 99.**
+6. **`sys_gettimeofday` (96)** so `ps -l` works.  Small.
 
-**Item 7 closed; item 7c retracted; item 7d fixed.**  **Item 11
-closed.**  **Item 7e: mechanism identified and reproduced; loop
-fixed; open because the bug is ash's.**
-
----
+**Item 7 closed; item 7c retracted; item 7d fixed; item 11 closed.**
+**Item 7e: a race, residual window open.**
 
 ## State on disk
 
@@ -589,29 +404,16 @@ it.
 ## The one-line summary
 
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
-Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  `v0.6.12` is a correctness milestone; `v0.6.13`
-is pending.  Session 51** built the applet batches and harness.
-**Session 52** retracted item 7c.  **Session 53** found the zombie
-leak.  **Session 54** closed item 11, fixed the NX family, made user
-faults honest.  **Session 55** closed the fork-sentinel leak.
-**Sessions 56-57** made three kernel fixes, built `mmap_nx` and
-`sigsegv_probe`, and falsified five mechanisms.  **Session 58**
-added the `fault_rip` walk (found to misread, retracted), fixed the
-ELF loader, wrote `pipe7e_stdio`.  **Session 59** wrote two
-`setjmp`/`longjmp` probes (both pass, falsifying two mechanisms);
-found the ash-side mechanism by reading the disassembly
-(`evaltree` never restores `globals+0x38` on its normal return, and
-`redirectsafe` restores the same field from a frame-local slot) and
-reproduced it first-party (`pipe7e_sjlj_stale`); and found and
-fixed a real kernel defect the reproduction surfaced
-(`signal_maybe_redirect` had no re-entry guard, so a handler that
-faulted looped forever; also `signal_handler[]` was never cleared
-on teardown).  **The next act is the `v0.6.13` bump; then the
-session-60 lead is item 12, signal delivery.**  See NEXT SESSION.
-One change at a time.**
-
----
+The userland is a tracked source tree at `userland/musl/`.  `v0.6.13`
+is the last tag; no bump.  The `testme` migration and the session-61
+kernel fixes are on `donix`'s `dev`, unpushed.  Session 60's finding:
+**the 7e family is a RACE, proven by the tick-rate curve** (10 Hz
+clean, 40 Hz the threshold, 100 Hz faults).  The precondition is
+ash's stale `jmp_buf`; the trigger is a timing-dependent kernel
+window that has not been found.  Five race windows are closed and
+committed; the residual race is the next session's lead.  **Do not
+chase memory corruption -- the rate curve says race.  Read the
+bytes, add one probe, run once.**  One change at a time.**
 
 ## How to use this file
 
