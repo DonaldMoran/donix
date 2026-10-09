@@ -3,6 +3,7 @@ default rel
 
 section .text
 global user_syscall_entry
+global g_user_rsp_save
 extern syscall_dispatch
 extern process_exit
 extern serial_print

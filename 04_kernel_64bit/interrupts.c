@@ -15,6 +15,7 @@
  * signature of a corrupted sysret target. */
 extern volatile uint64_t g_last_sysret_rcx;
 extern volatile uint64_t g_last_sysret_r11;
+extern volatile uint64_t g_user_rsp_save;
 extern volatile uint64_t g_last_syscall_num;
 extern volatile uint64_t g_last_fs_base;
 extern volatile uint64_t g_arch_prctl_addr[32];
@@ -228,13 +229,13 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
     pcb_t* self = process_get_current();
     if (!self) return;
 
-    serial_print("  --- user stack window [rsp-0x40 .. rsp+0x40] ---\n");
+    serial_print("  --- user stack window [rsp-0x200 .. rsp+0x200] ---\n");
     serial_print("  (fault_rsp = 0x"); serial_print_hex(fault_rsp); serial_print(")\n");
 
-    /* Signed offset so the loop can start below RSP.  -0x40 .. +0x40
+    /* Signed offset so the loop can start below RSP.  -0x200 .. +0x200
      * in 8-byte steps.  Note: fault_rsp - 0x40 may wrap if RSP is
      * near 0; that is the process's problem and we print garbage. */
-    for (int64_t off = -0x40; off <= 0x40; off += 8) {
+    for (int64_t off = -0x200; off <= 0x200; off += 8) {
         uint64_t slot_va = fault_rsp + (uint64_t)off;
 
         serial_print("    rsp");
@@ -835,6 +836,7 @@ void isr13_handler(exception_frame_t *frame) {
         serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
         serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
         serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+        serial_print("  g_user_rsp_save : 0x"); serial_print_hex(g_user_rsp_save); serial_print("\n");
             serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
     }
     serial_print("  --- raw frame dump ---\n");
@@ -921,6 +923,7 @@ void isr14_handler(exception_frame_t *frame) {
             serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
             serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
             serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+            serial_print("  g_user_rsp_save : 0x"); serial_print_hex(g_user_rsp_save); serial_print("\n");
             serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
             {
                 uint32_t _l, _h;
