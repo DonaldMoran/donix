@@ -548,6 +548,34 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
 
     child->rsp = frame_base;
     child->rip = p_rip;
+
+    /*
+     * 7e ordering instrument.  Prints the parent's and child's view of
+     * the slot the child's first post-syscall `ret` will pop: the user
+     * RSP the parent had at the fork syscall, resolved through each
+     * process's own cr3, and the 8 bytes at that address.  If the
+     * parent's slot is already 0xFFFFFFFF, the corruption predates the
+     * copy; if it is valid here and the child faults, the copy or a
+     * writer after it is at fault.  Diagnostic only; no behavior change.
+     * See docs/open-issues.md item 7e.
+     */
+    {
+        uint64_t _p_phys = vmm_get_phys_from_cr3(parent->cr3, p_rsp & ~0xFFFULL);
+        uint64_t _c_phys = vmm_get_phys_from_cr3(child->cr3,  p_rsp & ~0xFFFULL);
+        uint64_t _p_slot = 0, _c_slot = 0;
+        if (_p_phys) {
+            _p_slot = *(uint64_t*)(HHDM_START + _p_phys + (p_rsp & 0xFFF));
+        }
+        if (_c_phys) {
+            _c_slot = *(uint64_t*)(HHDM_START + _c_phys + (p_rsp & 0xFFF));
+        }
+        serial_print("7e-fork: p_rsp=0x");      serial_print_hex(p_rsp);
+        serial_print(" p_phys=0x");             serial_print_hex(_p_phys);
+        serial_print(" p_slot=0x");             serial_print_hex(_p_slot);
+        serial_print(" c_phys=0x");             serial_print_hex(_c_phys);
+        serial_print(" c_slot=0x");             serial_print_hex(_c_slot);
+        serial_print("\n");
+    }
 }
 
 pcb_t* process_get_current(void) {
