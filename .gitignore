@@ -51,6 +51,8 @@ boot*.txt
 
 # FatFs workaround backup (from the f_unlink debugging)
 04_kernel_64bit/fatfs/ff.cold
+04_kernel_64bit/keyboard.cold
+04_kernel_64bit/keyboard.code
 third_party/
 .fat_config_single
 .fat_config_dual

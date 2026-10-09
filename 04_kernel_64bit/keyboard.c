@@ -257,12 +257,35 @@ int kbd_buffer_has_data(void) {
 
 /* Flush outstanding input. Used when the shell execs a new process
  * and wants to discard anything the user typed while the previous
- * one was running. */
+ * one was running.
+ *
+ * INTERRUPT STATE IS PRESERVED.  This function is called from
+ * sys_execve, which runs its entire body with interrupts disabled
+ * (a cli at the top).  An earlier version of this function did an
+ * unconditional sti on the way out, which re-enabled interrupts
+ * for the remainder of sys_execve -- opening a window where a
+ * timer tick could observe a half-updated process state on the
+ * syscall-return path, and producing the flaky frame corruption
+ * that the pacing shim in sys_execve was temporarily working
+ * around.
+ *
+ * The fix: save the caller's RFLAGS, disable interrupts across the
+ * ring reset, and restore the saved IF on the way out.  Entering
+ * with interrupts on leaves them on; entering with them off leaves
+ * them off.  This is the same save/restore discipline pmm.c uses
+ * for pmm_irq_save/pmm_irq_restore, and it is the contract every
+ * kernel helper that touches shared state should have.
+ *
+ * Do NOT replace the save/restore with a bare cli/sti pair: the
+ * caller's IF is not ours to change. */
 void keyboard_buffer_flush(void) {
-    __asm__ volatile("cli" ::: "memory");
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) : : "memory");
     kbd_head = 0;
     kbd_tail = 0;
-    __asm__ volatile("sti" ::: "memory");
+    if (flags & 0x200) {
+        __asm__ volatile("sti" ::: "memory");
+    }
 }
 
 /*
