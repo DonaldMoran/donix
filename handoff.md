@@ -3,7 +3,7 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-09 (session 60 closed: the 7e family is
+**Last updated:** 2026-10-09 (the 7e family is
 a RACE, proven by a tick-rate curve; the `testme` migration landed
 on `donix`; five race windows closed; the session-61 kernel fixes
 cherry-picked and corrected.  **No bump.**  The tree is clean and
@@ -45,8 +45,8 @@ correctness milestone** -- item 7 closed, `process_create`'s failure
 exits fixed, the exit-path page-table leak closed.  **No new
 subsystem in `v0.6.12`.**
 
-**`v0.6.13` is pending.**  Sessions 51 through 60 are untagged work
-on `dev`, after `v0.6.12`: the applet batches and the harness; item
+**The last `v*` tag is read from git, not from this file.**  The
+work after the tag is on `dev`, unpushed: the applet batches and the harness; item
 7c retracted; the zombie leak and the NX / non-canonical family; the
 fork-path sentinel leak; the `isr14` phys-mask fix; the vector-6
 `#UD` handler; the `exit_group` termination fix; `mmap_nx` and
@@ -66,7 +66,7 @@ resolves to nothing; do not cite one as if it were a stable
 reference.
 
 **A plain commit can exist with no tag.**  Session 45's `run:` fix
-is one.  Sessions 51 through 59's docs commits are the same.  Such
+is one.  Later docs commits are the same.  Such
 commits ride along on `dev` until the next `v*` bump.  Do not invent
 a tag for one.
 
@@ -376,7 +376,7 @@ the older non-`2026*` tags.  One change at a time.  Do not edit
   `tests/pipe7e_sjlj_stale.c`; the Makefile unchanged.
 - `userland/scripts/` -- `test.sh`, `pipe_wake_probe.sh` (4000
   iterations).
-- `third_party/{busybox,busybox-install,musl-src,musl-install}/`
+- `third_party/{busybox,musl-src,musl-install}/`
   -- gitignored; **read freely, do not write.**
 - `toolchain/{install_musl.sh,musl-gcc.sh}` -- tracked.
 - `capture.txt` -- gitignored, truncated per run.  Captures
