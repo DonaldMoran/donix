@@ -3,6 +3,7 @@
 #include "include/keyboard.h"
 #include "include/interrupts.h"
 #include "include/serial.h"
+#include "include/race_probe.h"
 #include "include/process.h"
 #include "include/scheduler.h"
 #include "include/user_msr.h"
@@ -284,6 +285,7 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
     g_ticks++;
+    race_p1_tick_dump();
     vga_cursor_tick();
 
     /*
@@ -831,6 +833,7 @@ void isr13_handler(exception_frame_t *frame) {
     }
 
     if ((fault_cs & 3) == 3) {
+        race_p1_tick_dump();
         if (signal_maybe_redirect(frame, 4)) return;    /* SIGILL */
         fault_kill_current(0x0D);
     }
@@ -1055,6 +1058,7 @@ void isr14_handler(exception_frame_t *frame) {
      * earlier in the function and never reaches this point.
      */
     if (error_code & 4) {
+        race_p1_tick_dump();
         if (signal_maybe_redirect(frame, 11)) return;   /* SIGSEGV */
         fault_kill_current(0x0E);
     }

@@ -23,6 +23,7 @@ volatile uint64_t race_total;
 volatile uint64_t race_p1_last_block_tick = 0;
 volatile uint64_t race_p1_last_block_pid  = 0;
 volatile uint64_t race_p1_early_wakes     = 0;
+volatile uint64_t race_p1_dumped          = 0;
 #endif
 #if RACE_PROBE_P2_PCB_REUSE
 volatile uint64_t race_p2_unused_touches  = 0;
@@ -32,6 +33,7 @@ volatile uint64_t race_p3_lost            = 0;
 #endif
 
 void race_probe_dump(void) {
+    serial_lock();
     serial_print("\n=== RACE PROBE DUMP ===\n");
     serial_print("total records: "); serial_print_dec(race_total); serial_print("\n");
     serial_print("hits:          "); serial_print_dec(race_hits);  serial_print("\n");
@@ -67,6 +69,7 @@ void race_probe_dump(void) {
         serial_print("\n");
     }
     serial_print("=== END RACE PROBE DUMP ===\n\n");
+    serial_unlock();
 }
 
 #endif /* RACE_PROBE_ANY */

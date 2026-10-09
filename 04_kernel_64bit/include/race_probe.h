@@ -41,6 +41,11 @@
 
 #define RACE_SLOTS 64
 
+/* Forward declaration: every static inline below that dumps on a
+ * hit needs this visible.  It used to sit at the bottom of the
+ * header, which made the inlines see an implicit declaration. */
+void race_probe_dump(void);
+
 typedef struct {
     uint64_t pid;
     uint64_t a;
@@ -56,16 +61,18 @@ extern volatile uint64_t race_total;
 
 extern volatile uint64_t g_ticks;
 
-static inline void race_record(uint64_t slot,
-                               uint64_t pid,
-                               uint64_t a, uint64_t b) {
+__attribute__((noinline))
+static void race_record(uint64_t slot,
+                        uint64_t pid,
+                        uint64_t a, uint64_t b,
+                        uint64_t ra) {
     if (slot >= RACE_SLOTS) return;
     uint64_t idx = race_head[slot];
     race_rec_t* r = &race_log[slot];
     r->pid  = pid;
     r->a    = a;
     r->b    = b;
-    r->ra   = (uint64_t)__builtin_return_address(0);
+    r->ra   = ra;
     r->tick = g_ticks;
     race_head[slot] = idx + 1;
     race_total++;
@@ -83,19 +90,37 @@ extern volatile uint64_t race_p1_early_wakes;
 #define RACE_P1_BLOCK(pid, kind) do {                       \
     race_p1_last_block_tick = g_ticks;                      \
     race_p1_last_block_pid  = (pid);                        \
-    race_record(0, (pid), (kind), 0);                       \
+    race_record(0, (pid), (kind), 0,                        \
+                (uint64_t)__builtin_return_address(0));      \
 } while (0)
 
 #define RACE_P1_WAKE(pid, kind) do {                        \
     if (race_p1_last_block_pid == (pid) &&                  \
         g_ticks <= race_p1_last_block_tick) {               \
         race_p1_early_wakes++;                              \
-        race_record(1, (pid), (kind), race_p1_last_block_tick); \
+        race_record(1, (pid), (kind), race_p1_last_block_tick,   \
+                    (uint64_t)__builtin_return_address(0));      \
     }                                                       \
 } while (0)
 #else
 #define RACE_P1_BLOCK(pid, kind) do {} while (0)
 #define RACE_P1_WAKE(pid, kind)  do {} while (0)
+#endif
+
+/* Auto-dump: called from timer_preempt_handler every tick and
+ * from the fault handlers on the user-mode path.  Prints once,
+ * the first time race_p1_early_wakes goes nonzero, then latches
+ * off.  One compare per tick while the counter is zero. */
+#if RACE_PROBE_P1_BLOCK_WAKE
+extern volatile uint64_t race_p1_dumped;
+static inline void race_p1_tick_dump(void) {
+    if (race_p1_early_wakes && !race_p1_dumped) {
+        race_p1_dumped = 1;
+        race_probe_dump();
+    }
+}
+#else
+#define race_p1_tick_dump() do {} while (0)
 #endif
 
 /* ---- P2: PCB reuse ---- */
@@ -104,7 +129,8 @@ extern volatile uint64_t race_p2_unused_touches;
 #define RACE_P2_TOUCH(pcb) do {                             \
     if ((pcb) && (pcb)->state == 0) {                       \
         race_p2_unused_touches++;                           \
-        race_record(2, (pcb)->pid, (uint64_t)(pcb), 0);     \
+        race_record(2, (pcb)->pid, (uint64_t)(pcb), 0,     \
+                    (uint64_t)__builtin_return_address(0)); \
     }                                                       \
 } while (0)
 #else
@@ -120,8 +146,5 @@ void race_p3_scan(void);
 #define RACE_P3_TICK() do {} while (0)
 #endif
 
-#if RACE_PROBE_ANY
-void race_probe_dump(void);
-#endif
 
 #endif /* RACE_PROBE_H */

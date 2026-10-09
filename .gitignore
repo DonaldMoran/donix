@@ -36,6 +36,7 @@ archive/
 diff.sh
 collect_full_sources.sh
 capture.txt
+capture-*.txt
 
 # Boot / crash captures (the run script and manual QEMU runs)
 PFcapture.txt
