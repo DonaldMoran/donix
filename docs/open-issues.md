@@ -925,6 +925,32 @@ first bad one names where the write landed.  If that window is
 inside `user_syscall.c`, the writer is in this file and the
 grep missed it; if it is outside, the write is from another
 translation unit and the guard-band's return address names it.
+**`pcb->user_rsp` holds a kernel frame base where a user RSP is expected.**  Two faces, one field.  `interrupts.c:439` writes `current->user_rsp =
+stack_pointer` on the user-preempt path, but `stack_pointer` there is the
+handler's argument -- the kernel frame base `irq0_stub` passed via `mov rdi,
+rsp` (`isr.asm:83`) -- not the user RSP the field's name and consumer imply.
+`context_switch.asm:66` reads `pcb->user_rsp` (offset `0x610`) as the user
+stack pointer when it builds a resume frame for a process last preempted
+from user mode.  Second face: `process_fork_copy_frame` never sets
+`child->user_rsp` at all, so a fork child inherits whatever
+`process_create` left in the field.  Both faces bite on the same path --
+user-mode preemption followed by a resume through `context_switch.asm`'s
+user-preempted save path -- and a reader who fixes one without the other
+has not fixed it.  Not the 7e fault: 7e resumes from a fork frame built
+by `process_fork_copy_frame`, not from a user-preempted save.
+
+**`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window.**  `user_syscall.c:4358` lists the brk region as `[0x8000200000,
+0x8000300000)`.  But `sys_brk` has no upper bound -- it refuses
+`new_brk < heap_base` and accepts any `new_brk` above -- and `sys_fork`'s
+copy at `user_syscall.c:7964` walks `[0x8000200000, parent->brk_virt)`,
+the real bound.  A parent whose `brk_virt` has grown past `0x8000300000`
+forks a child that has pages the exec cleanup will neither unmap nor free.
+Leak, not corruption.  The comment at `user_syscall.c:7953-7959` records
+that the fixed window was replaced in the fork copy; the same window
+survives in the cleanup table, so the fix was applied to one of the two
+places.  Extend the cleanup row to the live bound, or walk
+`elf_page_list` and unmap by VA from the list itself.
+
 
 ### Test-design notes
 
