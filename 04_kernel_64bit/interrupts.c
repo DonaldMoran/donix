@@ -443,26 +443,35 @@ timer_preempt_handler(uint64_t stack_pointer) {
         // Pick next task.
         extern pcb_t* scheduler_ready_queue_next(void);
         pcb_t* next = scheduler_ready_queue_next();
+        /*
+         * Consecutive timer ticks that found the ready queue empty.
+         * Reset the moment a next task is found.  Boot transients
+         * empty the queue for a tick and then refill it; those must
+         * not consume the dump budget before pipe7e runs.  The dump
+         * below fires when the empty queue PERSISTS, which a stop
+         * does and a boot transient does not.  Item 7d.
+         */
+        static int _7e_empty_streak = 0;
+        if (next) {
+            _7e_empty_streak = 0;
+        }
         if (!next) {
             /*
-             * Bounded pool dump.  The idle state is reached here, in
-             * the timer path -- NOT through process_yield, which is
-             * where the earlier dump went (and never fired).  The
-             * monitor shows the CPU in kernel_idle_loop with the
-             * ready queue empty; this prints every PCB state the
-             * first few times the timer finds nothing to run, so the
+             * Persistent-empty pool dump.  The idle state is reached
+             * here, in the timer path -- NOT through process_yield,
+             * which is where the earlier dump went (and never fired).
+             * This prints every PCB state the third consecutive tick
+             * the queue is empty, and every 256 ticks after, so the
              * capture names whether the shell is BLOCKED (lost wake)
-             * or stranded in another state.  Bounded to 5 so the
-             * capture is not flooded on every idle tick; the last
-             * dump before the capture freezes is the one at the stop.
-             * Diagnostic only.
+             * or a process is stranded.  Boot transients never reach
+             * three ticks; a stop does.  Diagnostic only.
              */
-            static int _7e_dump_count = 0;
-            if (_7e_dump_count < 5) {
-                _7e_dump_count++;
+            _7e_empty_streak++;
+            if (_7e_empty_streak == 3 ||
+                (_7e_empty_streak > 3 && (_7e_empty_streak % 256) == 0)) {
                 serial_lock();
-                serial_print("TIMER-NO-NEXT #");
-                serial_print_dec((uint64_t)_7e_dump_count);
+                serial_print("TIMER-NO-NEXT streak=");
+                serial_print_dec((uint64_t)_7e_empty_streak);
                 serial_print(": queue empty, pool state:\n");
                 process_dump_all();
                 serial_unlock();
