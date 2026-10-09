@@ -62,6 +62,8 @@ void race_probe_dump(void) {
         serial_print_dec(race_log[i].a);
         serial_print(" b=");
         serial_print_dec(race_log[i].b);
+        serial_print(" site=");
+        serial_print_dec(race_log[i].site);
         serial_print(" tick=");
         serial_print_dec(race_log[i].tick);
         serial_print(" ra=0x");

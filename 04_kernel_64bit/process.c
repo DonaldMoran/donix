@@ -714,7 +714,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
     serial_print(" wake=ok\n");
     #endif
 
-    RACE_P1_WAKE(parent->pid, BLOCK_KIND_WAITPID);
+    RACE_P1_WAKE(parent->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAKE_PARENT);
     parent->state = PROC_STATE_READY;
     parent->block_kind = BLOCK_KIND_NONE;
     parent->wait_pid = 0;

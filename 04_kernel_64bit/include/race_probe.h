@@ -41,6 +41,13 @@
 
 #define RACE_SLOTS 64
 
+/* Site tags.  A compile-time constant passed at the macro call
+ * site.  Names the call site by construction -- does not depend
+ * on a return address, which for the block site belongs to the
+ * assembly syscall stub, not to sys_wait4. */
+#define RACE_SITE_WAIT4_BLOCK  1
+#define RACE_SITE_WAKE_PARENT  2
+
 /* Forward declaration: every static inline below that dumps on a
  * hit needs this visible.  It used to sit at the bottom of the
  * header, which made the inlines see an implicit declaration. */
@@ -50,6 +57,7 @@ typedef struct {
     uint64_t pid;
     uint64_t a;
     uint64_t b;
+    uint64_t site;
     uint64_t ra;
     uint64_t tick;
 } race_rec_t;
@@ -65,13 +73,14 @@ __attribute__((noinline))
 static void race_record(uint64_t slot,
                         uint64_t pid,
                         uint64_t a, uint64_t b,
-                        uint64_t ra) {
+                        uint64_t site, uint64_t ra) {
     if (slot >= RACE_SLOTS) return;
     uint64_t idx = race_head[slot];
     race_rec_t* r = &race_log[slot];
     r->pid  = pid;
     r->a    = a;
     r->b    = b;
+    r->site = site;
     r->ra   = ra;
     r->tick = g_ticks;
     race_head[slot] = idx + 1;
@@ -87,18 +96,19 @@ extern volatile uint64_t race_p1_last_block_tick;
 extern volatile uint64_t race_p1_last_block_pid;
 extern volatile uint64_t race_p1_early_wakes;
 
-#define RACE_P1_BLOCK(pid, kind) do {                       \
+#define RACE_P1_BLOCK(pid, kind, site) do {                 \
     race_p1_last_block_tick = g_ticks;                      \
     race_p1_last_block_pid  = (pid);                        \
-    race_record(0, (pid), (kind), 0,                        \
+    race_record(0, (pid), (kind), 0, (site),                \
                 (uint64_t)__builtin_return_address(0));      \
 } while (0)
 
-#define RACE_P1_WAKE(pid, kind) do {                        \
+#define RACE_P1_WAKE(pid, kind, site) do {                  \
     if (race_p1_last_block_pid == (pid) &&                  \
         g_ticks <= race_p1_last_block_tick) {               \
         race_p1_early_wakes++;                              \
         race_record(1, (pid), (kind), race_p1_last_block_tick,   \
+                    (site),                                     \
                     (uint64_t)__builtin_return_address(0));      \
     }                                                       \
 } while (0)
@@ -129,7 +139,7 @@ extern volatile uint64_t race_p2_unused_touches;
 #define RACE_P2_TOUCH(pcb) do {                             \
     if ((pcb) && (pcb)->state == 0) {                       \
         race_p2_unused_touches++;                           \
-        race_record(2, (pcb)->pid, (uint64_t)(pcb), 0,     \
+        race_record(2, (pcb)->pid, (uint64_t)(pcb), 0, 0,  \
                     (uint64_t)__builtin_return_address(0)); \
     }                                                       \
 } while (0)
