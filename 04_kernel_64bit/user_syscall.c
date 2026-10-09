@@ -5427,6 +5427,21 @@ long sys_write(int fd, const void* buf, size_t count) {
             self->state      = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_PIPE_WRITE;
 
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
             __asm__ volatile("sti");
             __asm__ volatile("hlt");
             /* Woken by pipe_wake_waiter via a reader's drain.
@@ -5856,6 +5871,21 @@ long sys_read(int fd, void* buf, size_t count) {
             if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
             self->state = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_NONE;
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
             __asm__ volatile("sti"); __asm__ volatile("hlt");
         }
         return (long)bytes_read;
@@ -6964,6 +6994,21 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                     }
                     self->state = PROC_STATE_BLOCKED;
                     self->block_kind = BLOCK_KIND_NONE;
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
                     __asm__ volatile("sti");
                     __asm__ volatile("hlt");
                     /* Woken by irq1_handler ->

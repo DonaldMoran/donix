@@ -411,7 +411,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
             current->rcx = frame->rcx; current->rbx = frame->rbx;
             current->rax = frame->rax;
             current->rip = frame->rip;
-            current->rsp = stack_pointer;
+            current->user_rsp = stack_pointer;
         }
 
         // Pick next task.

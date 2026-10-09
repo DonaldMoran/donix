@@ -935,3 +935,4 @@ _Static_assert(offsetof(pcb_t, rax)              == 0x108, "context_switch.asm: 
 _Static_assert(offsetof(pcb_t, rsp)              == 0x110, "context_switch.asm: rsp offset");
 _Static_assert(offsetof(pcb_t, rip)              == 0x118, "context_switch.asm: rip offset");
 _Static_assert(offsetof(pcb_t, block_kind)       == 0x158, "context_switch.asm: block_kind offset");
+_Static_assert(offsetof(pcb_t, user_rsp)         == 0x610, "context_switch.asm: user_rsp offset");

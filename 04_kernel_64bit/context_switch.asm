@@ -56,8 +56,14 @@ context_switch:
     jae .ring0_save
 
     ; --- USER-PREEMPTED SAVE PATH ---
+    ;
+    ; RSP here is the USER stack pointer, not pcb->rsp.  pcb->rsp
+    ; (0x110) is the KERNEL resume-frame base -- both save paths
+    ; write it that way, and reading it here delivered a kernel
+    ; address to a user-mode resume.  pcb->user_rsp (0x610) is
+    ; written by the user-mode preemption paths in interrupts.c.
     push qword 0x2B                     ; SS       [0x98]
-    push qword [r15 + 0x110]            ; RSP      [0x90]
+    push qword [r15 + 0x610]            ; RSP      [0x90]  <- pcb->user_rsp
     push qword 0x202                    ; RFLAGS   [0x88]
     push qword 0x33                     ; CS       [0x80]
     mov rax, [r15 + 0x118]              ; prev->rip

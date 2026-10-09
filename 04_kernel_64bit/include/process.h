@@ -218,6 +218,20 @@ typedef struct pcb {
      * slot starts clean.
      */
     int in_signal_handler;
+
+    /*
+     * The user stack pointer at the last user-mode entry.
+     *
+     * pcb->rsp is the KERNEL resume-frame base (both save paths in
+     * context_switch.asm write it that way).  The user-preempted
+     * save path needs the USER stack pointer, and reading pcb->rsp
+     * for it delivered a kernel value into a user-mode resume.
+     *
+     * PLACED AT THE END, after in_signal_handler, so no asserted
+     * offset moves.  context_switch.asm reads it by offset; the
+     * _Static_assert in process.c pins that offset.
+     */
+    uint64_t user_rsp;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)
