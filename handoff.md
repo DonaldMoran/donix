@@ -3,15 +3,18 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-09 (the 7e family is
-a RACE, proven by a tick-rate curve; the `testme` migration landed
-on `donix`; five race windows closed; the session-61 kernel fixes
-cherry-picked and corrected.  **No bump.**  The tree is clean and
-unpushed, and the next session works on `donix` directly.
+**Last updated:** 2026-10-09 (the 7e control-transfer fault is an
+**UNSOLVED RACE** -- not memory corruption.  It reproduces
+byte-identically at 100 Hz, and the kernel's syscall return path is
+CLEARED.  **No bump.**  The tree is dirty with this session's
+diagnostic, one scratch `pit_init` change, and three docs edits; see
+"Repo state" below.)
 
-**The next act is the 7e RACE.**  Not a bump, not item 12 as the
-lead.  The instrument is the tick-rate sweep plus the P13/P12/P11
-probes.  See "Where we are" and "NEXT SESSION" below.)
+**THE NEXT SESSION WORKS ON THE RACE, NOT ON MEMORY CORRUPTION.**
+A race presents as a wrong value in a slot, and there is **no store
+to find** -- the wrong value is the correct value for a different
+interleaving.  **Do not hunt the writer.  Instrument the
+ordering.**  The instrument is named under "NEXT SESSION".
 
 **Repo state -- run these; do not write it here.**  A header that
 names a commit or a tag count is wrong the moment the same commit
@@ -22,19 +25,33 @@ lands, so this file does not carry one:
     git tag --list 'v*' | tail -1   # last milestone
     git tag --list '2026*'          # live scratch tags
 
+**This session's uncommitted tree changes:**
+
+- `04_kernel_64bit/interrupts.c` -- `g_user_rsp_save` printed in
+  both `bad_target` blocks; user-stack window widened from
+  `-0x40..+0x40` to `-0x200..+0x200`.  **This is the instrument;
+  commit it.**
+- `04_kernel_64bit/user_syscall_entry.asm` -- `global
+  g_user_rsp_save`.  **Same change; commit with the above.**
+- `04_kernel_64bit/kmain.c` -- `pit_init(100)` -> `pit_init(10)`,
+  a scratch change for an end-of-session watch run.  **Not part of
+  the instrument.  Revert before committing the diagnostic, or set
+  it deliberately.**  The 100 Hz build is the one the fault
+  reproduces on.
+- `docs/open-issues.md`, `docs/gotchas.md`, `docs/session-log.md`
+  -- this session's documentation.  Commit with or after the
+  instrument.
+
 > **The rule this file carries forward, from session 52: an item
-> here that quotes an expected value is a claim.**  Session 51
-> filed item 7c as "`sha512sum` computes a WRONG digest for
-> `ABC`" with a value that turned out to be the SHA-512 of
-> lowercase `abc`.  Session 52 spent its time reading correct
-> code.  Sessions 53 through 58 falsified mechanism after
-> mechanism, each a plausible story read off a trace, each killed
-> by reading the source.  **Session 59's method was the
-> counter-example that paid off: every claim was checked against
-> the source, and the mechanism was found by *reading the
-> disassembly*, not by reasoning from a trace.**  The greps cost
-> seconds; the wrong readings cost sessions.  Read the walk, read
-> the disassembly, read the function -- not just its output.
+> here that quotes an expected value is a claim.**  A claim read
+> off a trace or a comment has cost this project sessions.  **Read
+> the walk, read the disassembly, read the function -- not just
+> its output.**  Session 62 added a new form of the same rule: **a
+> session number, a comment, and an address pairing are claims too
+> -- count it, read the body, and quote the bytes.**  This session
+> wrote "Session 62" before verifying the count, paired two `ret`
+> addresses as one function when they are two, and wrote two
+> anchors from memory that failed to match.
 
 **The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
 a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
@@ -46,15 +63,16 @@ exits fixed, the exit-path page-table leak closed.  **No new
 subsystem in `v0.6.12`.**
 
 **The last `v*` tag is read from git, not from this file.**  The
-work after the tag is on `dev`, unpushed: the applet batches and the harness; item
-7c retracted; the zombie leak and the NX / non-canonical family; the
-fork-path sentinel leak; the `isr14` phys-mask fix; the vector-6
-`#UD` handler; the `exit_group` termination fix; `mmap_nx` and
-`sigsegv_probe`; the ELF loader's `PF_X` and page-0 fixes; and
-**session 59's headline -- the ash-side 7e mechanism found by
-reading and reproduced, and the `signal_maybe_redirect` re-entry
-guard.**  The bump is a whole procedure; see below.  **It is a
-decision, not a default.**
+work after the tag is on `dev`, unpushed: the applet batches and the
+harness; item 7c retracted; the zombie leak and the NX /
+non-canonical family; the fork-path sentinel leak; the `isr14`
+phys-mask fix; the vector-6 `#UD` handler; the `exit_group`
+termination fix; `mmap_nx` and `sigsegv_probe`; the ELF loader's
+`PF_X` and page-0 fixes; session 59's ash-side 7e mechanism found by
+reading disassembly and the `signal_maybe_redirect` re-entry guard;
+the session-61 kernel fixes; and **session 62's `g_user_rsp_save`
+instrument and wide user-stack window.**  The bump is a whole
+procedure; see below.  **It is a decision, not a default.**
 
 Commits are named by tag only, never by SHA.  **Working tags
 (`YYYYMMDD-*`) are local scratch restore points** -- they exist while
@@ -65,22 +83,12 @@ message carries the narrative.  Once a scratch tag is dropped it
 resolves to nothing; do not cite one as if it were a stable
 reference.
 
-**A plain commit can exist with no tag.**  Session 45's `run:` fix
-is one.  Later docs commits are the same.  Such
-commits ride along on `dev` until the next `v*` bump.  Do not invent
-a tag for one.
+**A plain commit can exist with no tag.**  Such commits ride along
+on `dev` until the next `v*` bump.  Do not invent a tag for one.
 
 **Note on commit messages, and on this file too:** a commit message
 is a claim, not a fact.  Read the diff, not the subject.  **This
-file's item text is the same kind of claim.**  Session 52 exists
-because session 51's item 7c was believed; sessions 53 through 58
-falsified a dozen mechanisms that were plausible stories read off a
-trace.  **Session 59 is the one where reading source first found the
-mechanism** -- `evaltree`'s missing restore was found in the
-disassembly, not in a trace.  **Session 59 also produced two wrong
-calls of the opposite kind, by this file's own rules: a section
-title and a commit subject were read instead of the body, and both
-were wrong.**  See "Gotchas worth reading," below.
+file's item text is the same kind of claim.**
 
 ---
 
@@ -108,8 +116,7 @@ message inline via heredoc.  Do not split a single operation.
 - **Small files:** return the complete file, four-backtick fenced.
 - **Large files:** return a unified-diff hunk or a copy-block
   insertion, preceded by a bold **`WORK BEGINS HERE.`** marker.
-  The marker is load-bearing: before it, the assistant is
-  discussing; after it, the content is applyable.
+  The marker is load-bearing.
 
   **A whole-file return for a large file with non-ASCII content
   re-encodes every non-ASCII character and shows up as a large
@@ -117,25 +124,25 @@ message inline via heredoc.  Do not split a single operation.
   it should show **zero deletions**.  A full **replacement** of a
   section correctly shows both.  **A third shape: a Python edit
   with `count != 1` abort checks, which refuses to write if the
-  anchor doesn't match exactly once.**  That shape caught a real
-  ambiguity (an anchor matching twice) and wrote nothing.  Use it
-  for edits into large files.
+  anchor doesn't match exactly once.**  Session 62 used it six
+  times and it caught two bad anchors and wrote nothing both times.
 
 **Ask for source you do not have.**  The assistant does not have
 direct file access.  Before patching a file it has not seen **in
-this session**, it must ask for that file.  Never guess.
+this session**, it must ask for that file.  Never guess.  **Session
+62's corollary: before writing an anchor, read the file with
+`cat -A` and quote the bytes.**  Two anchors failed because they
+were written from memory of a paste.
 
 **The channel is the human.**  A session asks for a file by name
 and the human pastes it; a session asks for a command's output the
 same way -- a read-only block, one paste, and the state check
-first.  A session that needs a file should ask for it rather than
-reason from a summary, a tree listing, or a commit subject.
+first.
 
 **When editing a large file, quote the bytes.**  For an edit inside
 a big file, the instruction must quote the exact text being replaced
 and the exact text that replaces it, both copied from output the
-other side just pasted.  Read files with `cat -A` before writing
-anchors into them.
+other side just pasted.
 
 **A redirection binds to the last command in an `&&` chain.**
 
@@ -147,18 +154,17 @@ Makefile is a prerequisite.**
 **Do not edit `third_party/`.**  The vendored sources there are
 gitignored and rebuilt by the toolchain.  **But read them freely** --
 session 59's mechanism was found by disassembling
-`third_party/busybox/busybox_unstripped` and grepping
-`busybox_unstripped.map`.  Read-only is the point.
+`third_party/busybox/busybox_unstripped`; session 62 read
+`userland/musl/build/pipe7e.elf`'s disassembly the same way.
+Read-only is the point.
 
 **Hand-written `@@` hunk headers are a trap.**  Edit the file and
-let `git diff` produce the patch; always `git apply --check` before
-`git apply`.
+let `git diff` produce the patch.
 
 **A diagnostic that runs on the fault path is part of the system.**
-A fault-path diagnostic reads memory and prints serial output inside
-an exception handler, and the extra time can widen a race's window.
-Gate a fault-path diagnostic to the addresses it is for; do not
-assume it is inert.
+Session 58's gotcha, still true.  Session 62's complement: a
+diagnostic inside the `bad_target` guard prints only for the shapes
+it is for, which is the right scope.
 
 **The push / merge / tag sequence** (used for every `v*` bump):
 
@@ -183,11 +189,8 @@ session-log and handoff are written.  The tag is **annotated**; the
 merge is `--no-ff`.
 
 **A version is not necessarily a milestone.**  **`v0.6.12` is a
-correctness milestone.**  **`v0.6.13` is a candidate** -- a
-mechanism found, reproduced, and a real kernel defect fixed -- and
-the work since `v0.6.12` is 60+ commits across applets, the zombie
-leak, the NX family, and the probes.  The bump is a **decision**,
-not a default.
+correctness milestone.**  **`v0.6.13` is a candidate.**  The bump is
+a **decision**, not a default.
 
 ---
 
@@ -220,138 +223,147 @@ a build and test in the real tree.
 
 ---
 
-## Where we are -- after the last tag
+## Where we are -- after session 62
 
-**The 7e family is a RACE, and the tick-rate curve is the proof.**
-Same kernel, same image, same `pipe7e`, only `pit_init` varies:
+**The 7e control-transfer fault is an UNSOLVED RACE.  The
+tick-rate curve is the proof and it has been confirmed live:** at
+`pit_init(10)` the same kernel and image run past 3000 `pipe7e`
+iterations clean; at `pit_init(100)` the same binary faults within
+the first iterations.  A deterministic defect produces the same
+outcome at every rate.  This one does not.
 
-| `pit_init` | result |
-|---|---|
-| 10 | `PIPE7E-ALL-PASS`, 50000 iterations |
-| 20 | progresses, `iter 1000` within minutes |
-| 30 | progresses |
-| 40 | **begins to fail** |
-| 100 | faults, at `iter 4` to `iter 232` across runs |
+**A race is not memory corruption, and this is the session's
+headline.**  A race presents as a wrong value in a slot, and there
+is **no store to find** -- the wrong value is the correct value for
+a different interleaving.  Six mechanisms this session were writer
+hypotheses and **all six were refuted by reading the source.**
+**Instrument the ordering, not the store.**
 
-**A monotone failure curve with a threshold between 30 and 40 Hz
-is the signature of a race.**  A deterministic defect produces the
-same outcome at every rate.  This one does not.
+### What session 62 established, from bytes
 
-**The precondition is ash's stale `jmp_buf`; the trigger is the
-race.**  `evaltree` stores a pointer to its own stack frame's
-`jmp_buf` into `globals+0x38` and does not restore it on the normal
-return; `raise_exception` `_longjmp`s to it with no liveness check.
-That is session 59's finding and it is a *deterministic* defect --
-it explains why a stale buffer exists, not why it is only *reached*
-at the higher rate.  **Both are required.**
+**1. The kernel's syscall return path is CORRECT.**  Three runs,
+`RSP - g_user_rsp_save == 8` -- exactly the relation for a `ret`
+immediately after a `syscall`.  The kernel returns to the correct
+user RIP (`last sysret rcx = 0x4041F8`, `__syscall_cp_c`'s `ret`)
+and the correct user RSP.  **The corruption is in the user-stack
+CONTENTS, present before the `ret` executes.**  This was unknown
+before this session; the `g_user_rsp_save` line produced it.
+
+**2. The faulting frame sits in the STARTUP region of the stack.**
+The wide user-stack window shows `"Pe7epip"` / `"WD=/root"` (argv/
+envp strings) at `rsp+0x70`/`0x78`, `main`'s entry `0x400220` at
+`rsp-0x18`, and a **doubled saved frame** at `rsp-0x20` and
+`rsp-0x1C0`.  A frame in the startup region, with a function entry
+as a return address and the same values saved twice, is the shape
+of a frame built by a path that **sets up an initial frame** -- the
+`fork` child setup.
+
+**3. `pipe7e.elf` links NO `longjmp`/`setjmp`.**  The disassembly
+shows no such call.  **The handoff's long-carried `_longjmp(buf,
+1)` mechanism is not this binary's.**  The `jmp_buf` shape belongs
+to the ash faults; `pipe7e` has none.
+
+**4. `0x400CF2` and `0x4041F8` are two DIFFERENT thunks' post-
+syscall `ret`s.**  `0x400CF2` is `__restore_sigs`'s `ret` after
+`rt_sigprocmask` (syscall 14); `0x4041F8` is `__syscall_cp_c`'s
+`ret`.  The item text paired them as one function; corrected.
+
+**5. `__syscall_cp_c` is a bare syscall thunk** -- no cancellation
+branch.  `user_syscall_entry.asm`'s return-tail arithmetic traces
+correct (`rsp`, `rip`, `rflags` all read from the right slots).
 
 ### The fault's shape
 
-Every 7e fault produces a small integer at a return-address slot,
-where a `ret` popped it: `0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`.
-`last sysret rcx` is `__syscall_cp` (`0x400CF2`, `0x4041F8`), the
-musl cancellation wrapper on the stdio/lock path.  The value is
-`_longjmp(buf, 1)`'s return value.  `%fs` is a text address at every
-fault and all three records agree -- **the `fs_base` path is
-correct and is not the mechanism.**
+Every 100 Hz fault: `CR2 = RIP = 0xFFFFFFFF`, error `0x14` (user,
+instruction fetch), `RSP = 0x80000FBF90`,
+`g_user_rsp_save = 0x80000FBF88` (difference `0x8`), CR3
+`0x32D000`, pid 4 `pipe7e`.  **Three runs, byte-identical.**
 
-### What is fixed on `dev` (the migration and the kernel fixes)
+### Refuted -- do NOT re-walk
 
-The `testme` migration (13 commits, tag
-`20261009-donix-migrated`) plus the session-61 kernel fixes
-(tag `20261009-session61-fixes-merged`).  The fixes that closed
-race windows, each found by a probe and verified:
+Six mechanisms, each a writer hypothesis, each killed by reading
+the source:
 
-1. **Pipe lifetime.**  `put_pipe_ref` / `put_file_slot` gate the
-   free on `readers_open == 0 && writers_open == 0`.
-2. **Stranded `READY`.**  `process_yield` / `process_exit` re-add a
-   `READY` process off the queue before idling.
-3. **The sysret tail.**  `cli` across the whole return tail.
-4. **The `hlt`-return state.**  Reader resets `state = RUNNING`.
-5. **The invalid-`end` guard** on pipe slots.
-6. **The stale caller-saved register file** on block-and-resume
-   (session-61: the ring-0 save path reads 15 pcb slots, writes 6).
-7. **`pcb->rsp` / `pcb->user_rsp` split** (session-61), corrected
-   by `c8d6255` -- the user-mode save must write BOTH fields.
+- **`longjmp`/`setjmp`** -- not in `pipe7e.elf` (disassembly).
+- **Cancellation unwind** -- `__syscall_cp_c` is a bare thunk.
+- **Signal frame** -- signals are not delivered
+  (`user_syscall.c:5387,5392,6512,7604`).
+- **The `wait4` re-scan window** -- the re-scan runs **inside** the
+  `cli`; the comment at `user_syscall.c:5210` saying it is
+  "preemptible" is **stale**.
+- **`dup2` refcount undercount** -- `sys_dup2` **does** bump
+  `old_slot->refcount`.
+- **Exit-path fd leak / pipe use-after-free** -- `close_all_files`
+  uses `put_file_slot`; `put_pipe_ref` is gated on
+  `readers_open`/`writers_open`, and the comment says the stamp
+  probe proved that gate necessary.
 
-### What is NOT fixed
+Also do not re-open: item 7 (closed), item 7c (retracted), item 11
+(closed), the session-48 zone scan, the `fs_base` path (correct at
+every fault, three values agree at `0x408698`).
 
-**The 7e race itself.**  The fixes above closed windows; the family
-still fires at 100 Hz.  **The residual window is not yet found.**
-That is the next session's job.
+### The instrument now in the tree
 
-### What was falsified, so it is not re-walked
-
-- **Memory corruption** as the cause.  Five sessions chased it; the
-  rate curve says race.  The wrong values are *symptoms* of windows.
-- **The ready-queue lock** (P8: 6028 checks, all clean).
-- **The `fs_base` path** (three values agree at `0x408698`).
-- **The wake-kind inversion, the lost-wakeup instrument, the PMM
-  double-handout** -- all zero on the probes.
-- **The two `setjmp` probes** pass; those mechanisms are falsified.
+- `g_user_rsp_save` printed in both `bad_target` blocks
+  (`interrupts.c`).
+- `g_user_rsp_save` declared `global` in `user_syscall_entry.asm`.
+- The user-stack window is `-0x200 .. +0x200`.
+- The P13/P12/P11 probes, the P1/P8 probes, `RACE_PROBE_*` gates.
 
 ---
 
 ## NEXT SESSION
 
-**The lead is the 7e RACE.**  Not item 12 as the lead; item 12
-remains the fix that lets ash *survive* the fault and is the largest
-single target, but it is not the way to find the residual window.
+**The lead is the RACE.  The method is: instrument the ordering.**
 
-**The method: find the window, not the corruption.**
+1. **The `fork` stack-copy ordering.**  Print `parent->rsp`,
+   `parent->user_stack_virt`, `parent->user_stack_top` at fork time
+   and compare against `child->rsp`.  The copy is
+   `EAGER_COPY_REGION(parent->user_stack_virt, parent->user_stack_top)`
+   at `user_syscall.c:7940`; the two bounds are set once
+   (`process.c:311/366`, `user_syscall.c:4407/4455`) and are **not
+   updated as the stack grows**.  If the parent's `rsp` at fork
+   time falls outside the copied range, the child has no mapping
+   where the parent's `rsp` points, and its first `ret` after a
+   syscall reads `0xFFFFFFFF`.  **Two numbers, not a store hunt.**
 
-1. **Run `pipe7e` at 10 Hz and at 100 Hz, with the P13/P12/P11
-   probes on, and compare the counters.**  The difference is the
-   race.  The probes are in `04_kernel_64bit/include/race_probe.h`,
-   gated by `RACE_PROBE_*`.
-2. **The fault-path read:** when it faults, read `CR2`, `RIP`,
-   `last sysret rcx`, and the three `fs_base` values.  The shape
-   names the window.
-3. **The tick rate is the instrument.**  `pit_init(10)` widens the
-   window; `pit_init(100)` fires it.  A window that moves between
-   the rates is real; one that does not is not the one.
+2. **The same-point rate test.**  Run 10 Hz to 50000 iterations.
+   Fault at the same point as 100 Hz -> deterministic; pass -> the
+   race stands.  Either result is a finding.
 
-**Candidate windows the probes already point at:** the block sites
-that still do `sti; hlt` without a register save (`sys_wait4`'s
-yield path is the named gap -- it sets `BLOCKED` then calls
-`process_yield`, reaching `context_switch` by a different route);
-the `irq0_stub` resume path; the timer's `current->rsp` /
-`user_rsp` decision.  **Read the bytes, add one probe, run once.**
+3. **The open question, named not resolved:** why does the race
+   reproduce byte-identically?  A race can do that when one
+   ordering wins nearly every time.  The ordering instrument
+   answers it if the losing order is always the same.
 
 ### The candidates, in order
 
-1. **The residual 7e race.**  The lead.  The tick-rate sweep and
-   the probes; do not chase memory corruption.
-2. **Item 12 -- signal delivery.**  Largest; lets ash survive the
-   fault; unblocks `kill`, ash job control, the Wayland `SIGBUS`
-   path.  A workstream, not a commit -- scope it first.
+1. **The residual 7e race.**  The lead.  Ordering, not stores.
+2. **Item 12 -- signal delivery.**  Largest; unblocks `kill`, ash
+   job control, the Wayland `SIGBUS` path.  A workstream.
 3. **`sys_gettimeofday` (96).**  Small, patterned, independent.
    Unlocks `ps -l`.  **Note: 96, not 99.**
-4. **Documenting the ash mechanism** for a third-party patch.
 
 ### Do not
 
-**Do not chase memory corruption** -- the rate curve says race.
-**Do not point at musl or busybox** as the culprit binary; they are
-read-only and the trigger is a kernel-side window.  **Do not
-re-derive the `fs_base` path** -- it is correct.  Do not re-open
-item 7 (closed), item 11 (closed), or the session-48 zone scan.
-Do not re-litigate the five 7e mechanisms falsified in sessions
-56-57.  Do not re-run the two `setjmp` probes to "check".  Do not
-trust a page walk's verdict without reading the walk.  Do not drop
-the older non-`2026*` tags.  One change at a time.  Do not edit
-`third_party/` -- but do read it.
+**Do not chase memory corruption** -- it is a race.  **Do not point
+at musl or busybox** as the culprit binary.  **Do not re-derive the
+`fs_base` path** -- it is correct.  Do not re-open item 7, item 11,
+or the session-48 zone scan.  Do not re-run the two `setjmp`
+probes.  Do not trust a page walk's verdict without reading the
+walk.  Do not drop the older non-`2026*` tags.  One change at a
+time.  Do not edit `third_party/` -- but do read it.
 
 ---
 
 ## Open issues (top 6; full list in `docs/open-issues.md`)
 
-1. **`open-issues.md` item 7e: the control-transfer face.**  **It
-   is a RACE** (rate curve).  Precondition: ash's stale
-   `jmp_buf`.  Trigger: a timing-dependent kernel window, not yet
-   found.  **The lead.**
+1. **`open-issues.md` item 7e: the control-transfer face.**  An
+   **UNSOLVED RACE**, proven by the tick-rate curve, reproduced
+   byte-identically at 100 Hz.  **The kernel return path is
+   cleared; the corruption is user-stack contents.**  **The lead.**
 2. **`open-issues.md` item 12: signal delivery is a stub.**  The
-   largest single target; lets ash survive the fault.
+   largest single target.
 3. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 4. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 5. **`open-issues.md` item 9: no privilege model.**
@@ -379,15 +391,13 @@ the older non-`2026*` tags.  One change at a time.  Do not edit
 - `configs/busybox.config` -- tracked canonical config.
 - `userland/musl/` -- tracked musl userland.  Session 59 added
   `tests/pipe7e_stdio_sjlj.c`, `tests/pipe7e_stdio_heapjmp.c`,
-  `tests/pipe7e_sjlj_stale.c`; the Makefile unchanged.
-- `userland/scripts/` -- `test.sh`, `pipe_wake_probe.sh` (4000
-  iterations).
-- `third_party/{busybox,musl-src,musl-install}/`
-  -- gitignored; **read freely, do not write.**
+  `tests/pipe7e_sjlj_stale.c`.
+- `userland/scripts/` -- `test.sh`, `pipe_wake_probe.sh`.
+- `third_party/{busybox,musl-src,musl-install}/` -- gitignored;
+  **read freely, do not write.**
 - `toolchain/{install_musl.sh,musl-gcc.sh}` -- tracked.
 - `capture.txt` -- gitignored, truncated per run.  Captures
-  preserved outside the tree survive a rebuild and do not dirty
-  the tracked tree.
+  preserved outside the tree survive a rebuild.
 - `run` -- tracked; the build-and-capture fix.
 
 Kernel sources: `04_kernel_64bit/`.
@@ -412,14 +422,15 @@ it.
 **donix runs static musl-linked binaries on Linux x86_64 syscalls.
 The userland is a tracked source tree at `userland/musl/`.  `v0.6.13`
 is the last tag; no bump.  The `testme` migration and the session-61
-kernel fixes are on `donix`'s `dev`, unpushed.  Session 60's finding:
-**the 7e family is a RACE, proven by the tick-rate curve** (10 Hz
-clean, 40 Hz the threshold, 100 Hz faults).  The precondition is
-ash's stale `jmp_buf`; the trigger is a timing-dependent kernel
-window that has not been found.  Five race windows are closed and
-committed; the residual race is the next session's lead.  **Do not
-chase memory corruption -- the rate curve says race.  Read the
-bytes, add one probe, run once.**  One change at a time.**
+kernel fixes are on `donix`'s `dev`, unpushed.  Session 62's finding:
+**the 7e control-transfer fault is an UNSOLVED RACE** -- 10 Hz clean
+past 3000 iterations, 100 Hz faults within the first, three runs
+byte-identical.  **The kernel's syscall return path is CLEARED**
+(`RSP - g_user_rsp_save == 8`); the corruption is user-stack
+contents.  **A race is not memory corruption -- there is no store to
+find.  Do not hunt the writer; instrument the ordering.**  The next
+instrument is the `fork` stack-copy range: two numbers, not a store
+hunt.  One change at a time.**
 
 ## How to use this file
 
@@ -457,12 +468,15 @@ type's named fields are not what the pointer points at.**  Session
 prints a confident wrong verdict**; and **a diagnostic on the fault
 path is part of the system.**  Session 59's three: **a Python edit
 with a `count != 1` abort check catches an ambiguous anchor and
-writes nothing -- use it for edits into large files; a handler on
-the fault path with a corrupt `rsp` cannot run, so a redirect
-without a re-entry guard loops forever -- guard it; and reading the
-disassembly found the mechanism a dozen trace-readings had
-missed.**  **And session 59's meta-gotcha: a section title is a
-claim about its body, and a commit subject is a claim about its
-diff -- read the body, read the diff, not the title and not the
-subject.  Session 59 made that mistake twice.**  **This file's item
-text is the same kind of claim.**
+writes nothing; a handler on the fault path with a corrupt `rsp`
+cannot run, so a redirect without a re-entry guard loops forever;
+and reading the disassembly found the mechanism a dozen
+trace-readings had missed.**  **Session 59's meta-gotcha: a section
+title is a claim about its body, and a commit subject is a claim
+about its diff -- read the body, read the diff.**  **Session 62's
+three: a race is not memory corruption -- there is no store to
+find, so do not hunt the writer; a session number, a comment, and
+an address pairing are claims too -- count it, read the body, and
+quote the bytes; and before writing an edit anchor, read the file
+with `cat -A` and quote the bytes.**  **This file's item text is
+the same kind of claim.**

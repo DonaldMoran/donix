@@ -1,3 +1,67 @@
+## Session 62 — the 7e fault reproduces identically at 100 Hz; the kernel return path cleared
+
+*(Sessions 60 and 61 are recorded in the handoff and the commit
+messages, not in this file; the log's previous heading is Session
+59.)*
+
+The whole session ran at `pit_init(100)`.  Three runs of `pipe7e`
+produced **byte-identical fault state**: CR2 `0xFFFFFFFF`, faulting
+RIP `0xFFFFFFFF`, error `0x14`, RSP `0x80000FBF90`,
+`g_user_rsp_save` `0x80000FBF88` (difference `0x8`), CR3
+`0x32D000`, pid 4, and the same user-stack window down to the
+`"Pe7epip"` / `"WD=/root"` strings at `rsp+0x70`/`0x78` and the
+doubled saved frame at `rsp-0x20` and `rsp-0x1C0`.
+
+**The race stands.  It is not memory corruption, and the next
+session must not treat it as such.**  A race presents as a wrong
+value in a slot, and there is no store to find: the wrong value is
+the correct value for a different interleaving.  Do not hunt the
+writer.  Instrument the ordering.
+
+**The instrument that produced the session's durable result.**
+`g_user_rsp_save` was added to both fault handlers (3 insertions,
+0 deletions) and `global g_user_rsp_save` to
+`user_syscall_entry.asm` (1 insertion); the user-stack window was
+widened from `-0x40..+0x40` to `-0x200..+0x200`.  On three runs,
+`RSP - g_user_rsp_save == 8` -- exactly the relation for a `ret`
+immediately after a `syscall`.  **The kernel returns to the correct
+RIP and the correct RSP.  The corruption is in the user-stack
+contents.**
+
+**The disassembly corrections.**  `pipe7e.elf` links no
+`longjmp`/`setjmp` -- the handoff's `_longjmp(buf, 1)` mechanism is
+not this binary's.  `__syscall_cp_c` is a bare syscall thunk with
+no cancellation branch.  `0x400CF2` is `__restore_sigs`'s
+post-`rt_sigprocmask` `ret`; `0x4041F8` is `__syscall_cp_c`'s
+`ret` -- two thunks, not one, correcting the item text's pairing.
+
+**Six mechanisms refuted by reading the source:** `longjmp`/
+`setjmp` (not in the binary); cancellation unwind (bare thunk);
+signal frame (signals not delivered, `user_syscall.c:5387,5392,
+6512,7604`); the `wait4` re-scan window (the re-scan is inside the
+`cli`; the comment is stale); `dup2` refcount undercount
+(`sys_dup2` bumps it); the exit-path fd leak (`close_all_files`
+uses `put_file_slot`); the pipe use-after-free (`put_pipe_ref` is
+gated on `readers_open`/`writers_open`).
+
+**The end-of-session 10 Hz check.**  One run, clean past 3000
+`pipe7e` iterations.  At 100 Hz the same binary faults within the
+first iterations.
+
+**Next act.**  Instrument the `fork` stack-copy ordering: print
+`parent->rsp`, `parent->user_stack_virt`, `parent->user_stack_top`
+at fork time and compare against `child->rsp`.  The copy range
+(`user_syscall.c:7940`, `EAGER_COPY_REGION(parent->user_stack_virt,
+parent->user_stack_top)`) is set once and not updated as the stack
+grows.  Two numbers, not a store hunt.
+
+**Instrument now in the tree.**  Wide user-stack window in
+`dump_user_stack_window`; `g_user_rsp_save` in both `bad_target`
+blocks; `global g_user_rsp_save` in `user_syscall_entry.asm`.
+No tag, no bump.
+
+---
+
 ## Session 59 — the `setjmp`/`longjmp` probes, and the ash mechanism found and reproduced
 
 **Session open.**  Three code commits so far on `dev`, scratch-tagged

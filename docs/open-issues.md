@@ -12,26 +12,36 @@ numbers; the items below keep theirs.  References to "item 7" or
 correct.
 
 **Item 7e is a family.  Its heap-corruption face is fixed.  Its
-control-transfer face is a RACE -- proven by a tick-rate curve --
-that is NOT fork-specific, NOT NX-on-the-mmap-window, and NOT in
-the kernel's sysret path.  The PRECONDITION is ash's stale
-`jmp_buf` (`evaltree` never restores `globals+0x38` on its normal
-return); the TRIGGER is a timing-dependent window.**  Session 54
-wrote "closed as a BUSYBOX bug"; session 55 corrected that to "a
-suspicion"; session 57's work narrows it and falsifies five
-candidate mechanisms; **the rate curve proves it is a
-race.**  What the evidence supports is:
+control-transfer face is an UNSOLVED RACE CONDITION, proven by a
+tick-rate curve, that is NOT fork-specific, NOT
+NX-on-the-mmap-window, and NOT in the kernel's sysret path.**
+Session 54 wrote "closed as a BUSYBOX bug"; session 55
+corrected that to "a suspicion"; session 57's work narrows it
+and falsifies five candidate mechanisms.  **The rate curve is
+the proof and it has now been confirmed live: at
+`pit_init(10)` the same kernel and image run past 3000
+`pipe7e` iterations clean; at `pit_init(100)` the same binary
+faults within the first iterations.**  A deterministic defect
+produces the same outcome at every rate.  This one does not.
+**The precondition for the ASH faults is ash's stale `jmp_buf`
+(`evaltree` never restores `globals+0x38` on its normal return);
+that is NOT the precondition for `pipe7e`, which has no
+`jmp_buf` at all.  The trigger in both cases is the timing
+window.**  What the evidence supports is:
 
   - **The tick-rate curve.**  Same kernel, same
-    image, same `pipe7e`, only `pit_init` varies: **10 Hz runs
-    50000 iterations clean; 20 and 30 Hz progress; 40 Hz begins
-    to fail; 100 Hz faults, at `iter 4` to `iter 232` across
-    runs.**  A monotone failure curve with a threshold between
-    30 and 40 Hz is the signature of a race.  A deterministic
-    defect produces the same outcome at every rate.  **This is
-    what makes the `evaltree` precondition necessary but not
-    sufficient: the stale `jmp_buf` exists at every rate, but
-    it is only *reached* when the race lands.**
+    image, same `pipe7e`, only `pit_init` varies.  **The
+    100 Hz row is the one this session ran throughout: the
+    fault reproduces there, three times, byte-identically.
+    The 10 Hz row is one end-of-session confirmation run:
+    clean past 3000 iterations.**  The earlier-session table
+    -- 10 Hz clean at 50000, a threshold between 30 and 40 Hz
+    -- is a recorded earlier observation, not re-measured this
+    session.  A monotone curve of this shape is the signature
+    of a race: a deterministic defect produces the same
+    outcome at every rate.  **The stale `jmp_buf` is the ASH
+    precondition, not `pipe7e`'s -- `pipe7e` links no `jmp_buf`
+    at all.**
 
   - **The `%fs` path is correct.**  At every
     captured fault, `last fs_base`, `fs_base NOW` (the MSR at
@@ -46,11 +56,22 @@ race.**  What the evidence supports is:
 
   - **The fault's shape is a small integer at a return-address
     slot** (`0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`), where a
-    `ret` popped it.  `last sysret rcx` is `__syscall_cp`
-    (`0x400CF2`, `0x4041F8`), the musl cancellation wrapper on
-    the stdio/lock path.  The value is `_longjmp(buf, 1)`'s
-    return value, sitting where a return address belongs: a
-    stale `jmp_buf` reaching a returned frame, under a race.
+    `ret` popped it.  **The two `last sysret rcx` values name
+    two DIFFERENT thunks' post-syscall `ret`s, not one
+    function:** `0x400CF2` is `__restore_sigs`'s `ret` after
+    its `rt_sigprocmask` (syscall 14); `0x4041F8` is
+    `__syscall_cp_c`'s `ret` after the wrapped syscall.
+    **`pipe7e.elf` links NO `longjmp`/`setjmp`** -- the
+    disassembly shows no such call -- so for `pipe7e` the
+    value is NOT a `_longjmp(buf, 1)` return.  The `jmp_buf`
+    shape belongs to the ash faults.  **What IS established
+    for `pipe7e`:** the kernel returns to the correct RIP and
+    the correct RSP -- `RSP - g_user_rsp_save == 8`, on three
+    independent runs.  The corruption is in the USER STACK
+    CONTENTS, and the corrupted frame sits in the startup
+    region (`"Pe7epip"`, `"WD=/root"` at `rsp+0x70`/`0x78`,
+    `main`'s entry `0x400220` at `rsp-0x18`, a DOUBLED saved
+    frame at `rsp-0x20` and `rsp-0x1C0`).
 
   - **The five race windows are closed** (tag
     `20261009-pipe-lifetime-lostwakeup`): the pipe lifetime, the
@@ -533,11 +554,20 @@ tree: the PTE-for-`fault_rip` print (not yet added), and the
    - `pipe7e_sjlj_stale` (`/usr/bin/PIPE7E_SJLJ_STALE`) --
      reproduces the stale-`jmp_buf` shape first-party.
 
-   **Item 7e -- what is known.**  It is a RACE, proven by a
-   tick-rate curve.  **Do not chase the corrupted values; they
-   are symptoms of a timing window, not the cause.**  The full
-   narrative is in `session-log.md`, sessions 55-59; this is the
-   findings only.
+   **Item 7e -- what is known.**  It is an UNSOLVED RACE
+   CONDITION, proven by a tick-rate curve, and confirmed live
+   (10 Hz clean past 3000 iterations; 100 Hz faults within the
+   first).  **Do not chase the corrupted values; they are
+   symptoms of the racing order, not a bad store.**  The next
+   instrument is the `fork` stack-copy range: print
+   `parent->rsp`, `parent->user_stack_virt`,
+   `parent->user_stack_top` at fork time and compare against
+   `child->rsp`.  **One open question to carry:** at 100 Hz the
+   fault state reproduces byte-identically across runs (same
+   CR2, RIP, RSP, `g_user_rsp_save`, stack window).  A race can
+   do that when one ordering wins nearly every time, but it is
+   worth naming: why is the losing order always the same?  The
+   full narrative is in `session-log.md`.
 
    **Falsified mechanisms, so they are not re-walked.**  Each was
    proposed from a fault window or a trace and killed by reading

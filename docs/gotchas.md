@@ -1841,3 +1841,47 @@ session reaches for `objdump` earlier.
 **The tell.**  A dozen falsified mechanisms from traces, and no
 progress.  That is the signal to stop reading traces and start
 reading code.
+
+## A race presents as memory corruption; there is no store to find
+
+*Session 62.  The method correction that closes a multi-session
+detour.*
+
+A race and a deterministic defect present **the same way on a
+trace**: a wrong value in a slot, a `ret` to a bad address.  The
+difference is that a deterministic defect has a **writer** to
+find, and a race does not -- the wrong value is the correct value
+for a different interleaving.  So "what wrote this value?" is the
+right question for one and the wrong question for the other, and
+the trace cannot tell you which you have.
+
+The rate curve is the discriminator.  **When a symptom appears
+only above a tick rate, do not hunt the writer.**  Session 62
+spent six hypotheses on writers -- a `dup2` refcount undercount,
+an exit-path fd leak, a pipe use-after-free, a cancellation
+unwind -- and every one was refuted by reading the source.  The
+reads that mattered established an **ordering**: the `cli`-closed
+block/wake paths, and the `g_user_rsp_save` subtraction that
+proved the kernel return path correct.  **Instrument the
+ordering, not the store.**
+
+**The complement, and it is a caution.**  A race can reproduce
+byte-identically when one ordering wins nearly every time, so a
+reproducible fault does not by itself rule the race out.  Three
+100 Hz runs produced identical fault state -- same CR2, RIP,
+RSP, `g_user_rsp_save`, stack window.  That is worth naming as
+an open question (why is the losing order always the same?), not
+as a refutation.
+
+## A comment is a claim about its code
+
+*Session 62.*
+
+`user_syscall.c:5210` says the `wait4` late re-scan "is itself
+preemptible" -- the code runs the re-scan **inside the `cli`**.
+`interrupts.c`'s stack-window comment still said `-0x40` after
+the loop became `-0x200`.
+
+**The rule.**  Read the body, not the comment above it.  A stale
+comment is worse than none, because it sends the next reader down
+a path the code does not have.
