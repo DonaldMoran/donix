@@ -569,12 +569,24 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
         if (_c_phys) {
             _c_slot = *(uint64_t*)(HHDM_START + _c_phys + (p_rsp & 0xFFF));
         }
-        serial_print("7e-fork: p_rsp=0x");      serial_print_hex(p_rsp);
-        serial_print(" p_phys=0x");             serial_print_hex(_p_phys);
-        serial_print(" p_slot=0x");             serial_print_hex(_p_slot);
-        serial_print(" c_phys=0x");             serial_print_hex(_c_phys);
-        serial_print(" c_slot=0x");             serial_print_hex(_c_slot);
-        serial_print("\n");
+        /*
+         * Print only when a slot is non-zero.  A clean fork leaves
+         * both slots at 0 (or a benign small value from the parent's
+         * startup path); the fork worth seeing is the one whose slot
+         * is neither.  Printing every fork saturates the serial
+         * console -- 181 identical lines at iter 0, twice observed --
+         * and slows the guest enough that pipe7e never reaches
+         * iter 1000.  Quiet on the clean path, loud on the
+         * interesting one.
+         */
+        if (_p_slot != 0 || _c_slot != 0) {
+            serial_print("7e-fork: p_rsp=0x");      serial_print_hex(p_rsp);
+            serial_print(" p_phys=0x");             serial_print_hex(_p_phys);
+            serial_print(" p_slot=0x");             serial_print_hex(_p_slot);
+            serial_print(" c_phys=0x");             serial_print_hex(_c_phys);
+            serial_print(" c_slot=0x");             serial_print_hex(_c_slot);
+            serial_print("\n");
+        }
     }
 }
 
