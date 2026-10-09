@@ -24,6 +24,7 @@
 volatile uint64_t g_last_syscall_num = (uint64_t)-1;
 volatile uint64_t g_pipe_stamp_counter = 0;
 volatile uint64_t g_last_fs_base = 0;
+volatile uint64_t g_arch_prctl_addr[32];
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -8049,6 +8050,9 @@ void sys_exit(int status) {
 long sys_arch_prctl(int code, void* addr) {
     if (code == ARCH_SET_FS) {
         pcb_t* self = process_get_current();
+        if (self && self->pid < 32) {
+            g_arch_prctl_addr[self->pid] = (uint64_t)addr;
+        }
         /* Record every ARCH_SET_FS: the pid, the addr musl
          * passed, and what the MSR read back after the write.
          * This names whether the kernel mangled the value or

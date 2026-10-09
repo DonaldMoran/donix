@@ -17,6 +17,7 @@ extern volatile uint64_t g_last_sysret_rcx;
 extern volatile uint64_t g_last_sysret_r11;
 extern volatile uint64_t g_last_syscall_num;
 extern volatile uint64_t g_last_fs_base;
+extern volatile uint64_t g_arch_prctl_addr[32];
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -896,6 +897,25 @@ void isr14_handler(exception_frame_t *frame) {
             serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
             serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
             serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
+            {
+                uint32_t _l, _h;
+                __asm__ volatile("rdmsr" : "=a"(_l), "=d"(_h)
+                                 : "c"(0xC0000100u));
+                uint64_t _cur = ((uint64_t)_h << 32) | (uint64_t)_l;
+                serial_print("  fs_base NOW     : 0x"); serial_print_hex(_cur); serial_print("\n");
+            }
+            {
+                pcb_t* _c = process_get_current();
+                if (_c) {
+                    serial_print("  pcb->fs_base    : 0x"); serial_print_hex(_c->fs_base); serial_print("\n");
+                    serial_print("  pcb pid/name    : "); serial_print_dec(_c->pid); serial_print(" "); serial_print(_c->name); serial_print("\n");
+                    if (_c->pid < 32) {
+                        serial_print("  arch_prctl addr : 0x"); serial_print_hex(g_arch_prctl_addr[_c->pid]); serial_print("\n");
+                    }
+                } else {
+                    serial_print("  pcb             : (null)\n");
+                }
+            }
         }
         serial_print("  CR3               : 0x"); serial_print_hex(cr3); serial_print("\n");
         serial_print("  Walk indices: pml4=");
