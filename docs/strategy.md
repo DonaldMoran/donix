@@ -77,7 +77,7 @@ Design it knowing `/proc` and `/dev` are coming, but do not build
 the VFS they are commonly assumed to need.  See `ROADMAP.md`,
 "Make `/proc` possible."
 
-## Files that must not be touched
+## Files not to change without a specific tested reason
 
 Unless a specific tested problem requires it:
 - `process.c` -- especially `process_copy_kernel_frame`
@@ -102,8 +102,8 @@ Full A1-A6 narrative: `docs/migration-history.md`.
 
 - **Kernel shell:** `k` at boot prompt (`proclist`, `schstat`,
   `heapstat`, `selftest`, `fatls`, `elfload`).
-- **User shell:** `musl_sh`, launched automatically from the FAT
-  as `0:/MUSL_SH.ELF`.  Do not press `k`.  A FAT read failure is
+- **User shell:** `musl_sh`, launched automatically from the FAT.
+  Do not press `k`.  A FAT read failure is
   a serial PANIC.
 - **QEMU:** `make runkernel64-kvm-single` (fast),
   `make runkernel64-single` (TCG), `make logkernel64` (debug).
