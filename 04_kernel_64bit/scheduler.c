@@ -361,6 +361,24 @@ void scheduler_switch_to(pcb_t* next) {
          */
         next->state = PROC_STATE_RUNNING;
         next->block_kind = BLOCK_KIND_NONE;
+        /*
+         * Requeue.  A process left RUNNING here is current, and a
+         * current process does not need to be on the ready queue --
+         * until the CPU leaves it.  The paths that change
+         * `current` requeue the outgoing process only when its state
+         * is RUNNING, and the timer path requeues only when its own
+         * local `current` matches.  A RUNNING process left off the
+         * queue by this early return is the state the
+         * TIMER-NO-NEXT dump showed: pid 3 busybox RUNNING, off the
+         * queue, CPU in idle.  Adding it here is idempotent
+         * (scheduler_ready_queue_add checks membership), so a
+         * process already queued is unchanged.  Idle (pid 1) is
+         * deliberately never on the queue -- it is reached through
+         * process_find_by_pid(1) -- so skip it.  Item 7d.
+         */
+        if (next->pid != 1) {
+            scheduler_ready_queue_add(next);
+        }
         return;
     }
 
