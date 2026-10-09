@@ -4922,13 +4922,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     keyboard_buffer_flush();
 
-    serial_print("sys_execve: pid=");
-    serial_print_dec(self->pid);
-    serial_print(" entry=0x"); serial_print_hex(entry);
-    serial_print(" argc=");    serial_print_dec((uint64_t)argc);
-    serial_print(" rsp=0x");   serial_print_hex(rsp_init);
-    serial_print(" (");        serial_print(proc_name);
-    serial_print(")\n");
+    //serial_print("sys_execve: pid=");
+    //serial_print_dec(self->pid);
+    //serial_print(" entry=0x"); serial_print_hex(entry);
+    //serial_print(" argc=");    serial_print_dec((uint64_t)argc);
+    //serial_print(" rsp=0x");   serial_print_hex(rsp_init);
+    //serial_print(" (");        serial_print(proc_name);
+    //serial_print(")\n");
+    
+    /*
+     * TEMPORARY PACING SHIM -- NOT A FIX.  REMOVE WHEN THE FRAME
+     * BUG IS FIXED.
+     *
+     * This block replaces a serial_print that took about 5 ms of
+     * UART busy-wait.  That busy-wait was a timing cushion: it
+     * slowed the fork/exec/wait cycle enough that a frame-
+     * corruption bug on the syscall-return path stayed
+     * unreachable.  Removing the print exposes the bug (pipe7e
+     * faults at iteration 0; test.sh faults at row ~19).
+     *
+     * This loop reproduces the same ~5 ms of delay without
+     * emitting anything.  The iteration count is calibrated for
+     * this host and this build; it is not portable and it is not
+     * a substitute for fixing the bug.
+     *
+     * When the frame bug is fixed, DELETE THIS BLOCK.
+     * See tag 20261007-P5-only-repro for the target state.
+     */
+    //~ {
+        //~ volatile uint64_t _spin = 0;
+        //~ //for (uint64_t _i = 0; _i < 1000000ULL; _i++) {
+        //~ // for (uint64_t _i = 0; _i < 500000ULL; _i++) {
+        //~ for (uint64_t _i = 0; _i < 250000ULL; _i++) {
+        //~ //for (uint64_t _i = 0; _i < 125000ULL; _i++) {
+            //~ _spin += _i;
+        //~ }
+        //~ (void)_spin;
+    //~ }
 
     __asm__ volatile("sti");
     return 0;
