@@ -5942,6 +5942,19 @@ long sys_read(int fd, void* buf, size_t count) {
                 return 0;
             }
 
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
             __asm__ volatile("sti");
             __asm__ volatile("hlt");
             /* Woken by a peer's write or close, OR preempted by
