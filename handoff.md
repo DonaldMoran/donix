@@ -125,6 +125,12 @@ message inline via heredoc.  Do not split a single operation.
 direct file access.  Before patching a file it has not seen **in
 this session**, it must ask for that file.  Never guess.
 
+**The channel is the human.**  A session asks for a file by name
+and the human pastes it; a session asks for a command's output the
+same way -- a read-only block, one paste, and the state check
+first.  A session that needs a file should ask for it rather than
+reason from a summary, a tree listing, or a commit subject.
+
 **When editing a large file, quote the bytes.**  For an edit inside
 a big file, the instruction must quote the exact text being replaced
 and the exact text that replaces it, both copied from output the
