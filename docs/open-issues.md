@@ -12,12 +12,53 @@ numbers; the items below keep theirs.  References to "item 7" or
 correct.
 
 **Item 7e is a family.  Its heap-corruption face is fixed.  Its
-control-transfer face is a reproducible family that is NOT
-fork-specific, NOT NX-on-the-mmap-window, and NOT in the kernel's
-sysret path.  The mechanism is not identified.**  Session 54 wrote
-"closed as a BUSYBOX bug"; session 55 corrected that to "a
-suspicion"; session 57's work narrows it further and falsifies
-five candidate mechanisms.  What the evidence supports is:
+control-transfer face is a RACE -- proven by a tick-rate curve --
+that is NOT fork-specific, NOT NX-on-the-mmap-window, and NOT in
+the kernel's sysret path.  The PRECONDITION is ash's stale
+`jmp_buf` (`evaltree` never restores `globals+0x38` on its normal
+return); the TRIGGER is a timing-dependent window.**  Session 54
+wrote "closed as a BUSYBOX bug"; session 55 corrected that to "a
+suspicion"; session 57's work narrows it and falsifies five
+candidate mechanisms; **session 60's rate curve proves it is a
+race.**  What the evidence supports is:
+
+  - **The tick-rate curve (session 60).**  Same kernel, same
+    image, same `pipe7e`, only `pit_init` varies: **10 Hz runs
+    50000 iterations clean; 20 and 30 Hz progress; 40 Hz begins
+    to fail; 100 Hz faults, at `iter 4` to `iter 232` across
+    runs.**  A monotone failure curve with a threshold between
+    30 and 40 Hz is the signature of a race.  A deterministic
+    defect produces the same outcome at every rate.  **This is
+    what makes the `evaltree` precondition necessary but not
+    sufficient: the stale `jmp_buf` exists at every rate, but
+    it is only *reached* when the race lands.**
+
+  - **The `%fs` path is correct (session 60).**  At every
+    captured fault, `last fs_base`, `fs_base NOW` (the MSR at
+    the fault), and `pcb->fs_base` all read `0x408698`, and the
+    per-pid `arch_prctl` record shows the faulting process
+    **inherited** the value rather than setting it.  The MSR,
+    the PCB, and the syscall-entry record agree; the context
+    switch is restoring what the process set.  The value is a
+    text address because musl set it once, early.  **The value
+    is not the mechanism** -- it is a constant present at every
+    fault, at every rate.
+
+  - **The fault's shape is a small integer at a return-address
+    slot** (`0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`), where a
+    `ret` popped it.  `last sysret rcx` is `__syscall_cp`
+    (`0x400CF2`, `0x4041F8`), the musl cancellation wrapper on
+    the stdio/lock path.  The value is `_longjmp(buf, 1)`'s
+    return value, sitting where a return address belongs: a
+    stale `jmp_buf` reaching a returned frame, under a race.
+
+  - **The five session-60 race windows are closed** (tag
+    `20261009-pipe-lifetime-lostwakeup`): the pipe lifetime, the
+    stranded `READY` process, the sysret tail, the `hlt`-return
+    state, and the invalid-`end` guard.  Several workloads that
+    failed at `pit_init(100)` now pass; `pipe7e` moved from
+    `iter 0`/`iter 50` to `iter 232` before the race fires.
+    **Progress, not closure.**
 
   - **The heap-corruption face is diagnosed and fixed.**  The
     `movq %rbx, 0x2c35(%rip)` displacement corruption

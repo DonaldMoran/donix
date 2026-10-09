@@ -42,7 +42,7 @@ correctness milestone** -- item 7 closed, `process_create`'s failure
 exits fixed, the exit-path page-table leak closed.  **No new
 subsystem in `v0.6.12`.**
 
-**`v0.6.13` is pending.**  Sessions 51 through 59 are untagged work
+**`v0.6.13` is pending.**  Sessions 51 through 60 are untagged work
 on `dev`, after `v0.6.12`: the applet batches and the harness; item
 7c retracted; the zombie leak and the NX / non-canonical family; the
 fork-path sentinel leak; the `isr14` phys-mask fix; the vector-6
@@ -249,6 +249,98 @@ not editable.  **The only donix-side path to making 7e stop
 costing whole runs is item 12** -- a real signal subsystem, so ash
 can catch the fault and continue.
 
+### Session 60 -- the rate curve, and why 7e is a RACE
+
+**Session 60 measured the tick-rate curve, and it changes the
+reading of the mechanism above.**  Same kernel, same image,
+same `pipe7e`, only `pit_init` varies:
+
+| `pit_init` | result |
+|---|---|
+| 10 | `PIPE7E-ALL-PASS`, 50000 iterations |
+| 20 | progresses, `iter 1000` within minutes |
+| 30 | progresses, same result |
+| 40 | **begins to fail** |
+| 100 | faults, at `iter 4` to `iter 232` across runs |
+
+**A monotone failure curve with a threshold between 30 and 40 Hz
+is the signature of a race.**  A deterministic defect -- a wrong
+offset, a missing store, a corrupted buffer written
+unconditionally -- produces the same outcome at every rate.  This
+one does not.
+
+**So the mechanism above is the PRECONDITION, not the whole
+mechanism.**  `evaltree`'s missing restore is why a stale
+`jmp_buf` exists.  It does not explain why the stale buffer is
+*reached* only at the higher tick rate.  **Something else -- a
+race -- decides whether `raise_exception` longjmps to it, and
+the tick rate is what tips it.**  Both are required: the stale
+buffer must exist, and the race must deliver control into
+`raise_exception` at the wrong moment.
+
+**The session-60 controls:** several other workloads that
+failed at `pit_init(100)` now pass, after the five fixes below.
+`pipe7e` moved from `iter 0`/`iter 50` to `iter 232` at 100 Hz
+before the race fires.  That is progress, not closure.
+
+**The five fixes, committed and tagged
+`20261009-pipe-lifetime-lostwakeup`:**
+
+1. **Pipe lifetime.**  `put_pipe_ref` and `put_file_slot` gate
+   the `pipe_t` free on `readers_open == 0 && writers_open == 0`,
+   not on the ends refcount alone.  Found by the P13 stamp
+   probe: reader blocked on stamp 2, the close ran on stamp 1,
+   same address.
+2. **Stranded `READY`.**  `process_yield` and `process_exit`
+   re-add a `READY` process that is not on the ready queue
+   before falling to idle.  Found by reading the live pool with
+   `gva2gpa` + `pmemsave`: a helper `READY`, off the queue, CPU
+   in `kernel_idle_loop`.
+3. **The sysret-tail window.**  `user_syscall_entry.asm`
+   disables interrupts across the entire return tail.  Found by
+   reading the disassembly.
+4. **The `hlt`-return bug.**  The pipe reader resets state to
+   `RUNNING` after `hlt`, and does not clear `reader_waiting`
+   on a timer wake.
+5. **The invalid-`end` guard.**  `alloc_file_slot`
+   initializes `end = 0`; `put_file_slot` refuses to free a pipe
+   when a slot's `end` is neither READ nor WRITE.
+
+**The `%fs` measurements at the fault, and what they settled.**
+`last fs_base`, `fs_base NOW` (the MSR at the fault), and
+`pcb->fs_base` all read `0x408698` in every captured fault, and
+the per-pid `arch_prctl` record shows the faulting process
+**inherited** that value rather than setting it.  **The `fs_base`
+path is correct** (confirming the file's falsification 1); the
+value is a text address because musl set it once, early.  The
+rate curve says the `%fs` value is not the mechanism -- it is a
+constant present at every fault, at every rate.
+
+**The fault's shape, for the next session.**  Every 7e fault
+produces a small integer at a return-address slot, where a `ret`
+popped it: `0x1`, `0x4`, `0x32`, `0x0`, `0xFFFFFFFF`.
+`last sysret rcx` is `__syscall_cp` (`0x400CF2`, `0x4041F8`) --
+the musl cancellation wrapper, on the stdio/lock path.  The
+value is `_longjmp(buf, 1)`'s return value, and it sits where a
+return address belongs.  **A stale `jmp_buf` reaching a returned
+frame, under a race.**
+
+**The next session's lead is the race, not item 12.**  Item 12
+is still the fix that would let ash *survive* the fault, and it
+remains the largest target.  But the rate curve says there is a
+kernel-side window still open, and the instrument to find it is
+the tick-rate sweep plus the P13/P12/P11 probes: run `pipe7e` at
+10 Hz and at 100 Hz and compare the counters.  **The difference
+between the two runs is the race.**
+
+**Do not chase memory corruption.**  Five sessions did; the rate
+curve says race.  **Do not point at musl or busybox as the bug.**
+They are third-party and read-only; the precondition is ash's
+and that is documented.  The trigger is a timing-dependent race
+that can be found on the kernel side.  **Do not re-derive the
+`fs_base` path** -- it is correct, and session 60's measurements
+confirm it.
+
 ### The NX / non-canonical address family (session 54, unchanged)
 
 Four fixes, one mechanism: `vmm_get_phys*` strip `PT_NX`;
@@ -268,7 +360,17 @@ the machine lives.
 
 ## NEXT SESSION
 
-**Item 12 -- signal delivery -- is the lead.**  `sys_rt_sigaction`
+**The session-60 lead is the 7e race, and the rate curve is its
+instrument.**  The tick-rate sweep (10 Hz clean, 40 Hz the
+threshold, 100 Hz fault) proves the fault is a race.  The
+precondition is ash's stale `jmp_buf`; the trigger is a
+timing-dependent window that the higher tick rate opens more
+often.  **Run `pipe7e` at 10 Hz and 100 Hz with the P13/P12/P11
+probes on, and compare the counters.**  The difference is the
+race.  See "Where we are" above.
+
+**Item 12 -- signal delivery -- remains the largest target and
+the fix that would let ash survive the fault.**  `sys_rt_sigaction`
 is still a stub for every real signal.  Session 59's fix means
 `signal_handler[]` is per-process and cleared on teardown, and the
 redirect is guarded; what remains is the subsystem: a real
