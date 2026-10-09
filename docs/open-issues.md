@@ -993,6 +993,38 @@ line when `/proc` is next touched.
 reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
 small syscall from `g_ticks`, like `clock_gettime`.
 
+**A live pipe slot's `end` field is 0; no writer is in the
+source.**  Found by the P12 slot-29 probe (session 59/60, the
+`pipe7e` hunt).  A `file_slot_t` of kind `FILE_KIND_PIPE` was
+captured with `refcount = 2` (two fds sharing it) and
+`slot->end = 0`, at a fixed kernel-heap address.  `PIPE_END_READ`
+is 1 and `PIPE_END_WRITE` is 2; `0` is neither.
+
+The three writes to a pipe slot's `end` in `user_syscall.c` are
+`pipe_alloc_end` (`slot->end = end`), and `sys_pipe`
+(`rslot->end = PIPE_END_READ`, `wslot->end = PIPE_END_WRITE`).
+All three write 1 or 2, never 0.  The only `end = 0` writes in
+the file are the DIR and PROC slot paths in `open_resolved`,
+and those run on freshly-allocated slots of their own kind, not
+on a live shared pipe slot.
+
+**The writer is not in the source.**  The finding is recorded
+rather than chased, per this project's rule to name a window
+with a probe rather than reason from a corrupted value.
+
+**Observable consequence, closed.**  `put_file_slot` now refuses
+to free a pipe when a slot's `end` is neither READ nor WRITE --
+it records the event, frees the slot, and leaves the pipe alive.
+A leak is survivable; a lost wakeup is not.
+
+**Root cause, open.**  Next step: a guard-band.  Write a magic
+value to `slot->end` at slot creation and check it at every
+`put_file_slot`; the window between the last good read and the
+first bad one names where the write landed.  If that window is
+inside `user_syscall.c`, the writer is in this file and the
+grep missed it; if it is outside, the write is from another
+translation unit and the guard-band's return address names it.
+
 ### Test-design notes
 
 > **This section is not an open-issue list and does not belong in
