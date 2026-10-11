@@ -22,6 +22,20 @@
  * the syscall that was in flight when the fault fired is known.
  * Reset only by being overwritten by the next syscall. */
 volatile uint64_t g_last_syscall_num = (uint64_t)-1;
+
+/* Diagnostic for item 7e: snapshot of the user stack around
+ * g_user_rsp_save at syscall 14 (rt_sigprocmask) entry.  Dumped by
+ * isr14_handler's bad_target block so a fault at __restore_sigs's
+ * ret can be compared against the stack as it looked when the
+ * syscall was entered.  If the values match at fault time, the
+ * corruption predates the syscall; if they differ, something wrote
+ * to the user stack during the syscall.
+ * Diagnostic only. */
+extern volatile uint64_t g_user_rsp_save;
+uint64_t g_sys14_rsp_save;
+uint64_t g_sys14_slots[8];
+int      g_sys14_valid;
+
 volatile uint64_t g_pipe_stamp_counter = 0;
 volatile uint64_t g_last_fs_base = 0;
 volatile uint64_t g_arch_prctl_addr[32];
@@ -1876,8 +1890,39 @@ static void put_file_slot(file_slot_t* slot) {
                     (uint64_t)slot->obj,
                     RACE_SITE_PIPE_CLOSE, 1);
     }
-    if (slot->refcount > 1) {
-        slot->refcount--;
+    uint32_t _old_rc = __atomic_fetch_sub(&slot->refcount, 1,
+                                          __ATOMIC_SEQ_CST);
+    if (_old_rc > 1) {
+        /*
+         * Diagnostic (PPS-early): this close took the early return,
+         * so the writers_open / readers_open decrement below did NOT
+         * run.  If the helper's fd 1 (the write end) reaches this
+         * path with refcount > 1, writers_open stays positive and
+         * the reader on the other end never sees EOF.  Bounded to
+         * 40 events.  Item 7d.
+         */
+        if (slot->kind == FILE_KIND_PIPE) {
+            static int _dbg_ret = 0;
+            if (_dbg_ret < 5000) {
+                _dbg_ret++;
+                pcb_t* _s = process_get_current();
+                pipe_t* _pp = (pipe_t*)slot->obj;
+                serial_lock();
+                serial_print("PPS-early pid=");
+                serial_print_dec(_s ? _s->pid : 0);
+                serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                serial_print(" end="); serial_print_dec(slot->end);
+                serial_print(" rc="); serial_print_dec(_old_rc);
+                if (_pp) {
+                    serial_print(" ro="); serial_print_dec(_pp->readers_open);
+                    serial_print(" wo="); serial_print_dec(_pp->writers_open);
+                    serial_print(" rw=0x"); serial_print_hex((uint64_t)_pp->reader_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)_pp);
+                }
+                serial_print("\n");
+                serial_unlock();
+            }
+        }
         return;
     }
     if (slot->kind == FILE_KIND_FILE) {
@@ -1985,6 +2030,28 @@ static void put_file_slot(file_slot_t* slot) {
         }
         if (slot->end == PIPE_END_READ) {
             if (pipe->readers_open > 0) pipe->readers_open--;
+            /*
+             * Diagnostic (PPS-close-read): the read end just reached
+             * refcount 0.  Print the resulting counts and whether a
+             * writer waiter was present.  Bounded to 40 events.
+             */
+            {
+                static int _dbg_rr = 0;
+                if (_dbg_rr < 5000) {
+                    _dbg_rr++;
+                    pcb_t* _s = process_get_current();
+                    serial_lock();
+                    serial_print("PPS-close-read pid=");
+                    serial_print_dec(_s ? _s->pid : 0);
+                    serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" ww=0x"); serial_print_hex((uint64_t)pipe->writer_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print("\n");
+                    serial_unlock();
+                }
+            }
             {
                 pcb_t* _sc = process_get_current();
                 RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
@@ -1999,6 +2066,32 @@ static void put_file_slot(file_slot_t* slot) {
             }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
+            /*
+             * Diagnostic (PPS-close-write): the write end just reached
+             * refcount 0.  Print the resulting counts and whether a
+             * reader waiter was present.  If writers_open is 0 but
+             * reader_waiting is NULL, the reader has not yet blocked
+             * and will check writers_open itself under cli; if
+             * reader_waiting is set, the wake below fires.  Bounded
+             * to 40 events.  Item 7d.
+             */
+            {
+                static int _dbg_ww = 0;
+                if (_dbg_ww < 5000) {
+                    _dbg_ww++;
+                    pcb_t* _s = process_get_current();
+                    serial_lock();
+                    serial_print("PPS-close-write pid=");
+                    serial_print_dec(_s ? _s->pid : 0);
+                    serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" rw=0x"); serial_print_hex((uint64_t)pipe->reader_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print("\n");
+                    serial_unlock();
+                }
+            }
             {
                 pcb_t* _sc = process_get_current();
                 RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
@@ -2345,7 +2438,7 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
             }
             if (newfd == -1) return -(long)EAGAIN_;
 
-            slot->refcount++;
+            __atomic_fetch_add(&slot->refcount, 1, __ATOMIC_SEQ_CST);
             self->file_table[newfd] = slot;
             FDTRACE({ serial_print("fcntl DUPFD fd="); serial_print_dec((uint64_t)fd);
                       serial_print(" min="); serial_print_dec((uint64_t)min);
@@ -3118,7 +3211,7 @@ long sys_dup2(int oldfd, int newfd) {
     }
 
     /* Share the slot and take a new reference. */
-    old_slot->refcount++;
+    __atomic_fetch_add(&old_slot->refcount, 1, __ATOMIC_SEQ_CST);
     self->file_table[newfd] = old_slot;
 
     FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
@@ -5916,6 +6009,21 @@ long sys_read(int fd, void* buf, size_t count) {
                            ((uint64_t)pipe->used << 32) |
                            (uint64_t)pipe->writers_open,
                            RACE_SITE_READ_CHECK);
+            {
+                static int _dbg_rb = 0;
+                if (_dbg_rb < 5000) {
+                    _dbg_rb++;
+                    serial_print("PPS-reader-check pid=");
+                    serial_print_dec(self->pid);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print(" used="); serial_print_dec(pipe->used);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" rc="); serial_print_dec(pipe->refcount);
+                    serial_print(" stamp="); serial_print_dec(pipe->stamp);
+                    serial_print("\n");
+                }
+            }
             if (pipe->used > 0) {
                 __asm__ volatile("sti");
                 break;
@@ -8055,7 +8163,7 @@ long sys_fork(void) {
     for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
         file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
         if (!_slot) continue;
-        _slot->refcount++;
+        __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
         child->file_table[_fd] = _slot;
     }
 
@@ -8175,7 +8283,32 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
         case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-        case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+        // case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+                case SYS_RT_SIGPROCMASK: {
+            /* Snapshot the user stack around g_user_rsp_save before
+             * the handler runs.  Diagnostic for item 7e only. */
+            uint64_t rs = g_user_rsp_save;
+            g_sys14_rsp_save = rs;
+            g_sys14_valid = 0;
+            {
+                pcb_t* _c = process_get_current();
+                if (_c && rs >= 0x8000000000ULL && rs < 0x8000100000ULL) {
+                    for (int i = 0; i < 8; i++) {
+                        uint64_t va = rs - 8 + (uint64_t)i * 8;
+                        uint64_t p = vmm_get_phys_from_cr3(_c->cr3, va);
+                        g_sys14_slots[i] = p
+                            ? *(uint64_t*)(HHDM_START + p)
+                            : 0xDEADBEEFCAFEBABEULL;
+                    }
+                    g_sys14_valid = 1;
+                }
+            }
+            return (uint64_t)sys_rt_sigprocmask((int)arg0,
+                                                (const void*)arg1,
+                                                (void*)arg2,
+                                                (size_t)arg3);
+        }
+        
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
