@@ -1854,14 +1854,24 @@ static void put_pipe_ref(pipe_t* pipe) {
  * inside its own cli region, so the pointer and the state stay
  * consistent.
  */
-static void pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
-    if (!waiter) return;
-    if (waiter->state != PROC_STATE_BLOCKED) return;
-    if (waiter->block_kind != kind) return;
+/* Returns 1 if the wake was delivered, 0 if the waiter was not
+ * in a state to receive it (NULL, not BLOCKED, or blocked for a
+ * different reason).  Callers MUST only clear the waiter field
+ * on a return of 1.  A no-op wake that still clears the field
+ * is a lost wakeup: the reader can be running (state = RUNNING
+ * after a hlt return) with reader_waiting still = self, so a
+ * close in that window no-ops on the state check, clears the
+ * field, and the next block publishes it only after the close
+ * has already given up. */
+static int pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
+    if (!waiter) return 0;
+    if (waiter->state != PROC_STATE_BLOCKED) return 0;
+    if (waiter->block_kind != kind) return 0;
 
     waiter->state      = PROC_STATE_READY;
     waiter->block_kind = BLOCK_KIND_NONE;
     scheduler_ready_queue_add(waiter);
+    return 1;
 }
 
 static void put_file_slot(file_slot_t* slot) {
@@ -1903,7 +1913,7 @@ static void put_file_slot(file_slot_t* slot) {
          */
         if (slot->kind == FILE_KIND_PIPE) {
             static int _dbg_ret = 0;
-            if (_dbg_ret < 5000) {
+            if (_dbg_ret < 20000) {
                 _dbg_ret++;
                 pcb_t* _s = process_get_current();
                 pipe_t* _pp = (pipe_t*)slot->obj;
@@ -2037,7 +2047,7 @@ static void put_file_slot(file_slot_t* slot) {
              */
             {
                 static int _dbg_rr = 0;
-                if (_dbg_rr < 5000) {
+                if (_dbg_rr < 20000) {
                     _dbg_rr++;
                     pcb_t* _s = process_get_current();
                     serial_lock();
@@ -2060,9 +2070,10 @@ static void put_file_slot(file_slot_t* slot) {
                                RACE_SITE_CLOSE_READ);
             }
             if (pipe->readers_open == 0 && pipe->writer_waiting) {
-                pipe_wake_waiter(pipe->writer_waiting,
-                                 BLOCK_KIND_PIPE_WRITE);
-                pipe->writer_waiting = NULL;
+                if (pipe_wake_waiter(pipe->writer_waiting,
+                                     BLOCK_KIND_PIPE_WRITE)) {
+                    pipe->writer_waiting = NULL;
+                }
             }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
@@ -2077,7 +2088,7 @@ static void put_file_slot(file_slot_t* slot) {
              */
             {
                 static int _dbg_ww = 0;
-                if (_dbg_ww < 5000) {
+                if (_dbg_ww < 20000) {
                     _dbg_ww++;
                     pcb_t* _s = process_get_current();
                     serial_lock();
@@ -2102,9 +2113,10 @@ static void put_file_slot(file_slot_t* slot) {
             if (pipe->writers_open == 0 && pipe->reader_waiting) {
                 RACE_P13_EVENT((uint64_t)pipe, 0, 0,
                                RACE_SITE_WRITE_WAKE);
-                pipe_wake_waiter(pipe->reader_waiting,
-                                 BLOCK_KIND_PIPE_READ);
-                pipe->reader_waiting = NULL;
+                if (pipe_wake_waiter(pipe->reader_waiting,
+                                     BLOCK_KIND_PIPE_READ)) {
+                    pipe->reader_waiting = NULL;
+                }
             } else if (pipe->writers_open == 0 &&
                        (uint64_t)pipe == race_p13_watch_pipe) {
                 /* Lost close: writers_open hit 0 and there was no
@@ -3145,15 +3157,17 @@ long sys_close(int fd) {
          */
         if (slot->end == PIPE_END_WRITE) {
             if (pipe->reader_waiting) {
-                pipe_wake_waiter(pipe->reader_waiting,
-                                 BLOCK_KIND_PIPE_READ);
-                pipe->reader_waiting = NULL;
+                if (pipe_wake_waiter(pipe->reader_waiting,
+                                     BLOCK_KIND_PIPE_READ)) {
+                    pipe->reader_waiting = NULL;
+                }
             }
         } else if (slot->end == PIPE_END_READ) {
             if (pipe->writer_waiting) {
-                pipe_wake_waiter(pipe->writer_waiting,
-                                 BLOCK_KIND_PIPE_WRITE);
-                pipe->writer_waiting = NULL;
+                if (pipe_wake_waiter(pipe->writer_waiting,
+                                     BLOCK_KIND_PIPE_WRITE)) {
+                    pipe->writer_waiting = NULL;
+                }
             }
         }
     }
@@ -5560,9 +5574,10 @@ long sys_write(int fd, const void* buf, size_t count) {
                 pipe->used += (uint32_t)done;
                 /* A reader may have been waiting while we copied. */
                 if (pipe->reader_waiting) {
-                    pipe_wake_waiter(pipe->reader_waiting,
-                                     BLOCK_KIND_PIPE_READ);
-                    pipe->reader_waiting = NULL;
+                    if (pipe_wake_waiter(pipe->reader_waiting,
+                                         BLOCK_KIND_PIPE_READ)) {
+                        pipe->reader_waiting = NULL;
+                    }
                 }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
@@ -5578,8 +5593,10 @@ long sys_write(int fd, const void* buf, size_t count) {
         if (pipe->reader_waiting) {
             RACE_P13_EVENT((uint64_t)pipe, self->pid, 0,
                            RACE_SITE_WRITE_WAKE);
-            pipe_wake_waiter(pipe->reader_waiting, BLOCK_KIND_PIPE_READ);
-            pipe->reader_waiting = NULL;
+            if (pipe_wake_waiter(pipe->reader_waiting,
+                                 BLOCK_KIND_PIPE_READ)) {
+                pipe->reader_waiting = NULL;
+            }
         }
         return (long)done;
     }
@@ -6011,7 +6028,7 @@ long sys_read(int fd, void* buf, size_t count) {
                            RACE_SITE_READ_CHECK);
             {
                 static int _dbg_rb = 0;
-                if (_dbg_rb < 5000) {
+                if (_dbg_rb < 20000) {
                     _dbg_rb++;
                     serial_print("PPS-reader-check pid=");
                     serial_print_dec(self->pid);
@@ -6133,9 +6150,10 @@ long sys_read(int fd, void* buf, size_t count) {
                                   span) != 0) {
                 pipe->used -= (uint32_t)done;
                 if (pipe->writer_waiting) {
-                    pipe_wake_waiter(pipe->writer_waiting,
-                                     BLOCK_KIND_PIPE_WRITE);
-                    pipe->writer_waiting = NULL;
+                    if (pipe_wake_waiter(pipe->writer_waiting,
+                                         BLOCK_KIND_PIPE_WRITE)) {
+                        pipe->writer_waiting = NULL;
+                    }
                 }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
@@ -6147,8 +6165,10 @@ long sys_read(int fd, void* buf, size_t count) {
 
         /* Space freed: wake a waiting writer, if any. */
         if (pipe->writer_waiting) {
-            pipe_wake_waiter(pipe->writer_waiting, BLOCK_KIND_PIPE_WRITE);
-            pipe->writer_waiting = NULL;
+            if (pipe_wake_waiter(pipe->writer_waiting,
+                                 BLOCK_KIND_PIPE_WRITE)) {
+                pipe->writer_waiting = NULL;
+            }
         }
         return (long)done;
     }
