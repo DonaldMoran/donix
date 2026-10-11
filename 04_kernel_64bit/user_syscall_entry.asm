@@ -50,7 +50,6 @@ user_syscall_entry:
     test rsp, rsp
     jz .no_stack
 
-    sti
 
     ; Save original callee-saved registers FIRST.
     push rbx
@@ -101,6 +100,8 @@ user_syscall_entry:
     mov rdx, rsi                    ; arg1 -> rdx
     mov rsi, rdi                    ; arg0 -> rsi
     mov rdi, rax                    ; num  -> rdi
+
+    sti
 
     call syscall_dispatch
     
