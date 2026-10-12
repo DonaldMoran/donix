@@ -78,8 +78,6 @@ void scheduler_ready_queue_add(pcb_t* process) {
             ready_queue_tail = NULL;
             /* fall through: add as the sole entry, below */
         } else {
-            sched4_record(process->pid, 7,
-                          (uint64_t)__builtin_return_address(0));
             return;
         }
     }
