@@ -50,6 +50,40 @@ void scheduler_ready_queue_add(pcb_t* process) {
         return;
     }
 
+    /*
+     * The queue is in the state {head=NULL, tail=process}: head was
+     * cleared without clearing the tail.  contains() walks from the
+     * head, so it returns 0 and does not catch this.  If we proceed
+     * with the add, we set:
+     *     process->prev = ready_queue_tail;   // = process
+     *     ready_queue_tail->next = process;   // = process
+     *     ready_queue_tail = process;
+     * producing a self-link on both prev and next.  The process is
+     * then on no reachable chain, but the tail still points at it,
+     * and every later add to the same process repeats the self-link.
+     *
+     * The Q-FIRST-BAD capture on 2026-10-12 showed this happening
+     * first inside pipe_wake_waiter's call to add, at t=27637, on a
+     * tail PCB whose next pointed at itself.  The self-link was
+     * observed before the add and remained after.
+     *
+     * The healing here is local: if head is NULL, the tail is a
+     * stale reference to a node that is not in any chain, and the
+     * correct recovery is to clear the tail and add the process as
+     * the sole entry.  If head is non-NULL, the tail is real and we
+     * are already on the queue; refuse the add.
+     */
+    if (ready_queue_tail == process) {
+        if (ready_queue_head == NULL) {
+            ready_queue_tail = NULL;
+            /* fall through: add as the sole entry, below */
+        } else {
+            sched4_record(process->pid, 7,
+                          (uint64_t)__builtin_return_address(0));
+            return;
+        }
+    }
+
     if (process->state == PROC_STATE_RUNNING) {
         process->state = PROC_STATE_READY;
     }
