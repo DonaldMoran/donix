@@ -1,3 +1,170 @@
+## Session 63 — the eight fixes and five cleanups, applied to donix
+
+One documentation session plus the cherry-pick it records.  **Not
+a milestone in the usual sense**: no new feature, no new applet,
+no `v*` tag.  The session brought `donix` forward by eight
+correctness fixes and five diagnostic cleanups that had been
+developed and verified in a scratch tree (`testme`), and it
+verified that the result is byte-identical to the scratch tree.
+
+**The headline: `donix` now contains the eight fixes and five
+cleanups from the 2026-10-10/11/12 cycle.**  The 7e pipe wake
+race, the wait4 lost wakeup, and the ready-queue self-link are
+closed.  The canary passes 28/28 in the common case.  Two bugs
+remain open; see `handoff.md`.
+
+### The 14 commits, in order
+
+| Commit | Subject |
+|---|---|
+| `93333cb` | `user_syscall: atomic RMW on file_slot_t.refcount` |
+| `0248d63` | `user_syscall: pipe_wake_waiter returns success; gate field clear` |
+| `f457ec8` | `user_syscall_entry: move sti to just before call syscall_dispatch` |
+| `2fb368a` | `interrupts: rescan pool in kernel-mode timer before idling` |
+| `32917a9` | `scheduler: reset clears pcb links; contains walks the queue` |
+| `f5fbfd8` | `pipe: reader clears its own publish; wakers leave the field set` |
+| `7273457` | `process_reclaim: remove PCB from ready queue before UNUSED` |
+| `8afa84d` | `scheduler: heal {head=NULL, tail=process} instead of self-linking` |
+| `2353c5c` | `scheduler: drop sched4_record call from self-tail heal (testme-only diagnostic)` |
+| `cdbf7bc` | `cleanup: silence three compiler warnings (unused fn, shift count, unused var)` |
+| `1e93d26` | `cleanup: remove 7e-queue success-path diagnostic from timer` |
+| `d411eda` | `cleanup: gate PPS-* pipe diagnostics behind RACE_PROBE_PPS_VERBOSE (default 0)` |
+| `6eb9b27` | `cleanup: gate process_dump_all VGA half; lengthen TIMER-IDLE-STALL to 10 min` |
+| `60d29e8` | `cleanup: gate 7e-fork behind RACE_PROBE_FORK_SLOT (probe gates unchanged)` |
+
+That is 8 fixes plus 1 fold-in (`2353c5c` drops a `testme`-only
+reference that `8afa84d` carried) plus 5 cleanups.
+
+### How the cherry-picks were developed
+
+The eight fixes and five cleanups were authored and verified in
+`/home/noneya/code/testme`, a scratch clone of `donix`.  The
+`testme` tree accumulated diagnostics that were **not** meant for
+`donix`: the `sched4_record` ring, the `PPS-*` pipe prints, the
+`7e-queue` timer prints, the `7e-fork` slot check, the `RESCAN`
+report.  The cycle's task was to separate the fixes from the
+diagnostics and bring only the fixes forward.
+
+**Two cherry-picks conflicted.**  Both were resolved by hand:
+
+- **`e3705d4`** (`interrupts: rescan pool in kernel-mode timer
+  before idling`).  One conflict region, a
+  `{head=NULL, tail=process}`-shaped take-theirs.  The commit also
+  carried a **broken C string literal** —
+  `serial_print(": queue empty, pool state:\n");` had a real
+  newline byte where the two-character `\n` escape should be.
+  The literal was correct in the `testme` working tree (a later
+  commit had replaced the whole region), but the commit itself
+  shipped it broken.  Fixed during the resolution.
+- **`c3e5c97`** (`pipe: reader clears its own publish; wakers
+  leave the field set`).  Five conflict regions.  Four were
+  "delete `pipe->reader_waiting = NULL;` at a waker site" (the
+  `c3e5c97` fix), each turning into an empty success branch.  One
+  was the substantive reader-side change in `sys_read`'s pipe
+  loop: the reader clears its own publish, and the wakers do not.
+
+**`cfff858`** (`scheduler: heal {head=NULL, tail=process} instead
+of self-linking`) was cherry-picked clean and then followed by
+`2353c5c`, a small commit dropping a `sched4_record` call that
+`cfff858` had carried because the diagnostic existed only in
+`testme`.
+
+**The five cleanups** were applied as direct edits, one commit
+each, on top of the eight fixes:
+
+- `cdbf7bc` — three compiler warnings: `static void race_record`
+  → `static inline`, `RACE_P12_SLOT` shifts cast to `uint64_t`,
+  an unused `pcb_t* head` local deleted.
+- `1e93d26` — the `7e-queue #N` block in `timer_preempt_handler`
+  removed (it fired on the first eight preemptions of every
+  boot).
+- `d411eda` — the four `PPS-*` pipe prints gated behind
+  `RACE_PROBE_PPS_VERBOSE`, default 0.
+- `6eb9b27` — the VGA half of `process_dump_all` gated behind
+  `RACE_PROBE_DUMP_VGA`, default 0; the `TIMER-IDLE-STALL`
+  interval raised from 5000 to 60000 ticks so it fires on a
+  10-minute stall, not a between-rows idle moment.
+- `60d29e8` — the `7e-fork` slot check gated behind
+  `RACE_PROBE_FORK_SLOT`, default 0.
+
+### The script
+
+The cherry-pick sequence was proven reproducible by
+`apply-fixes-to-donix.sh`, a self-contained shell script.  Given
+a fresh copy of `donix` at `5537465`, the script produces the
+patched state in one run.  The proof is the tree hash: a fresh
+`cp -a donix` plus the script yields
+
+    aaa2ad3659ef039ff13a8be32f1717127935cace
+
+which is the same tree hash as the scratch tree that was developed
+by hand.  Two independent paths, one identical result.
+
+The script's commits have different SHAs than the ones in this
+log (committer timestamps differ between the two runs) but
+identical subjects and identical trees.  The SHAs in the table
+above are `donix`'s, produced by running the script against the
+real `donix`.
+
+### What was verified
+
+| Test | Result |
+|---|---|
+| Kernel build after every commit | `make -C 04_kernel_64bit FAT_CONFIG=single` exit 0, no warnings |
+| Tree hash vs `patch_donix` | identical (`aaa2ad3659ef039ff13a8be32f1717127935cace`) |
+| Canary `--full` | 28/28 passed on the patched tree |
+| `pipe7e` | **not re-tested** on the patched tree (see below) |
+
+The kernel builds with no warnings.  The `race_probe.h` gates
+P1, P8, P11, P12, P13 are on (they fire only at stall); PPS,
+DUMP_VGA, FORK_SLOT are off.  `RACE_PROBE_ANY` is 1.
+
+### The two bugs that remain
+
+**Bug 1 — user-mode #PF with kernel RSP (verified).**  A
+user-mode page fault at user RIP `0x40786B` with `%rsp` holding
+a kernel stack address (`0xFFFFFFFF802A2640`), CR2 =
+`RSP + 0x98`, error code `0x5`.  The fault dump is in
+`capture-fork-rsp-fault-20261012.txt`.  It fired once in
+`canary --full` on the row `echo hi | wc`; the next run with the
+same binary passed 28/28.  Timing-dependent.
+
+**Bug 2 — the pipe7e stall (not re-tested).**  The last `pipe7e`
+run was on a build that predated the cleanups and stalled at
+iteration ~20500 with the helper `RUNNING` at its ELF entry
+`0x40022B` (its `_start`) and the reader blocked in a pipe read.
+Whether the patched tree still stalls is **unknown**.  That
+verification is the first thing the next session does.
+
+### What this session did not do
+
+- **The reference docs were not brought to current state.**
+  `open-issues.md` still records items 7d and 7e as open, and
+  item 7e's writeup frames the pipe wake race as an unsolved
+  race.  Both are closed by this cycle.  The reference docs will
+  be updated in a documentation pass.
+- **The pipe7e verification was not run.**  See Bug 2 above.
+- **The `testme` scratch tree was not deleted.**  It is still at
+  `/home/noneya/code/testme`; the next session boots
+  `patch_donix` and `testme` in parallel to compare.
+- **No `v*` tag was applied.**  The session is not a milestone;
+  the next milestone bump comes after the remaining bugs are
+  closed.
+
+### The meta-lesson, for the record
+
+This cycle's most expensive mistake was in a handoff written
+before this one.  The previous handoff's lead — "the execve-to-
+run handoff" — had been dropped from a rewrite without a note,
+because a stall (the user-RSP #PF) had been found and the pipe7e
+stall was thought closed by the eight fixes.  It was not
+re-tested.  **The lesson:** do not write a handoff that claims a
+bug is closed based on a test that was never run on the final
+tree.  The pipe7e verification is now the first action of the
+next session, and the current `handoff.md` says so explicitly.
+
+---
+
 ## Session 62 — the 7e fault reproduces identically at 100 Hz; the kernel return path cleared
 
 *(Sessions 60 and 61 are recorded in the handoff and the commit
