@@ -27,7 +27,7 @@ stack address between syscall entry and return.
 
 **Next-session instrument:** a runtime invariant check in
 `user_syscall_entry.asm`, just before the `mov rsp, [rsp - 72]`.
-Verify the loaded value is in `(0x8000000000,
+Verify the loaded value is in `\[0x8000000000,
 0x8000100000)`.  If not, print `SYS-RETURN: bad user RSP = 0x...`
 and `process_get_current()->pid`, then `hlt`.  Scratch only;
 revert once the writer is named.  Pair with a GDB hardware
@@ -96,7 +96,7 @@ The following items are genuinely open and unchanged in status:
   process, temporary.
 - **item 10 -- `CR4.OSFXSR` is set, no SSE save.**  Stopgap in
   place (userland compiled with `-mno-sse*`); the real fix is
-  kernel-side FXSAVE/FXRSTXR.
+  kernel-side FXSAVE/FXRSTOR.
 - **item 12 -- signal delivery is a stub.**  The largest open
   item.  Unblocks `kill`, ash job control, and the Wayland
   `SIGBUS` path.
@@ -1062,7 +1062,7 @@ user-preempted save path -- and a reader who fixes one without the other
 has not fixed it.  Not the 7e fault: 7e resumes from a fork frame built
 by `process_fork_copy_frame`, not from a user-preempted save.
 
-**`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window.**  `user_syscall.c:4358` lists the brk region as `(0x8000200000,
+**`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window.**  `user_syscall.c:4358` lists the brk region as `\[0x8000200000,
 0x8000300000)`.  But `sys_brk` has no upper bound -- it refuses
 `new_brk < heap_base` and accepts any `new_brk` above -- and `sys_fork`'s
 copy at `user_syscall.c:7964` walks `[0x8000200000, parent->brk_virt)`,
