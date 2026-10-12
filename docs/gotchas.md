@@ -1,3 +1,322 @@
+## A diagnostic on the success path is noise; on the failure path it is signal
+
+*Session 63.  The cleanup phase of the eight-fix cycle.  Not a
+bug -- a diagnostic-discipline rule that cost the cycle four
+full rebuild-and-boot cycles before it was named.*
+
+The scratch tree accumulated success-path diagnostics over six
+sessions of chasing two races: `PPS-early`, `PPS-close-read`,
+`PPS-close-write`, `PPS-reader-check` (four pipe prints), the
+`7e-queue #N` timer prints, the `7e-fork` slot check.  Every one
+of them fired during **normal operation** and printed to serial.
+By the end of the chase, the capture file from a `canary --full`
+run contained hundreds of lines of diagnostic output between the
+canary rows.
+
+The cleanup phase gated each of the success-path diagnostics
+behind a `RACE_PROBE_*` define and left them at 0.  The result:
+the same workload, same kernel fixes, produced a capture that was
+mostly the canary rows.  Nothing about the kernel's behavior
+changed; only its logging did.
+
+**The rule.**  A diagnostic added to a kernel is not free.  It
+costs serial bandwidth, it changes the timing of the system it
+is trying to observe, and it fills the capture with output that
+a reader has to skip past to find what is wrong.  A diagnostic
+that fires **only on the failure path** -- the fault handlers,
+the stall banners, the invariants that should never fire -- is
+worth keeping unconditional.  A diagnostic that fires on the
+**success path** -- per-operation counters, per-call prints, a
+print on every fork -- belongs behind a compile-time gate,
+default off, and is turned on only when chasing the specific bug
+it instruments.
+
+**The tell.**  A capture file where the canary rows or the
+workload's own output are a minority of the lines.  Or a stall
+that moves when a diagnostic is added or removed, because the
+diagnostic's serial I/O widened or narrowed a timing window.
+The stall point in this cycle's chase moved from ~180 to ~1900
+to ~5200 to ~7900 to ~20500 as diagnostics were added, and
+several of those moves correlated with the instrument, not with
+the fix.
+
+**The complement, and it is the other half of the rule.**  A
+diagnostic that fires on the failure path is signal, and it
+should be unconditional.  `TIMER-IDLE-STALL`, `TIMER-NO-NEXT`,
+`YIELD-TO-IDLE`, the fault frame dumps (`#GP`, `#PF`, `#UD`),
+the preemption ring -- each fires only when something is wrong,
+and each earned its place by naming a mechanism during the
+chase.  When the cleanup phase considered gating them, the rule
+was: they do not fire on a healthy boot, they are the entire
+value of a capture when the boot is not healthy, and they stay.
+
+**Where this shape recurs.**  Same family as "a diagnostic that
+saturates the serial console changes the timing of the system it
+is trying to observe" (session 62) and "a diagnostic declared
+but never wired is not a diagnostic" (session 53).  The session-
+62 entry is about a diagnostic that exists but perturbs; the
+session-53 entry is about a diagnostic that exists but does not
+fire.  This one is about the diagnostic that fires when it
+should not, and the fix is a gate, not a removal.
+
+## `set -e` at the top of a command block that edits and commits
+
+*Session 63.  An edit-script gotcha, and it produced an orphan
+commit that had to be reset.*
+
+The working style already says "a Python edit with a `count != 1`
+abort check catches an ambiguous anchor and writes nothing"
+(session 59).  The missing complement: **without `set -e` at the
+top of the command block, a Python script that aborts still lets
+the rest of the block run.**
+
+In this cycle, an edit block contained three Python scripts, each
+with its own `count != 1` guard, followed by `git add` and
+`git commit`.  The first two scripts ran and wrote their files.
+The third aborted on an ambiguous anchor.  The block continued:
+`git add` staged the two files that *had* been modified, and
+`git commit` committed a partial change.  The commit message
+described a change that was not in the commit.  The build failed
+on the next step, and the orphan commit had to be reset.
+
+**The rule.**  A command block that edits files and then commits
+them must start with `set -e` (and `set -o pipefail` if the
+block contains pipelines).  With `set -e`, a Python script that
+`sys.exit(1)`s aborts the whole block before the `git add` runs.
+Without it, the exit code is discarded -- Python's `sys.exit(1)`
+is a return from a subprocess, not a shell abort -- and the block
+proceeds to the commit.
+
+**The tell.**  A commit whose diff does not match its message, in
+a session that used an edit script.  Or: an edit block in which
+the only safe thing to do after a failed edit is to stop, and the
+block does not stop.
+
+**The safe shape.**
+
+    set -e
+    set -o pipefail
+    cd /path/to/repo || exit 1
+    git status -sb
+    python3 - <<'PYEOF'
+    ...
+    PYEOF
+    python3 - <<'PYEOF'
+    ...
+    PYEOF
+    git add <explicit files>
+    git status -sb
+    git commit -m '...'
+
+If any of the Python scripts aborts, the block aborts.  The
+`git add` never runs on a partially-edited tree.
+
+**Where this shape recurs.**  Same family as "a redirection binds
+to the last command in an `&&` chain" (session 45) and "the
+incremental kernel build can silently skip" (session 41): a
+command sequence whose *behavior* does not match what its syntax
+says.  In the `&&` case, a redirection scoped to one command and
+was read as scoping to the chain.  In the incremental-build case,
+`make` read a timestamp as content and skipped the rebuild.  Here,
+a shell reads a subprocess's exit code as optional and continues.
+In all three, the fix is to make the command do what it reads as
+doing -- wrap the chain, clean before rebuild, put `set -e` at
+the top -- and the lesson is the same: the command line is a
+claim, checked against its output.
+
+## An edit script's idempotency guard must cover every insertion
+
+*Session 63.  A tooling gotcha.  The same block was added twice
+because only the last insertion was guarded.*
+
+The working style for this project says a Python edit that adds a
+block must check whether the block already exists before adding
+it.  In this cycle, a script added three things to
+`scheduler.c`: a set of static variables, a small
+`q_check_after_mutator` inline function, and a
+`scheduler_dump_first_bad_head_null` function at the end of the
+file.  The script's idempotency guard was on the **last**
+insertion only:
+
+    if "scheduler_dump_first_bad_head_null" not in src:
+        src += """..."""
+    else:
+        print("NOTE: dumper already present, not re-adding")
+
+The script was run once, aborted partway through due to an
+ambiguous anchor on a different edit, and re-run.  On the second
+run, the guard on the dumper saw the string from the first run
+and correctly skipped re-adding it -- but the guard on the
+statics and the inline function did **not** exist, so those two
+were added a second time.  The file ended up with two
+definitions of `g_q_first_bad_head_null_tick` and two definitions
+of `q_check_after_mutator`.  The compiler would have refused it,
+but the script's exit code was clean and the tree looked
+plausible until `make` was run.
+
+**The rule.**  An idempotency guard must be a check on **every
+insertion the script makes**, not just the last one.  The pattern
+that scales is to wrap each insertion in an `if <unique marker>
+not in src:` test, where `<unique marker>` is a short string that
+appears only if that specific block is already present.  If the
+script adds two variables and a function, it needs three guards,
+one per insertion.
+
+**The tell.**  A script run twice in the same session, once after
+a failed run.  Or: a large insertion block with a single guard at
+the top or bottom, and multiple independent pieces inside it.
+
+**The safe shape.**
+
+    if "g_q_first_bad_head_null_tick" not in src:
+        src = src.replace(anchor, anchor + addition, 1)
+    if "q_check_after_mutator" not in src:
+        src = src.replace(anchor2, anchor2 + addition2, 1)
+    if "scheduler_dump_first_bad_head_null" not in src:
+        src += addition3
+
+Three checks, one per insertion.  Two of them abort silently on a
+second run (because the block is already there); the third guards
+the function that would produce a duplicate symbol.
+
+**Where this shape recurs.**  Same family as "a fix with no test
+is indistinguishable from an unfixed defect" (session 43): an
+artifact that is *present* but not *checked*.  The session-43 fix
+was present and correct and had never been run.  This is an
+insertion script that was correct for one run and wrong for two,
+because the guard covered one of its three insertions.  The check
+in both is the same: for a script or a fix, ask what a *second*
+invocation would do, not what the first one did.
+
+## `nm` output moves between builds; re-run it before every watchpoint
+
+*Session 63.  A diagnostic gotcha that cost two watchpoint runs.*
+
+The QEMU monitor and GDB take kernel symbol addresses from `nm`
+output.  A watchpoint armed on a specific address fires when the
+kernel writes to that address.  The working style says "`nm`
+output moves between builds -- re-run it before using any address
+from this file, a previous paste, or a commit message."
+
+In this cycle, a watchpoint was armed on `0xFFFFFFFF8030A378`,
+which `nm` had reported as `ready_queue_head` in an earlier
+build.  The kernel was rebuilt several times between the `nm`
+and the watchpoint.  In the current build, `ready_queue_head` had
+moved to `0xFFFFFFFF8030A4F8` -- 0x180 bytes higher, because the
+build had grown `.bss` by 0x180.  `0xFFFFFFFF8030A378` was a
+different variable, or padding.  The watchpoint was armed on the
+wrong address and never fired.
+
+The mistake surfaced only because a GDB session happened to
+disassemble the function that writes `ready_queue_head` and
+printed the correct address in a comment: `movq $0x0,
+0x1ed89a(%rip) # 0xffffffff8030a4f8 <ready_queue_head>`.  The
+address in the disassembly did not match the address the
+watchpoint had been armed on.  That is the only reason the
+mismatch was caught.
+
+**The rule.**  Re-run `nm 04_kernel_64bit/kernel.elf | sort`
+immediately before arming any watchpoint, and use the output
+from that run.  A watchpoint address from a previous paste, a
+previous session, or a comment is a claim about a previous
+build.  The current build is what the CPU is executing.
+
+**The tell.**  A watchpoint that does not fire when a write is
+expected, or that fires on an unexpected value.  Both are
+consistent with the address having moved.
+
+**The stronger habit.**  For any address used more than once in a
+session -- a watchpoint, a `p` command, an `x` command, a
+`grep`-based symbol lookup -- write it down *once*, at the
+moment it is verified against the current `nm`, and use that
+value for the rest of the session.  If the tree is rebuilt, the
+values are stale; verify them again.
+
+**Where this shape recurs.**  Same family as "a wrong constant
+propagated because it was consistent with itself" (session 39)
+and "a fix can make an earlier branch unreachable" (session 44):
+a value that was true when written and is checked by nothing.
+The PIT case was a wrong frequency in a comment; the branch case
+was a guard whose condition could not be true.  This is an
+address whose meaning changed when the file it referred to was
+rebuilt.  In all three, the check is the same: go to the source
+of truth -- the call site, the variable's assignment, the current
+`nm` output -- not to a copy from earlier.
+
+## A script that trusts a hand-written conflict resolution must verify the resolution applied
+
+*Session 63.  A cherry-pick-script gotcha.  The same conflict
+arose twice in the same session, with the same resolution, and
+the script did not check that the resolution ran.*
+
+The cherry-pick script for the eight-fix cycle handled two known
+conflicts (`e3705d4`, `c3e5c97`) by matching the conflict text
+with a Python regex and replacing it with the correct content.
+The pattern was:
+
+    cherry c3e5c97 yes || {
+        python3 - <<'PYEOF'
+        # ... resolve conflicts ...
+        PYEOF
+        git add file
+        GIT_EDITOR=true git cherry-pick --continue
+    }
+
+The `|| { ... }` branch runs only when `cherry` returns non-zero
+(conflict).  Inside, the Python script resolves the conflicts,
+`git add` stages the file, and `cherry-pick --continue` finalizes
+the commit.  If the Python script's `count != 1` guard fires (an
+ambiguous anchor), it `sys.exit(1)`s -- and **because the block is
+inside an `||`, `set -e` does not abort the shell**.  The block
+continues to `git add` and `git cherry-pick --continue`.  If the
+file still has conflict markers, `--continue` fails, and the
+script aborts.  That is the loud path.
+
+The quiet path is worse: if the Python script **wrote the file**
+but the resolution was subtly wrong (a marker left behind, a
+section duplicated), `git add` stages the wrong content and
+`cherry-pick --continue` succeeds, committing a bad resolution.
+The script proceeds to the next cherry-pick, and the bad
+resolution is only discovered when the build fails.
+
+**The rule.**  A script that resolves a conflict by rewriting the
+file must verify the rewrite succeeded *before* `git add`.  At
+minimum, grep for the conflict markers (`<<<<<<<`, `=======`,
+`>>>>>>>`) and abort if any remain.  Better: assert that the
+conflict region no longer exists and the replacement text does.
+The pattern:
+
+    python3 - <<'PYEOF'
+    # ... resolve ...
+    if "<<<<<<<" in src or ">>>>>>>" in src:
+        print("ABORT: markers remain")
+        sys.exit(1)
+    PYEOF
+    if grep -q '<<<<<<<' file; then
+        echo "ABORT: markers remain after resolve"
+        exit 5
+    fi
+    git add file
+    GIT_EDITOR=true git cherry-pick --continue
+
+The `grep` is the belt-and-suspenders for the case where the
+Python script exits 0 but did not write (a silent no-op).
+
+**The tell.**  A cherry-pick script with a conflict-resolution
+branch, where the resolution step has no post-rewrite check.  Or:
+a cherry-pick that "succeeds" and then fails on the build with a
+conflict marker in the file.
+
+**Where this shape recurs.**  Same family as "a test's expected
+value is a claim" (session 52) and "a fix with no test is
+indistinguishable from an unfixed defect" (session 43): a
+correctness claim that is checked by nothing.  The session-52
+case had a wrong constant the test never checked.  This one has
+a resolution step the script never verified.  In both, the
+missing thing is a check on the artifact the step produced -- the
+test's expected value, the script's written file -- not a check
+on the process that produced it.
+
 ## A fork that overwrites a child's file table leaks per fork
 
 *Session 55 (`sys_fork`'s inherited fds), commit `2fc7fde`, scratch
