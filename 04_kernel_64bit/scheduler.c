@@ -115,19 +115,39 @@ int scheduler_ready_queue_empty(void) {
 int scheduler_ready_queue_contains(pcb_t* process) {
     if (!process) return 0;
     /*
-     * A process is on the queue if any of these hold:
-     *   - it has a prev (not the head)
-     *   - it has a next (not the tail)
-     *   - it is the head (covers the single-element case)
+     * Walk the queue.  The previous implementation used link
+     * presence as a proxy for membership; a process with
+     * stale links from a previous membership reported true
+     * even when off-queue, and scheduler_ready_queue_add()
+     * then no-opped on it.  Walking is O(n) with n <= 32 and
+     * is the only membership test that cannot give a false
+     * positive.
      */
-    return process->prev != NULL
-        || process->next != NULL
-        || process == ready_queue_head;
+    for (pcb_t* p = ready_queue_head; p; p = p->next) {
+        if (p == process) return 1;
+    }
+    return 0;
 }
 
 void scheduler_reset(void) {
+    /*
+     * Clear the queue AND every process's link fields.  A
+     * process whose links survive the reset makes
+     * scheduler_ready_queue_contains() return true forever
+     * after (link presence was used as a proxy for queue
+     * membership), and scheduler_ready_queue_add() then
+     * silently no-ops on it -- the process is stranded
+     * off-queue.  That is exactly what the 7e pipe stall
+     * showed: qhead_after_add=0 after a call to add.
+     */
     ready_queue_head = NULL;
     ready_queue_tail = NULL;
+    for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+        pcb_t* _p = process_get_pcb(_i);
+        if (!_p) continue;
+        _p->next = NULL;
+        _p->prev = NULL;
+    }
     current_process = NULL;
     process_set_current(NULL);
 }
