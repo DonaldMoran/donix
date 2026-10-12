@@ -53,6 +53,15 @@
 #ifndef RACE_PROBE_DUMP_VGA
 #define RACE_PROBE_DUMP_VGA 0
 #endif
+/* Fork-time user-stack slot check in process_fork_copy_frame.
+ * Prints the 8 bytes the child's first post-syscall `ret` will
+ * pop, resolved through the parent's and child's cr3.  Fires
+ * on almost every fork on a healthy system, so it is
+ * success-path noise unless a fork-frame bug is being chased.
+ * Default 0. */
+#ifndef RACE_PROBE_FORK_SLOT
+#define RACE_PROBE_FORK_SLOT 0
+#endif
 
 #if (RACE_PROBE_P1_BLOCK_WAKE || RACE_PROBE_P2_PCB_REUSE || \
      RACE_PROBE_P3_LOST_READY  || RACE_PROBE_P8_READYQ   || \

@@ -549,6 +549,7 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
     child->rsp = frame_base;
     child->rip = p_rip;
 
+#if RACE_PROBE_FORK_SLOT
     /*
      * 7e ordering instrument.  Prints the parent's and child's view of
      * the slot the child's first post-syscall `ret` will pop: the user
@@ -588,6 +589,7 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
             serial_print("\n");
         }
     }
+#endif
 }
 
 pcb_t* process_get_current(void) {
