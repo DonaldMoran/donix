@@ -1,4 +1,127 @@
-### Open
+# Open issues
+
+**Last updated: 2026-10-12** (after the eight-fix cycle, session
+63; `donix` HEAD `60d29e8` + doc commits, tree hash
+`aaa2ad3659ef039ff13a8be32f1717127935cace`).
+
+## Live status
+
+**Two bugs are open.  Everything below this block is a
+historical writeup; read the block first, then the writeup for
+the item it names.**
+
+### Bug 1 -- user-mode #PF with kernel RSP
+
+A user-mode page fault at user RIP `0x40786B` with `%rsp`
+holding a kernel stack address (`0xFFFFFFFF802A2640`), CR2 =
+`RSP + 0x98`, error code `0x5`.  The fault dump is in
+`capture-fork-rsp-fault-20261012.txt`.  It fired once in
+`canary --full` on the row `echo hi | wc`; the next run with the
+same binary passed 28/28.  Timing-dependent, unreproducible on
+demand.
+
+**Candidate mechanism:** the user RSP slot in the syscall entry
+frame, or the frame loaded by `context_switch.asm`'s
+user-preempted save path, is being overwritten with a kernel
+stack address between syscall entry and return.
+
+**Next-session instrument:** a runtime invariant check in
+`user_syscall_entry.asm`, just before the `mov rsp, [rsp - 72]`.
+Verify the loaded value is in `(0x8000000000,
+0x8000100000)`.  If not, print `SYS-RETURN: bad user RSP = 0x...`
+and `process_get_current()->pid`, then `hlt`.  Scratch only;
+revert once the writer is named.  Pair with a GDB hardware
+watchpoint on the child's user RSP slot.
+
+### Bug 2 -- the pipe7e stall, NOT re-tested on the patched tree
+
+The last `pipe7e` run was on a build that predated the cleanups.
+It stalled at iteration ~20500 with the helper `RUNNING` at its
+ELF entry `0x40022B` (its `_start`) and the reader blocked in a
+pipe read.  **We do not know whether the patched tree still
+stalls.**  That is the first thing the next session must check.
+
+**The hypothesis** (from the pre-cleanup observation): the
+kernel is resuming the helper at its ELF entry on each syscall
+return, not at the saved user RIP.  `_start` is five
+instructions and a `call`; it is not a loop.  The candidates are
+the frame's `-56` slot (user RIP) being overwritten between
+entry and return, `g_syscall_stack_top` being overwritten with a
+mid-stack value, or `sys_execve`'s frame rewrite being re-used
+because a subsequent syscall entry did not write the slot.
+
+**The verification:** boot `patch_donix` and `donix`, run
+`pipe7e` on each, compare.  Turn on `RACE_PROBE_FORK_SLOT` for
+the run; leave `RACE_PROBE_PPS_VERBOSE` off.  Add the
+user-RSP invariant check if Bug 1 fires first.
+
+**The old item 7e's pipe wake face -- which was the pre-cycle
+"UNSOLVED RACE CONDITION" -- is CLOSED.**  See "Closed since the
+last rewrite" below.  The writeup under item 7e in this file is
+historical; it describes a race that `c3e5c97` closed.
+
+## Closed since the last rewrite
+
+The eight-fix cycle of 2026-10-10/11/12 closed the following.
+Their historical writeups remain below; the item text is
+retained for reference, not as a statement of live status.
+
+- **item 7d -- the lost-wakeup hang.**  Closed by `364be3b`
+  (`process_reclaim` removes the PCB from the ready queue before
+  marking it `UNUSED`).  The P11 counters went from 9% success
+  to 99.3% across the cycle.
+- **item 7e's pipe wake face.**  Closed by `c3e5c97` (reader
+  clears its own publish; wakers leave the field set).  The
+  six-session 7e chase ends here for the pipe wake race.
+- **item 7e's heap-corruption face.**  Closed by `session 55`'s
+  `user_syscall_clear_file_table` (`2fc7fde`), already noted in
+  the file.
+- **item 11 -- the zombie leak.**  Closed by session 54's
+  `close_all_files` call at the top of `process_exit`.
+- **item 7c -- the sha512sum "wrong digest".**  Retracted in
+  session 52; the file already marks it RETRACTED.
+- **item 7 -- the silent `vmm_map_page*` returns.**  Closed in
+  session 49; the file already notes this.
+
+## Still open
+
+The following items are genuinely open and unchanged in status:
+
+- **item 5 -- `-EPIPE` delivered without `SIGPIPE`.**  Same
+  subsystem as item 12.
+- **item 8 -- symlinks: recorded design, not scheduled.**  The
+  pathname dispatch seam exists; the symlink consumer has not
+  been built.
+- **item 9 -- no privilege model.**  uid/gid are 0 for every
+  process, temporary.
+- **item 10 -- `CR4.OSFXSR` is set, no SSE save.**  Stopgap in
+  place (userland compiled with `-mno-sse*`); the real fix is
+  kernel-side FXSAVE/FXRSTXR.
+- **item 12 -- signal delivery is a stub.**  The largest open
+  item.  Unblocks `kill`, ash job control, and the Wayland
+  `SIGBUS` path.
+- **item 13 -- `CONFIG_ASH_JOB_CONTROL` gap.**  Needs item 12's
+  subsystem plus process groups and a controlling terminal.
+- **items 1-6, and the "also open" paragraph.**  Not audited
+  this cycle.  The "also open" paragraph is marked by the file
+  itself as "may be stale"; it predates `v0.6.12`.
+
+**Also open, un-numbered:** the boot-time `#PF` at `0x400000`
+(item 7a), the `#GP` at `0x42F1A7` (item 7b), and the
+`CR2=0x44` / `RIP=0x419FD9` page fault (mentioned under item
+7b).  All three are unobserved since the PMM zone-scan fix and
+the session-63 cycle; none is confirmed fixed.
+
+---
+
+## Historical writeups
+
+**Everything below this line predates the 2026-10-12 cycle and is
+unchanged.**  Read the item with the live-status block above in
+mind.  Where the block says an item is closed, the writeup is
+history.
+
+### Open (as of session 62)
 
 **Items 7 and 11 are closed and the list is not renumbered.**
 Item 7 was the silent `vmm_map_page*` returns; session 49 fixed
@@ -939,7 +1062,7 @@ user-preempted save path -- and a reader who fixes one without the other
 has not fixed it.  Not the 7e fault: 7e resumes from a fork frame built
 by `process_fork_copy_frame`, not from a user-preempted save.
 
-**`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window.**  `user_syscall.c:4358` lists the brk region as `[0x8000200000,
+**`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window.**  `user_syscall.c:4358` lists the brk region as `(0x8000200000,
 0x8000300000)`.  But `sys_brk` has no upper bound -- it refuses
 `new_brk < heap_base` and accepts any `new_brk` above -- and `sys_fork`'s
 copy at `user_syscall.c:7964` walks `[0x8000200000, parent->brk_virt)`,
