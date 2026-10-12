@@ -1903,6 +1903,7 @@ static void put_file_slot(file_slot_t* slot) {
     uint32_t _old_rc = __atomic_fetch_sub(&slot->refcount, 1,
                                           __ATOMIC_SEQ_CST);
     if (_old_rc > 1) {
+#if RACE_PROBE_PPS_VERBOSE
         /*
          * Diagnostic (PPS-early): this close took the early return,
          * so the writers_open / readers_open decrement below did NOT
@@ -1933,6 +1934,7 @@ static void put_file_slot(file_slot_t* slot) {
                 serial_unlock();
             }
         }
+#endif
         return;
     }
     if (slot->kind == FILE_KIND_FILE) {
@@ -2040,6 +2042,7 @@ static void put_file_slot(file_slot_t* slot) {
         }
         if (slot->end == PIPE_END_READ) {
             if (pipe->readers_open > 0) pipe->readers_open--;
+#if RACE_PROBE_PPS_VERBOSE
             /*
              * Diagnostic (PPS-close-read): the read end just reached
              * refcount 0.  Print the resulting counts and whether a
@@ -2062,6 +2065,7 @@ static void put_file_slot(file_slot_t* slot) {
                     serial_unlock();
                 }
             }
+#endif
             {
                 pcb_t* _sc = process_get_current();
                 RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
@@ -2077,6 +2081,7 @@ static void put_file_slot(file_slot_t* slot) {
             }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
+#if RACE_PROBE_PPS_VERBOSE
             /*
              * Diagnostic (PPS-close-write): the write end just reached
              * refcount 0.  Print the resulting counts and whether a
@@ -2103,6 +2108,7 @@ static void put_file_slot(file_slot_t* slot) {
                     serial_unlock();
                 }
             }
+#endif
             {
                 pcb_t* _sc = process_get_current();
                 RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
@@ -6031,6 +6037,7 @@ long sys_read(int fd, void* buf, size_t count) {
                            ((uint64_t)pipe->used << 32) |
                            (uint64_t)pipe->writers_open,
                            RACE_SITE_READ_CHECK);
+#if RACE_PROBE_PPS_VERBOSE
             {
                 static int _dbg_rb = 0;
                 if (_dbg_rb < 20000) {
@@ -6046,6 +6053,7 @@ long sys_read(int fd, void* buf, size_t count) {
                     serial_print("\n");
                 }
             }
+#endif
             if (pipe->used > 0) {
                 __asm__ volatile("sti");
                 break;
