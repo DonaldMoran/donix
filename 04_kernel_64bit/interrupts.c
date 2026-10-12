@@ -384,7 +384,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * Diagnostic only.  Item 7d.
              */
             static uint64_t _idle_dump_last = 0;
-            if (g_ticks - _idle_dump_last >= 5000) {
+            if (g_ticks - _idle_dump_last >= 60000) {
                 _idle_dump_last = g_ticks;
                 serial_lock();
                 serial_print("TIMER-IDLE-STALL t=");

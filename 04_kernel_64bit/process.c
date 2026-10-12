@@ -782,9 +782,11 @@ void process_dump_all(void) {
     serial_print("---  -------------------  -------  ----------  ----------\n");
     serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
     vga_print("=== PROCESS LIST ===\n");
     vga_print("PID  Name                State    Entry       Kernel Stack\n");
     vga_print("---  -------------------  -------  ----------  ----------\n");
+#endif
 
     for (int i = 0; i < MAX_PROCESSES; i++) {
         pcb_t* p = &pcb_pool[i];
@@ -816,6 +818,7 @@ void process_dump_all(void) {
         serial_print("\n");
         serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
         vga_print_dec_cur(p->pid); vga_print("  ");
         vga_print(p->name);
         for (int j = len; j < 18; j++) vga_print(" ");
@@ -826,13 +829,16 @@ void process_dump_all(void) {
         vga_print(" 0x"); vga_print_hex_cur(p->entry_point);
         vga_print(" 0x"); vga_print_hex_cur(p->kernel_stack_top);
         vga_print("\n");
+#endif
     }
 
     serial_lock();
     serial_print("=== END PROCESS LIST ===\n\n");
     serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
     vga_print("=== END PROCESS LIST ===\n");
+#endif
 }
 
 void process_test_clone(void) {

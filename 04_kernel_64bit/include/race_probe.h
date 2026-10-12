@@ -44,6 +44,15 @@
 #ifndef RACE_PROBE_PPS_VERBOSE
 #define RACE_PROBE_PPS_VERBOSE 0
 #endif
+/* VGA half of process_dump_all().  The serial half is what
+ * capture.txt records and is unconditional.  The VGA half
+ * scribbles the framebuffer every time the dump fires, which
+ * is what puts the PROCESS LIST on the visible console.  Set
+ * to 1 only when doing an interactive on-screen debugging
+ * session; default 0 for headless capture runs. */
+#ifndef RACE_PROBE_DUMP_VGA
+#define RACE_PROBE_DUMP_VGA 0
+#endif
 
 #if (RACE_PROBE_P1_BLOCK_WAKE || RACE_PROBE_P2_PCB_REUSE || \
      RACE_PROBE_P3_LOST_READY  || RACE_PROBE_P8_READYQ   || \
