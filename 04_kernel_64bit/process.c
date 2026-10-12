@@ -911,6 +911,27 @@ void process_reclaim(pcb_t* pcb) {
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
 
+    /*
+     * Remove the PCB from the ready queue before it is marked
+     * UNUSED.  process_destroy already does this; process_reclaim
+     * did not, and the asymmetry is a correctness bug on its own.
+     *
+     * A reclaimed PCB can still be the queue's tail: the exiting
+     * process was removed from the queue in process_exit, but a
+     * later rescan (timer !peek, timer !next, process_exit's
+     * rescan, process_yield's rescan) can re-add a zombie-shaped
+     * slot if it appears READY/RUNNING with links consistent.  The
+     * exact shape that leaves the tail pointing at a reclaimed PCB
+     * is not fully understood, but the defensive fix is right
+     * either way: no PCB should be on the ready queue while its
+     * state is UNUSED.
+     *
+     * scheduler_ready_queue_remove is idempotent -- it returns
+     * immediately if the PCB is off-queue -- so this costs nothing
+     * on the normal path.
+     */
+    scheduler_ready_queue_remove(pcb);
+
     pcb->state = PROC_STATE_UNUSED;
     pcb->pid = 0;
     /*
