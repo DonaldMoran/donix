@@ -2115,7 +2115,6 @@ static void put_file_slot(file_slot_t* slot) {
                                RACE_SITE_WRITE_WAKE);
                 if (pipe_wake_waiter(pipe->reader_waiting,
                                      BLOCK_KIND_PIPE_READ)) {
-                    pipe->reader_waiting = NULL;
                 }
             } else if (pipe->writers_open == 0 &&
                        (uint64_t)pipe == race_p13_watch_pipe) {
@@ -3159,7 +3158,6 @@ long sys_close(int fd) {
             if (pipe->reader_waiting) {
                 if (pipe_wake_waiter(pipe->reader_waiting,
                                      BLOCK_KIND_PIPE_READ)) {
-                    pipe->reader_waiting = NULL;
                 }
             }
         } else if (slot->end == PIPE_END_READ) {
@@ -5576,7 +5574,6 @@ long sys_write(int fd, const void* buf, size_t count) {
                 if (pipe->reader_waiting) {
                     if (pipe_wake_waiter(pipe->reader_waiting,
                                          BLOCK_KIND_PIPE_READ)) {
-                        pipe->reader_waiting = NULL;
                     }
                 }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
@@ -5595,7 +5592,6 @@ long sys_write(int fd, const void* buf, size_t count) {
                            RACE_SITE_WRITE_WAKE);
             if (pipe_wake_waiter(pipe->reader_waiting,
                                  BLOCK_KIND_PIPE_READ)) {
-                pipe->reader_waiting = NULL;
             }
         }
         return (long)done;
@@ -6022,6 +6018,15 @@ long sys_read(int fd, void* buf, size_t count) {
 
         for (;;) {
             __asm__ volatile("cli");
+            /* Reader clears its own publish on wake.
+             * The waker leaves reader_waiting set: it
+             * may fire between the reader's dispatch
+             * and re-block, and its clear would wipe
+             * the fresh publish.  The reader owns this
+             * field. */
+            if (pipe->reader_waiting == self) {
+                pipe->reader_waiting = NULL;
+            }
             RACE_P13_EVENT((uint64_t)pipe, self->pid,
                            ((uint64_t)pipe->used << 32) |
                            (uint64_t)pipe->writers_open,
