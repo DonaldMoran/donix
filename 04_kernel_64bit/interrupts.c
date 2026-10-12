@@ -372,6 +372,54 @@ timer_preempt_handler(uint64_t stack_pointer) {
         extern pcb_t* scheduler_ready_queue_peek_next(void);
         pcb_t* peek = scheduler_ready_queue_peek_next();
         if (!peek || peek->pid == 1) {
+            /*
+             * Diagnostic: the kernel-mode timer found the ready queue
+             * empty (or holding only idle).  No user process is
+             * runnable.  The TIMER-NO-NEXT / YIELD-TO-IDLE dumps
+             * cannot see this -- they fire only from the !next path
+             * below -- so a stall reached through THIS branch is
+             * silent.  Print the pool state once every 500 ticks
+             * (~5 s at 100 Hz), which is enough to name every
+             * process's state at the stall without flooding.
+             * Diagnostic only.  Item 7d.
+             */
+            static uint64_t _idle_dump_last = 0;
+            if (g_ticks - _idle_dump_last >= 5000) {
+                _idle_dump_last = g_ticks;
+                serial_lock();
+                serial_print("TIMER-IDLE-STALL t=");
+                serial_print_dec(g_ticks);
+                serial_print(" cur=");
+                serial_print_dec(current ? current->pid : 0);
+                serial_print(": queue empty, pool state:\n");
+                process_dump_all();
+                serial_unlock();
+            }
+            /*
+             * Rescan the pool for a stranded READY process
+             * before returning to idle.  Without this, a
+             * process that was switched away from while
+             * RUNNING and left off the ready queue (state
+             * READY, not on-queue) is never dispatched: the
+             * timer checks the queue, finds it empty, and
+             * returns to idle every tick forever.  The 7e
+             * stall at t=5000 showed exactly this shape:
+             * PIPE7E_HELPER READY, off-queue, pipe7e
+             * BLOCKED bk=2 waiting for its next write.
+             *
+             * The user-mode path and process_yield both
+             * rescan; the kernel-mode timer branch did not.
+             * Item 7d. */
+            for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+                pcb_t* _p = process_get_pcb(_i);
+                if (!_p) continue;
+                if (_p == current) continue;
+                if (_p->pid == 1) continue;
+                if (_p->state != PROC_STATE_READY &&
+                    _p->state != PROC_STATE_RUNNING) continue;
+                if (scheduler_ready_queue_contains(_p)) continue;
+                scheduler_ready_queue_add(_p);
+            }
             return stack_pointer;
         }
 
