@@ -234,7 +234,6 @@ void __attribute__((noreturn)) process_exit(void) {
     close_all_files(exiting);
 
     {
-        pcb_t* head = scheduler_ready_queue_peek_next();
         serial_lock();
         #if TRACE_EXIT
         serial_print("EXIT: pid=");

@@ -87,7 +87,7 @@ extern volatile uint64_t race_total;
 extern volatile uint64_t g_ticks;
 
 __attribute__((noinline))
-static void race_record(uint64_t slot,
+static inline void race_record(uint64_t slot,
                         uint64_t pid,
                         uint64_t a, uint64_t b,
                         uint64_t site, uint64_t ra) {
@@ -354,7 +354,7 @@ extern volatile uint64_t race_p12_writers_nonzero;
             if ((writers_after) != 0) race_p12_writers_nonzero++;   \
         }                                                           \
         race_record(12, (slot_end),                                  \
-                    ((refc_before) << 40) | ((refc_after) << 32) |  \
+                    ((uint64_t)(refc_before) << 40) | ((uint64_t)(refc_after) << 32) |  \
                     ((writers_before) << 16) | (writers_after),     \
                     (waiter), RACE_SITE_PIPE_CLOSE, 0);             \
     } while (0)
