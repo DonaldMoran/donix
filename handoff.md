@@ -309,9 +309,21 @@ all?*  Two framings:
   the process -- which requires a "which path last saved this" flag,
   because `.ring0_save` cannot tell whether the timer saved the
   process or it is saving it itself.
+- **(c)** `.ring0_save` should not save a process that has no resume
+  meaning.  `process_exit` sets `exiting->state =
+  PROC_STATE_TERMINATED` before calling `context_switch`, and a
+  terminated process is never resumed.  The PCB already carries
+  the fact that matters; check it at the top of `.ring0_save` and
+  jump to `.skip_save` if set.  No new field, no flag, no
+  caller-side bookkeeping.
 
-**Do not propose a fix until (a) or (b) is chosen.**  The writeup
-that chooses between them is the deliverable.
+**Framing (c) was chosen this session, implemented, and refuted by
+the run.**  The implementation is described under "Refuted"
+below; the short version is that it made the stall worse, not
+better, and the commit was reset away rather than reverted.
+
+**Do not propose a fix until a framing survives a run.**  (a) and
+(b) have not been tried.  (c) has, and failed.
 
 ### The queue-mutator race -- OPEN
 
@@ -345,6 +357,26 @@ the bad state is still not identified.
 - **The `.ring0_save` RIP+RSP change** -- category error, not run.
 - **The `.ring0_save` frame-build as Bug 1's cause** -- refuted by
   `d6ada2f`.  Bug 1 was the `user_rsp` writer, not `.ring0_save`.
+- **Framing (c) -- skip the `.ring0_save` for a terminated `prev`**
+  -- refuted by `pipe7e`, 2026-10-13.  The commit was reset, not
+  reverted; this line is the record.  The change added, at the
+  top of `.ring0_save`:
+
+      mov rax, [r15 + 0x028]      ; prev->state
+      cmp rax, 5                  ; PROC_STATE_TERMINATED
+      je .skip_save
+
+  The reasoning was internally consistent: a terminated process
+  is never resumed, its save is meaningless, and the PCB carries
+  the fact that matters.  **The run made the stall worse, not
+  better.**  Pre-change, `pipe7e` reached `iter 1000` clean and
+  was stopped manually.  Post-change, it reached `iter 2000`,
+  then hard-stalled at `iter 3000`: `pipe7e` BLOCKED, its
+  `PIPE7E_HELPER` child RUNNING and off-queue, CPU in idle,
+  `TIMER-IDLE-STALL` repeating every 60000 ticks forever.  The
+  skip is load-bearing beyond the frame build in a way the code
+  reading did not see.  **Do not re-try (c) without new
+  instrumentation.**
 - **"Two RUNNING processes in one dump violates the one-current
   invariant."**  Wrong -- `timer_preempt_handler` excludes pid 1.
 - **Also do not re-open:** item 7, item 7c, item 11, the session-48
@@ -552,5 +584,17 @@ count of writers.  Grep the whole tree before writing the number
 into the handoff.  This session's Bug 2 enumeration said 'four `rip`
 writers' until a grep over `user_syscall.c` found the fifth, in
 `sys_execve`."
+"A framing that looks safe by code reading can be refuted by a
+run.  Framing (c) for Bug 2 was internally consistent, agreed with
+the PCB state, and made the workload worse.  The refutation cost
+one `pipe7e` run; the alternative was discovering it three sessions
+later when the shape had changed."
+"A post-write check string must be copied from the `new` literal
+in the edit script, not retyped.  Three times this session a
+retyped check differed from the actual inserted text by one
+backtick or one parenthetical, fired a spurious `ERROR:`, and
+made a correct edit look broken.  A false-negative check is
+worse than no check: it costs a round trip and it teaches you
+to distrust the verification step."
 
 **This file's item text is the same kind of claim.**
