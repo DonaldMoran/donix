@@ -413,7 +413,6 @@ timer_preempt_handler(uint64_t stack_pointer) {
             for (int _i = 0; _i < MAX_PROCESSES; _i++) {
                 pcb_t* _p = process_get_pcb(_i);
                 if (!_p) continue;
-                if (_p == current) continue;
                 if (_p->pid == 1) continue;
                 if (_p->state != PROC_STATE_READY &&
                     _p->state != PROC_STATE_RUNNING) continue;
