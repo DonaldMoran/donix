@@ -31,7 +31,8 @@ menu() {
     # -no-reboot -no-shutdown pair freezes QEMU at a fault for reading,
     # instead of rebooting or exiting.
     # { make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor none -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
-    { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
+    # { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
+    { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -s -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
     :  # no-op so an empty body is valid
 }
 
