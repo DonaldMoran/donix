@@ -983,6 +983,7 @@ void process_destroy(pcb_t* pcb) {
 }
 
 /* ABI LOCK COMPLIANCE VERIFICATION ASSERTS */
+_Static_assert(offsetof(pcb_t, state)            == 0x028, "context_switch.asm: state offset");
 _Static_assert(offsetof(pcb_t, cr3)              == 0x030, "context_switch.asm: cr3 offset");
 _Static_assert(offsetof(pcb_t, entry_point)      == 0x038, "context_switch.asm: entry_point offset");
 _Static_assert(offsetof(pcb_t, user_stack_top)   == 0x070, "context_switch.asm: user_stack_top offset");
