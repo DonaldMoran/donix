@@ -289,7 +289,7 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
     g_ticks++;
-    race_p1_tick_dump();
+    race_p1_timer_dump();
     vga_cursor_tick();
 
     /*

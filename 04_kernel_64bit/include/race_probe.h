@@ -62,6 +62,16 @@
 #ifndef RACE_PROBE_FORK_SLOT
 #define RACE_PROBE_FORK_SLOT 0
 #endif
+/* Timer-tick auto-dump of the race ring.  race_p1_tick_dump()
+ * fires the first time a P1 early wake or a P13 pipe-reader block
+ * is recorded, which happens on a healthy busy system -- so the
+ * print is success-path noise and it saturates the serial console.
+ * The timer call site is gated by this; the two fault-handler call
+ * sites (isr13, isr14) are NOT, because a fault is a failure-path
+ * event and the ring is signal there.  Default 0. */
+#ifndef RACE_PROBE_P1_AUTODUMP
+#define RACE_PROBE_P1_AUTODUMP 0
+#endif
 
 #if (RACE_PROBE_P1_BLOCK_WAKE || RACE_PROBE_P2_PCB_REUSE || \
      RACE_PROBE_P3_LOST_READY  || RACE_PROBE_P8_READYQ   || \
@@ -176,6 +186,16 @@ static inline void race_p1_tick_dump(void) {
 }
 #else
 #define race_p1_tick_dump() do {} while (0)
+#endif
+
+/* Gated timer-tick call site.  The dump function above is called
+ * unconditionally by the fault handlers; this macro is what the
+ * timer calls, so the auto-dump can be silenced on a healthy run
+ * without silencing the fault-path dump. */
+#if RACE_PROBE_P1_AUTODUMP
+#define race_p1_timer_dump() race_p1_tick_dump()
+#else
+#define race_p1_timer_dump() do {} while (0)
 #endif
 
 /* ---- P2: PCB reuse ---- */
