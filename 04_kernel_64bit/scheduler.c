@@ -87,13 +87,27 @@ void scheduler_ready_queue_add(pcb_t* process) {
     }
 
     process->next = NULL;
-    process->prev = ready_queue_tail;
-    if (ready_queue_tail) {
-        ready_queue_tail->next = process;
-    } else {
+    if (ready_queue_head == NULL) {
+        /*
+         * Head is NULL: whatever ready_queue_tail held, it is not a
+         * walkable chain -- if it were, the head would not be NULL.
+         * Link the new process as the sole entry with itself as both
+         * head and tail.  This covers {head=NULL, tail=process},
+         * which the block above already heals, and the sibling
+         * {head=NULL, tail=<other PCB>} which it does not: taking
+         * the tail branch there would link the new process after a
+         * node nothing can reach and leave head NULL, so every
+         * reader would still see an empty queue.  That is the
+         * pipe7e stall of 2026-10-13.
+         */
+        process->prev = NULL;
         ready_queue_head = process;
+        ready_queue_tail = process;
+    } else {
+        process->prev = ready_queue_tail;
+        ready_queue_tail->next = process;
+        ready_queue_tail = process;
     }
-    ready_queue_tail = process;
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
