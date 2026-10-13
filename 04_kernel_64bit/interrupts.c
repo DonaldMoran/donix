@@ -483,7 +483,17 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * are read, by different paths, so both must be
              * written.
              */
-            current->user_rsp = stack_pointer;
+            /*
+             * user_rsp is the USER stack pointer -- it is read by
+             * context_switch.asm's user-preempted save path and pushed
+             * into the resume frame's RSP slot, which iretq loads with
+             * CS=0x33.  The value the CPU pushed on the CPL 3->0
+             * transition is frame->rsp (EXC_OFF_RSP = 19); stack_pointer
+             * is the kernel interrupt-frame base.  Writing stack_pointer
+             * here delivered a kernel address into a user-mode resume --
+             * Bug 1: user-mode #PF with kernel RSP, CR2 == RSP, err 0x5.
+             */
+            current->user_rsp = frame->rsp;
             current->rsp      = stack_pointer;
         }
 
