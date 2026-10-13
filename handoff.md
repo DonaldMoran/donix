@@ -5,42 +5,42 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-13 (three fixes committed and tagged; two
-bugs open.  Read "NEXT SESSION" first.)
+**Last updated:** 2026-10-13 (second session).  The user-RSP writer
+fix is committed and tagged, and the Bug 1 reproduction it targets is
+cleared.  `pipe7e` regression is pending.  Two threads remain open:
+Bug 2's design question and the queue-mutator race.  Read "NEXT
+SESSION" first.
 
-**THE HEADLINE: the 2026-10-13 session closed the pipe7e stall's
-downstream consequences but did not fix its root cause, and it
-reproduced Bug 1.  Three fixes are committed under the tag
-`20261013-queue-and-rescan-fixes`:**
+**THE HEADLINE: `d6ada2f` (tag `20261013-userrsp-writer-fix`)
+changed the user-mode preemption in `timer_preempt_handler` to write
+`frame->rsp` -- the CPU-pushed user RSP -- into `pcb->user_rsp`,
+instead of `stack_pointer`, the kernel interrupt-frame base.
+`pcb->user_rsp`'s only reader is `context_switch.asm`'s
+user-preempted save path at offset 0x610, which pushes it into the
+resume frame's RSP slot; `iretq` loads that with CS=0x33.  A kernel
+address in that slot faults on the next user stack access -- Bug 1's
+exact shape.**
 
-1. `scheduler_ready_queue_add` no longer builds an un-walkable queue
-   when `head == NULL` and `tail` points at a stale PCB.
-2. The timer's stranded-process re-scan no longer skips `current`.
-3. The P1 race-probe auto-dump is gated behind
-   `RACE_PROBE_P1_AUTODUMP` (default 0) on the timer path only; the
-   fault-handler calls stay ungated.
+**The fix is verified on Bug 1's known reproduction.**  The
+2026-10-13 reproduction was `sh /root/scripts/test.sh` row 12
+(`uniq`), faulting at `RIP=0x412835`, `RSP=0xFFFFFFFF802A2640`,
+`CS=0x33`, `CR2=RSP`, error code `0x5`.  After `d6ada2f`, that row
+passes, twice.  `canary --full` passes 28/28 three times.  No
+user-mode #PF, no #GP, no fault of any kind in the post-fix capture.
 
-**TWO bugs remain open, and they are different bugs:**
+**The fix is not a regression check yet.**  `pipe7e` -- the workload
+that has stressed this class of bug hardest -- has not been run on
+the fixed tree.  That is the next session's first action.
 
-**Bug 1 (VERIFIED, REPRODUCED 2026-10-13): a user-mode page fault
-with a kernel stack address in `%rsp`.**  Reproduced in the applet
-test (`sh /root/scripts/test.sh`) at row 12, `uniq`.  Fault:
-`RIP=0x412835`, `RSP=0xFFFFFFFF802A2640`, `CS=0x33`, `CR2` = `RSP`,
-error code 0x5 (user read of a present supervisor page).  The same
-shape as the 2026-10-12 capture (`0x40786B`).  Capture saved as
-`capture-pf-0x412835-*.txt`.  The kernel killed the faulting process
-and the shell survived -- correct behavior, and the fault is a real
-reproduction.
-
-**Bug 2 (ROOT CAUSE IDENTIFIED, NOT FIXED): `context_switch.asm`'s
-`.ring0_save` writes the caller's return address as the resume RIP.**
-When a process is saved inside a `call context_switch` at
-`process_exit`'s Site-1, and later resumed, it resumes at the `hlt`
-guard after the call and stops.  The two downstream fixes made this a
-livelock instead of a deadlock: the timer is alive, the queue is
-repaired, the helper is re-run, and it resumes into the `hlt` again.
-The system cycles rather than hangs.  The root-cause fix is a design
-question -- see "Bug 2" below, and do not guess at it.
+**One diagnostic fired, and it is not a fault.**  A `YIELD-TO-IDLE`
+queue dump appeared once during `test.sh` row 6, showing `idle`
+RUNNING, `busybox` pid 94 RUNNING, `busybox` pid 66 BLOCKED,
+`busybox` pid 3 BLOCKED, `musl_sh` pid 2 BLOCKED, `busybox` pid 96
+ZOMBIE.  The test continued and passed.  This is the item-7d
+scheduler state -- the ready queue transiently emptied and the
+rescan re-added what it could -- and it is the visible surface of
+the queue-mutator race, still open.  It is NOT Bug 1: no fault
+occurred.
 
 **Repo state -- run these; do not write it here.**
 
@@ -123,6 +123,32 @@ Read it twice and compare.
 address, flags.**  A PCB field that is the same width may be a
 different kind.  Check the kind before moving a value into a slot.
 
+**A field's comment is a claim about its use.  `pcb->user_rsp`'s
+comment said "the USER stack pointer" while the only writer put a
+kernel address in it.  The comment was right; the writer was wrong.**
+
+**Two scripts that differ by one character pair will be pasted
+wrong.**  If a script and its correction are near-identical, delete
+by hand instead of re-pasting.  This session spent three attempts on
+a marker string (`/* DIAG-... */` vs `DIAG-...`) before switching to
+a manual edit.
+
+**A guard that aborts when its marker string is absent will silently
+no-op on the present-and-correctly-formed case if the marker carries
+the wrong delimiters.**  Match the smallest substring that is
+actually present, and re-verify after the write.
+
+**A post-write verification string that does not quote the inserted
+text verbatim is a false negative, not a failure.**  Quote the
+check string from the edit itself, not from a paraphrase of the
+edit's intent.
+
+**A count of writers derived from the files you have read is not a
+count of writers.**  Grep the whole tree before writing the number
+into the handoff.  This session's Bug 2 enumeration said "four `rip`
+writers" until `grep -n '\->rip *=\|\->rsp *='` over
+`user_syscall.c` found the fifth, in `sys_execve`.
+
 ---
 
 ## What donix is
@@ -138,81 +164,65 @@ Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 
 ## Where we are
 
-**Three fixes committed and tagged `20261013-queue-and-rescan-fixes`:**
+**The user-RSP writer fix is committed and tagged.**
 
-1. **`scheduler_ready_queue_add` repair.**  When `head == NULL`, the
-   add now starts a fresh queue with the new process as both ends,
-   instead of taking the `if (ready_queue_tail)` branch and leaving
-   `head` unset.  The old self-tail-heal covered
-   `{head=NULL, tail==process}`; this covers `{head=NULL,
-   tail==<other PCB>}`, which is the shape the 2026-10-13 stall
-   showed.
-2. **Timer re-scan hole.**  `interrupts.c`'s re-scan no longer skips
-   `current`.  The other two re-scans (in `scheduler.c`) never did.
-3. **P1 auto-dump gate.**  `RACE_PROBE_P1_AUTODUMP` (default 0) gates
-   the timer's call to the race-ring dump.  The fault-handler calls
-   remain ungated -- a fault is failure-path signal.
+### Bug 1 -- user-mode #PF with kernel RSP -- REPRODUCTION CLEARED
 
-**Plus a `run` change:** `-display none` (the comment claimed headless
-all along) and `-s` (GDB stub).
-
-**Two bugs remain open:**
-
-### Bug 1 -- user-mode #PF with kernel RSP (VERIFIED, REPRODUCED)
-
-Fault: `RIP=0x412835` (user), `RSP=0xFFFFFFFF802A2640` (kernel stack),
-`CS=0x33`, `CR2` = `RSP`, error code `0x5`.  The user RSP was
-corrupted to a kernel stack address; the next user stack access
-faulted on a supervisor page.  Reproduced 2026-10-13 in
+**Symptom.**  Fault at `RIP=0x412835` (user), `RSP=0xFFFFFFFF802A2640`
+(kernel), `CS=0x33`, `CR2=RSP`, error code `0x5` (user read of a
+present supervisor page).  Reproduced 2026-10-13 in
 `sh /root/scripts/test.sh`, row 12 (`uniq`).  Same shape as the
 2026-10-12 capture at `0x40786B`.
 
-**Candidate mechanisms, not yet distinguished:**
+**Root cause, now named in code.**  `interrupts.c`'s user-preempted
+save block had:
 
-- **A.**  The syscall-entry frame's user-RSP slot is overwritten
-  between entry and return.  The slot is written by `push qword
-  [rel g_user_rsp_save]` and read by `mov rsp, [rsp - 72]`.  A
-  kernel-mode interrupt that pushes at the wrong depth lands on it.
-- **B.**  The `context_switch.asm` user-preempted save path delivers
-  a kernel value.  `pcb->user_rsp` exists specifically because this
-  path once did.
-- **C.**  `pcb->user_rsp` itself holds a kernel value.  It is written
-  in `interrupts.c`'s user-preempted save block as
-  `current->user_rsp = stack_pointer;` alongside `current->rsp =
-  stack_pointer;`.
+    current->user_rsp = stack_pointer;
 
-**The instrument that names the writer is the one the 2026-10-12
-session wrote and this session reverted.**  Re-apply it: in
-`04_kernel_64bit/user_syscall_entry.asm`, just before `mov rsp,
-[rsp - 72]` on the return path, check that the loaded value is in
-`[0x8000000000, 0x8000100000)`.  If not, **store** it to a global and
-**halt** -- do not call `serial_print`, because `rsp` is about to
-become a user address and a fault-path handler with a bad `rsp`
-cannot run.  Read the stored value via GDB over the `-s` stub.
+`stack_pointer` is the kernel interrupt-frame base that `irq0_stub`
+passed to `timer_preempt_handler`.  `pcb->user_rsp`'s only reader is
+`context_switch.asm:66`:
 
-The check was tested and did **not** false-positive across two pipe7e
-runs on the 2026-10-13 tree.  It is the right first instrument.
+    push qword [r15 + 0x610]   ; RSP [0x90] <- pcb->user_rsp
 
-**And pair it with the 7e-fork slot print.**  `RACE_PROBE_FORK_SLOT`
-is in the tree, default 0.  Turn it on for the run: it prints the
-parent's and child's view of the slot the child's first post-syscall
-`ret` will pop.
+which is the resume frame's RSP slot, loaded by `iretq` with CS=0x33.
+The kernel address was delivered into user-mode `%rsp`, and the next
+user stack access faulted on a supervisor page.
 
-### Bug 2 -- the `.ring0_save` resume frame (ROOT CAUSE IDENTIFIED)
+**The fix.**  `frame->rsp` is the CPU-pushed user RSP (EXC_OFF_RSP =
+19), already in the frame the handler holds.  Write that.
+`current->rsp = stack_pointer` is unchanged: that field is the
+kernel resume-frame base and the existing comment explains why it
+takes the frame base.
+
+**Observed at boot, on the first user-mode preemption (pid 3, ash):**
+
+    DIAG-USER-RSP: stack_pointer=0xFFFFFFFF80292710
+                   frame->rsp=0x00000080000FBF10
+                   frame->cs=0x0000000000000033 pid=3
+
+`stack_pointer` is the same shape as the faulting RSP; `frame->rsp`
+is a user address in [0x8000000000, 0x8000100000).
+
+**Post-fix verification.**  `canary --full` 28/28, three times.
+`sh /root/scripts/test.sh` 57/57, twice.  No fault in either.
+Row 12 (`uniq`) -- the exact reproduction -- passes.
+
+**Still pending:** `pipe7e` on the fixed tree.
+
+### Bug 2 -- the `.ring0_save` resume frame -- WRITER NAMED, DESIGN QUESTION OPEN
 
 **Mechanism.**  `context_switch.asm`'s `.ring0_save` builds a resume
 frame whose RIP slot is `[rsp + 48]` -- the caller's return address
 of `call context_switch`.  For `process_exit`'s Site-1 caller, that
 return address is the `nopl` after the call, which falls into the
-`hlt` guard at `process_exit+0x100`.  A process saved there and later
-resumed resumes at the guard and stops.
+`hlt` guard at `process_exit+0x100`.  A process saved there and
+later resumed resumes at the guard and stops.
 
-**What the 2026-10-13 fixes changed.**  The stall is now a livelock
-rather than a deadlock: the timer is alive (`g_ticks` advances at
-~100 Hz), the queue is repaired by fix 1, the helper is re-run by
-fix 2, and it resumes into the `hlt` again.  The banner repeats every
-60000 ticks with an identical process list.  The system runs; the
-helper never makes progress.
+**The 2026-10-13 fixes made this a livelock rather than a deadlock:**
+the timer is alive, the queue is repaired, the helper is re-run, and
+it resumes into the `hlt` again.  The system cycles rather than
+hangs.
 
 **The two failed fix attempts and exactly why each failed:**
 
@@ -223,23 +233,105 @@ helper never makes progress.
 - **RIP+RSP**: change RIP to `prev->rip` and RSP to `prev->rsp`.
   **Not run -- caught by reading the frame-build downstream.**
   `prev->rsp` is a *frame base*, and the frame's RSP slot holds the
-  *stack address* the `iretq` loads.  Those are different kinds of
-  value.  **Category error.**
+  *stack address* the `iretq` loads.  **Category error.**
 
-**The design gap.**  The PCB does not record which path last wrote
-`pcb->rip` and `pcb->rsp`.  The timer writes them together
-(`current->rip = frame->rip; current->rsp = stack_pointer;`), and the
-pair is consistent.  `.ring0_save` writes `pcb->rsp` but not
-`pcb->rip`, and uses a *different* RIP source.  So the pair is
-consistent only when the timer is the last writer.  `.ring0_save`
-cannot tell whether the timer saved the process or it is saving it
-itself.
+**THE LAST-WRITER READ IS DONE.**  Enumerating every writer:
 
-**The read the next session should do first:**  trace which function
-last wrote `pcb->rip` and `pcb->rsp` for a stalled process.  Either a
-scratch "last writer" field, or a careful reading of the paths.  Do
-not propose a fix until the writer is named and the correct pair for
-a ring-0 resume is defined.
+*`pcb->rip` writers (five):*
+1. `process_create`: `pcb->rip = entry_point;` -- a user address, once.
+2. `timer_preempt_handler`, kernel-mode branch: `current->rip =
+   frame->rip;` -- a kernel address.
+3. `timer_preempt_handler`, user-mode branch: `current->rip =
+   frame->rip;` -- a user address.
+4. `process_fork_copy_frame`: `child->rip = p_rip;` -- the parent's
+   user RIP, once.
+5. `sys_execve` (section 8, `self->rip = entry;`) -- the new
+   program's entry, a user address.  Execve also rewrites the
+   syscall-entry frame's RIP slot (`ktop[-7] = entry;`), so it
+   writes RIP in TWO places; see the finding below.
+
+*`pcb->rsp` writers (six):*
+1. `process_create`: a kernel frame base, once.
+2. `timer_preempt_handler`, kernel-mode branch: `stack_pointer`, a
+   kernel frame base.
+3. `timer_preempt_handler`, user-mode branch: `stack_pointer`, a
+   kernel frame base.
+4. `.ring0_save`: `mov [r15 + 0x110], rsp` -- the frame base of the
+   resume frame it built.
+5. user-preempted save path: `mov [r15 + 0x110], rsp` -- the frame
+   base of the resume frame it built.
+6. `process_fork_copy_frame`: the child's frame base, once.
+
+`sys_execve` writes `pcb->rip` but NOT `pcb->rsp`: it rewrites
+the syscall-entry frame's RSP slot (`ktop[-9] = rsp_init;`)
+directly and leaves `pcb->rsp` untouched.  So the execve path
+maintains RIP in the PCB and in the frame, and maintains RSP
+only in the frame.
+
+**The finding.**  Every writer of `pcb->rsp` writes a **kernel
+address** -- `rsp` is consistently "kernel frame base."  But the
+two fields are not maintained as a pair by any single discipline:
+
+- **two paths write `rsp` and not `rip`**: `.ring0_save` and the
+  user-preempted save path.  Both build a resume frame and record
+  its base, but neither consults or updates `pcb->rip`.
+- **one path writes `rip` and not `rsp`**: `sys_execve`, which
+  writes `self->rip = entry` and rewrites the frame's RSP slot
+  directly, leaving `pcb->rsp` stale.
+
+So "what should `pcb->rip` / `pcb->rsp` hold right now" is
+unanswerable from the PCB alone -- it depends on which path last
+touched either field, and the paths do not agree on whether the two
+fields move together.  `.ring0_save` is the path that breaks
+`process_exit`'s Site-1, but the asymmetry is a property of the
+write discipline, not of `.ring0_save` alone.  `.ring0_save` builds
+a self-consistent frame (it chooses its own RIP, from `[rsp + 48]`),
+but the RIP it chooses is the return address of `context_switch`'s
+caller, which for `process_exit`'s Site-1 caller is not a resumable
+point.
+
+**The correct pair for a ring-0 resume** is therefore: `rip` = the
+kernel address the process should resume at, and `rsp` = the kernel
+frame base of a frame whose RIP slot holds that same address.
+`.ring0_save` produces a frame satisfying the second half but not
+necessarily the first -- it does not consult `pcb->rip` at all.
+
+**The design question, which is what the next session must answer
+before proposing a fix:**  *Should `.ring0_save` be resumable at
+all?*  Two framings:
+
+- **(a)** `.ring0_save` is the wrong tool for `process_exit`'s
+  Site-1, and the fix is to not call `context_switch` from a site
+  whose return address is not a resumable point.  The exit path
+  would hand off differently.
+- **(b)** `.ring0_save` should be resumable, and the fix is to give
+  it a `pcb->rip` to resume at, written by whatever path last saved
+  the process -- which requires a "which path last saved this" flag,
+  because `.ring0_save` cannot tell whether the timer saved the
+  process or it is saving it itself.
+
+**Do not propose a fix until (a) or (b) is chosen.**  The writeup
+that chooses between them is the deliverable.
+
+### The queue-mutator race -- OPEN
+
+The `{head=NULL, tail=stale}` state that the 2026-10-13 queue fix
+repairs is produced by some interleaving of the queue mutators that
+was never identified.  The `YIELD-TO-IDLE` dump in this session's
+post-fix capture is a live specimen:
+
+    YIELD-TO-IDLE: queue empty, pool state:
+    1  idle      RUNNING
+    2  musl_sh   BLOCKED
+    3  busybox   BLOCKED
+    66 busybox   BLOCKED
+    94 busybox   RUNNING
+    96 busybox   ZOMBIE
+
+The queue empty, `current` (pid 94) RUNNING, and the rescan recovered.
+The mutators are `scheduler_ready_queue_add`, `_remove`, `_next`,
+`_contains`, and `scheduler_reset`.  The interleaving that produces
+the bad state is still not identified.
 
 ### Refuted -- do NOT re-walk
 
@@ -251,6 +343,8 @@ a ring-0 resume is defined.
 - **The ready-queue self-link** -- closed by `cfff858`.
 - **The `.ring0_save` RIP-only change** -- refuted, `#UD` at `0xBF`.
 - **The `.ring0_save` RIP+RSP change** -- category error, not run.
+- **The `.ring0_save` frame-build as Bug 1's cause** -- refuted by
+  `d6ada2f`.  Bug 1 was the `user_rsp` writer, not `.ring0_save`.
 - **"Two RUNNING processes in one dump violates the one-current
   invariant."**  Wrong -- `timer_preempt_handler` excludes pid 1.
 - **Also do not re-open:** item 7, item 7c, item 11, the session-48
@@ -260,48 +354,49 @@ a ring-0 resume is defined.
 
 ## NEXT SESSION
 
-**Step 0: re-apply the Bug 1 instrument, then run.**
+**Step 0: run `pipe7e` on the fixed tree.**  This is the regression
+check for `d6ada2f`.  One run is sufficient: the "two runs" in the
+previous handoff was tied to the invariant-check discriminator
+protocol, which the fix has made moot.  Run the second only if the
+first is clean and you want belt-and-suspenders.
 
-Re-apply the `user_syscall_entry.asm` user-RSP invariant check
-(described under Bug 1 above).  Turn `RACE_PROBE_FORK_SLOT` on.
-Rebuild.  Run `pipe7e` and `canary --full`.  Capture aside before
-each run overwrites `capture.txt`:
+Capture aside before the run overwrites `capture.txt`:
 
-    cp capture.txt canary-bug1-$(date +%Y%m%d-%H%M).txt
+    cp capture.txt capture-pre-pipe7e-$(date +%Y%m%d-%H%M).txt
 
-**If the check fires:** read the stored bad value via GDB over the
-`-s` stub, then set a hardware watchpoint on the user-RSP slot at
-`<child_kernel_stack_top> - 72` and re-run to catch the writer.  The
-slot address is `pcb->kernel_stack_top - 72` for the faulting
-process.
+If `pipe7e` faults at a user RIP with a kernel RSP: the `user_rsp`
+writer is not the only cause, and the fault's CR2 and RSP are the
+next read.  If it passes: `d6ada2f` is the regression-checked fix.
 
-**If the check does not fire and canary faults at a user RIP with a
-kernel RSP:** the corruption is after the check's read and before
-`mov rsp, [rsp - 72]`.  That narrows the window, and the check moves
-to just after the `mov`, read via GDB instead of print.
+**Step 1: write the Bug 2 design writeup.**  Choose (a) or (b) from
+the section above, with reasoning from the code.  Do not write a fix
+until the framing is chosen.  The last-writer read is done; this is
+the pair-definition step the previous handoff called for.
 
-**Step 1: one change, one commit, then re-test.**
-
-**Step 2: write the Bug 2 root-cause read**, per the section above,
-only after Bug 1 has a named writer or is ruled out for this cycle.
+**Step 2: identify the queue-mutator interleaving.**  The
+`YIELD-TO-IDLE` specimen is a starting point.  The five mutators and
+their write orders are in `scheduler.c`.  The question is which
+interleaving, under preemption, produces `{head=NULL, tail=stale}`.
 
 ### The candidates, in order
 
-1. **Bug 1 -- the user-RSP corruption.**  Instrument first.
-2. **Bug 2 -- the `.ring0_save` resume frame.**  A design question;
-   see the read above.  Do not guess.
-3. **Item 12 -- signal delivery.**  Largest; unblocks `kill`, ash job
+1. **`pipe7e` regression** for `d6ada2f`.
+2. **Bug 2 -- the `.ring0_save` resume frame.**  Design question;
+   the writer is named.
+3. **The queue-mutator race.**  Specimen in hand; interleaving
+   unidentified.
+4. **Item 12 -- signal delivery.**  Largest; unblocks `kill`, ash job
    control, the Wayland `SIGBUS` path.  A workstream.
-4. **`sys_gettimeofday` (96).**  Small, patterned, independent.
+5. **`sys_gettimeofday` (96).**  Small, patterned, independent.
    Unlocks `ps -l`.  Note: 96, not 99.
 
 ### Do not
 
-Do not apply the script or re-run the cherry-pick sequence.
-The tree is already patched.  Do not chase the pipe wake path,
-the atomic refcount, the `fs_base` path, item 7, item 11, or the
-session-48 zone scan.  One change at a time.  Do not edit
-`third_party/` -- but do read it.
+Do not apply the script or re-run the cherry-pick sequence.  The tree
+is already patched.  Do not chase the pipe wake path, the atomic
+refcount, the `fs_base` path, item 7, item 11, or the session-48 zone
+scan.  One change at a time.  Do not edit `third_party/` -- but do
+read it.
 
 Do not run `git reset --hard` without first committing every
 diagnostic you care about.
@@ -309,29 +404,30 @@ diagnostic you care about.
 Do not arm a GDB watchpoint on an address without re-running
 `nm` on the current build.
 
-Do not propose a `.ring0_save` fix before naming the writer of
-`pcb->rip`/`pcb->rsp`.
+Do not propose a `.ring0_save` fix before (a)/(b) is chosen.
+
+Do not re-paste a near-identical script; edit by hand.
 
 ---
 
 ## Open issues (top 6)
 
-1. **Bug 1 -- user-mode #PF with kernel RSP.**  Reproduced
-   2026-10-13.  Instrument first.
-2. **Bug 2 -- `.ring0_save` resume frame.**  Root cause identified,
-   fix not designed.
-3. **`open-issues.md` item 12: signal delivery is a stub.**
-4. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
-5. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-6. **`open-issues.md` item 9: no privilege model.**
+1. **`pipe7e` regression for `d6ada2f`.**  Pending.
+2. **Bug 2 -- `.ring0_save` resume frame.**  Writer named; framing
+   (a) or (b) to be chosen.
+3. **The queue-mutator race.**  `{head=NULL, tail=stale}` interleaving
+   unidentified.
+4. **`open-issues.md` item 12: signal delivery is a stub.**
+5. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
+6. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
    **`sys_gettimeofday` (96)** so `ps -l` works.  Small.
 
 ---
 
 ## State on disk
 
-Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored;
-one run per truncate.
+Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored; one
+run per truncate.
 
 The pre-patch backup `donix-before-apply-20261012` (or its tarball)
 holds the un-patched donix at `5537465`.
@@ -339,26 +435,25 @@ holds the un-patched donix at `5537465`.
 The script `apply-fixes-to-donix.sh` lives at
 `/home/noneya/code/apply-fixes-to-donix.sh` (or a copy in `docs/`).
 
-`patch_donix` may be archived; `donix` is the working tree.
-
 Tags from this cycle, local only:
 `20261013-session-start` (`04df9eb`),
-`20261013-queue-and-rescan-fixes` (the four 2026-10-13 commits).
+`20261013-queue-and-rescan-fixes`,
+`20261013-userrsp-writer-fix` (`d6ada2f`).
 
 ---
 
 ## One-line summary
 
-**Three fixes are committed under
-`20261013-queue-and-rescan-fixes`: the `scheduler_ready_queue_add`
-repair, the timer re-scan hole, and the P1 auto-dump gate.  Two bugs
-remain: (1) a user-mode #PF with a kernel RSP, reproduced
-2026-10-13 at `RIP=0x412835`, `RSP=0xFFFFFFFF802A2640`; (2) the
-`.ring0_save` resume frame, whose root cause is known and whose fix
-is a design question.  The next session's first action is to
-re-apply the `user_syscall_entry.asm` user-RSP invariant check, turn
-on `RACE_PROBE_FORK_SLOT`, and run.  Do not guess at the `.ring0_save`
-fix.**
+**`d6ada2f` (tag `20261013-userrsp-writer-fix`) fixed the
+`pcb->user_rsp` writer: `frame->rsp`, the CPU-pushed user RSP, not
+`stack_pointer`, the kernel frame base.  Bug 1's known reproduction
+(`test.sh` row 12, `uniq`) is cleared; `canary --full` 28/28 and
+`test.sh` 57/57 all pass.  `pipe7e` regression is pending.  Bug 2's
+writer is named -- `.ring0_save` writes `rsp` and not `rip`, and the
+asymmetry is the bug -- and the next step is choosing framing (a) or
+(b) before any fix.  The queue-mutator race is still open, with a
+live `YIELD-TO-IDLE` specimen in hand.  The next session's first
+action is the `pipe7e` regression run.**
 
 ## How to use this file
 
@@ -438,5 +533,24 @@ same width may be a different kind."
 a clean canary printed the whole race ring."
 "The tag must be created after the commits it names; a tag created
 before them names the wrong tree."
+"A field's comment is a claim about its use.  `pcb->user_rsp`'s
+comment said 'the USER stack pointer' while the only writer put a
+kernel address in it.  The comment was right; the writer was wrong."
+"Two scripts that differ by one character pair will be pasted wrong.
+If a script and its correction are near-identical, delete by hand
+instead of re-pasting."
+"A guard that aborts when its marker string is absent will silently
+no-op on the present-and-correctly-formed case if the marker carries
+the wrong delimiters.  Match the smallest substring that is actually
+present, and re-verify after the write."
+"A post-write verification string that does not quote the inserted
+text verbatim is a false negative, not a failure.  Quote the check
+string from the edit itself, not from a paraphrase of the edit's
+intent."
+"A count of writers derived from the files you have read is not a
+count of writers.  Grep the whole tree before writing the number
+into the handoff.  This session's Bug 2 enumeration said 'four `rip`
+writers' until a grep over `user_syscall.c` found the fifth, in
+`sys_execve`."
 
 **This file's item text is the same kind of claim.**
