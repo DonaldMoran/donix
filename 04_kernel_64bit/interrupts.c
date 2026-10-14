@@ -383,6 +383,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * process's state at the stall without flooding.
              * Diagnostic only.  Item 7d.
              */
+#if RACE_PROBE_IDLE_DUMP
             static uint64_t _idle_dump_last = 0;
             if (g_ticks - _idle_dump_last >= 60000) {
                 _idle_dump_last = g_ticks;
@@ -397,6 +398,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
                 /* Ring dump for the race, on the failure path. */
                 race_probe_dump();
             }
+#endif
             /*
              * Rescan the pool for a stranded READY process
              * before returning to idle.  Without this, a
@@ -526,6 +528,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * three ticks; a stop does.  Diagnostic only.
              */
             _7e_empty_streak++;
+#if RACE_PROBE_IDLE_DUMP
             if (_7e_empty_streak == 3 ||
                 (_7e_empty_streak > 3 && (_7e_empty_streak % 256) == 0)) {
                 serial_lock();
@@ -537,6 +540,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
                 /* Ring dump for the race, on the failure path. */
                 race_probe_dump();
             }
+#endif
             if (current->pid == 1) {
                 current->timeslice_ticks = 0;
                 return stack_pointer;

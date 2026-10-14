@@ -29,6 +29,22 @@
 #ifndef RACE_PROBE_P3_LOST_READY
 #define RACE_PROBE_P3_LOST_READY 0
 #endif
+/* Empty-queue dump gate.  Controls the three failure-path dumps
+ * that fire when the scheduler is about to fall to idle:
+ *   YIELD-TO-IDLE   (scheduler.c, process_yield)
+ *   TIMER-IDLE-STALL (interrupts.c, timer kernel-mode branch)
+ *   TIMER-NO-NEXT    (interrupts.c, timer user-mode branch)
+ * Each prints the pool and calls race_probe_dump.
+ *
+ * Default 0: these fire on a healthy system every time the queue is
+ * momentarily empty, which on an interactive console scrolls the
+ * prompt away.  Set to 1 for one build when chasing a stall.  The
+ * P8 counter (RACE_PROBE_P8_READYQ) is the regression check for the
+ * queue race and is separate; do not turn it off to silence these.
+ */
+#ifndef RACE_PROBE_IDLE_DUMP
+#define RACE_PROBE_IDLE_DUMP 0
+#endif
 #ifndef RACE_PROBE_P8_READYQ
 #define RACE_PROBE_P8_READYQ 1
 #endif
