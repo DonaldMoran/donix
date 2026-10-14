@@ -29,7 +29,20 @@ pcb_t* scheduler_ready_queue_peek_next(void) {
 }
 
 void scheduler_ready_queue_add(pcb_t* process) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD, process);
+    /*
+     * Snapshot head and tail ONCE.  race_p8_check reads head/tail
+     * several times (the per-call record and each violation record),
+     * and race_record evaluates its arguments in an unspecified
+     * order.  Reading the globals more than once lets a tick change
+     * one of them between reads, and the check then compares a head
+     * from one instant against a tail from another -- a state that
+     * was never simultaneously true.  That is what produced the
+     * spurious bad_tail_next violations: the same node read as head
+     * in one argument and as not-head in another.
+     */
+    pcb_t* h = ready_queue_head;
+    pcb_t* t = ready_queue_tail;
+    race_p8_check(h, t, RACE_SITE_Q_ADD, process);
     if (!process) return;
 
     /*
@@ -155,7 +168,10 @@ void scheduler_ready_queue_add(pcb_t* process) {
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE, process);
+    /* Snapshot head and tail once; see the note in _add. */
+    pcb_t* h = ready_queue_head;
+    pcb_t* t = ready_queue_tail;
+    race_p8_check(h, t, RACE_SITE_Q_REMOVE, process);
     if (!process) return;
 
     /* Defensive: if the process has no prev and no next and is not
@@ -200,8 +216,18 @@ void scheduler_ready_queue_remove(pcb_t* process) {
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_NEXT,
-                  ready_queue_head);
+    /*
+     * Snapshot head and tail ONCE, and pass the SAME snapshot as
+     * both head and process.  Previously this passed
+     * ready_queue_head as head and read it AGAIN for process; with
+     * race_record's unspecified argument evaluation order, a tick
+     * could change ready_queue_head between the two reads, so the
+     * record showed a head from one instant and a process from
+     * another.
+     */
+    pcb_t* h = ready_queue_head;
+    pcb_t* t = ready_queue_tail;
+    race_p8_check(h, t, RACE_SITE_Q_NEXT, h);
 
     /*
      * Skip any head that is a RUNNING process other than the one on
