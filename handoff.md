@@ -322,8 +322,65 @@ the run.**  The implementation is described under "Refuted"
 below; the short version is that it made the stall worse, not
 better, and the commit was reset away rather than reverted.
 
+**THE STALL IS LIVE AND CAPTURED.**  A later run of the same
+session stalled at `iter 37000` and was read live with GDB over
+the `-s` stub.  The frame decode is below; it confirms the
+mechanism `.ring0_save` builds a resume frame with the caller's
+return address as RIP, and for `process_exit`'s caller that
+address is the `while(1) hlt` guard.
+
+**The captured state (post-`d6ada2f`, post-(c)-reset):**
+
+    current_process  = &pcb_pool[4], pid 37822, state RUNNING
+    ready_queue_head = 0
+    ready_queue_tail = 0
+    g_ticks          = 0xa2fba at attach, 0xa355a after 14s
+    (the tick counter advanced -- the system is livelocked,
+     not frozen; the CPU is looping in the hlt)
+
+**The stalled process's resume frame** (`pcb->rsp` =
+`0xffffffff8029a6c0`), decoded by slot:
+
+    +0x78 RIP    = 0xffffffff8011b531   process_exit's hlt guard
+    +0x80 CS     = 0x18                 kernel code segment
+    +0x88 RFLAGS = 0x202                standard IF=1
+    +0x90 RSP    = 0xffffffff8029a760   kernel stack, frame+0xa0
+
+CS=0x18 means `.ring0_save` built the frame (the user-preempted
+path builds CS=0x33).  RSP = frame base + 0xa0 is the full
+20-slot frame size, so the RSP slot is the caller's stack past
+the frame -- exactly what `.ring0_save`'s `lea rax, [rsp + 64]`
+computes.  The frame is well-formed: RIP, CS, RSP, RFLAGS are
+all the right kind of value for the slots they are in.  The
+frame is not malformed; it is a valid resume frame for the
+wrong resume point.
+
+**What the pool walk ruled out, for this stall:**
+
+  - `g_bad_user_rsp` is 0: the syscall-return invariant check
+    did not fire.  The syscall-entry frame is NOT the source.
+  - The stalled process's `pcb->user_rsp` is `0x80000fbe20`, a
+    valid user stack address.  The open-issues fork-child
+    `user_rsp = 0` gap is NOT this stall.
+  - Every live PCB's `next` and `prev` are 0.  No stale queue
+    links; the queue-mutator race did NOT produce this.
+  - The ready queue is correctly empty.  No self-link, no
+    cycle.
+
+**What is not yet named: why the process was resumed.**  It
+reached `process_exit`, `.ring0_save` parked it with the hlt
+frame, and something resumed it there.  The state in the pool
+is RUNNING, not TERMINATED or ZOMBIE, so its state was changed
+between the save and the resume.  Candidates: a self-switch
+(`next == exiting`), a rescan re-adding it after the save, or
+a slot reuse that did not overwrite the frame.  The pool walk
+cannot distinguish them; the next read is a `RACE_PROBE` at
+`process_exit` around the `context_switch` call, or a GDB
+watchpoint on `pcb_pool[4].state` across the stall.
+
 **Do not propose a fix until a framing survives a run.**  (a) and
-(b) have not been tried.  (c) has, and failed.
+(b) have not been tried.  (c) has, and failed.  The next step is
+to name the resumer, not to pick a framing.
 
 ### The queue-mutator race -- OPEN
 
