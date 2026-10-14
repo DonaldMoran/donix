@@ -179,9 +179,44 @@ pcb_t* scheduler_ready_queue_next(void) {
      * Loop, because there can be more than one such head (a rescan
      * can re-add more than one RUNNING member).
      */
+    /*
+     * Skip any RUNNING head, unconditionally.
+     *
+     * A RUNNING process must never be returned by this function.
+     * Two cases, and the earlier form of this guard handled only
+     * one of them:
+     *
+     *   - a RUNNING process that is NOT current_process: a stale
+     *     dispatch, caught by the guard's second clause.
+     *
+     *   - a RUNNING process that IS current_process: the process
+     *     already on the CPU.  The caller asked for "the next
+     *     process to run" and the head is the one already running.
+     *     Resuming it from its own pcb->rsp -- a save from before
+     *     it was last dispatched, with the stack long since moved
+     *     past it -- loads a garbage frame and the resume side
+     *     stops.  The earlier guard's `!= current_process` clause
+     *     let exactly this case through.
+     *
+     * The 2026-10-13 second GDB read of a pipe7e halt showed the
+     * current_process case: PIPE7E_HELPER pid 4383, state RUNNING,
+     * next->rsp == rsp, g_ticks frozen, the CPU at the resume
+     * side's kernel-CS validation with the frame's CS slot holding
+     * a PCB pointer.  The first read (pid 12222) showed the same
+     * frame shape with the process NOT current -- that case the
+     * old clause caught.  This clause is the remaining hole.
+     *
+     * current_process is RUNNING by the scheduler's invariant, so
+     * "skip any RUNNING head" subsumes both cases: there is no
+     * RUNNING head that is safe to return.
+     *
+     * A NULL return is handled by every caller: process_exit falls
+     * to idle/halt, process_yield rescans the pool, the timer
+     * falls back to idle.  Skipping current_process is correct --
+     * you never switch to the process already on the CPU.
+     */
     while (ready_queue_head &&
-           ready_queue_head->state == PROC_STATE_RUNNING &&
-           ready_queue_head != current_process) {
+           ready_queue_head->state == PROC_STATE_RUNNING) {
         pcb_t* skip = ready_queue_head;
         ready_queue_head = skip->next;
         if (ready_queue_head) {
