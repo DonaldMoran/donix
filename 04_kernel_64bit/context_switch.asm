@@ -25,6 +25,75 @@ global context_switch
 %define KERNEL_BASE 0xFFFFFFFF80000000
 
 ; void context_switch(pcb_t* prev, pcb_t* next)
+; void context_switch_no_save(pcb_t* prev, pcb_t* next)
+;
+; A hand-off entry point for a caller that is NOT coming back --
+; process_exit's tail.  It shares context_switch's prologue and
+; resume side but skips the entire save block, so no resume frame
+; is built and no pcb field of `prev` is written.
+;
+; WHY THIS EXISTS.  context_switch's save paths build a resume
+; frame whose RIP is either [rsp + 48] (the caller's return
+; address -- the ring0_save path) or prev->rip (the user-preempted
+; path).  Both are correct for a caller that expects to be resumed
+; at the instruction after `call context_switch`.  process_exit
+; does NOT: it is __attribute__((noreturn)), and the instruction
+; after its `call context_switch` is the `while(1) hlt` guard the
+; compiler emits as the noreturn fallback.  Saving a resume frame
+; there produces a well-formed kernel frame whose RIP is the hlt
+; guard.  The frame is not malformed; the resume point is wrong.
+; If such a process is ever resumed -- by a rescan, a self-switch,
+; or a slot reuse that did not overwrite the frame -- it resumes
+; at the guard and stops.
+;
+; WHAT IT DOES NOT DO.  It does not write prev->rsp, prev->cr3, or
+; the prev GPR slots.  It does not consult prev at all (rdi is
+; ignored).  The exiting process is about to have its PCB reclaimed
+; or reaped; nothing reads those fields again.
+;
+; WHY IT IS SAFE.  The resume side (context_switch_resume) reads
+; ONLY `next`: cr3 at [r12 + 0x30], frame base at [r12 + 0x110],
+; and the frame at that base.  It never reads prev.  So skipping
+; the save side leaves next's resume byte-identical to
+; context_switch's, and prev is simply not written.
+;
+; WHY THIS IS NOT FRAMING (c).  (c) added a conditional jump to
+; the resume label from INSIDE ring0_save, so it reached the
+; resume label with a different stack depth and register state
+; than the normal path -- the prologue's six pushes plus the save
+; block's own pushes, with r15 live.  (c) made pipe7e worse.  This
+; entry point reaches the resume side by the SAME path
+; `context_switch(NULL, next)` already takes: the prologue's six
+; pushes, `mov r12, rsi`, then the jump to the resume label.  That
+; path already runs today -- process_init's first dispatch of idle
+; has prev == NULL and goes through it -- so it is exercised code,
+; not a new depth.  r12 (next) is the only register the resume
+; side needs, and the prologue sets it.
+;
+; WHAT THE PROLOGUE'S SIX PUSHES ARE FOR HERE.  On the switch-to-
+; next path they are ABANDONED, not balanced: the pop_frame path
+; pops the 15-GPR resume frame and iretqs, and the six prologue
+; pushes are left on the stack of the process being left behind.
+; They are balanced only on the restore_and_return path
+; (next == NULL), which is what `context_switch(NULL, next)` uses
+; today.  Pushing them here costs six stores and no correctness;
+; it keeps this entry point reaching the resume side by the
+; identical path.
+;
+; Callers: process_exit (scheduler.c).  Do not call this from a
+; site that expects to be resumed -- use context_switch.
+global context_switch_no_save
+context_switch_no_save:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsi            ; r12 = next
+    ; rdi (prev) is deliberately ignored.
+    jmp context_switch_resume
+
 context_switch:
     push rbp
     push rbx
@@ -36,7 +105,7 @@ context_switch:
     mov r12, rsi            ; r12 = next
 
     test rdi, rdi
-    jz .skip_save
+    jz context_switch_resume
 
     ; r15 = prev (scratch; real r15 value is reloaded from PCB slot).
     mov r15, rdi
@@ -92,7 +161,7 @@ context_switch:
     mov [r15 + 0x110], rsp              ; prev->rsp = frame base
     mov rax, cr3
     mov [r15 + 0x30], rax
-    jmp .skip_save
+    jmp context_switch_resume
 
     ; --- RING-0 SAVE PATH ---
 .ring0_save:
@@ -141,9 +210,9 @@ context_switch:
     mov [r15 + 0x110], rsp              ; prev->rsp = frame base
     mov rax, cr3
     mov [r15 + 0x30], rax
-    ; fall through to .skip_save
+    ; fall through to context_switch_resume
 
-.skip_save:
+context_switch_resume:
     test r12, r12
     jz .restore_and_return
 

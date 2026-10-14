@@ -15,6 +15,14 @@ static uint64_t schedule_count = 0;
 static uint64_t yield_count = 0;
 
 extern void context_switch(pcb_t* prev, pcb_t* next);
+/*
+ * Hand-off entry point: like context_switch, but skips the
+ * save side entirely.  For process_exit, which is
+ * __attribute__((noreturn)) and must not build a resume
+ * frame whose RIP is its own hlt guard.  See the comment on
+ * context_switch_no_save in context_switch.asm.
+ */
+extern void context_switch_no_save(pcb_t* prev, pcb_t* next);
 
 pcb_t* scheduler_ready_queue_peek_next(void) {
     return ready_queue_head;
@@ -435,7 +443,7 @@ void __attribute__((noreturn)) process_exit(void) {
     exiting->fs_base = rdmsr(0xC0000100);
     wrmsr(0xC0000100, next->fs_base);
 
-    context_switch(exiting, next);
+    context_switch_no_save(exiting, next);
 
     while(1) asm volatile("hlt");
 }
