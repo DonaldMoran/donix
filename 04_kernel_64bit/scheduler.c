@@ -30,6 +30,32 @@ pcb_t* scheduler_ready_queue_peek_next(void) {
 
 void scheduler_ready_queue_add(pcb_t* process) {
     /*
+     * CRITICAL SECTION.  The whole function, not just the link.
+     *
+     * _add is called from process_yield with interrupts ON, and
+     * from the timer's process_wake_all_blocked and from
+     * scheduler_switch_to with interrupts OFF.  With interrupts on,
+     * a tick can fire in the middle of this function -- and that
+     * tick runs process_wake_all_blocked, which calls _add and
+     * _remove.  So one queue mutation can nest inside another, and
+     * the queue is left inconsistent (a tail move with no matching
+     * clear).  The 2026-10-14 ring showed exactly that: an add's
+     * entry record, then the next add's entry record with the tail
+     * moved back one node, and no _remove record in between --
+     * because the remove ran inside the first add's window.
+     *
+     * Save and restore the caller's interrupt flag rather than a
+     * bare cli/sti: _add is called from contexts where interrupts
+     * must stay OFF (process_exit, scheduler_switch_to's cli,
+     * process_wake_all_blocked from an IRQ).  A bare sti on the way
+     * out would re-enable interrupts inside those contexts.
+     *
+     * EVERY early return restores the flag first.
+     */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    /*
      * Snapshot head and tail ONCE.  race_p8_check reads head/tail
      * several times (the per-call record and each violation record),
      * and race_record evaluates its arguments in an unspecified
@@ -43,7 +69,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
     pcb_t* h = ready_queue_head;
     pcb_t* t = ready_queue_tail;
     race_p8_check(h, t, RACE_SITE_Q_ADD, process);
-    if (!process) return;
+    if (!process) { __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags)); return; }
 
     /*
      * Idle (pid 1) is never on the ready queue.  It is reached by
@@ -58,7 +84,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
      * shape the timer dump could not see.  Guard here, once, for
      * every caller.
      */
-    if (process->pid == 1) return;
+    if (process->pid == 1) { __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags)); return; }
 
     /*
      * Idempotency guard.  See scheduler_ready_queue_contains for
@@ -68,6 +94,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
      * cycle.
      */
     if (scheduler_ready_queue_contains(process)) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
         return;
     }
 
@@ -99,6 +126,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
             ready_queue_tail = NULL;
             /* fall through: add as the sole entry, below */
         } else {
+            __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
             return;
         }
     }
@@ -183,20 +211,28 @@ void scheduler_ready_queue_add(pcb_t* process) {
     pcb_t* eh = ready_queue_head;
     pcb_t* et = ready_queue_tail;
     race_p8_check(eh, et, RACE_SITE_Q_ADD, process);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
+    /* CRITICAL SECTION; see the note in _add.  Every early return
+     * restores the caller's interrupt flag. */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
     /* Snapshot head and tail once; see the note in _add. */
     pcb_t* h = ready_queue_head;
     pcb_t* t = ready_queue_tail;
     race_p8_check(h, t, RACE_SITE_Q_REMOVE, process);
-    if (!process) return;
+    if (!process) { __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags)); return; }
 
     /* Defensive: if the process has no prev and no next and is not
        the head, it is not on the queue. Removing it would set
        ready_queue_head = process->next = NULL and corrupt the
        queue. */
     if (!process->prev && !process->next && ready_queue_head != process) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
         return;
     }
 
@@ -237,9 +273,17 @@ void scheduler_ready_queue_remove(pcb_t* process) {
     pcb_t* eh = ready_queue_head;
     pcb_t* et = ready_queue_tail;
     race_p8_check(eh, et, RACE_SITE_Q_REMOVE, process);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
+    /* CRITICAL SECTION; see the note in _add.  _next pops from the
+     * head and can run with interrupts on (process_yield).  Every
+     * return restores the caller's interrupt flag. */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
     /*
      * Snapshot head and tail ONCE, and pass the SAME snapshot as
      * both head and process.  Previously this passed
@@ -332,7 +376,10 @@ pcb_t* scheduler_ready_queue_next(void) {
         skip->prev = NULL;
     }
 
-    if (!ready_queue_head) return NULL;
+    if (!ready_queue_head) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return NULL;
+    }
 
     pcb_t* next = ready_queue_head;
     ready_queue_head = next->next;
@@ -343,6 +390,7 @@ pcb_t* scheduler_ready_queue_next(void) {
     }
     next->next = NULL;
     next->prev = NULL;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return next;
 }
 
