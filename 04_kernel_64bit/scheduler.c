@@ -108,13 +108,49 @@ void scheduler_ready_queue_add(pcb_t* process) {
          * reader would still see an empty queue.  That is the
          * pipe7e stall of 2026-10-13.
          */
-        process->prev = NULL;
+        /*
+         * The queue was empty: this process is both head and tail.
+         * Order matters -- set the tail BEFORE clearing prev, so at
+         * every instant the published state is consistent.  (For the
+         * empty case there is no old tail, so any order works; the
+         * order is kept the same as the else branch below so the two
+         * read alike.)
+         */
         ready_queue_head = process;
         ready_queue_tail = process;
+        process->prev = NULL;
     } else {
-        process->prev = ready_queue_tail;
-        ready_queue_tail->next = process;
+        /*
+         * ORDER MATTERS.  Advance the tail BEFORE linking the old
+         * tail to the new node.
+         *
+         * The old order was:
+         *     process->prev = ready_queue_tail;
+         *     ready_queue_tail->next = process;   <-- old tail->next set
+         *     ready_queue_tail = process;         <-- tail moved
+         * Between those last two lines, the old tail has a non-NULL
+         * next AND is still the published tail.  A timer tick in that
+         * window runs timer_preempt_handler -> scheduler_ready_queue_
+         * next -> race_p8_check and finds tail->next != NULL.  That
+         * is the bad_tail_next violation: a single-node queue
+         * (head == tail) whose tail has a non-NULL next.
+         *
+         * The 2026-10-14 race ring showed it exactly: record 29545
+         * (add, head == tail == 73336), then two tick-skip records,
+         * then record 29549 (next, tail == 73336, tail->next !=
+         * NULL).  No queue-mutator record between -- the write was
+         * inside this add, after its race_p8_check at the top.
+         *
+         * With the tail advanced first, the invariant holds at every
+         * instant: if old_tail->next is set, the tail has already
+         * moved past old_tail; if the tail has moved, old_tail->next
+         * is set.  There is no window where a node is the published
+         * tail and its next is non-NULL.
+         */
+        pcb_t* old_tail = ready_queue_tail;
         ready_queue_tail = process;
+        process->prev = old_tail;
+        old_tail->next = process;
     }
 }
 
