@@ -37,8 +37,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-#define ITERS 50000
-#define MARKER_EVERY 1000
+#define ITERS 100000
+#define MARKER_EVERY 500
 
 static int fails = 0;
 
