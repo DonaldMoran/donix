@@ -507,6 +507,41 @@ void __attribute__((noreturn)) process_exit(void) {
         while (1) __asm__ volatile("hlt");
     }
 
+    /*
+     * A RUNNING next is the process on the CPU; it must not be
+     * handed to.  next came from scheduler_ready_queue_next, which
+     * skips a RUNNING head at pop time -- but the process can become
+     * RUNNING between the pop and here (a rescan, a peer wake, or the
+     * self-switch case in scheduler_switch_to).  This is the same
+     * window e7e3e6b closes for scheduler_switch_to; process_exit
+     * does not go through scheduler_switch_to, so it needs its own
+     * check.
+     *
+     * Fall to idle rather than dispatch.  Do NOT re-enter
+     * process_yield: it calls scheduler_switch_to, which calls
+     * context_switch with prev = current_process, and prev is the
+     * ZOMBIE exiting process -- that would re-open the Bug 2
+     * hlt-guard frame that 6bfa008 closed.
+     */
+    if (next->state == PROC_STATE_RUNNING) {
+        pcb_t* idle = process_find_by_pid(1);
+        if (idle) {
+            extern void tss_set_kernel_stack(uint64_t stack);
+            extern void tss_set_syscall_stack(uint64_t stack);
+            current_process = idle;
+            process_set_current(idle);
+            idle->state = PROC_STATE_RUNNING;
+            idle->total_ticks++;
+            exiting->fs_base = rdmsr(0xC0000100);
+            wrmsr(0xC0000100, idle->fs_base);
+            tss_set_kernel_stack(idle->kernel_stack_top);
+            tss_set_syscall_stack(idle->kernel_stack_top);
+            context_switch_no_save(exiting, idle);
+        }
+        __asm__ volatile("cli");
+        while (1) __asm__ volatile("hlt");
+    }
+
     current_process = next;
     process_set_current(next);
     next->state = PROC_STATE_RUNNING;
