@@ -6024,15 +6024,41 @@ long sys_read(int fd, void* buf, size_t count) {
 
         for (;;) {
             __asm__ volatile("cli");
-            /* Reader clears its own publish on wake.
-             * The waker leaves reader_waiting set: it
-             * may fire between the reader's dispatch
-             * and re-block, and its clear would wipe
-             * the fresh publish.  The reader owns this
-             * field. */
-            if (pipe->reader_waiting == self) {
-                pipe->reader_waiting = NULL;
-            }
+            /*
+             * DO NOT clear pipe->reader_waiting here.
+             *
+             * This block used to do:
+             *     if (pipe->reader_waiting == self)
+             *         pipe->reader_waiting = NULL;
+             * with the comment "the reader owns this field."
+             *
+             * That clear was the lost-wakeup race.  The reader
+             * clears at the TOP of the loop and re-publishes at
+             * the BLOCK site further down, in a different cli
+             * section, with sti/hlt between them.  A writer that
+             * runs in that gap does:
+             *     if (pipe->reader_waiting) { wake; }
+             * sees NULL, does nothing, and the reader then
+             * re-publishes and blocks with no pending wake.  It
+             * sleeps until the next tick -- and the tick path
+             * skips it, because block_kind is not NONE -- until
+             * a later write that may miss the same window again.
+             *
+             * Measured on pipe7e 2026-10-14 (race ring, three
+             * dumps): P13 wake: 0 and P13 eof: 0 on every
+             * capture, P13 block == P13 create, and P12
+             * wake_no_waiter == writers_nonzero exactly.  The
+             * reader published itself for every pipe it created
+             * and was never once woken by the pipe wake path.
+             *
+             * The field is left set across wakeups.  The reader
+             * re-publishes at the block site on every iteration
+             * that is about to block.  A successful wake clears
+             * it (the waker's `if (pipe_wake_waiter(...))
+             * pipe->reader_waiting = NULL;`).  A stale pointer
+             * to a running reader is harmless: pipe_wake_waiter
+             * checks state == BLOCKED and refuses otherwise.
+             */
             RACE_P13_EVENT((uint64_t)pipe, self->pid,
                            ((uint64_t)pipe->used << 32) |
                            (uint64_t)pipe->writers_open,
