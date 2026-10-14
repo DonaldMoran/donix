@@ -274,6 +274,24 @@ extern volatile uint64_t race_p8_bad_self;
 extern volatile uint64_t race_p8_checks;
 #define race_p8_check(head, tail, site) do {                             \
     race_p8_checks++;                                                    \
+    /*                                                                    \
+     * Record EVERY call, not just the violations.  The ring then holds   \
+     * the last 256 queue operations, and the call that left             \
+     * tail->next != NULL is one of them.                                \
+     *                                                                    \
+     * Before this, race_record ran only in the four violation branches.  \
+     * The ring at a violation showed the violation itself but not the   \
+     * call that produced it -- the producer was earlier and had been    \
+     * overwritten by slot=11 tick-skip records.  The 2026-10-14        \
+     * P8-gated dumps showed exactly that: slot=8 site=5 (the check     \
+     * that FOUND it) with slot=11 site=13 in the two records before    \
+     * it, and no queue-mutator record in the window.                   \
+     *                                                                    \
+     * a=head, b=tail.  The transition to tail->next != NULL is visible  \
+     * as one record where b is a node whose next is not NULL, with the  \
+     * next record's b being a different (or NULL) tail.                 \
+     */                                                                   \
+    race_record(8, 0, (uint64_t)(head), (uint64_t)(tail), (site), 0);   \
     if ((head) && (head)->prev != NULL) {                                \
         race_p8_bad_head_prev++;                                         \
         race_record(8, (head)->pid, (uint64_t)(head), 0, (site), 0);     \
