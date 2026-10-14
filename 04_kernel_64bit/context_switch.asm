@@ -24,6 +24,36 @@ global context_switch
 
 %define KERNEL_BASE 0xFFFFFFFF80000000
 
+; EMIT_HEX reg -- emit the 16 hex digits of `reg` to COM1 (0x3F8),
+; most-significant nibble first.  Register-only: no call, no push,
+; no stack use.  Clobbers rax, rcx, rdx.  Does NOT touch rsp or r12,
+; so a caller on the unknown-CS halt path can emit several slots in
+; a row without losing the frame it is reporting.
+;
+; Unrolled deliberately: a loop needs a variable shift count and a
+; nibble counter, both of which want registers the caller may be
+; using.  16 unrolled steps use only rax, rcx, rdx and leave rsp,
+; r12, rbx, rsi, rdi, r8-r15 alone.
+;
+; %1 is a register (r12, rbx, rax, ...).  It is not modified: each
+; step copies it into rcx before shifting.
+%macro EMIT_HEX 1
+    mov rcx, %1
+%assign %%i 60
+%rep 16
+    mov rax, rcx
+    shr rax, %%i
+    and eax, 0x0F
+    add eax, 0x30               ; '0'
+    cmp eax, 0x39               ; '9'
+    lea edx, [eax + 7]          ; letter case: '0'..'9' -> 'A'..'F' is +7
+    cmova eax, edx              ; if eax > '9', take the letter case
+    mov dx, 0x3F8
+    out dx, al
+%assign %%i (%%i - 4)
+%endrep
+%endmacro
+
 ; void context_switch(pcb_t* prev, pcb_t* next)
 ; void context_switch_no_save(pcb_t* prev, pcb_t* next)
 ;
@@ -250,10 +280,57 @@ context_switch_resume:
     cmp rbx, 0x33
     je .frame_cs_user
 
-    ; Unknown CS: emit 'C' and halt.
+    ; Unknown CS: the resume frame's CS slot is neither 0x18 nor 0x33.
+    ; Emit a one-line report and halt.  rsp already points at the
+    ; garbage frame, so nothing here calls a C function or pushes;
+    ; raw out to COM1, register-only, and rsp/r12 are preserved.
+    ;
+    ; Format:  C\nN=<r12> R=<[rsp+78]> S=<[rsp+80]> F=<[rsp+88]> P=<[rsp+90]>\n
+    ; N is the next pcb the scheduler picked (name it in gdb with
+    ; x/s N+8).  R is the saved RIP slot, S the bad CS slot, F the
+    ; RFLAGS slot, P the saved RSP slot.
     mov dx, 0x3F8
     mov al, 'C'
     out dx, al
+    mov al, 0x0A
+    out dx, al
+    mov al, 'N'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX r12
+    mov al, ' '
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x78]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'S'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x80]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'F'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x88]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'P'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x90]
+    EMIT_HEX rbx
     mov al, 0x0A
     out dx, al
     hlt
