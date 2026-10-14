@@ -281,6 +281,23 @@ extern volatile uint64_t race_p8_checks;
     if ((tail) && (tail)->next != NULL) {                                \
         race_p8_bad_tail_next++;                                         \
         race_record(8, (tail)->pid, (uint64_t)(tail), 0, (site), 0);     \
+        /*                                                               \
+         * Dump the ring at the moment of the violation.  The ring       \
+         * holds the last 256 race_record calls; the queue-mutator       \
+         * calls immediately before this one are the sequence that       \
+         * left tail->next != NULL.                                      \
+         *                                                               \
+         * Gated to the first three: the console cost is bounded, and    \
+         * three violations are enough to see the shape.  After that,    \
+         * the counter still climbs (it is the before/after metric)      \
+         * and the dump is silent.                                       \
+         *                                                               \
+         * race_probe_dump takes serial_lock, which is nesting-safe      \
+         * and restores the caller's interrupt flag; race_p8_check       \
+         * runs inside the scheduler's cli, not inside serial_lock,      \
+         * so the nesting is clean.                                      \
+         */                                                              \
+        if (race_p8_bad_tail_next <= 3) race_probe_dump();               \
     }                                                                    \
     if ((head) && (head)->next == (head)) {                              \
         race_p8_bad_self++;                                              \
