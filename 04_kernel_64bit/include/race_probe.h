@@ -108,6 +108,7 @@ typedef struct {
     uint64_t site;
     uint64_t ra;
     uint64_t tick;
+    uint64_t slot;   /* event class: which race_record call site */
 } race_rec_t;
 
 extern race_rec_t        race_log[RACE_SLOTS];
@@ -118,22 +119,38 @@ extern volatile uint64_t race_total;
 extern volatile uint64_t g_ticks;
 
 __attribute__((noinline))
+/*
+ * race_record -- write one record into the shared ring.
+ *
+ * CHANGED 2026-10-14: this used to write race_log[slot], one record
+ * per slot NUMBER, so the dump showed the LAST value per class and
+ * could not show an interleaving.  It now writes a single ring: each
+ * call overwrites the oldest entry, so the dump shows the last
+ * RACE_SLOTS calls in chronological order, across all classes.  That
+ * is what names the queue-mutator interleaving.
+ *
+ * `slot` is now stored as a field (race_rec_t.slot), not used as an
+ * index.  The value is the class the caller passes (the RACE_SITE_*
+ * numbers for the queue mutators).  race_head[0] is the ring's write
+ * counter; race_head[1..] are unused.
+ */
 static inline void race_record(uint64_t slot,
                         uint64_t pid,
                         uint64_t a, uint64_t b,
                         uint64_t site, uint64_t ra) {
-    if (slot >= RACE_SLOTS) return;
-    uint64_t idx = race_head[slot];
-    race_rec_t* r = &race_log[slot];
+    uint64_t wr  = race_head[0];
+    uint64_t idx = wr % RACE_SLOTS;
+    race_rec_t* r = &race_log[idx];
     r->pid  = pid;
     r->a    = a;
     r->b    = b;
     r->site = site;
     r->ra   = ra;
     r->tick = g_ticks;
-    race_head[slot] = idx + 1;
+    r->slot = slot;
+    race_head[0] = wr + 1;
     race_total++;
-    if (idx == 0) race_hits++;
+    if (wr == 0) race_hits++;
 }
 
 #endif /* RACE_PROBE_ANY */

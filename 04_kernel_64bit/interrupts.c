@@ -394,6 +394,8 @@ timer_preempt_handler(uint64_t stack_pointer) {
                 serial_print(": queue empty, pool state:\n");
                 process_dump_all();
                 serial_unlock();
+                /* Ring dump for the race, on the failure path. */
+                race_probe_dump();
             }
             /*
              * Rescan the pool for a stranded READY process
@@ -532,6 +534,8 @@ timer_preempt_handler(uint64_t stack_pointer) {
                 serial_print(": queue empty, pool state:\n");
                 process_dump_all();
                 serial_unlock();
+                /* Ring dump for the race, on the failure path. */
+                race_probe_dump();
             }
             if (current->pid == 1) {
                 current->timeslice_ticks = 0;

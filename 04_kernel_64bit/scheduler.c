@@ -768,6 +768,8 @@ void process_yield(void) {
                 serial_print("YIELD-TO-IDLE: queue empty, pool state:\n");
                 process_dump_all();
                 serial_unlock();
+                /* Ring dump for the race, on the failure path. */
+                race_probe_dump();
                 next = process_find_by_pid(1);
                 if (!next) return;
             }

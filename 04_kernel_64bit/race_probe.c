@@ -154,24 +154,50 @@ void race_probe_dump(void) {
     }
 #endif
 
-    serial_print("--- ring (up to 32) ---\n");
-    for (int i = 0; i < RACE_SLOTS && i < 32; i++) {
-        if (race_head[i] == 0) continue;
-        serial_print("  slot ");
-        serial_print_dec((uint64_t)i);
-        serial_print(" pid=");
-        serial_print_dec(race_log[i].pid);
-        serial_print(" a=");
-        serial_print_dec(race_log[i].a);
-        serial_print(" b=");
-        serial_print_dec(race_log[i].b);
-        serial_print(" site=");
-        serial_print_dec(race_log[i].site);
-        serial_print(" tick=");
-        serial_print_dec(race_log[i].tick);
-        serial_print(" ra=0x");
-        serial_print_hex(race_log[i].ra);
-        serial_print("\n");
+    /*
+     * Ring, in chronological order: oldest surviving to newest.
+     *
+     * CHANGED 2026-10-14: race_record now writes a ring, so this
+     * prints the last RACE_SLOTS calls in the order they were made,
+     * not one value per slot number.  That is the queue-mutator
+     * sequence that produced the empty queue -- the interleaving.
+     *
+     * Print the last 64 to keep the serial output bounded; the
+     * interesting events are the few calls immediately before the
+     * dump fired, and 64 covers several mutator rounds.
+     */
+    {
+        uint64_t wr  = race_head[0];
+        uint64_t n   = (wr < RACE_SLOTS) ? wr : RACE_SLOTS;
+        uint64_t show = (n < 64) ? n : 64;
+        uint64_t start = (wr >= show) ? (wr - show) : 0;
+        serial_print("--- ring: last ");
+        serial_print_dec(show);
+        serial_print(" of ");
+        serial_print_dec(n);
+        serial_print(" (total ");
+        serial_print_dec(wr);
+        serial_print(") ---\n");
+        for (uint64_t k = start; k < wr; k++) {
+            uint64_t idx = k % RACE_SLOTS;
+            serial_print("  ");
+            serial_print_dec(k);
+            serial_print(" slot=");
+            serial_print_dec(race_log[idx].slot);
+            serial_print(" pid=");
+            serial_print_dec(race_log[idx].pid);
+            serial_print(" a=");
+            serial_print_dec(race_log[idx].a);
+            serial_print(" b=");
+            serial_print_dec(race_log[idx].b);
+            serial_print(" site=");
+            serial_print_dec(race_log[idx].site);
+            serial_print(" tick=");
+            serial_print_dec(race_log[idx].tick);
+            serial_print(" ra=0x");
+            serial_print_hex(race_log[idx].ra);
+            serial_print("\n");
+        }
     }
     serial_print("=== END RACE PROBE DUMP ===\n\n");
     serial_unlock();
