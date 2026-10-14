@@ -637,11 +637,34 @@ void scheduler_switch_to(pcb_t* next) {
      * RUNNING (process_create sets it), so process_start's direct
      * call is not affected either.
      */
+    __asm__ volatile("cli");
+
+    /*
+     * A RUNNING next must not be dispatched.  This check is INSIDE
+     * the cli, not before it.
+     *
+     * It used to sit above the cli.  That read next->state with
+     * interrupts on, and a timer tick between the read and the cli
+     * could change the state.  The guard then passed on a READY
+     * process, and the dispatch proceeded with a process that was
+     * RUNNING by the time context_switch resumed its frame.
+     *
+     * The 2026-10-14 GDB read of a test.sh row-30 'C' showed
+     * exactly this: busybox at pcb_pool+9368, current_process ==
+     * that same PCB, state RUNNING, and the frame at its pcb->rsp
+     * holding user-space values in the CPU slots (CS = a user stack
+     * address, RFLAGS = a user code address).  The guard above the
+     * cli had read READY; the state changed before the cli; the
+     * dispatch resumed a stale frame.
+     *
+     * With the check here, the state cannot change between the read
+     * and the resume -- the cli holds until context_switch's resume
+     * side has loaded the frame.
+     */
     if (next->state == PROC_STATE_RUNNING) {
+        __asm__ volatile("sti");
         return;
     }
-
-    __asm__ volatile("cli");
 
     pcb_t* prev = current_process;
     current_process = next;
