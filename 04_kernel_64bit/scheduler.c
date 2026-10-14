@@ -172,8 +172,17 @@ void scheduler_ready_queue_add(pcb_t* process) {
      * operation produced.  Together they bracket the write, so the
      * ring names the operation that left an inconsistent queue
      * rather than the next operation that noticed it.
+     *
+     * Snapshot head and tail ONCE, exactly as the entry check does.
+     * Passing the globals directly lets a tick change one between
+     * race_p8_check's reads, and the record then compares a head
+     * from one instant against a tail from another -- a state that
+     * was never simultaneously true.  The entry checks were fixed
+     * this way in 8e3c53f; the exit checks were added without it.
      */
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD, process);
+    pcb_t* eh = ready_queue_head;
+    pcb_t* et = ready_queue_tail;
+    race_p8_check(eh, et, RACE_SITE_Q_ADD, process);
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
@@ -224,9 +233,10 @@ void scheduler_ready_queue_remove(pcb_t* process) {
     process->prev = NULL;
 
     /* EXIT check: record the queue state AFTER the unlink; see the
-     * note in _add. */
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE,
-                  process);
+     * note in _add.  Snapshot once, like the entry check. */
+    pcb_t* eh = ready_queue_head;
+    pcb_t* et = ready_queue_tail;
+    race_p8_check(eh, et, RACE_SITE_Q_REMOVE, process);
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
