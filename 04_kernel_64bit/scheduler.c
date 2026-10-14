@@ -175,7 +175,24 @@ void scheduler_ready_queue_remove(pcb_t* process) {
     if (process->next) {
         process->next->prev = process->prev;
     } else {
+        /*
+         * Removing the LAST node: the tail becomes process->prev.
+         * process->prev->next still points at process, and it must
+         * be cleared -- otherwise the new tail has a non-NULL next
+         * and the tail invariant is violated.
+         *
+         * This was the bad_tail_next producer.  The 2026-10-14 race
+         * ring showed it: an add created a two-node queue
+         * (head == 73336, tail == process, 73336->next == process),
+         * a remove then took the queue back to one node with
+         * ready_queue_tail = 73336 but left 73336->next = process,
+         * and the next _next check found head == tail == 73336 with
+         * tail->next != NULL.
+         */
         ready_queue_tail = process->prev;
+        if (ready_queue_tail) {
+            ready_queue_tail->next = NULL;
+        }
     }
 
     process->next = NULL;
