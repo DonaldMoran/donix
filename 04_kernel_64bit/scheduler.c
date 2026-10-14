@@ -165,6 +165,15 @@ void scheduler_ready_queue_add(pcb_t* process) {
         process->prev = old_tail;
         old_tail->next = process;
     }
+
+    /*
+     * EXIT check: record the queue state AFTER the linking.  The
+     * entry check above shows the state before; this shows what the
+     * operation produced.  Together they bracket the write, so the
+     * ring names the operation that left an inconsistent queue
+     * rather than the next operation that noticed it.
+     */
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD, process);
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
@@ -213,6 +222,11 @@ void scheduler_ready_queue_remove(pcb_t* process) {
 
     process->next = NULL;
     process->prev = NULL;
+
+    /* EXIT check: record the queue state AFTER the unlink; see the
+     * note in _add. */
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE,
+                  process);
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
