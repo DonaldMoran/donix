@@ -792,6 +792,30 @@ void scheduler_switch_to(pcb_t* next) {
     __asm__ volatile("cli");
 
     /*
+     * Second check inside the cli: next == current_process.
+     *
+     * The self-switch check at function entry reads current_process
+     * with interrupts ON.  A timer tick between that check and this
+     * cli can set current_process = next (the timer's
+     * scheduler_set_current).  Then prev = current_process at the
+     * dispatch below is next, and context_switch(next, next) runs:
+     * the save path writes next->rsp = its own frame base, and the
+     * resume loads that same frame and reads its CPU slots from the
+     * middle of its own stack -- the 'C' halt at
+     * context_switch_resume.frame_cs_kernel, with N == R (next ==
+     * the value in the RIP slot).
+     *
+     * Re-check here, under the cli, so the state cannot change
+     * between the check and the dispatch.  Same shape as d3c7f20
+     * (the test.sh row-30 'C'): the guard that was left above the
+     * cli is the window.
+     */
+    if (next == current_process) {
+        __asm__ volatile("sti");
+        return;
+    }
+
+    /*
      * A RUNNING next must not be dispatched.  This check is INSIDE
      * the cli, not before it.
      *
