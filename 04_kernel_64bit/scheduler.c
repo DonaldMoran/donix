@@ -29,7 +29,7 @@ pcb_t* scheduler_ready_queue_peek_next(void) {
 }
 
 void scheduler_ready_queue_add(pcb_t* process) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD);
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_ADD, process);
     if (!process) return;
 
     /*
@@ -155,7 +155,7 @@ void scheduler_ready_queue_add(pcb_t* process) {
 }
 
 void scheduler_ready_queue_remove(pcb_t* process) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE);
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_REMOVE, process);
     if (!process) return;
 
     /* Defensive: if the process has no prev and no next and is not
@@ -200,7 +200,8 @@ void scheduler_ready_queue_remove(pcb_t* process) {
 }
 
 pcb_t* scheduler_ready_queue_next(void) {
-    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_NEXT);
+    race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_NEXT,
+                  ready_queue_head);
 
     /*
      * Skip any head that is a RUNNING process other than the one on

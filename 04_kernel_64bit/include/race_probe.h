@@ -272,7 +272,7 @@ extern volatile uint64_t race_p8_bad_tail_next;
 extern volatile uint64_t race_p8_bad_links;
 extern volatile uint64_t race_p8_bad_self;
 extern volatile uint64_t race_p8_checks;
-#define race_p8_check(head, tail, site) do {                             \
+#define race_p8_check(head, tail, site, process) do {                    \
     race_p8_checks++;                                                    \
     /*                                                                    \
      * Record EVERY call, not just the violations.  The ring then holds   \
@@ -291,7 +291,15 @@ extern volatile uint64_t race_p8_checks;
      * as one record where b is a node whose next is not NULL, with the  \
      * next record's b being a different (or NULL) tail.                 \
      */                                                                   \
-    race_record(8, 0, (uint64_t)(head), (uint64_t)(tail), (site), 0);   \
+    /*                                                                    \
+     * ra carries the process this call is operating on, so a grep        \
+     * for a node's address finds every operation that touched it --       \
+     * not just the ones where it happened to be head or tail.             \
+     * _next passes head (it operates on the head); _add and _remove       \
+     * pass their process argument.                                        \
+     */                                                                   \
+    race_record(8, 0, (uint64_t)(head), (uint64_t)(tail), (site),        \
+                (uint64_t)(process));                                    \
     if ((head) && (head)->prev != NULL) {                                \
         race_p8_bad_head_prev++;                                         \
         race_record(8, (head)->pid, (uint64_t)(head), 0, (site), 0);     \
