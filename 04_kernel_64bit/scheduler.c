@@ -571,6 +571,41 @@ void scheduler_switch_to(pcb_t* next) {
         return;
     }
 
+    /*
+     * A RUNNING process that is not current_process must not be
+     * dispatched.
+     *
+     * scheduler_ready_queue_next's guard checks state at POP time.
+     * Between the pop and this point, the process's state can change:
+     * a rescan, a peer wake, or this function's own self-switch case
+     * can set it RUNNING.  The pop-time guard cannot see that; this
+     * check is on the current value, at dispatch time, and it sees it.
+     *
+     * A RUNNING non-current process has been made RUNNING without
+     * being put on the CPU.  Dispatching it resumes it from a
+     * pcb->rsp that names a frame its last legitimate save left; for
+     * a process that has been running since, the stack has moved past
+     * that frame and the resume side loads a transposed region of
+     * stack.  The 2026-10-13 third GDB read of a pipe7e halt showed
+     * this: PIPE7E_HELPER pid 82550, state RUNNING, next->rsp ==
+     * $rsp, g_ticks frozen, the frame's CPU slots holding the values
+     * of its GPR slots shifted -- a frame read at the wrong base.
+     *
+     * Refuse.  This is the dispatch-time half of the invariant
+     * 'a RUNNING process is the one on the CPU'.  The pop-time half
+     * is in scheduler_ready_queue_next; the two together close the
+     * window between the pop and the resume.
+     *
+     * The self-switch case above (next == current_process) is
+     * handled before this point and is not affected: it returns
+     * without dispatching.  A freshly created process is READY, not
+     * RUNNING (process_create sets it), so process_start's direct
+     * call is not affected either.
+     */
+    if (next->state == PROC_STATE_RUNNING) {
+        return;
+    }
+
     __asm__ volatile("cli");
 
     pcb_t* prev = current_process;
