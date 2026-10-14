@@ -148,6 +148,51 @@ void scheduler_ready_queue_remove(pcb_t* process) {
 
 pcb_t* scheduler_ready_queue_next(void) {
     race_p8_check(ready_queue_head, ready_queue_tail, RACE_SITE_Q_NEXT);
+
+    /*
+     * Skip any head that is a RUNNING process other than the one on
+     * the CPU.
+     *
+     * The rescans in process_exit, process_yield,
+     * scheduler_switch_to, and timer_preempt_handler re-add READY or
+     * stranded-RUNNING pool members that are not on the queue.  The
+     * RUNNING acceptance is a workaround for a process left RUNNING
+     * and off-queue (item 7d).  The workaround is what lets a
+     * RUNNING non-current process onto the queue.
+     *
+     * Dispatching such a process is wrong regardless of how it got
+     * there: a RUNNING process is not runnable-from-a-frame, and its
+     * pcb->rsp names whatever frame its last legitimate save left --
+     * for a process that has been running since, that frame has been
+     * overwritten.  Resuming it loads a garbage frame and the resume
+     * side stops (the 'C' halt, or a validation branch with a bad
+     * RIP).  The 2026-10-13 GDB read of a pipe7e halt showed exactly
+     * this: PIPE7E_HELPER pid 12222, state RUNNING, dispatched as
+     * next, pcb->rsp = kernel_stack_pool+81456, frame slots not a
+     * CPU frame, g_ticks frozen.
+     *
+     * Unlink and skip.  The process is left off the queue; if it is
+     * genuinely the running process, the caller that selected it is
+     * the bug, and if it is stale, it must not be dispatched.  Either
+     * way this function must not return it.
+     *
+     * Loop, because there can be more than one such head (a rescan
+     * can re-add more than one RUNNING member).
+     */
+    while (ready_queue_head &&
+           ready_queue_head->state == PROC_STATE_RUNNING &&
+           ready_queue_head != current_process) {
+        pcb_t* skip = ready_queue_head;
+        ready_queue_head = skip->next;
+        if (ready_queue_head) {
+            ready_queue_head->prev = NULL;
+        } else {
+            ready_queue_tail = NULL;
+        }
+        skip->next = NULL;
+        skip->prev = NULL;
+    }
+
     if (!ready_queue_head) return NULL;
 
     pcb_t* next = ready_queue_head;
