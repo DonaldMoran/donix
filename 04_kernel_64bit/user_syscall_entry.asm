@@ -24,6 +24,13 @@ section .bss
 align 8
 g_user_rsp_save: resq 1
 
+; INVARIANT CHECK (scratch, for the Bug 1 hunt): if the user RSP
+; the syscall-return path is about to load is not in the user
+; range, store it here and hlt.  Read via GDB over the -s stub.
+align 8
+global g_bad_user_rsp
+g_bad_user_rsp: resq 1
+
 section .data
 align 8
 ; Last values passed to sysret. Diagnostic only: the exception handler
@@ -186,6 +193,27 @@ user_syscall_entry:
     pop rbp
     pop rbx
 
+    ; --- INVARIANT CHECK (scratch, Bug 1 hunt) ---
+    ; Every GPR is live here; the comment below says so.  Save
+    ; rax (syscall return value) and rbx (just popped, the
+    ; user's rbx) to the stack for scratch, bounds-check the
+    ; user RSP, restore, and continue.  On failure: store the
+    ; bad value and hlt -- no serial_print, because rsp is
+    ; about to become a user address and a fault-path print
+    ; with a bad rsp cannot run.  Read via GDB (-s stub).
+    push rax
+    push rbx
+    mov rax, [rsp - 56]            ; candidate (was [R-72]; -16 for the two pushes)
+    mov rbx, 0x8000100000
+    cmp rax, rbx
+    jae .bad_user_rsp
+    mov rbx, 0x8000000000
+    cmp rax, rbx
+    jb  .bad_user_rsp
+    pop rbx                        ; restore user rbx
+    pop rax                        ; restore syscall return value
+    ; --- end invariant check ---
+
     ; rsp is now 72 bytes past the user RSP slot: 24 (skipped) +
     ; 6*8 (the six pops).  Load the user RSP directly into rsp,
     ; with no intermediate GPR.
@@ -201,6 +229,10 @@ user_syscall_entry:
     mov [rel g_last_sysret_r11], r11
 
     o64 sysret
+
+.bad_user_rsp:
+    mov [rel g_bad_user_rsp], rax  ; rax holds the bad candidate
+    hlt
 
 .handle_exit:
     ; Same teardown, but we do not return to user mode: process_exit
