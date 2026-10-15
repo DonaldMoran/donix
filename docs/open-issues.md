@@ -15,65 +15,41 @@ not reused.
 
 ## The next thing
 
-**A RUNNING process dispatched as `next` — `7fff450` did NOT
-close it.  There are two sites; only one is guarded.**
+**Item 12 -- signal delivery.**  With Bug 3 closed, the largest
+open item is the signal subsystem.  It unblocks `kill`, ash job
+control (item 13), and the Wayland `SIGBUS` path (item 5's
+sibling).  See the item below for the full shape.
 
-`pipe7e` reached `iter 80500` and hit `context_switch.asm`'s
-unknown-CS halt:
+**Closed since the last update: the RUNNING-process-dispatched-
+as-`next` bug (Bug 3).**  `pipe7e` reached `iter 80500` and hit
+`context_switch.asm`'s unknown-CS halt:
 
     C
     N=FFFFFFFF8027C7D0 R=FFFFFFFF8027C7D0 S=FFFFFFFF8029B2A0
     F=FFFFFFFF8011B895 P=0000000000000000
 
-`N == R`: `next` is `C7D0` and the frame's RIP slot holds `C7D0`.
-`S` is a kernel stack address, `F` is `process_exit+757`, `P` is
-0 — the values of `context_switch`'s own locals on the stack, not
-a resume frame.  The dispatch was `context_switch(next, next)`:
-`prev == next`.
+`N == R`: the dispatch was `context_switch(next, next)`.  Two
+sites, two guards:
 
-**`7fff450` is in the tree and the `C` fired again.**  The run
-that showed it lost its capture; a later run was clean.  One
-clean run does not close an intermittent fault.  **Still open.**
+  - **Site 1 -- `scheduler_switch_to`.**  The self-switch check at
+    function entry read `current_process` with interrupts on; a
+    timer tick before the `cli` could set
+    `current_process = next`.  **`7fff450`** re-checks
+    `next == current_process` inside the `cli`.
+  - **Site 2 -- `timer_preempt_handler`.**  The timer returns
+    `next->rsp` directly; it does not call
+    `scheduler_switch_to`.  A peer wake could set
+    `current->state = READY` between the queue pop and the use,
+    so `next == current` and the timer returned the frame it had
+    just saved.  **`e21ebf0`** resumes `current`'s own frame as a
+    no-op switch.
 
-**Site 1 — `scheduler_switch_to`.**  Its self-switch check at
-function entry reads `current_process` with interrupts **on**.  A
-timer tick between that check and the `cli` can set
-`current_process = next`.  `7fff450` adds a second
-`next == current_process` re-check inside the `cli`, before the
-RUNNING guard.
+**Verified:** `pipe7e` `PIPE7E-ALL-PASS` at 200,000 iterations,
+`canary --full` 28/28, `test.sh` 57/57.  Tagged
+`20261014-selfswitch-two-sites` on `359e060`.
 
-**Site 2 — `timer_preempt_handler`.**  The timer does **not** call
-`scheduler_switch_to`; it returns `next->rsp` directly to
-`irq0_stub`, which does `mov rsp, rax`.  The path:
-
-  - The kernel-mode branch's pool rescan re-adds a RUNNING
-    `current` to the ready queue when it is not on it.
-  - The next tick's `scheduler_ready_queue_next()` pops
-    `current`.  Its guard skips a RUNNING head — but a peer wake
-    can set `current->state = READY` between the pop and the use.
-  - The quantum block then sets `current->state = READY`,
-    re-adds `current`, sets `next->state = RUNNING` (the same
-    process), and `return next->rsp` — which is the frame this
-    tick just saved.
-  - `irq0_stub` does `mov rsp, rax` and pops its own frame: the
-    `N == R` shape.
-
-**The fix at site 2:** in `timer_preempt_handler`, after the
-`!next` block and before `current->state = PROC_STATE_READY`, add
-
-    if (next == current) {
-        current->timeslice_ticks = 0;
-        return stack_pointer;
-    }
-
-so a self-pick resumes `current`'s own frame as a no-op switch,
-exactly as the `current->pid == 1` early return does.
-
-**The verification:** capture the run.  The `C` line's
-`N`/`R`/`S`/`F`/`P` values name the site — `N == R` with `S` a
-kernel stack address is the shape.  Run `pipe7e` to `iter 80500`
-with the serial teed to `capture.txt`, then `test.sh` 57/57 and
-`canary --full` 28/28.  Tag the verified state.
+**The queue-mutator race is also closed** (`c85d074`, tagged
+`20261014-queue-race-closed` on `3eb1d61`).
 
 ---
 
