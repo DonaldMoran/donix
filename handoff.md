@@ -332,15 +332,16 @@ Do not propose a `.ring0_save` fix -- Bug 2 is closed by `6bfa008`.
 
 ## Open issues (top 6)
 
-1. **Bug 3 -- a RUNNING process dispatched as `next`.**  Two sites,
-   two guards (`7fff450`, `e21ebf0`), unverified.  The read is the
-   `pipe7e` result.
-2. **`open-issues.md` item 12: signal delivery is a stub.**
-3. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
-4. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-5. **`sys_gettimeofday` (99)** so `ps -l` works.  Small.
-6. **`process_dump_all`'s `DETACHED` state** -- may mask a
+1. **`open-issues.md` item 12: signal delivery is a stub.**  The
+   largest open item; unblocks `kill`, ash job control (item 13),
+   and the Wayland `SIGBUS` path.
+2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
+3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
+4. **`sys_gettimeofday` (99)** so `ps -l` works.  Small.
+5. **`process_dump_all`'s `DETACHED` state** -- may mask a
    stranded-process bug.
+6. **Item 7a/7b** -- the boot-time `#PF` at `0x400000` and the
+   busybox `#GP` at `0x42F1A7`.  Both unobserved, not fixed.
 
 ---
 
