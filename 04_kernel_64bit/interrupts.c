@@ -551,6 +551,34 @@ timer_preempt_handler(uint64_t stack_pointer) {
             }
         }
 
+        /*
+         * timer: self-pick resumes current -- do not "switch" to it.
+         *
+         * scheduler_ready_queue_next() can pop `current`.  Its guard
+         * skips a RUNNING head, but a peer wake (process_wake_all_
+         * blocked, a pipe wake, a wait4 wake) can set
+         * current->state = READY between the pop and here, and the
+         * kernel-mode branch's pool rescan re-adds a stranded
+         * RUNNING current.  When next == current, the block below
+         * would set current->state = READY, re-add current, set
+         * next->state = RUNNING (the same process), and return
+         * next->rsp -- which is the frame THIS tick just saved at
+         * 0x110.  irq0_stub then does `mov rsp, rax` and pops its
+         * own frame: the 'C' halt, with N == R (next == the value
+         * in the RIP slot) and S a kernel stack address.
+         *
+         * 7fff450 guarded the scheduler_switch_to path; the timer
+         * does not call scheduler_switch_to -- it returns next->rsp
+         * directly -- so it needs its own check.
+         *
+         * A self-pick is a no-op switch: resume current's own frame,
+         * exactly as the current->pid == 1 early return above does.
+         */
+        if (next == current) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
         /* Only a RUNNING current goes back on the ready queue. A
            BLOCKED process must stay off it; that is what makes "a
            shell waiting for input does not prevent any other process
