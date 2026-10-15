@@ -1,3 +1,175 @@
+## The `C` line's five fields are named by the asm that prints them; decode them before proposing a fix
+
+*Session 65.  A method correction that would have saved the
+session's first three attempts.*
+
+`context_switch.asm`'s unknown-CS branch prints
+
+    C
+    N=<r12> R=<[rsp+78]> S=<[rsp+80]> F=<[rsp+88]> P=<[rsp+90]>
+
+The comment above the printer names each field.  The **test** is
+`S`, the CS slot: the halt fires because `S` is neither `0x18`
+nor `0x33`.  `R` is the RIP slot and is printed for context, not
+tested.  `N` is `r12`, the next PCB.
+
+**The rule.**  A diagnostic that prints five fields is a
+five-field claim.  Decode every field against the code that
+prints it before reading any of them as the fault.  This session
+read `R` as the fault (a "RIP holds a PCB pointer" story), then
+read `S` as zero from a GDB frame dump when the live `C` line
+said `S` was a kernel stack address — three stories, each killed
+by the field the code actually tests.
+
+**The signature.**  `N == R` in the `C` line means `next` equals
+the value in the frame's RIP slot — the self-dispatch
+signature.  `S` a kernel stack address and `P` zero means the
+frame base is a live stack frame, not a resume frame.
+
+## Two sites call `context_switch`; a guard at one is not a guard at both
+
+*Session 65.*
+
+`scheduler_switch_to` calls `context_switch(prev, next)` and can
+be guarded by a check on `next == current_process` and
+`next->state`.  `timer_preempt_handler` does **not** call
+`context_switch` — it returns `next->rsp` directly to
+`irq0_stub`, which does `mov rsp, rax`.  A guard added at
+`scheduler_switch_to` does not cover the timer path, and the
+timer path can pick `current` as `next` when a peer wake sets
+`current->state = READY` between the queue pop and the use.
+
+**The rule.**  Enumerate the callers of the primitive before
+guarding one of them.  `grep 'context_switch'` finds both; a
+guard written at the first is a guard at half the sites.  The
+same shape recurs at `process_exit`'s hand-off
+(`context_switch_no_save`), which is a third path.
+
+## `race_head[0]` is a write counter; the last-written index is `(race_head[0] - 1) % 256`
+
+*Session 65.*
+
+`race_record` does
+
+    uint64_t wr  = race_head[0];
+    uint64_t idx = wr % RACE_SLOTS;
+    ... write race_log[idx] ...
+    race_head[0] = wr + 1;
+
+So `race_head[0]` is the number of writes **completed**, and the
+last write landed at `(race_head[0] - 1) % RACE_SLOTS`, not
+`race_head[0] % RACE_SLOTS`.
+
+**The rule.**  A ring's head value is a count, not an index, when
+the increment happens after the write.  Read the write path to
+know which.  This session derived index 72 (wrong byte of the
+hex), then 137 (`% 256` of the count), before the **tick
+sequence** across the window named 136 — the record after which
+the tick drops from `0xFD4A0` to `0xFD47F`.  The tick sequence,
+not the arithmetic, was the check that caught it.
+
+**The complement.**  A ring's recency is **ring order**, not
+memory address.  "The last 64 entries" by address reads the
+stale tail when the ring has wrapped.
+
+## `process_initialize_pcb` memsets the PCB; `kernel_stack_slot_free` does not clear the stack
+
+*Session 65.*
+
+`process_initialize_pcb` does `memset(pcb, 0, sizeof(pcb_t))`, so
+a reused PCB carries no stale `rsp`, `rip`, `next`, `prev`, or
+GPR fields.  `kernel_stack_slot_free` clears the slot ownership
+and the PCB's pointers but **does not touch the 16 KB stack
+region**, so a reused slot carries the previous process's frames.
+
+**The rule.**  Two resources, two teardowns.  A reused PCB is
+clean; a reused stack is not.  A stale frame read from a reused
+slot looks like a live frame with wrong-kind values.  Clearing
+the stack in `kernel_stack_slot_free` is the missing teardown.
+
+## `preempt_frame_t` matches `PUSH_ALL_GPRS` exactly
+
+*Session 65.*
+
+`interrupts.c`'s `preempt_frame_t` declares `r15 … r8`, `rbp …
+rax`, `rip, cs, rflags, rsp, ss`.  `isr.asm`'s `PUSH_ALL_GPRS`
+pushes `rax` first and `r15` last, so `rsp` after the macro
+points at the `r15` slot, and the CPU's five slots land at
+`+0x78..+0x98`.  The struct and the macro agree slot for slot.
+
+**The rule.**  A frame-layout mismatch is a candidate only after
+the struct and the push order are compared.  This session
+considered a layout mismatch as the `C`'s cause; the comparison
+refuted it in two reads.
+
+## A critical section for a queue must cover the whole function, not just the link
+
+*Session 65.  The queue-mutator race.*
+
+`scheduler_ready_queue_add` had no `cli`.  The window is not only
+the link write — it is **between the guard and the write**, and
+it includes every early return.  A timer tick mid-add runs
+`process_wake_all_blocked`, which calls `_add` and `_remove`:
+one mutation nests inside another.
+
+**The rule.**  Wrap the whole function: save RFLAGS, `cli`, do
+the work, restore RFLAGS on **every** return path including the
+early ones.  A `cli` around only the link write leaves the guard
+and the walk unprotected, and the nested call is the producer.
+
+## A verification check with a wrong expected count makes a correct edit look broken
+
+*Session 65.  Three times in one session.*
+
+An edit script's post-write check asserts a count.  When the
+expected count is wrong, the check fails, the diff is correct,
+and the session spends a round trip on a non-bug.
+
+**The rule.**  Count occurrences in the tree before writing the
+expected count into the check.  `grep -c` the actual file; do
+not compute the count from the edit's intent.
+
+## A triple-quoted string in a Python edit must be closed before the next statement
+
+*Session 65.*
+
+A missing `""", 1)` produces a `SyntaxError`.  The tree is
+unchanged when a script fails this way — a `SyntaxError` means
+nothing ran — but the error consumes the next line, so the
+reported failure points at the wrong place.
+
+**The rule.**  Read the edit script's `SyntaxError` as "nothing
+ran."  Fix the string, re-run; do not debug the tree.
+
+## An `#if` block that gates a `static` variable leaves it unreferenced
+
+*Session 65.*
+
+`interrupts.c`'s `_7e_empty_streak` is incremented outside
+`#if RACE_PROBE_IDLE_DUMP` and read only inside it.  With the
+gate off, the compiler warns `set but not used`.  The build does
+not fail — there is no `-Werror`.
+
+**The rule.**  A warning from a gated block is not a failure.
+Leave it, or move the variable inside the gate; do not add
+`-Werror` to silence it.
+
+## A captured fault that is not written to disk is a run that has to be repeated
+
+*Session 65.*
+
+A `C` fired again with the site-1 guard in the tree, and the
+capture was lost.  The run has to be repeated to know the
+`N`/`R`/`S`/`F`/`P` values.
+
+**The rule.**  Before a long timing-sensitive run, redirect the
+serial to a file.  `capture.txt` is the file; one run per
+truncate.  A fault the terminal scrolled past is a fault with no
+record.
+
+---
+
+
 ## A diagnostic on the success path is noise; on the failure path it is signal
 
 *Session 63.  The cleanup phase of the eight-fix cycle.  Not a

@@ -1,3 +1,117 @@
+## Session 65 — the queue race closes; the `C` is two sites, not one
+
+*2026-10-14.  A full session: the queue-mutator race closed, the
+`C` at `iter 80500` traced to two dispatch sites, and both files
+rewritten to a live-list shape.*
+
+**The headline: `c85d074` closed the queue-mutator race.**
+`scheduler_ready_queue_add` had no `cli` and is called with
+interrupts on from `process_yield`, so a timer tick mid-add ran
+`process_wake_all_blocked`, which calls `_add` and `_remove` —
+one queue mutation nested inside another, leaving a tail move
+with no matching clear.  The fix wraps `_add`, `_remove`, and
+`_next` in save-flags/`cli`/restore-flags: each whole function
+is one critical section, and every early return restores the
+interrupt flag.  Verified: `bad_tail_next = 0` across 3,098,489
+P8 checks in a `pipe7e` run that reached `iter 80500` (before
+the fix: 500+ over 100,000 iterations).
+
+**The tag:** `20261014-queue-race-closed` on `3eb1d61`.
+
+### The `C` at iter 80500
+
+`pipe7e` reached `iter 80500` and hit `context_switch.asm`'s
+unknown-CS halt:
+
+    C
+    N=FFFFFFFF8027C7D0 R=FFFFFFFF8027C7D0 S=FFFFFFFF8029B2A0
+    F=FFFFFFFF8011B895 P=0000000000000000
+
+The `C` printer's five fields are `N=<r12>` (the next PCB),
+`R=<[rsp+0x78]>` (the RIP slot), `S=<[rsp+0x80]>` (the CS slot —
+**the test**), `F=<[rsp+0x88]>` (RFLAGS), `P=<[rsp+0x90]>` (RSP).
+The halt fires because `S` is neither `0x18` nor `0x33`.
+
+Here `N == R`: `next` is `C7D0` and the frame's RIP slot holds
+`C7D0`.  `S` is a kernel stack address, `F` is `process_exit+757`,
+`P` is 0 — the values of `context_switch`'s own locals on the
+stack, not a resume frame.  The dispatch was
+`context_switch(next, next)`: `prev == next`.
+
+### Two sites, two guards
+
+**Site 1 — `scheduler_switch_to`.**  Its self-switch check at
+function entry reads `current_process` with interrupts on.  A
+timer tick between the check and the `cli` can set
+`current_process = next`.  **`7fff450`** adds a second
+`next == current_process` re-check inside the `cli`, before the
+RUNNING guard.  **It did not close the `C`** — it fired again on
+a run with the fix in the tree (capture lost); a later run was
+clean.
+
+**Site 2 — `timer_preempt_handler`.**  The timer does not call
+`scheduler_switch_to`; it returns `next->rsp` directly to
+`irq0_stub`, which does `mov rsp, rax`.  `scheduler_ready_queue_next()`
+can pop `current`: its guard skips a RUNNING head, but a peer wake
+can set `current->state = READY` between the pop and the use, and
+the kernel-mode branch's pool rescan re-adds a stranded RUNNING
+`current`.  When `next == current`, the quantum block set
+`current->state = READY`, re-added `current`, set
+`next->state = RUNNING` (the same process), and returned
+`next->rsp` — the frame this tick had just saved.  `irq0_stub`
+popped its own frame.  **`e21ebf0`** adds a `next == current`
+guard that resumes `current`'s own frame as a no-op switch.
+
+**Both guards are unverified at the time of writing** — the
+`pipe7e` run that decides them is in progress.
+
+### Closed this session, in order
+
+| Commit | Subject |
+|---|---|
+| `7aaaafd` | `pipe: remove the reader's self-clear of pipe->reader_waiting` |
+| `d3c7f20` | `sched: RUNNING-next guard must be inside the cli, not before it` |
+| `c85d074` | `sched: _add, _remove, _next are critical sections` |
+| `3eb1d61` | `diag: gate the empty-queue dumps behind RACE_PROBE_IDLE_DUMP` |
+| `7fff450` | `sched: re-check next == current_process inside the cli` |
+| `e21ebf0` | `sched: timer self-pick resumes current, does not switch to it` |
+| `03af23a` | `docs: open-issues is a live list; next thing is the two-site C` |
+
+The four dispatch guards from the same span —
+`8dc47cf`, `85da375`, `e7e3e6b`, `d7d8c40` — are the site-1
+history before `7fff450`.
+
+### What was verified
+
+| Test | Result |
+|---|---|
+| `bad_tail_next` across a `pipe7e` to `iter 80500` | 0 in 3,098,489 P8 checks |
+| `pipe7e` to `iter 80500`, post-`e21ebf0` | in progress |
+| `test.sh` | pending the run |
+| `canary --full` | pending the run |
+
+### Files rewritten
+
+`open-issues.md` was rewritten from a 1143-line historical
+document to a live list of open issues only; the closed items
+(Bug 1, Bug 2, 7d, 11, 7c, 7, the `user_rsp` writer) and the
+historical writeups were dropped.  `handoff.md` was rewritten to
+the 2026-10-14 state.  This file and `gotchas.md` follow.
+
+### The method correction this session earned
+
+The `C`'s five fields were decoded against the asm that prints
+them only at the **end** of the session, after three successive
+"the fix is here" stories (the pipe-reader loop-back, a
+`sys_read` loop-back, a timer-frame copy).  The `N == R` shape
+in the actual `C` line named the real mechanism on the first
+read; the work was in decoding the five fields against the
+`context_switch.asm` printer, which the first message of the
+session already contained.  Recorded as a gotcha.
+
+---
+
+
 ## Session 63 — the eight fixes and five cleanups, applied to donix
 
 One documentation session plus the cherry-pick it records.  **Not
