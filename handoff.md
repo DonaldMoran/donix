@@ -5,11 +5,9 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-14 (close).  The queue-mutator race is
-CLOSED and tagged.  The `pipe7e` `C` is CLOSED -- two sites, two
-guards, verified by `pipe7e` at 200000 iterations, `canary --full`
-28/28, and `test.sh` 57/57, tagged `20261014-selfswitch-two-sites`.
-Read "NEXT SESSION" first.
+**Last updated:** 2026-10-15.  The queue-mutator race is CLOSED and
+tagged.  The `pipe7e` `C` is OPEN -- four shapes at `pit_init(250)`,
+one root (frame placement).  Read "NEXT SESSION" first.
 
 **THE HEADLINE: `c85d074` closed the queue-mutator race.**
 `scheduler_ready_queue_add` had no `cli` and is called with
@@ -23,8 +21,7 @@ section.  Verified: `bad_tail_next = 0` across 3,098,489 P8 checks
 **The queue race is closed and tagged.**  Tag
 `20261014-queue-race-closed` on `3eb1d61`.
 
-**THE `C` IS CLOSED: a RUNNING process dispatched as `next` — two
-sites, two guards, verified.**  `pipe7e` reached `iter 80500` and
+**THE `C` IS OPEN: a resume frame that is not a valid resume frame.**  `pipe7e` reached `iter 80500` and
 hit `context_switch.asm`'s unknown-CS halt:
 
     C
@@ -60,9 +57,13 @@ popped its own frame.  **Fixed by `e21ebf0`** — a self-pick now
 resumes `current`'s own frame as a no-op switch.  **Being tested
 as this file is written.**
 
-**Verified:** `pipe7e` `PIPE7E-ALL-PASS` at 200,000 iterations,
-`canary --full` 28/28, `test.sh` 57/57.  Tagged
-`20261014-selfswitch-two-sites` on `359e060`.
+**The default-rate shape is closed** (`7fff450` + `e21ebf0`,
+tagged `20261014-selfswitch-two-sites`).  **The 250 Hz shapes are
+open.**  `63c44ff` and `359c895` closed two of them; the fourth,
+`N->rip == put_file_slot + 956`, is open.  The root is frame
+placement: `pcb->rsp` points at a frame the process's own kernel C
+stack overwrites.  The structural fix -- a reserved frame region at
+the top of each kernel stack -- is the next session's work.
 
 **Repo state -- run these; do not write it here.**
 
