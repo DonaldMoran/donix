@@ -281,34 +281,79 @@ Unobserved, not fixed.  Different vector, location, and phase from
 
 ## NEXT SESSION
 
-**Step 0: read the running `pipe7e` result.**
+**The task: fix the `C`.  It is the only thing on this list.**
 
-- **Clean to `iter 80500` (and to `iter 100000` if the test goes
-  that far):** run it a second time.  Two clean runs close Bug 3.
-  Then `test.sh` 57/57 and `canary --full` 28/28, then tag the
-  verified state.
-- **`C` again with `N == R`, `S` a kernel stack address:** the guard
-  did not catch the path.  The next read is `S` and `F`: if
-  `S == N` the frame base is the PCB itself; if `S` is a kernel
-  stack address, the resume loaded a stack address from somewhere
-  that is not `pcb->rsp`.
-- **`C` with a different shape:** a third site.  New evidence; add a
-  third entry to the top block.
+The `C` is `context_switch.asm`'s unknown-CS halt.  At
+`pit_init(250)`, `pipe7e` fires it at `iter 10000` with:
 
-**Step 1: the regression set** -- `test.sh` 57/57, `canary --full`
-28/28 -- and tag the verified state.
+    C
+    N=FFFFFFFF8027C810 R=0000000000408124 S=FFFFFFFF8029B2B0
+    F=0000000000408124 P=FFFFFFFF8027C1F8
 
-**Step 2: the candidates, in order.**
+GDB reads from that halt: `N = PIPE7E_HELPER`, `N->state =
+RUNNING`, `N->rip = put_file_slot + 956`, and
+`N->rsp == $rsp` (`p/x $rsp - N->rsp == 0`).
 
-1. **Item 12 -- signal delivery.**  Largest; unblocks `kill`, ash
-   job control, the Wayland `SIGBUS` path.  A workstream.
-2. **`sys_gettimeofday` (99).**  Small, patterned, independent.
-   Unlocks `ps -l`.
-3. **Item 10 -- the XMM save.**  Kernel-side FXSAVE/FXRSTOR, then
-   drop `-mno-sse*` from the userland CFLAGS.
-4. **The `process_dump_all` `DETACHED` state** -- a process READY
-   with `prev == NULL && next == NULL` is labeled DETACHED, which
-   may mask a stranded-process bug.
+**The root, established this session:** the timer frame is built
+at the kernel C stack's live `rsp`.  When the C stack unwinds,
+its `pop`s read the frame's slots.  The frame is not overwritten
+by growth; it is overwritten by the C stack's own unwind, because
+the frame sits in the addresses the C stack will pop through.
+Four `C` shapes at 250 Hz are four instances of this one root.
+
+**The fix, and the attempt that failed:**
+
+- **Attempted:** `67701df` reserved `FRAME_RESERVE` (0x400) at
+  the top of each kernel stack and moved `TSS.RSP0` and
+  `g_syscall_stack_top` down by it.  **It broke `wait4`** -- the
+  first `musl_sh` `wait4` returned to RIP 0/RSP 0 (a `#PF` with
+  `CR2 = 0`), because `sys_execve`'s offsets and the `wait4`
+  path's frame offsets were written for the old `top - N` layout
+  and were not all moved.  Reverted in `5587d70`.  **The reserve
+  is still the right direction; the offsets it needs are
+  incomplete.**
+
+- **The task:** move the timer frame into a region the C stack's
+  unwind cannot reach, **and move every offset that anchors at
+  `kernel_stack_top` together.**  The sites to move, from
+  `grep -rn 'kernel_stack_top'`:
+    - `user_syscall_entry.asm`'s 11 pushes and the
+      `g_user_rsp_save` slot (relative to `rsp`, so they follow
+      if the start moves).
+    - `process_create`'s initial frame at `top - 0xA0`.
+    - `process_fork_copy_frame`'s frame at `top - 0xA0` and its
+      reads at `top - 56`, `-64`, `-72`.
+    - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]` (moved
+      in `67701df`, but the rest of the path was not).
+    - **`sys_wait4`'s syscall-entry frame offsets -- NOT YET
+      READ.  This is the path that broke `67701df`.  Read it
+      before retrying the reserve.**
+    - every `tss_set_kernel_stack` / `tss_set_syscall_stack`
+      call site (14 of them), which is one edit in `tss.c`.
+
+- **Then `irq0_stub` copies the kernel-mode interrupt frame into
+  the reserve.**  The user-mode frame is already in the reserve
+  (the CPU switched to `TSS.RSP0`); only the kernel-mode path
+  needs the copy.  The copy is 20 quadwords: push the 15 GPRs at
+  the live `rsp`, copy all 20 slots to the reserve, call the
+  handler with the reserve base, `iretq` from there.
+
+**Order of work:**
+
+1. Read `sys_wait4`'s frame offsets (`grep -n 'kernel_stack_top'
+   04_kernel_64bit/user_syscall.c`, then the function).
+2. Read the other offset sites the failed attempt missed.
+3. Write the complete offset map into this file.
+4. Re-apply the reserve with **every** offset moved.
+5. Add the `irq0_stub` copy.
+6. Run `pipe7e` at `pit_init(250)` past `iter 10000`, then
+   `canary --full` and `test.sh`.
+
+**Do not stop at the guard.**  The four guards (`7fff450`,
+`e21ebf0`, `63c44ff`, `359c895`) each closed a reachable
+self-pick.  They are correct and they stay.  They are not the
+fix.  The fix is the frame placement, and this session must
+land it.
 
 ### Do not
 
