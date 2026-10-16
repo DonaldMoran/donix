@@ -43,8 +43,10 @@ cannot reach, and move **every** offset that anchors at
   - `process_fork_copy_frame` (`top - 0xA0`, reads at `-56`,
     `-64`, `-72`).
   - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]`.
-  - **`sys_wait4` -- NOT YET READ.  This is the path that broke
-    `67701df`.  Read it first.**
+  - **`sys_execve`'s full frame layout -- NOT YET READ.**  The
+    reserve moved `ktop` but the entry's pushes are at
+    `ktop - 88`; `ktop[-7]` is off by 24.  `sys_wait4` was
+    checked and has no absolute-offset read.
   - the 14 `tss_set_*` call sites (one edit in `tss.c`).
   - `irq0_stub`'s kernel-mode copy of the 20-slot frame into the
     reserve.
