@@ -5,65 +5,71 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-15.  The queue-mutator race is CLOSED and
-tagged.  The `pipe7e` `C` is OPEN -- four shapes at `pit_init(250)`,
-one root (frame placement).  Read "NEXT SESSION" first.
+**Last updated:** 2026-10-16.  The `C` is **CONTAINED, not closed**.
+The mechanism is named to the last step (a ZOMBIE reaches dispatch),
+a guard refuses it, and the machine now runs past the point every
+prior build died.  The **cause** -- how a zombie reaches
+`scheduler_switch_to` as `next` -- is OPEN and is the task.  Read
+"NEXT SESSION" first.
 
-**THE HEADLINE: `c85d074` closed the queue-mutator race.**
-`scheduler_ready_queue_add` had no `cli` and is called with
-interrupts on from `process_yield`, so a timer tick could fire
-mid-add and nest another `_add`/`_remove` inside it, leaving a tail
-move with no matching clear.  Wrapping `_add`, `_remove`, and
-`_next` in save-flags/`cli`/restore-flags made each one a critical
-section.  Verified: `bad_tail_next = 0` across 3,098,489 P8 checks
-(3.1 million) in a `pipe7e` run that reached `iter 80500`.
+**THE `C`, in one paragraph.**  `context_switch_resume` loads
+`next->rsp` and reads 20 slots as a resume frame.  The 2026-10-16
+SW2-trace run named the last step: `scheduler_switch_to` is entered
+with `next->state == PROC_STATE_ZOMBIE` (st=4), `next->rsp` points at
+a **zeroed** region (no resume frame), the function sets the state
+RUNNING and calls `context_switch`, and the resume reads CS = 0 and
+halts.  A zombie has called `process_exit`; it is not runnable and has
+no frame.  This is **containment**: `scheduler_switch_to` now refuses
+`next->state == ZOMBIE || TERMINATED` before the `current_process`
+assignment (print tag `SWITCH-DEAD`).  The zombie is left for its
+parent to reap and the dispatch does not happen.
 
-**The queue race is closed and tagged.**  Tag
-`20261014-queue-race-closed` on `3eb1d61`.
+**The churn -- the slot is CONSTANT, the owner changes.**  A 100 kHz
+pipe7e run produced five `SWITCH-DEAD` events in 24500 iterations,
+all on the SAME pool slot:
 
-**THE `C` IS OPEN: a resume frame that is not a valid resume frame.**  `pipe7e` reached `iter 80500` and
-hit `context_switch.asm`'s unknown-CS halt:
+    iter  9500  SWITCH-DEAD  next=0xFFFFFFFF8027D530  pid=9811   st=4  PIPE7E_HELPER
+    iter 11000  SWITCH-DEAD  next=0xFFFFFFFF8027D530  pid=11348  st=4  PIPE7E_HELPER
+    iter 18000  SWITCH-DEAD  next=0xFFFFFFFF8027D530  pid=18442  st=4  PIPE7E_HELPER
+    iter 20000  SWITCH-DEAD  next=0xFFFFFFFF8027D530  pid=20378  st=4  PIPE7E_HELPER
+    iter 24500  SWITCH-DEAD  next=0xFFFFFFFF8027D530  pid=24559  st=4  PIPE7E_HELPER
+    iter 28500  YIELD-REFUSE  next pid=1 name=idle state=RUNNING
 
-    C
-    N=FFFFFFFF8027C7D0 R=FFFFFFFF8027C7D0 S=FFFFFFFF8029B2A0
-    F=FFFFFFFF8011B895 P=0000000000000000
+The pid changes and increases; the slot does not.  So the slot is
+reclaimed and reused, and a reference to it survives the reclaim and
+reaches dispatch.  **The reference is SLOT-SPECIFIC, not "last
+reclaimed"** -- if it were the last reclaimed, the slot would vary.
+Whatever holds it names THIS slot (`0xFFFFFFFF8027D530`) and is not
+cleared when the slot is reclaimed.  That is the narrowing clue.
 
-`N == R`: `next` is `C7D0` and the frame's RIP slot holds `C7D0`.
-`S` is a kernel stack address, `F` is `process_exit+757`, `P` is
-0 — the values of `context_switch`'s own locals on the stack, not a
-resume frame.  The dispatch was `context_switch(next, next)`:
-`prev == next`.
+`YIELD-REFUSE` on idle also fires (same class: a RUNNING process
+selected), so both containment paths are active.
 
-**Site 1 — `scheduler_switch_to`.**  Its self-switch check at
-function entry reads `current_process` with interrupts **on**.  A
-timer tick between that check and the `cli` can set
-`current_process = next`.  **Fixed by `7fff450`** — a second
-`next == current_process` re-check inside the `cli`, before the
-RUNNING guard.  **`7fff450` did not close the `C`** — it fired
-again on a run with the fix in the tree, capture lost; a later run
-was clean.
+**What landed (commit `6f7344b`).**
+  - `scheduler.c`: `scheduler_switch_to` refuses ZOMBIE/TERMINATED
+    dispatch before the assignment.  Print tag `SWITCH-DEAD`.  **Keep.**
+  - `scheduler.c`: the `SW2-*` dispatch trace (entry, after the
+    assignment, before the call) is gated behind `SW2_TRACE`,
+    default 0.  Flip to 1 for a diagnosis build.  **Keep.**
+  - Plus the session's earlier dispatch work, in the same commit:
+    `process_exit`'s zombie `no_save`; the three rescans that no
+    longer re-add a RUNNING process; the `noop_switch` guard; the
+    extended `C` report; the pipe block paths via `process_yield`;
+    the `isr.asm`/`tss.c` fault-stack fallback; the three range-check
+    detectors (detectors, NOT fixes).
 
-**Site 2 — `timer_preempt_handler`.**  The timer does **not** call
-`scheduler_switch_to`; it returns `next->rsp` directly to
-`irq0_stub`, which does `mov rsp, rax`.  `scheduler_ready_queue_next()`
-can pop `current`: its guard skips a RUNNING head, but a peer wake
-can set `current->state = READY` between the pop and the use, and
-the kernel-mode branch's pool rescan re-adds a stranded RUNNING
-`current`.  When `next == current`, the quantum block set
-`current->state = READY`, re-added `current`, set
-`next->state = RUNNING` (the same process), and returned
-`next->rsp` — the frame this tick had just saved.  `irq0_stub`
-popped its own frame.  **Fixed by `e21ebf0`** — a self-pick now
-resumes `current`'s own frame as a no-op switch.  **Being tested
-as this file is written.**
+**The `process_destroy` fix (commit `c2a3f89`, tag
+`20261016-destroy-both-current`).**  `process_destroy` wrote
+process.c's file-local `current_process` directly, leaving
+scheduler.c's copy pointing at the destroyed PCB.  Route the clear
+through `scheduler_set_current`.  Independently correct.  **Not** the
+`C`'s holder -- at the last `C` both copies agreed.
 
-**The default-rate shape is closed** (`7fff450` + `e21ebf0`,
-tagged `20261014-selfswitch-two-sites`).  **The 250 Hz shapes are
-open.**  `63c44ff` and `359c895` closed two of them; the fourth,
-`N->rip == put_file_slot + 956`, is open.  The root is frame
-placement: `pcb->rsp` points at a frame the process's own kernel C
-stack overwrites.  The structural fix -- a reserved frame region at
-the top of each kernel stack -- is the next session's work.
+**THE RATE.**  100 kHz (`pit_init(100000)`) is the **interleaving
+lab**: it stresses timing windows.  100 Hz (shipping) is **path
+coverage**: user-mode preemption and run-to-completion.  Neither
+subsumes the other; validate a fix under both.  ~1 event per 4500
+iterations at 100 kHz is ~1 per ~4.5M at 100 Hz.
 
 **Repo state -- run these; do not write it here.**
 
@@ -77,459 +83,220 @@ the top of each kernel stack -- is the next session's work.
 Read this before proposing any command block.
 
 **One change at a time.** A "change" is a commit, verified before the
-next one starts.
+next one starts.  **Verify by RUNNING, not by committing** -- build,
+run, see the behavior, THEN commit.
 
 **The state check comes before the command block.** Every command
 block starts with `git status -sb` (or `git log`).
 
-**A command block is one paste -- but write it to a file first.**
+**A command block is one paste -- write it to a file first.**
 `git add`, `git status`, `git commit`, and `git tag` belong in **one**
-block, with the commit message inline via heredoc.  **Do not paste a
-block with `cd ... || exit 1` into an interactive shell** -- the
-`exit` closes the terminal.  Write the block to `/tmp/<name>.sh` with
-`cat > ... <<'SCRIPT_EOF'`, then run `bash /tmp/<name>.sh`.
-
-**Two file-return styles.** Small files: complete file, four-backtick
-fenced. Large files: unified-diff hunk or copy-block insertion,
-preceded by `WORK BEGINS HERE.`.
+block, with the message inline via heredoc.  **Do not paste a block
+with `cd ... || exit 1` into an interactive shell** -- the `exit`
+closes the terminal.  Write to `/tmp/<name>.sh` with
+`cat > ... <<'SCRIPT_EOF'`, then `bash /tmp/<name>.sh`.
 
 **Python edits with `count != 1` abort checks are the preferred edit
-style.** **Put `set -e` at the top of the script** if the block edits
-and commits.  **Idempotent edit scripts.** A Python edit that adds a
-block must check whether the block already exists.
+style.**  **`set -e` at the top.**  **Idempotent edit scripts.**
+**Do the count check IN PYTHON (`str.count`), not with `grep`.**
+`grep -Fc` does not do multi-line matches; `grep -Fxc` requires a
+whole-line match.  Both produced false abort counts this session.
+`str.count` is the only honest multi-line count.
 
-**Count occurrences before asserting a count.**  A verification
-check whose expected count is wrong makes a correct edit look
-broken.  Three times this session a check failed on a wrong
-expected count, not on a broken edit.  Check the actual count
-first.
+**BEFORE ASSERTING A COUNT, count the occurrences in the file and
+write the expected number from that count, not from memory.**
 
-**A triple-quoted string in a Python edit must be closed before the
-next statement.**  A missing `""", 1)` produced a `SyntaxError` that
-consumed the next line.  The tree is unchanged when a script fails
-this way -- a `SyntaxError` means nothing ran.
+**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.**  Grep the
+file, confirm the count is 1 **and** the match is in the intended
+function.
 
-**A post-write check string must be copied from the `new` literal
-in the edit script, not retyped.**  Retyping loses a backtick or a
-parenthesis and fires a spurious `ERROR:`.
+**A post-write check string must be copied from the `new` literal,
+not retyped.**
 
-**Ask for source you do not have.** Before patching a file it has
-not seen **in this session**, ask for it.  **Before writing an
-anchor, read the file with `cat -A` and quote the bytes.** **Anchor
-on structure, not whitespace.**
+**Ask for source you do not have.**  Before patching a file it has
+not seen **in this session**, ask for it.  **Before writing an anchor,
+read the file with `cat -A` and quote the bytes.**
 
-**A diagnostic that saturates the serial console changes the timing
-of the system it is trying to observe.  A diagnostic on the SUCCESS
-path is noise.  A diagnostic on the FAILURE path is signal.**
+**The build is TWO steps.**  `make -C 04_kernel_64bit
+FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
+hdd-single.img` builds the image.  Running only the second copies a
+STALE `kernel.bin`.  Always run both, and verify `kernel.elf` is newer
+than the source you edited.
 
-**Commit diagnostics before any `git reset --hard`.**
+**`nm` output moves between builds.**  Re-run `nm` before using any
+address.
 
-**The QEMU monitor socket is a diagnostic tool.**  `qemu-system`
-started with `-monitor unix:/tmp/donix-mon,server,nowait` can be
-read with `socat - UNIX-CONNECT:/tmp/donix-mon`.  **Under
-`-enable-kvm`, the monitor's `xp` cannot translate guest kernel
-virtual addresses -- use `x` instead.**
+**A diagnostic on the SUCCESS path is noise.  A diagnostic on the
+FAILURE path is signal.**  `SW2-*` is success-path (gated).  The
+refuse lines (`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`,
+`EXIT-REFUSE`) and the `C` report are failure-path (kept).
 
-**GDB over the `-s` stub is the read for the live or halted PCB.**
-`gdb 04_kernel_64bit/kernel.elf`, then `target remote :1234`.
-**Connecting halts the guest; detach resumes it.**  Do not attach
-during a timing-sensitive run -- a pause changes the timing.  Attach
-after the run finishes, or immediately when it stalls.
+**`SWITCH-DEAD` print decision.**  Keep it **unconditional** while
+chasing the cause -- it is the only visible evidence the underlying
+selection bug is active.  Gate it (or remove it) once the selection is
+fixed.
 
-**`nm` output moves between builds.**  Re-run
-`nm 04_kernel_64bit/kernel.elf | sort` before using any address.
+**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT `-g`).
+Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028, `cr3`
+0x030, `entry_point` 0x038, `kernel_stack_virt` 0x048,
+`kernel_stack_top` 0x050, `rsp` 0x110, `rip` 0x118, `next` 0x120,
+`prev` 0x128, `block_kind` 0x158.  `sizeof(pcb_t)` = 0x618.  Read the
+PCB dump and identify fields by value.  **CONSIDER BUILDING WITH
+`-g`.**
 
-**Two identical register reads do not distinguish "hung" from
-"livelocked at high frequency."  The tick counter (`g_ticks`) does.**
-
-**A frame slot holds a specific kind of value.**  A PCB field that
-is the same width may be a different kind.  Check the kind before
-moving a value into a slot.
-
-**A field's comment is a claim about its use.**  `pcb->user_rsp`'s
-comment said "the USER stack pointer" while the writer put a kernel
-address in it.  The comment was right; the writer was wrong.
-
-**The build does not have `-Werror`; a warning is not a failure.**
-An `unused variable` warning from a gated block is fine.
-
-**Verify a label's scope before adding a second non-local label to
-an asm file.**  NASM scopes `.`-labels to the most recent non-local
-label.  A second entry point needs a non-local target for both to
-reach.
-
-**A faulting `C` that is not captured is a run that has to be
-repeated.**  Run `pipe7e` with the serial teed to `capture.txt`.
-The handoff's own rule: "A captured fault is not a diagnosed one."
+**Do not run `git reset --hard` without stashing first.  Do not edit
+`third_party/`.  Do not commit `kmain.c`'s `pit_init(100000)` -- the
+committed value is 100.  Do not call the `C` closed on one clean run.**
 
 ---
 
 ## What donix is
 
-A fork of dons-os. Goal: a Unix-like OS that runs static
-musl-linked binaries on the Linux x86_64 syscall ABI, natively.
-Newlib is gone. Userland is a tracked source tree at
-`userland/musl/`. Phase B (busybox) is well underway.
+A fork of dons-os.  Goal: a Unix-like OS that runs static musl-linked
+binaries on the Linux x86_64 ABI, natively.  Newlib is gone.
+Userland is a tracked source tree at `userland/musl/`.  Phase B
+(busybox) is well underway.
 
-Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
+Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
 
 ---
 
 ## Where we are
 
-### CLOSED -- the queue-mutator race (`c85d074`)
+### OPEN -- how a ZOMBIE reaches `scheduler_switch_to` as `next`
 
-**The race was real and is now closed.**  `scheduler_ready_queue_add`
-had no `cli` and is called from `process_yield` with interrupts ON.
-A timer tick mid-add runs `process_wake_all_blocked`, which calls
-`_add` and `_remove` -- so one queue mutation could nest inside
-another, leaving a tail move with no matching clear.
+**This is the task.  It is the only thing on this list.**
 
-**The fix:** `_add`, `_remove`, `_next` each save RFLAGS, `cli`, do
-their work, and restore RFLAGS on every return path (including the
-early returns).  The whole function is one critical section.
+The `C` is contained (`SWITCH-DEAD`).  The **cause** is that a zombie
+is being *selected* for dispatch.  A zombie was removed from the ready
+queue by `process_exit` (`scheduler_ready_queue_remove(exiting)`), and
+the three rescans skip non-READY (`if (_p->state !=
+PROC_STATE_READY) continue;`), so no rescan re-adds it.  Yet it
+reaches dispatch, on ONE slot, with the pid changing -- so the slot is
+reclaimed and reused, and a SLOT-SPECIFIC reference survives.
 
-**The evidence:** `bad_tail_next = 0` across 3,098,489 P8 checks in
-a run that reached `iter 80500`.  Before the fix it reached 500+ over
-100,000 iterations.  The two earlier fixes (`ecae22a` add link order,
-`93eda39` remove tail clear) closed genuine transient windows but
-were not the producer; the nesting was.
+**Where a stale `pcb_t*` can live.**  Search these, in this order:
+  1. `ready_queue_head` / `ready_queue_tail` -- the queue may hold a
+     pointer to a reclaimed PCB.
+  2. `pcb->next` / `pcb->prev` (offsets 0x120 / 0x128) of *other*
+     PCBs -- a link to a reclaimed PCB left in a live neighbor.
+  3. `current_process` (both copies -- they agreed at the last `C`).
+  4. `pipe->reader_waiting` / `pipe->writer_waiting` -- RULED OUT for
+     pipe7e: the helper writes 2 bytes into a 4096-byte pipe and never
+     blocks, so the waiter fields are never set on this path.
+  5. `parent->wait_pid` -- a pid, not a pointer; resolved via
+     `process_find_by_pid`, which skips UNUSED.  Low risk.
 
-**Tagged** `20261014-queue-race-closed` on `3eb1d61`.
+**The instrument to run first.**  At `SWITCH-DEAD`, walk the ready
+queue and every live PCB's `next`/`prev` and print any that equal the
+zombie's `next` pointer.  Gate it behind `SW2_TRACE` so it only fires
+when the guard fires.  The zombie slot was `0xFFFFFFFF8027D530` in the
+last build; re-run `nm` for the current value.
 
-### CLOSED -- the pipe reader's lost wakeup (`7aaaafd`)
+**The narrowing clue:** the slot is CONSTANT across events.  A
+reference that is "the last reclaimed slot" would vary; this one does
+not.  So the holder names this slot specifically and is not cleared
+on reclaim.  Candidates that fit "names one slot persistently":
+`ready_queue_tail`, a specific `pcb->next`/`prev`, or a static local.
 
-`sys_read`'s pipe loop cleared `pipe->reader_waiting` at the top of
-every iteration and re-published at the block site, in a different
-`cli` section.  A writer in the gap found NULL and did nothing.
-Removed the self-clear; the reader leaves the field set across
-wakeups and re-publishes at each block.
+### LANDED -- containment (`6f7344b`)
 
-### CLOSED -- the `test.sh` row-30 `C` (`d3c7f20`)
+See "What landed" at the top.
 
-`scheduler_switch_to`'s RUNNING-next guard read `next->state` above
-the `cli`; a tick changed it before the `cli`; the dispatch resumed
-a stale frame.  Moved the guard inside the `cli`, with `sti` on the
-refuse path.  `test.sh` 57/57 and `canary --full` 28/28 after it.
+### CLOSED
 
-### CLOSED -- Bug 1, the user-RSP writer (`d6ada2f`)
+- **The `process_destroy` single-copy write** (`c2a3f89`, tag
+  `20261016-destroy-both-current`).
+- **The queue-mutator race** (`c85d074`).
+- **The pipe reader's lost wakeup** (`7aaaafd`).
+- **Bug 1, the user-RSP writer** (`d6ada2f`).
+- **Bug 2, the `process_exit` hlt-guard resume** (`6bfa008`).
 
-`timer_preempt_handler`'s user-mode branch wrote `stack_pointer` (the
-kernel frame base) into `pcb->user_rsp`.  The reader is
-`context_switch.asm`'s user-preempted save path, which pushes it
-into a resume frame's RSP slot; `iretq` loads it with CS=0x33.  The
-fix writes `frame->rsp`, the CPU-pushed user RSP.
+### Refuted -- do NOT re-walk
 
-### CLOSED -- Bug 2, the `process_exit` hlt-guard resume (`6bfa008`)
-
-`process_exit`'s `call context_switch` built a `.ring0_save` frame
-whose RIP was the compiler's noreturn `hlt` guard.  Added
-`context_switch_no_save`, a hand-off entry point that shares the
-prologue and resume side but skips the save block.
-
-### CLOSED -- the four scheduler dispatch guards
-
-`8dc47cf`, `85da375`, `e7e3e6b`, `d7d8c40`: a RUNNING process must
-not be dispatched as `next`, at pop time, at `scheduler_switch_to`,
-and at `process_exit`'s hand-off.
-
-### OPEN -- Bug 3: a RUNNING process dispatched as `next`
-
-**Two sites, both guarded, neither verified.**  Site 1
-(`scheduler_switch_to`) guarded by `7fff450`; site 2
-(`timer_preempt_handler`) guarded by `e21ebf0`.  The `C` line's
-`N == R` is the signature.  **The test is running as this file is
-written.**  Do not call it closed until `pipe7e` reaches
-`iter 80500` clean on `capture.txt`, twice.
-
-### OPEN -- item 7a, the boot-time `#PF` at `0x400000`
-
-Unobserved, not fixed.  The `20261003-vmm-map-diag` instrumentation
-is in the tree and did not fire on the boots that followed.  When it
-returns, the `free` field separates the two candidates.
-
-### OPEN -- item 7b, a user-mode `#GP` at `0x42F1A7` in busybox
-
-Unobserved, not fixed.  Different vector, location, and phase from
-7a.  Needs its own instrument.
-
----
-
-## Refuted -- do NOT re-walk
-
-- The queue-mutator race as an *unfixed* bug -- **closed by
-  `c85d074`.**
-- The pipe wake handshake -- closed by `c3e5c97`.
-- The atomic refcount race -- closed by `e1e8549`.
-- The stale-link queue membership -- closed by `a0f9779`.
-- The timer's missing pool rescan -- closed by `e3705d4`.
-- The wait4 lost wakeup -- refuted; `r3` refusals are the normal
-  "child exited before parent blocked" count, the code is correct.
-- Framing (c) for Bug 2 -- refuted by `pipe7e`, commit reset.
-- The `.ring0_save` RIP-only and RIP+RSP changes -- refuted.
-- **The pipe-reader loop-back as the `C`'s site** -- refuted.  The
-  `C` is `context_switch(next, next)`, not a pipe wake.
-- **The timer-frame-copy fix** -- refuted.  The frame is not
-  clobbered by the C stack; it is the self-pick.
-- **The queue instrumentation as the producer** -- the snapshot
-  fixes (`8e3c53f`, `441dd1d`) and the exit checks (`9db304d`) were
-  real fixes to the *instrument*, not the queue.
-- Also do not re-open: item 7, item 7c, item 11, the session-48 zone
-  scan, the `fs_base` path, the `longjmp`/`setjmp` family.
+- **The reserve / frame placement.**  `67701df` + `5587d70`.
+- **The `next->rsp = 0` clear.**  Broke blocking; reverted.
+- **The pipe block path as the writer.**  Converted to
+  `process_yield`; the `C` remained.
+- **`sys_execve`, `sys_wait4`, `sys_brk` as the site.**  Checked.
+- **The pipe-waiter fields as the stale holder** -- ruled out: the
+  helper never blocks, so they are never set.
+- **The `current_process` dual-copy divergence at the `C`** -- both
+  copies agreed.  (The `process_destroy` fix is still correct.)
+- **A switch-to-self guard in `scheduler_switch_to`'s TAIL** --
+  attempted; it fires after `current_process = next` and refuses every
+  dispatch, hanging at iter 0.  Reverted.  Any such check must be
+  BEFORE the assignment.
+- Do not re-open: item 7, item 7c, item 11, the session-48 zone scan,
+  the `fs_base` path, the `longjmp`/`setjmp` family.
 
 ---
 
 ## NEXT SESSION
 
-**The task: fix the `C`.  It is the only thing on this list.**
+**The task: find the SLOT-SPECIFIC stale reference that carries the
+zombie's slot into `scheduler_switch_to`.**
 
-The `C` is `context_switch.asm`'s unknown-CS halt.  At
-`pit_init(250)`, `pipe7e` fires it at `iter 10000` with:
+**The plan, in order:**
 
-    C
-    N=FFFFFFFF8027C810 R=0000000000408124 S=FFFFFFFF8029B2B0
-    F=0000000000408124 P=FFFFFFFF8027C1F8
+1. **Reproduce at 100 kHz.**  Build both steps, run pipe7e at
+   `pit_init(100000)` (the current `kmain.c`; do NOT commit it).  Wait
+   for a `SWITCH-DEAD`.
 
-GDB reads from that halt: `N = PIPE7E_HELPER`, `N->state =
-RUNNING`, `N->rip = put_file_slot + 956`, and
-`N->rsp == $rsp` (`p/x $rsp - N->rsp == 0`).
+2. **Find the holder.**  Add the queue-walk instrument gated behind
+   `SW2_TRACE` (default 1 for this run): at `SWITCH-DEAD`, walk
+   `ready_queue_head`/`tail` (`nm`) and every live PCB's `next`/`prev`
+   and print any that equal the zombie's `next`.  If one does, that is
+   the stale reference.
 
-**The root, established this session:** the timer frame is built
-at the kernel C stack's live `rsp`.  When the C stack unwinds,
-its `pop`s read the frame's slots.  The frame is not overwritten
-by growth; it is overwritten by the C stack's own unwind, because
-the frame sits in the addresses the C stack will pop through.
-Four `C` shapes at 250 Hz are four instances of this one root.
+3. **Fix the holder.**  Clear the stale reference in `process_reclaim`
+   (or `process_destroy`) -- the function that makes the slot reusable.
 
-**The fix, and the attempt that failed:**
+**Do not** re-apply a switch-to-self guard in the tail of
+`scheduler_switch_to`.  **Do not** call the range checks the fix.
 
-- **Attempted:** `67701df` reserved `FRAME_RESERVE` (0x400) at
-  the top of each kernel stack and moved `TSS.RSP0` and
-  `g_syscall_stack_top` down by it.  **It broke `wait4`** -- the
-  first `musl_sh` `wait4` returned to RIP 0/RSP 0 (a `#PF` with
-  `CR2 = 0`), because `sys_execve`'s offsets and the `wait4`
-  path's frame offsets were written for the old `top - N` layout
-  and were not all moved.  Reverted in `5587d70`.  **The reserve
-  is still the right direction; the offsets it needs are
-  incomplete.**
-
-- **The task:** move the timer frame into a region the C stack's
-  unwind cannot reach, **and move every offset that anchors at
-  `kernel_stack_top` together.**  The sites to move, from
-  `grep -rn 'kernel_stack_top'`:
-    - `user_syscall_entry.asm`'s 11 pushes and the
-      `g_user_rsp_save` slot (relative to `rsp`, so they follow
-      if the start moves).
-    - `process_create`'s initial frame at `top - 0xA0`.
-    - `process_fork_copy_frame`'s frame at `top - 0xA0` and its
-      reads at `top - 56`, `-64`, `-72`.
-    - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]` (moved
-      in `67701df`, but the rest of the path was not).
-    - **`sys_execve`'s full frame layout -- NOT YET READ.**  The
-      reserve move changed `ktop` from `self->kernel_stack_top`
-      to `self->kernel_stack_top - FRAME_RESERVE`, but the
-      syscall entry's own pushes are at `top - FRAME_RESERVE - 88`
-      while `sys_execve` writes `ktop[-7]` (= `ktop - 56`).  The
-      RIP slot is at `ktop - 80`, so `ktop[-7]` is off by 24.
-      **`sys_wait4` was checked and does NOT read the entry frame
-      by an absolute offset** -- it takes its arguments from the
-      C call, relative to `rsp`.  The break is in `sys_execve`'s
-      offsets, not `sys_wait4`'s.
-    - every `tss_set_kernel_stack` / `tss_set_syscall_stack`
-      call site (14 of them), which is one edit in `tss.c`.
-
-- **Then `irq0_stub` copies the kernel-mode interrupt frame into
-  the reserve.**  The user-mode frame is already in the reserve
-  (the CPU switched to `TSS.RSP0`); only the kernel-mode path
-  needs the copy.  The copy is 20 quadwords: push the 15 GPRs at
-  the live `rsp`, copy all 20 slots to the reserve, call the
-  handler with the reserve base, `iretq` from there.
-
-**Order of work:**
-
-1. Read `sys_wait4`'s frame offsets (`grep -n 'kernel_stack_top'
-   04_kernel_64bit/user_syscall.c`, then the function).
-2. Read the other offset sites the failed attempt missed.
-3. Write the complete offset map into this file.
-4. Re-apply the reserve with **every** offset moved.
-5. Add the `irq0_stub` copy.
-6. Run `pipe7e` at `pit_init(250)` past `iter 10000`, then
-   `canary --full` and `test.sh`.
-
-**Do not stop at the guard.**  The four guards (`7fff450`,
-`e21ebf0`, `63c44ff`, `359c895`) each closed a reachable
-self-pick.  They are correct and they stay.  They are not the
-fix.  The fix is the frame placement, and this session must
-land it.
+**Before writing any edit, count the anchor IN PYTHON and confirm it
+is 1 and in the intended function.**
 
 ### Do not
 
-Do not apply the script or re-run the cherry-pick sequence.  The
-tree is already patched.  Do not chase the pipe wake path (closed),
-the atomic refcount (closed), the `fs_base` path, item 7, item 11,
-or the session-48 zone scan.  One change at a time.  Do not edit
-`third_party/` -- but do read it.
-
-Do not run `git reset --hard` without first committing every
-diagnostic you care about.
-
-Do not attach GDB to a run that is progressing -- a pause changes
-the timing.  Attach after it finishes or when it stalls.
-
-Do not call either `C` guard verified on one clean run.  The `C` is
-intermittent; one clean run does not settle it.
-
-Do not propose a `.ring0_save` fix -- Bug 2 is closed by `6bfa008`.
+Do not commit `kmain.c`.  Do not call the `C` closed on one clean
+run.  Do not run `git reset --hard` without stashing first.  Do not
+edit `third_party/`.
 
 ---
 
 ## Open issues (top 6)
 
-1. **`open-issues.md` item 12: signal delivery is a stub.**  The
-   largest open item; unblocks `kill`, ash job control (item 13),
-   and the Wayland `SIGBUS` path.
+1. **`open-issues.md` item 12: signal delivery is a stub.**
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-4. **`sys_gettimeofday` (99)** so `ps -l` works.  Small.
-5. **`process_dump_all`'s `DETACHED` state** -- may mask a
-   stranded-process bug.
-6. **Item 7a/7b** -- the boot-time `#PF` at `0x400000` and the
-   busybox `#GP` at `0x42F1A7`.  Both unobserved, not fixed.
+4. **`sys_gettimeofday` (99)** so `ps -l` works.
+5. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
+   process bug.
+6. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
 
 ---
 
 ## State on disk
 
-Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored;
-one run per truncate.
-
-Tags from this cycle, local only:
+Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
+Tags from earlier cycles:
 `20261013-session-start` (`04df9eb`),
-`20261013-queue-and-rescan-fixes`,
-`20261013-userrsp-writer-fix` (`d6ada2f`),
 `20261014-pipe7e-100k-clean` (`7aaaafd`),
 `20261014-test57-canary28-clean` (`d3c7f20`),
-`20261014-queue-race-closed` (`3eb1d61`).
+`20261014-queue-race-closed` (`3eb1d61`),
+`20261014-selfswitch-two-sites`,
+`20261016-destroy-both-current` (`c2a3f89`).
 
 ---
 
 ## One-line summary
 
-**`c85d074` closed the queue-mutator race -- `_add`, `_remove`,
-`_next` are critical sections, and `bad_tail_next` stayed 0 across
-3.1 million checks.  Tag `20261014-queue-race-closed`.  Bug 3 is
-open: a RUNNING process dispatched as `next`, with the `C` line's
-`N == R` as the signature.  Two sites, two guards -- `7fff450` for
-`scheduler_switch_to`, `e21ebf0` for `timer_preempt_handler` -- and
-neither is verified.  The `pipe7e` result being captured now decides
-it.  Item 12 (signal delivery) is the next workstream if Bug 3
-closes.**
-
-## How to use this file
-
-At session start, paste this file and say "Continue from here and
-request any files you need." Run the `git` commands -- they are
-the state; this file is the narrative.
-
-At session end, **rewrite the narrative.**  Do **not** write repo
-state.  New gotchas go to `docs/gotchas.md`; new commit rows go to
-`docs/session-log.md`; new open issues go to `docs/open-issues.md`.
-This file never grows.  Name commits by tag only.
-
-**When a session's findings change an earlier numbered step,
-edit the step in place.**
-
-**Gotchas worth reading before the next change.**
-
-"A fix with no test is indistinguishable from an unfixed defect."
-"A test can encode an earlier version's behavior."
-"A consumer inferred from behavior is not a consumer."
-"A function that has never run is correct by inspection only."
-"A test's expected value is a claim."
-"A diagnostic declared but never wired is not a diagnostic."
-"A halt in a fault handler is a diagnostic that never runs."
-"Put cleanup in the teardown, not each entry point."
-"A fork that overwrites a child's file table leaks per fork."
-"A captured fault is not a diagnosed one."
-"A captured fault that is not written to disk is a run that has to
-be repeated."
-"Hand-written `@@` hunk headers are a trap."
-"A type's named fields are not what the pointer points at."
-"A page walk that descends through a supervisor level prints a
-confident wrong verdict."
-"A diagnostic on the fault path is part of the system."
-"A section title is a claim about its body, and a commit subject is
-a claim about its diff -- read the body, read the diff."
-"A race is not memory corruption -- there is no store to find."
-"A session number, a comment, and an address pairing are claims too."
-"Before writing an edit anchor, read the file with `cat -A` and quote
-the bytes."
-"A diagnostic that saturates the serial console changes the timing
-of the system it is trying to observe."
-"`git reset --hard` discards uncommitted work; commit diagnostics
-before resetting."
-"Anchor on structure, not whitespace."
-"A Python edit with a `count != 1` guard writes nothing, but without
-`set -e` the command block keeps going and commits a partially-edited
-tree."
-"An edit script's idempotency guard must cover every insertion."
-"`nm` output moves between builds -- re-run it before every
-watchpoint address."
-"The QEMU monitor has no `watch` command; use GDB `target remote`."
-"A diagnostic on the SUCCESS path is noise; a diagnostic on the
-FAILURE path is signal."
-"Do not write a handoff that claims a bug is closed based on a test
-that was never run on the final tree."
-"A command block written as a script is not safe to paste into an
-interactive shell; `exit` in the paste closes the terminal."
-"Under `-enable-kvm` the QEMU monitor's `xp` cannot translate guest
-kernel virtual addresses; use `x`, or GDB over the `-s` stub."
-"Two identical register reads do not distinguish 'hung' from
-'livelocked at high frequency'; the tick counter (`g_ticks`) does."
-"A `strtonum`/`awk` symbol lookup can return a confidently wrong
-nearest symbol; a lexical range filter over equal-length hex `nm`
-output is the reliable check."
-"A frame slot holds a specific kind of value; a PCB field that is the
-same width may be a different kind."
-"The tag must be created after the commits it names; a tag created
-before them names the wrong tree."
-"A field's comment is a claim about its use."
-"Two scripts that differ by one character pair will be pasted wrong."
-"A guard that aborts when its marker string is absent will silently
-no-op on the present-and-correctly-formed case if the marker carries
-the wrong delimiters."
-"A post-write verification string that does not quote the inserted
-text verbatim is a false negative, not a failure."
-"A count of writers derived from the files you have read is not a
-count of writers."
-"A framing that looks safe by code reading can be refuted by a
-run."
-"A post-write check string must be copied from the `new` literal
-in the edit script, not retyped."
-"**A verification check with a wrong expected count makes a correct
-edit look broken.  Three times this session a check failed on a wrong
-count.  Count occurrences before asserting a count.**"
-"**A triple-quoted string in a Python edit must be closed before the
-next statement; a missing `"""` produces a `SyntaxError` that
-consumes the next line.  The tree is unchanged.**"
-"**An `#if` block that gates a `static` variable leaves it
-unreferenced; the compiler warns but the build does not fail.**"
-"**A critical section for a queue must cover the whole function,
-not just the link.  The nesting window is between the guard and the
-write, and every early return must restore the interrupt flag.**"
-"**A RUNNING process on the ready queue is dispatched as `next` and
-resumed from a stale frame.  The window is any restore of
-`state = RUNNING` followed by a loop-back to a re-block.**"
-"**Two sites call `context_switch`: `scheduler_switch_to` and
-`timer_preempt_handler`.  A guard at one is not a guard at both.**"
-"**The `C` line's `S` slot is the CS slot and is the test; `R` is
-context, not the test.  `N == R` is the self-dispatch signature.**"
-"**`race_head[0]` is a write counter; the last-written index is
-`(race_head[0] - 1) % 256`, not `race_head[0] % 256`.**"
-"**`process_initialize_pcb` `memset`s the whole PCB, so a reused
-PCB carries no stale fields.  `kernel_stack_slot_free` does not
-clear the stack, so a reused slot does carry stale frames.**"
-"**`preempt_frame_t` matches `PUSH_ALL_GPRS` exactly; a frame-layout
-bug is not the `C`'s cause.**"
-
-**This file's item text is the same kind of claim.**
+**The `C` is CONTAINED (`SWITCH-DEAD` refuses a ZOMBIE dispatch), and
+the cause is OPEN: a SLOT-SPECIFIC stale `pcb_t*` reaches
+`scheduler_switch_to`.  Five events in 24500 iterations at 100 kHz all
+named the SAME slot `0xFFFFFFFF8027D530` (this build) with a CHANGING
+pid -- so the holder names this slot and is not cleared on reclaim.
+Next: at `SWITCH-DEAD`, walk the ready queue and every live PCB's
+`next`/`prev` for that slot, and clear it in `process_reclaim`.**
