@@ -452,6 +452,33 @@ timer_preempt_handler(uint64_t stack_pointer) {
     if (current->timeslice_ticks >= SCHED_QUANTUM) {
         current->timeslice_ticks = 0;
 
+        /*
+         * Refuse the switch when the tick interrupted a queue mutator.
+         *
+         * scheduler_ready_queue_add / _remove / _next save the
+         * caller's interrupt flag with pushfq/popfq and cli around
+         * the body.  The compiler's epilogue -- pop r15/r12/r14/rbx/
+         * rbp, then ret -- runs AFTER the popfq that restores IF, so
+         * a tick can land in those six instructions with interrupts
+         * ENABLED.  When it does, irq0_stub builds a frame at the
+         * live rsp, this handler saves current->rsp = stack_pointer,
+         * and returns next->rsp.  If next is the interrupted process,
+         * the resume loads that same frame and halts on its CS slot:
+         * the 'C' with next->rsp == $rsp and frame->rip inside
+         * scheduler_ready_queue_add (observed at +651, pop %r15).
+         *
+         * Refusing the switch leaves the mutator to finish; the next
+         * tick sees a consistent queue.  The range covers _add,
+         * race_record, _remove, _next, and the padding between them
+         * -- the whole queue-mutator region.  Re-check the addresses
+         * with nm after any rebuild: symbol addresses move.
+         */
+        if ((uint64_t)frame->rip >= (uint64_t)(uintptr_t)scheduler_ready_queue_add &&
+            (uint64_t)frame->rip <  (uint64_t)(uintptr_t)scheduler_ready_queue_empty) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
         // For user-mode current, save its frame now.
         if ((frame->cs & 3) == 3) {
             current->r15 = frame->r15; current->r14 = frame->r14;
