@@ -325,9 +325,16 @@ Four `C` shapes at 250 Hz are four instances of this one root.
       reads at `top - 56`, `-64`, `-72`.
     - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]` (moved
       in `67701df`, but the rest of the path was not).
-    - **`sys_wait4`'s syscall-entry frame offsets -- NOT YET
-      READ.  This is the path that broke `67701df`.  Read it
-      before retrying the reserve.**
+    - **`sys_execve`'s full frame layout -- NOT YET READ.**  The
+      reserve move changed `ktop` from `self->kernel_stack_top`
+      to `self->kernel_stack_top - FRAME_RESERVE`, but the
+      syscall entry's own pushes are at `top - FRAME_RESERVE - 88`
+      while `sys_execve` writes `ktop[-7]` (= `ktop - 56`).  The
+      RIP slot is at `ktop - 80`, so `ktop[-7]` is off by 24.
+      **`sys_wait4` was checked and does NOT read the entry frame
+      by an absolute offset** -- it takes its arguments from the
+      C call, relative to `rsp`.  The break is in `sys_execve`'s
+      offsets, not `sys_wait4`'s.
     - every `tss_set_kernel_stack` / `tss_set_syscall_stack`
       call site (14 of them), which is one edit in `tss.c`.
 
