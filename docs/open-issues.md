@@ -15,40 +15,42 @@ not reused.
 
 ## The next thing
 
-**Item 12 -- signal delivery.**  With Bug 3 closed, the largest
-open item is the signal subsystem.  It unblocks `kill`, ash job
-control (item 13), and the Wayland `SIGBUS` path (item 5's
-sibling).  See the item below for the full shape.
+**The `C` is OPEN.  Four shapes at `pit_init(250)`, one root.**
 
-**Closed since the last update: the RUNNING-process-dispatched-
-as-`next` bug (Bug 3).**  `pipe7e` reached `iter 80500` and hit
-`context_switch.asm`'s unknown-CS halt:
+The `C` is `context_switch.asm`'s unknown-CS halt.  The test is
+the `S` field (the CS slot): the halt fires when `[rsp+0x80]` is
+neither `0x18` nor `0x33`.  At `pit_init(250)`, `pipe7e` fires it
+four times with four different frames, all the same class: a
+resume frame that is not a valid resume frame.
 
-    C
-    N=FFFFFFFF8027C7D0 R=FFFFFFFF8027C7D0 S=FFFFFFFF8029B2A0
-    F=FFFFFFFF8011B895 P=0000000000000000
+  - `iter 80500` (default rate): the self-pick.
+    `N == R`, `next->rsp == $rsp`.  `7fff450` (site 1,
+    `scheduler_switch_to`) and `e21ebf0` (site 2,
+    `timer_preempt_handler`) closed it at that rate.
+  - `iter 9750` at 250 Hz: the epilogue self-pick.
+    `N->rip == scheduler_ready_queue_add + 651 == pop %r15`,
+    after the `popf` that restored IF.  `63c44ff` refuses the
+    switch when `frame->rip` is in the queue-mutator range.
+  - sub-`iter-1000` at 250 Hz: the `kfree` self-pick.
+    `N->rip == kfree + 1`, `N->rsp == $rsp`, on the
+    `process_exit` path.  `359c895` refuses when
+    `next->rsp == stack_pointer`.
+  - `iter 10000` at 250 Hz: `N->rip == put_file_slot + 956`,
+    `N->rsp == $rsp`, on the `process_exit` path.  **Open.**
 
-`N == R`: the dispatch was `context_switch(next, next)`.  Two
-sites, two guards:
+**The root is frame placement.**  `pcb->rsp` points at a resume
+frame built at the tick's live `rsp`, and the process's own kernel
+C stack overwrites it before the frame is read again.  The four
+guards treat symptoms.  The structural fix: reserve the top of
+each kernel stack for frames, start the kernel C `rsp` below the
+reserve, so the C stack never reaches a frame.  That is the next
+session's work.
 
-  - **Site 1 -- `scheduler_switch_to`.**  The self-switch check at
-    function entry read `current_process` with interrupts on; a
-    timer tick before the `cli` could set
-    `current_process = next`.  **`7fff450`** re-checks
-    `next == current_process` inside the `cli`.
-  - **Site 2 -- `timer_preempt_handler`.**  The timer returns
-    `next->rsp` directly; it does not call
-    `scheduler_switch_to`.  A peer wake could set
-    `current->state = READY` between the queue pop and the use,
-    so `next == current` and the timer returned the frame it had
-    just saved.  **`e21ebf0`** resumes `current`'s own frame as a
-    no-op switch.
+**The commits are real improvements but do not close the bug.**
+`7fff450`, `e21ebf0`, `63c44ff`, `359c895`, `39d572c` are on
+`dev`, untagged as a closure.
 
-**Verified:** `pipe7e` `PIPE7E-ALL-PASS` at 200,000 iterations,
-`canary --full` 28/28, `test.sh` 57/57.  Tagged
-`20261014-selfswitch-two-sites` on `359e060`.
-
-**The queue-mutator race is also closed** (`c85d074`, tagged
+**The queue-mutator race is closed** (`c85d074`, tagged
 `20261014-queue-race-closed` on `3eb1d61`).
 
 ---
