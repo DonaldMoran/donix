@@ -978,7 +978,7 @@ void process_destroy(pcb_t* pcb) {
     pcb->in_signal_handler = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
-    if (current_process == pcb) current_process = NULL;
+    if (current_process == pcb) scheduler_set_current(NULL);
     serial_print("PROCESS: Process destroyed\n");
 }
 
