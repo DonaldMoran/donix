@@ -4,7 +4,6 @@
 #include "include/vga.h"
 #include "include/serial.h"
 #include "include/vmm.h"
-#include "include/process.h"   /* FRAME_RESERVE */
 
 static tss_t* tss = (tss_t*)TSS_PHYS_ADDR;
 static uint8_t* iomap = (uint8_t*)(TSS_PHYS_ADDR + sizeof(tss_t));
@@ -108,19 +107,14 @@ tss_set_kernel_stack(uint64_t stack) {
         serial_print_hex(stack);
         serial_print("\n");
     }
-    /* FRAME_RESERVE: see process.h.  The CPU's ring-3 -> ring-0
-       switch pushes at TSS.RSP0, and the interrupt frame must land
-       in the reserve, not in the C stack's region. */
-    tss->rsp0 = stack - FRAME_RESERVE;
+    tss->rsp0 = stack;
 }
 
 /* Set the kernel stack top that user_syscall_entry.asm will load on
    entry. Must be called in lockstep with tss_set_kernel_stack: both
    should point at the same per-process kernel stack. */
 void tss_set_syscall_stack(uint64_t stack) {
-    /* FRAME_RESERVE: see process.h.  user_syscall_entry.asm loads
-       this into rsp, so the C stack starts below the reserve. */
-    g_syscall_stack_top = stack - FRAME_RESERVE;
+    g_syscall_stack_top = stack;
 }
 
 /* Print the current TSS fields on demand. Called from the kernel

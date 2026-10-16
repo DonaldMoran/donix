@@ -5161,7 +5161,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     /* ---- 7. Rewrite the syscall-entry frame. ---- */
-    uint64_t* ktop = (uint64_t*)(self->kernel_stack_top - FRAME_RESERVE);
+    uint64_t* ktop = (uint64_t*)self->kernel_stack_top;
     ktop[-7] = entry;      /* -56: user RIP  */
     ktop[-9] = rsp_init;   /* -72: user RSP  */
     ktop[-12] = (uint64_t)argc;       /* -96: rdi */

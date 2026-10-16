@@ -7,13 +7,6 @@
 #define MAX_PROCESSES 32
 #define PROC_NAME_LEN 32
 #define PROC_STACK_SIZE  16384   // 16KB: syscall entry + nested timer frame + sys_read blocking headroom
-/*
- * Top of each kernel stack reserved for resume frames only.  The
- * kernel C stack starts at kernel_stack_top - FRAME_RESERVE and
- * grows down, so a frame built in the reserve is never reached by
- * the C stack's unwind.  See tss_set_kernel_stack and irq0_stub.
- */
-#define FRAME_RESERVE    0x400
 #define MAX_PROCESS_FILES 64
 #define PROC_CWD_MAX 128
 
