@@ -15,40 +15,42 @@ not reused.
 
 ## The next thing
 
-**The `C` is OPEN.  Four shapes at `pit_init(250)`, one root.**
+**Fix the `C`.  This is the task, not a description.**
 
-The `C` is `context_switch.asm`'s unknown-CS halt.  The test is
-the `S` field (the CS slot): the halt fires when `[rsp+0x80]` is
-neither `0x18` nor `0x33`.  At `pit_init(250)`, `pipe7e` fires it
-four times with four different frames, all the same class: a
-resume frame that is not a valid resume frame.
+The `C` is `context_switch.asm`'s unknown-CS halt; the test is
+the `S` field (the CS slot).  Four shapes fire at
+`pit_init(250)`; all four are one root.
 
-  - `iter 80500` (default rate): the self-pick.
-    `N == R`, `next->rsp == $rsp`.  `7fff450` (site 1,
-    `scheduler_switch_to`) and `e21ebf0` (site 2,
-    `timer_preempt_handler`) closed it at that rate.
-  - `iter 9750` at 250 Hz: the epilogue self-pick.
-    `N->rip == scheduler_ready_queue_add + 651 == pop %r15`,
-    after the `popf` that restored IF.  `63c44ff` refuses the
-    switch when `frame->rip` is in the queue-mutator range.
-  - sub-`iter-1000` at 250 Hz: the `kfree` self-pick.
-    `N->rip == kfree + 1`, `N->rsp == $rsp`, on the
-    `process_exit` path.  `359c895` refuses when
-    `next->rsp == stack_pointer`.
-  - `iter 10000` at 250 Hz: `N->rip == put_file_slot + 956`,
-    `N->rsp == $rsp`, on the `process_exit` path.  **Open.**
+**The root:** the timer frame is built at the kernel C stack's
+live `rsp`.  The C stack's unwind pops through the frame's
+slots.  The frame must be moved to a region the unwind cannot
+reach.
 
-**The root is frame placement.**  `pcb->rsp` points at a resume
-frame built at the tick's live `rsp`, and the process's own kernel
-C stack overwrites it before the frame is read again.  The four
-guards treat symptoms.  The structural fix: reserve the top of
-each kernel stack for frames, start the kernel C `rsp` below the
-reserve, so the C stack never reaches a frame.  That is the next
-session's work.
+**The failed attempt:** `67701df` reserved `FRAME_RESERVE` at the
+top of each kernel stack and moved `TSS.RSP0` and
+`g_syscall_stack_top` down.  It broke the first `musl_sh`
+`wait4` (a `#PF` with `CR2 = 0`, RIP 0, RSP 0) because
+`sys_execve`'s offsets and **`sys_wait4`'s** frame offsets were
+written for the old `top - N` layout and were not all moved.
+Reverted in `5587d70`.
 
-**The commits are real improvements but do not close the bug.**
-`7fff450`, `e21ebf0`, `63c44ff`, `359c895`, `39d572c` are on
-`dev`, untagged as a closure.
+**The fix:** move the timer frame into a reserve the C stack
+cannot reach, and move **every** offset that anchors at
+`kernel_stack_top` with it.  The sites:
+  - `user_syscall_entry.asm` (relative to `rsp`; follows the
+    start move).
+  - `process_create` (`top - 0xA0`).
+  - `process_fork_copy_frame` (`top - 0xA0`, reads at `-56`,
+    `-64`, `-72`).
+  - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]`.
+  - **`sys_wait4` -- NOT YET READ.  This is the path that broke
+    `67701df`.  Read it first.**
+  - the 14 `tss_set_*` call sites (one edit in `tss.c`).
+  - `irq0_stub`'s kernel-mode copy of the 20-slot frame into the
+    reserve.
+
+**The four guards** (`7fff450`, `e21ebf0`, `63c44ff`, `359c895`)
+stay.  They closed reachable self-picks; they are not the fix.
 
 **The queue-mutator race is closed** (`c85d074`, tagged
 `20261014-queue-race-closed` on `3eb1d61`).
