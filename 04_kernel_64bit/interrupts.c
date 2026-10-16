@@ -606,6 +606,35 @@ timer_preempt_handler(uint64_t stack_pointer) {
             return stack_pointer;
         }
 
+        /*
+         * Self-pick by VALUE: next->rsp is the frame THIS tick built.
+         *
+         * The identity check above (next == current) misses the case
+         * where next != current but next->rsp == stack_pointer.  That
+         * happens when the kernel-mode save above wrote
+         * <the interrupted process>->rsp = stack_pointer and the pop
+         * then returned that same PCB while `current` was a different
+         * process -- a stale or just-saved frame base pointing at the
+         * frame irq0_stub is standing on.  Resuming it pops that frame
+         * and halts on its CS slot.
+         *
+         * Observed at pit_init(250), pipe7e before iter 1000:
+         *
+         *   C
+         *   N=FFFFFFFF8027C810 R=00000080000FBFF0 S=0000000000400200
+         *   F=FFFFFFFF8027C810 P=FFFFFFFF8029B2E0
+         *
+         * N = PIPE7E_HELPER, N->rip = kfree + 1, N->rsp == $rsp.
+         *
+         * Checked BEFORE any side effect: no state change, no queue
+         * add, no cr3 switch.  A value self-pick is a no-op switch,
+         * like the identity self-pick.
+         */
+        if (next->rsp == stack_pointer) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
         /* Only a RUNNING current goes back on the ready queue. A
            BLOCKED process must stay off it; that is what makes "a
            shell waiting for input does not prevent any other process
