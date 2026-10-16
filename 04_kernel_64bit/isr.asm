@@ -22,6 +22,12 @@ extern irq1_handler
 extern isr13_handler
 extern isr_default_handler
 
+; Top of the #DF IST stack, used as a fallback stack by the #GP and #PF
+; stubs when rsp == 0.  Without it, a fault with rsp == 0 makes the
+; stub's first PUSH fault, which becomes a #DF with no diagnostic --
+; the original fault's RIP is lost.  df_ist_stack_top is set in tss.c.
+extern df_ist_stack_top
+
 ; =====================================================================
 ; Macros for GPR save/restore. Used by every stub that calls C.
 ; The C ABI lets the callee clobber rax, rcx, rdx, rsi, rdi, r8..r11,
@@ -170,6 +176,13 @@ isr8_stub:
 ; #GP — general protection fault (CPU pushes an error code)
 isr13_stub:
     cli
+    ; If rsp is 0, PUSH_ALL_GPRS would fault and turn this into a #DF
+    ; with no diagnostic.  Switch to the IST stack so the handler can
+    ; print the original fault.
+    test rsp, rsp
+    jnz .gp_have_stack
+    mov rsp, [rel df_ist_stack_top]
+.gp_have_stack:
     PUSH_ALL_GPRS
     mov rdi, rsp
     call isr13_handler
@@ -180,6 +193,10 @@ isr13_stub:
 ; #PF — page fault (CPU pushes an error code)
 isr14_stub:
     cli
+    test rsp, rsp
+    jnz .pf_have_stack
+    mov rsp, [rel df_ist_stack_top]
+.pf_have_stack:
     PUSH_ALL_GPRS
     mov rdi, rsp
     call isr14_handler

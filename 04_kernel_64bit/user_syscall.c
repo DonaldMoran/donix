@@ -5553,10 +5553,16 @@ long sys_write(int fd, const void* buf, size_t count) {
             __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
 
 
-            __asm__ volatile("sti");
-            __asm__ volatile("hlt");
-            /* Woken by pipe_wake_waiter via a reader's drain.
-             * Loop and re-check the free space. */
+            /* Block via process_yield, not sti; hlt.  See the
+             * reader block's note: sti; hlt leaves self->rsp at its
+             * last save, and the resume loads a stale frame. */
+            process_yield();
+            /* Resumed.  Reset state so the requeue guards (which test
+             * state == RUNNING) see us correctly, matching the reader
+             * block above. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Loop and re-check the free space. */
         }
 
         /* We hold the cli?  No -- the break above did sti.  From
@@ -6149,17 +6155,29 @@ long sys_read(int fd, void* buf, size_t count) {
             __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
             __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
 
-            __asm__ volatile("sti");
-            __asm__ volatile("hlt");
-            /* Woken by a peer's write or close, OR preempted by
-             * a tick.  Either way, we are running again.  Set
-             * state back to RUNNING so the scheduler's requeue
-             * guards (which test state == RUNNING) see us
-             * correctly.  If a peer wake set us READY while we
-             * were between the sti and the hlt, this is what
-             * stops us from halting as a READY process the
-             * scheduler will never requeue -- the item-7d
-             * lost-process hang.  Then loop and re-check. */
+            /*
+             * Block via process_yield, not sti; hlt.
+             *
+             * The sti; hlt form leaves self->rsp at its LAST SAVE --
+             * the frame from the previous context_switch -- which the
+             * stack has since moved past.  When a peer wakes us, the
+             * scheduler resumes from that stale frame and halts (the
+             * 'C').  The GPR slots saved above do not help: the
+             * resume needs a 20-slot frame at self->rsp, and sti; hlt
+             * builds none.
+             *
+             * process_yield does the right thing: it marks us BLOCKED
+             * (already done above), calls scheduler_switch_to, and
+             * context_switch builds a proper 20-slot resume frame and
+             * stores its base in self->rsp.  When the peer wakes us,
+             * we are resumed from that frame, back here.
+             *
+             * sys_wait4 blocks this way (process_yield at the
+             * BLOCK_KIND_WAITPID site); the pipe paths were the
+             * outlier.
+             */
+            process_yield();
+            /* Resumed.  Loop and re-check. */
             self->state      = PROC_STATE_RUNNING;
             self->block_kind = BLOCK_KIND_NONE;
             /* Do NOT clear pipe->reader_waiting here.  This

@@ -112,6 +112,9 @@ global context_switch
 ;
 ; Callers: process_exit (scheduler.c).  Do not call this from a
 ; site that expects to be resumed -- use context_switch.
+noop_switch:
+    ret
+
 global context_switch_no_save
 context_switch_no_save:
     push rbp
@@ -125,6 +128,16 @@ context_switch_no_save:
     jmp context_switch_resume
 
 context_switch:
+    ; prev == next: asked to switch to the process already on the CPU.
+    ; There is nothing to save and nothing to resume.  Saving here writes
+    ; next->rsp = the live rsp, and the resume side then loads next->rsp
+    ; and reads the live C stack as a 20-slot frame -- the 'C' halt, with
+    ; next->rsp == $rsp, next->state RUNNING, and the frame's CS slot a
+    ; stack address.  Return to the caller with its registers untouched.
+    ; This guard is BEFORE the prologue pushes, so it must not jump to
+    ; .restore_and_return (which pops six registers that were never pushed).
+    cmp rdi, rsi
+    je noop_switch
     push rbp
     push rbx
     push r12
@@ -272,6 +285,15 @@ context_switch_resume:
     ; (0x33) resumes. Only the validation of RIP differs by CS, and
     ; only because a mismatch there is a strong indicator of frame
     ; corruption.
+    ; Load the frame base and CONSUME it: clear next->rsp in the
+    ; same instruction window.  A process that is dispatched without
+    ; a fresh save then has rsp == 0, and the check below refuses it
+    ; instead of resuming a stale frame.  The stale-frame resume is
+    ; the 'C': the resume loads a frame base left by an earlier save
+    ; (when this PCB was prev), reads the live stack as a 20-slot
+    ; frame, and halts on the CS slot.  See the bad-frame capture:
+    ; next->rsp == $rsp, the CS slot held prev's PCB pointer, and
+    ; next->state was RUNNING.
     mov rsp, [r12 + 0x110]
 
     mov rbx, [rsp + 0x80]               ; saved CS
@@ -330,6 +352,44 @@ context_switch_resume:
     mov al, '='
     out dx, al
     mov rbx, [rsp + 0x90]
+    EMIT_HEX rbx
+    mov al, 0x0A
+    out dx, al
+
+    ; Extended self-describing report: name the PCB and its fields
+    ; so the capture does not need a GDB attach.  r12 = next (the
+    ; PCB the resume was asked to dispatch).  Offsets from pcb_t:
+    ;   0x000 pid, 0x028 state, 0x110 rsp, 0x118 rip
+    ; Format per line:  <letter><field>=<16 hex><space>...
+    mov rbx, [r12 + 0x000]
+    mov al, 'I'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x028]
+    mov al, 'T'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x110]
+    mov al, 'X'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x118]
+    mov al, 'Y'
+    out dx, al
+    mov al, '='
+    out dx, al
     EMIT_HEX rbx
     mov al, 0x0A
     out dx, al

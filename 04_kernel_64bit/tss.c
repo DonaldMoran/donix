@@ -38,10 +38,17 @@ uint64_t g_syscall_stack_top = 0;
  * underflows. */
 static uint8_t df_ist_stack[4096] __attribute__((aligned(16)));
 
+/* Top of the #DF IST stack, exported so the #GP and #PF stubs can use
+   it as a fallback stack when rsp == 0.  Without a fallback, a fault
+   with rsp == 0 makes the stub's first PUSH fault, and the original
+   fault's RIP is lost to a bare #DF. */
+uint64_t df_ist_stack_top = 0;
+
 void tss_init_ist(void) {
     uint64_t top = (uint64_t)df_ist_stack + sizeof(df_ist_stack);
     top &= ~0xFULL;  /* 16-byte alignment for the SysV ABI */
     tss->ist1 = top;
+    df_ist_stack_top = top;
 
     serial_print("TSS: IST1 (#DF) top = 0x");
     serial_print_hex(top);

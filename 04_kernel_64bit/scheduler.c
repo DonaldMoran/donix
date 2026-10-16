@@ -5,6 +5,28 @@
 #include "include/trace.h"
 #include "include/race_probe.h"
 
+/*
+ * SW2_TRACE -- dispatch-trace instrumentation for scheduler_switch_to.
+ *
+ * Default 0: the SW2-* prints compile to nothing, so the dispatcher is
+ * as fast as it was before the trace and the serial console is clean.
+ * Set to 1 for one build when diagnosing a dispatch-path problem.
+ *
+ * The three traced sites (entry, after the current_process assignment,
+ * and immediately before context_switch) fire on EVERY dispatch, so
+ * they are success-path noise and are gated.  The zombie/terminated
+ * refuse print (SWITCH-DEAD) is failure-path signal and is NOT gated.
+ */
+#ifndef SW2_TRACE
+#define SW2_TRACE 0
+#endif
+
+#if SW2_TRACE
+#define SW2_PRINT(...) do { serial_lock(); __VA_ARGS__; serial_unlock(); } while (0)
+#else
+#define SW2_PRINT(...) do {} while (0)
+#endif
+
 #define KERNEL_BASE 0xFFFFFFFF80000000ULL
 
 static pcb_t* ready_queue_head = NULL;
@@ -564,8 +586,7 @@ void __attribute__((noreturn)) process_exit(void) {
              */
             if (_p == current_process) continue;
             if (_p->pid == 1) continue;   /* idle is never queued */
-            if (_p->state != PROC_STATE_READY &&
-                _p->state != PROC_STATE_RUNNING) continue;
+            if (_p->state != PROC_STATE_READY) continue;
             if (scheduler_ready_queue_contains(_p)) continue;
             scheduler_ready_queue_add(_p);
         }
@@ -638,7 +659,7 @@ void __attribute__((noreturn)) process_exit(void) {
             exiting->fs_base = rdmsr(0xC0000100);
             wrmsr(0xC0000100, idle->fs_base);
 
-            context_switch(exiting, idle);
+            context_switch_no_save(exiting, idle);
             /* Not reached. */
         }
 
@@ -655,6 +676,49 @@ void __attribute__((noreturn)) process_exit(void) {
         serial_unlock();
 
         serial_print("process_exit: no runnable process, halting\n");
+        __asm__ volatile("cli");
+        while (1) __asm__ volatile("hlt");
+    }
+
+    /*
+     * Refuse to dispatch a next whose rsp is not inside its own
+     * kernel stack.  This is the process_exit counterpart to
+     * scheduler_switch_to's SWITCH-REFUSE, and it catches the
+     * 2026-10-16 'C': next->rip was close_all_files, next->rsp
+     * pointed at a frame the stack had moved past, and
+     * context_switch_no_save resumed it and halted.
+     *
+     * kernel_stack_virt and kernel_stack_top are both virtual (see
+     * process.c), so this range check is in the same address space as
+     * rsp.  A next outside its own stack has no dispatchable frame.
+     *
+     * Fall to idle: process_exit's own idle fallback below is the
+     * safe path, and it never resumes a stale frame.
+     */
+    if (next->pid != 1 &&
+        (next->rsp < next->kernel_stack_virt ||
+         next->rsp >= next->kernel_stack_virt + PROC_STACK_SIZE)) {
+        serial_lock();
+        serial_print("EXIT-REFUSE: next pid=");
+        serial_print_dec(next->pid);
+        serial_print(" name=");
+        serial_print(next->name);
+        serial_print(" rsp outside stack -> idle\n");
+        serial_unlock();
+        pcb_t* _idle = process_find_by_pid(1);
+        if (_idle) {
+            extern void tss_set_kernel_stack(uint64_t stack);
+            extern void tss_set_syscall_stack(uint64_t stack);
+            current_process = _idle;
+            process_set_current(_idle);
+            _idle->state = PROC_STATE_RUNNING;
+            _idle->total_ticks++;
+            exiting->fs_base = rdmsr(0xC0000100);
+            wrmsr(0xC0000100, _idle->fs_base);
+            tss_set_kernel_stack(_idle->kernel_stack_top);
+            tss_set_syscall_stack(_idle->kernel_stack_top);
+            context_switch_no_save(exiting, _idle);
+        }
         __asm__ volatile("cli");
         while (1) __asm__ volatile("hlt");
     }
@@ -758,6 +822,15 @@ void scheduler_switch_to(pcb_t* next) {
         return;
     }
 
+    SW2_PRINT(
+        serial_print("SW2-ENTRY next=0x"); serial_print_hex((uint64_t)next);
+        serial_print(" pid="); serial_print_dec(next->pid);
+        serial_print(" st="); serial_print_dec(next->state);
+        serial_print(" nm="); serial_print(next->name);
+        serial_print(" cur=0x"); serial_print_hex((uint64_t)current_process);
+        serial_print("\n");
+    );
+
     /*
      * A RUNNING process that is not current_process must not be
      * dispatched.
@@ -842,9 +915,49 @@ void scheduler_switch_to(pcb_t* next) {
         return;
     }
 
+    /* A ZOMBIE or TERMINATED process must never be dispatched.
+     *
+     * The 2026-10-16 SW2 instrumentation caught exactly this:
+     *
+     *   SW2-ENTRY next=... pid=169 st=4 nm=PIPE7E_HELPER
+     *   SW2-ASSIGN ... nextst=4
+     *   SW2-CALL  ... nextst=2 rsp=0xFFFFFFFF8029C080 kv=... kt=...
+     *   C
+     *   N=FFFFFFFF8027D650 R=... S=0000000000000000 F=0 P=0
+     *
+     * state 4 is PROC_STATE_ZOMBIE.  next->rsp was inside its own
+     * kernel stack (kv <= rsp < kt), so the range detector did not
+     * fire, but the contents at rsp were zeroed -- a zombie has no
+     * resume frame.  The resume read S=F=P=0 and halted.
+     *
+     * A zombie has called process_exit; it is not runnable and is
+     * only waiting to be reaped by sys_wait4.  A terminated process
+     * is already reclaimed.  Neither has a frame to resume.  Refuse
+     * before the assignment, so current_process is not overwritten
+     * and the caller's prev stays current. */
+    if (next->state == PROC_STATE_ZOMBIE ||
+        next->state == PROC_STATE_TERMINATED) {
+        serial_lock();
+        serial_print("SWITCH-DEAD next=0x"); serial_print_hex((uint64_t)next);
+        serial_print(" pid="); serial_print_dec(next->pid);
+        serial_print(" st="); serial_print_dec(next->state);
+        serial_print(" nm="); serial_print(next->name);
+        serial_print("\n");
+        serial_unlock();
+        return;
+    }
+
     pcb_t* prev = current_process;
     current_process = next;
     process_set_current(next);
+
+    SW2_PRINT(
+        serial_print("SW2-ASSIGN prev=0x"); serial_print_hex((uint64_t)prev);
+        serial_print(" next=0x"); serial_print_hex((uint64_t)next);
+        serial_print(" nextpid="); serial_print_dec(next->pid);
+        serial_print(" nextst="); serial_print_dec(next->state);
+        serial_print("\n");
+    );
 
     if (next->pid != 1) {
         scheduler_ready_queue_remove(next);
@@ -855,6 +968,39 @@ void scheduler_switch_to(pcb_t* next) {
         if (prev->pid != 1) {
             scheduler_ready_queue_add(prev);
         }
+    }
+
+    /* scheduler_ready_queue_remove/_add save and restore the caller's
+     * interrupt flag.  process_yield calls this function with
+     * interrupts ON, so those restore IF=1, and a timer tick in the
+     * window between them and context_switch re-enters the timer's
+     * dispatch, sets current_process = next, and marks next RUNNING
+     * before this function reaches context_switch.  The dispatch then
+     * runs with next == current_process, the resume loads next->rsp --
+     * the live stack -- and context_switch_resume halts on the CS
+     * slot.  Re-close the window the queue helpers opened. */
+    __asm__ volatile("cli");
+
+    /* Re-check next->state AFTER the cli.  The check at the top of this
+     * function ran before scheduler_ready_queue_remove/_add, and those
+     * restore the caller's interrupt flag.  A timer tick in that window
+     * runs timer_preempt_handler, which can set next->state = RUNNING
+     * and scheduler_set_current(next) before this function reaches
+     * context_switch.  The dispatch then runs with next already
+     * current, the resume loads next->rsp -- the live stack -- and
+     * context_switch_resume halts on the CS slot.  Re-check under the
+     * cli so the state cannot change between the check and the
+     * dispatch. */
+    if (next->state == PROC_STATE_RUNNING) {
+        serial_lock();
+        serial_print("SW2-RET-RUNNING next=0x"); serial_print_hex((uint64_t)next);
+        serial_print(" pid="); serial_print_dec(next->pid);
+        serial_print(" nm="); serial_print(next->name);
+        serial_print(" cur=0x"); serial_print_hex((uint64_t)current_process);
+        serial_print("\n");
+        serial_unlock();
+        __asm__ volatile("sti");
+        return;
     }
 
     next->state = PROC_STATE_RUNNING;
@@ -872,6 +1018,113 @@ void scheduler_switch_to(pcb_t* next) {
        See the fs_base comment in process.h. */
     if (prev) prev->fs_base = rdmsr(0xC0000100);
     wrmsr(0xC0000100, next->fs_base);
+
+    /* SWITCH-RANGE: refuse a next whose rsp is outside its own stack.
+     * kernel_stack_virt and kernel_stack_top are both virtual, so the
+     * range is in the same address space as rsp.  The 2026-10-16
+     * capture had next->rsp at slot 5's base while kernel_stack_virt
+     * named slot 5 + 0x1D0: the frame was in the wrong slot, and the
+     * rsp == 0 check below did not catch it. */
+    if (next->pid != 1 &&
+        (next->rsp < next->kernel_stack_virt ||
+         next->rsp >= next->kernel_stack_virt + PROC_STACK_SIZE)) {
+        serial_lock();
+        serial_print("SWITCH-REFUSE: next pid=");
+        serial_print_dec(next->pid);
+        serial_print(" name=");
+        serial_print(next->name);
+        serial_print(" rsp outside stack -> idle\n");
+        serial_unlock();
+        pcb_t* _idle2 = process_find_by_pid(1);
+        if (_idle2 && _idle2 != current_process) {
+            current_process = _idle2;
+            process_set_current(_idle2);
+            _idle2->state = PROC_STATE_RUNNING;
+            next = _idle2;
+        } else {
+            __asm__ volatile("sti");
+            return;
+        }
+    }
+
+    /*
+     * Refuse to dispatch a next whose rsp is not a live frame.
+     *
+     * The stale-frame captures showed next RUNNING with next->rsp
+     * pointing at a frame from an earlier save -- a timer preemption
+     * in serial_putc, or a prior context_switch -- which the resume
+     * then read as a 20-slot frame and halted on (the 'C').
+     *
+     * context_switch.asm now clears next->rsp (offset 0x110) when the
+     * resume consumes it, so a zero here means "this process has not
+     * been saved since it was last resumed."  It is not dispatchable:
+     * its rsp names no frame.  Refuse, requeue it as READY, and return
+     * so the caller can pick again.  The print names the process, so
+     * the capture records every occurrence without a GDB attach.
+     */
+    if (next->rsp == 0) {
+        /*
+         * Refuse to dispatch a next that has no frame.
+         *
+         * next->rsp == 0 means the field was consumed by a resume
+         * and never re-written by a save: this process was dispatched
+         * without being saved.  Dispatching it resumes a stale frame
+         * and halts (the 'C').  Requeue it and DO NOT RETURN.
+         *
+         * The callers of this function do not handle a return: it is
+         * called from process_yield (which parked the outgoing process
+         * as BLOCKED) and its return would unwind into a frame whose
+         * process is not runnable.  That unwind produced the #GP ->
+         * #DF with rsp == 0 at isr13_stub.  Instead, fall to idle:
+         * idle is always dispatchable, and switching to it never
+         * returns to this frame.  The timer and the next wake will
+         * pick the requeued process up again.
+         */
+        serial_lock();
+        serial_print("SWITCH-REFUSE: next pid=");
+        serial_print_dec(next->pid);
+        serial_print(" name=");
+        serial_print(next->name);
+        serial_print(" rsp=0 -> idle\n");
+        serial_unlock();
+        next->state = PROC_STATE_READY;
+        scheduler_ready_queue_add(next);
+
+        pcb_t* idle = process_find_by_pid(1);
+        if (idle && idle != current_process) {
+            /*
+             * Fall to idle.  context_switch does NOT update
+             * current_process -- scheduler_switch_to does that before
+             * the dispatch, and the refuse path bypassed it.  Without
+             * this, current_process stays at the refused process (or
+             * 0 after a scheduler_reset), and timer_preempt_handler's
+             * `if (!current) return` makes every subsequent tick a
+             * no-op: the queue is never drained, nothing is dispatched,
+             * and idle runs hlt forever.  That was the hang.
+             */
+            current_process = idle;
+            process_set_current(idle);
+            idle->state = PROC_STATE_RUNNING;
+            next = idle;
+        } else {
+            /* No idle to fall to: keep the caller running rather
+             * than returning into a parked frame.  This is the old
+             * behavior and is reached only if idle is gone. */
+            __asm__ volatile("sti");
+            return;
+        }
+    }
+
+    SW2_PRINT(
+        serial_print("SW2-CALL prev=0x"); serial_print_hex((uint64_t)prev);
+        serial_print(" next=0x"); serial_print_hex((uint64_t)next);
+        serial_print(" nextpid="); serial_print_dec(next->pid);
+        serial_print(" nextst="); serial_print_dec(next->state);
+        serial_print(" rsp=0x"); serial_print_hex(next->rsp);
+        serial_print(" kv=0x"); serial_print_hex(next->kernel_stack_virt);
+        serial_print(" kt=0x"); serial_print_hex(next->kernel_stack_top);
+        serial_print("\n");
+    );
 
     context_switch(prev, next);
 }
@@ -948,8 +1201,7 @@ void process_yield(void) {
                  */
                 if (_p == current_process) continue;
                 if (_p->pid == 1) continue;   /* idle is never queued */
-                if (_p->state != PROC_STATE_READY &&
-                    _p->state != PROC_STATE_RUNNING) continue;
+                if (_p->state != PROC_STATE_READY) continue;
                 if (scheduler_ready_queue_contains(_p)) continue;
                 scheduler_ready_queue_add(_p);
             }
@@ -975,6 +1227,58 @@ void process_yield(void) {
                 if (!next) return;
             }
         }
+    }
+
+    /*
+     * Refuse to yield to the process already on the CPU.
+     *
+     * Two ways next can equal current_process here:
+     *
+     *   - the fallback above set next = current_process when the
+     *     queue was empty and the current process was READY;
+     *
+     *   - a tick landed between scheduler_ready_queue_next() and this
+     *     point and made current_process = next.
+     *
+     * Either way, dispatching it is wrong: scheduler_switch_to would
+     * save current_process as prev and resume it as next, on its own
+     * live stack, and context_switch_resume would read the live stack
+     * as a 20-slot frame and halt on the CS slot.  Stay on the CPU
+     * instead: the process is already running, and its frame is
+     * whatever it is executing on.
+     */
+    if (next == current_process) {
+        current_process->state = PROC_STATE_RUNNING;
+        return;
+    }
+
+    /*
+     * Refuse to dispatch a next that is already RUNNING.
+     *
+     * A RUNNING process is, by the scheduler's invariant, the one on
+     * the CPU.  Dispatching it as a switch target resumes it from a
+     * pcb->rsp that names a frame its last save left -- and for a
+     * process that has been running since, the stack has moved past
+     * that frame.  The 2026-10-16 capture caught exactly this:
+     * sys_wait4 -> process_yield picked a next whose state was
+     * RUNNING and whose rip was serial_putc+44 (a timer preemption),
+     * and context_switch resumed it from the stale frame.
+     *
+     * scheduler_switch_to has its own RUNNING guard, but it is above
+     * the queue-helper calls that restore interrupts, and the check
+     * here is at the decision point.  Same shape as the
+     * next == current_process guard above.
+     */
+    if (next->state == PROC_STATE_RUNNING) {
+        serial_lock();
+        serial_print("YIELD-REFUSE: next pid=");
+        serial_print_dec(next->pid);
+        serial_print(" name=");
+        serial_print(next->name);
+        serial_print(" state=RUNNING\n");
+        serial_unlock();
+        current_process->state = PROC_STATE_RUNNING;
+        return;
     }
 
     scheduler_switch_to(next);

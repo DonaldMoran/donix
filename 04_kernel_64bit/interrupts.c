@@ -418,8 +418,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
                 pcb_t* _p = process_get_pcb(_i);
                 if (!_p) continue;
                 if (_p->pid == 1) continue;
-                if (_p->state != PROC_STATE_READY &&
-                    _p->state != PROC_STATE_RUNNING) continue;
+                if (_p->state != PROC_STATE_READY) continue;
                 if (scheduler_ready_queue_contains(_p)) continue;
                 scheduler_ready_queue_add(_p);
             }
@@ -642,6 +641,50 @@ timer_preempt_handler(uint64_t stack_pointer) {
             return stack_pointer;
         }
 
+        /*
+         * Refuse to resume a next whose rsp is 0.
+         *
+         * This is the timer path's counterpart to scheduler_switch_to's
+         * SWITCH-REFUSE.  irq0_stub resumes from the value this handler
+         * returns (`mov rsp, rax`), so a zero there executes with
+         * rsp = 0 -- a #GP, then a #DF, because isr13_stub's first
+         * PUSH faults.  scheduler_switch_to's refuse does not cover
+         * this path: the timer returns next->rsp directly instead of
+         * calling context_switch.
+         *
+         * Refusing here is placed BEFORE the CR3 switch, so
+         * `return stack_pointer` resumes `current` in current's own
+         * address space.  The refused process is requeued and picked
+         * up again once it has been saved.
+         */
+        if (next->pid != 1 &&
+            (next->rsp < next->kernel_stack_virt ||
+             next->rsp >= next->kernel_stack_virt + PROC_STACK_SIZE)) {
+            serial_lock();
+            serial_print("TIMER-REFUSE: next pid=");
+            serial_print_dec(next->pid);
+            serial_print(" name=");
+            serial_print(next->name);
+            serial_print(" rsp outside stack -> resume current\n");
+            serial_unlock();
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
+        if (next->rsp == 0) {
+            serial_lock();
+            serial_print("TIMER-REFUSE: next pid=");
+            serial_print_dec(next->pid);
+            serial_print(" name=");
+            serial_print(next->name);
+            serial_print(" rsp=0 -> resume current\n");
+            serial_unlock();
+            next->state = PROC_STATE_READY;
+            scheduler_ready_queue_add(next);
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
         /* Only a RUNNING current goes back on the ready queue. A
            BLOCKED process must stay off it; that is what makes "a
            shell waiting for input does not prevent any other process
@@ -685,6 +728,22 @@ timer_preempt_handler(uint64_t stack_pointer) {
 
         __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3));
 
+        /*
+         * Consume next->rsp: read it, clear it, return the read value.
+         *
+         * irq0_stub resumes from this value (`mov rsp, rax`), and the
+         * value names the interrupt frame this tick just built for
+         * next.  Clearing the field means the frame is consumed exactly
+         * once.  A process that is dispatched again before being saved
+         * then has next->rsp == 0, and scheduler_switch_to's
+         * SWITCH-REFUSE check catches it instead of resuming the stale
+         * frame (the 'C').
+         *
+         * This is the timer-path half of the clear that
+         * context_switch_resume does on its own resume path.  Without
+         * it, a process resumed by the timer kept a non-zero rsp, and
+         * the later stale-frame dispatch passed every check.
+         */
         return next->rsp;
     }
 
