@@ -539,10 +539,17 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * below fires when the empty queue PERSISTS, which a stop
          * does and a boot transient does not.  Item 7d.
          */
+#if RACE_PROBE_IDLE_DUMP
+        /*
+         * The streak counter exists only under the gate.  With the
+         * gate off, nothing reads it, and declaring it outside the
+         * #if makes clang warn 'set but not used'.  Item 7d.
+         */
         static int _7e_empty_streak = 0;
         if (next) {
             _7e_empty_streak = 0;
         }
+#endif
         if (!next) {
             /*
              * Persistent-empty pool dump.  The idle state is reached
@@ -554,8 +561,8 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * or a process is stranded.  Boot transients never reach
              * three ticks; a stop does.  Diagnostic only.
              */
-            _7e_empty_streak++;
 #if RACE_PROBE_IDLE_DUMP
+            _7e_empty_streak++;
             if (_7e_empty_streak == 3 ||
                 (_7e_empty_streak > 3 && (_7e_empty_streak % 256) == 0)) {
                 serial_lock();
