@@ -18,7 +18,7 @@
  * refuse print (SWITCH-DEAD) is failure-path signal and is NOT gated.
  */
 #ifndef SW2_TRACE
-#define SW2_TRACE 1
+#define SW2_TRACE 0
 #endif
 
 #if SW2_TRACE
@@ -1225,6 +1225,23 @@ void process_yield(void) {
     if (!current_process) return;
     if (current_process->pid == 1) return;
 
+    /*
+     * Hold cli from here through scheduler_switch_to.
+     *
+     * The pop (scheduler_ready_queue_next) returns next under its own
+     * cli and restores the caller's flag on the way out.  With the
+     * caller's flag ON, a tick between the pop and scheduler_switch_to
+     * can turn next's slot READY->ZOMBIE, which is the SWITCH-DEAD
+     * window: the yield is then wasted on a refused dispatch.  Holding
+     * cli across the pop, the checks below, and the call closes it:
+     * no tick can change the slot between the pop and the dispatch.
+     *
+     * EVERY return after this point must sti first.  The success path
+     * (scheduler_switch_to) does not return -- context_switch leaves
+     * via the new process -- so it needs no sti.
+     */
+    __asm__ volatile("cli");
+
     yield_count++;
 
     if (current_process->state == PROC_STATE_RUNNING) {
@@ -1300,7 +1317,7 @@ void process_yield(void) {
                 race_probe_dump();
 #endif
                 next = process_find_by_pid(1);
-                if (!next) return;
+                if (!next) { __asm__ volatile("sti"); return; }
             }
         }
     }
@@ -1325,6 +1342,7 @@ void process_yield(void) {
      */
     if (next == current_process) {
         current_process->state = PROC_STATE_RUNNING;
+        __asm__ volatile("sti");
         return;
     }
 
@@ -1354,6 +1372,7 @@ void process_yield(void) {
         serial_print(" state=RUNNING\n");
         serial_unlock();
         current_process->state = PROC_STATE_RUNNING;
+        __asm__ volatile("sti");
         return;
     }
 
