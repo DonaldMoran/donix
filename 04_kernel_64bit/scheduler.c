@@ -18,7 +18,7 @@
  * refuse print (SWITCH-DEAD) is failure-path signal and is NOT gated.
  */
 #ifndef SW2_TRACE
-#define SW2_TRACE 0
+#define SW2_TRACE 1
 #endif
 
 #if SW2_TRACE
@@ -943,6 +943,61 @@ void scheduler_switch_to(pcb_t* next) {
         serial_print(" st="); serial_print_dec(next->state);
         serial_print(" nm="); serial_print(next->name);
         serial_print("\n");
+#if SW2_TRACE
+        /*
+         * Chase instrument: find who still refers to the zombie's
+         * slot.  Walk the ready queue's head/tail, both
+         * current_process copies, and every live PCB's next/prev.
+         * Print every reference that equals `next`.  The first
+         * SWITCH-DEAD names the holder.
+         *
+         * Read the globals through their nm addresses so the
+         * instrument does not need them re-declared; they are
+         * static in scheduler.c and process.c.
+         */
+        {
+            extern pcb_t* ready_queue_head;
+            extern pcb_t* ready_queue_tail;
+            uint64_t here = (uint64_t)next;
+            if ((uint64_t)ready_queue_head == here) {
+                serial_print("  HOLDER ready_queue_head=0x");
+                serial_print_hex(here); serial_print("\n");
+            }
+            if ((uint64_t)ready_queue_tail == here) {
+                serial_print("  HOLDER ready_queue_tail=0x");
+                serial_print_hex(here); serial_print("\n");
+            }
+            if ((uint64_t)current_process == here) {
+                serial_print("  HOLDER scheduler current_process=0x");
+                serial_print_hex(here); serial_print("\n");
+            }
+            if ((uint64_t)process_get_current() == here) {
+                serial_print("  HOLDER process.c current_process=0x");
+                serial_print_hex(here); serial_print("\n");
+            }
+            for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+                pcb_t* _p = process_get_pcb(_i);
+                if (!_p) continue;
+                if ((uint64_t)_p == here) continue;   /* itself, skip */
+                if ((uint64_t)_p->next == here) {
+                    serial_print("  HOLDER pcb[");
+                    serial_print_dec((uint64_t)_i);
+                    serial_print("] pid="); serial_print_dec(_p->pid);
+                    serial_print(" nm="); serial_print(_p->name);
+                    serial_print(" ->next=0x"); serial_print_hex(here);
+                    serial_print("\n");
+                }
+                if ((uint64_t)_p->prev == here) {
+                    serial_print("  HOLDER pcb[");
+                    serial_print_dec((uint64_t)_i);
+                    serial_print("] pid="); serial_print_dec(_p->pid);
+                    serial_print(" nm="); serial_print(_p->name);
+                    serial_print(" ->prev=0x"); serial_print_hex(here);
+                    serial_print("\n");
+                }
+            }
+        }
+#endif
         serial_unlock();
         return;
     }
@@ -991,14 +1046,35 @@ void scheduler_switch_to(pcb_t* next) {
      * context_switch_resume halts on the CS slot.  Re-check under the
      * cli so the state cannot change between the check and the
      * dispatch. */
-    if (next->state == PROC_STATE_RUNNING) {
+    if (next->state != PROC_STATE_READY) {
+        /*
+         * next is not in the state the caller expected.  It was
+         * READY when the caller popped it, but the slot can change
+         * between the pop and this point: RUNNING (a peer wake),
+         * ZOMBIE (it exited and process_exit marked it), or UNUSED
+         * (it was reclaimed and the slot reused).  None is
+         * dispatchable.
+         *
+         * The 2026-10-16 SWITCH-DEAD trace showed the window: a
+         * zombie reached scheduler_switch_to as next while the slot
+         * was reclaimed-and-reused between dispatch decisions.
+         *
+         * current_process was set to next ABOVE, before the queue
+         * helpers reopened interrupts.  Restore it to prev so the
+         * refuse does not leave the two out of step.  On the RUNNING
+         * case this also fixes the old divergence: the previous
+         * code left current_process = next while the CPU stayed on
+         * prev.
+         */
         serial_lock();
-        serial_print("SW2-RET-RUNNING next=0x"); serial_print_hex((uint64_t)next);
+        serial_print("SWITCH-REFUSE: next=0x"); serial_print_hex((uint64_t)next);
         serial_print(" pid="); serial_print_dec(next->pid);
+        serial_print(" st="); serial_print_dec(next->state);
         serial_print(" nm="); serial_print(next->name);
-        serial_print(" cur=0x"); serial_print_hex((uint64_t)current_process);
-        serial_print("\n");
+        serial_print(" -> resume prev\n");
         serial_unlock();
+        current_process = prev;
+        process_set_current(prev);
         __asm__ volatile("sti");
         return;
     }
