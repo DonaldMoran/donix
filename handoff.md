@@ -268,7 +268,7 @@ Do NOT re-walk the refuted paths below.
 - **A caller heap overflow.**  The enriched trace + the merge trace
   proved the merge arithmetic correct; the "corruption" was an
   interleaved `kfree`.  The heap had a race, not an overflow.
-- Do not re-open: item 7, item 7c, item 11, the session-48 zone scan,
+- Do not re-open: item 11, the session-48 zone scan,
   the `fs_base` path, the `longjmp`/`setjmp` family.
 
 ---
