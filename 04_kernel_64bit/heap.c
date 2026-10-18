@@ -6,6 +6,21 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * HEAP_TRACE_MERGE -- print the coalesce merge arithmetic.
+ *
+ * Default 0: no output.  Set to 1 for one build to see, for every
+ * merge, the current block, its size before, the next block, its
+ * size, and the resulting size.  The 2026-10-18 heap_validate
+ * prev_mismatch showed a merged block whose size was 0x30 (one
+ * heap_header_t) larger than the chain allowed; this trace names
+ * whether the += double-counts or the pre-merge size was already
+ * wrong.
+ */
+#ifndef HEAP_TRACE_MERGE
+#define HEAP_TRACE_MERGE 0
+#endif
+
 /* No local HEAP_START: use the one in heap.h.  A local #define here
  * would silently shadow it and the two could drift. */
 
@@ -144,7 +159,23 @@ void heap_init(uint64_t start, size_t size) {
 static heap_header_t* find_free_block(size_t size) {
     heap_header_t* current = free_list;
 
+    /*
+     * Bounded walk.  A corrupt block whose next points at itself (or
+     * any cycle) makes the unbounded walk spin forever with interrupts
+     * off, hanging the kernel.  The heap has at most
+     * heap_mapped / sizeof(heap_header_t) blocks, so a walk longer
+     * than that is a cycle.  Return NULL -- the callers handle a failed
+     * allocation -- and name the block.
+     */
+    uint64_t steps = 0;
+    uint64_t max_steps = (heap_mapped / sizeof(heap_header_t)) + 1;
     while (current) {
+        if (++steps > max_steps) {
+            serial_print("HEAP: free-list cycle at 0x");
+            serial_print_hex((uint64_t)current);
+            serial_print("\n");
+            return NULL;
+        }
         if (!current->used && current->size >= size) {
             return current;
         }
@@ -174,6 +205,12 @@ static void split_block(heap_header_t* block, size_t size) {
     heap_header_t* new_block =
         (heap_header_t*)((uint8_t*)block + sizeof(heap_header_t) + size);
 
+    /* A corrupt block->size can make new_block land at or before block.
+     * A self-link is never a valid split.  Refuse both; the caller
+     * keeps the larger block, which is correct and safe. */
+    if ((uint64_t)new_block <= (uint64_t)block) return;
+    if (block->next == new_block) return;
+
     new_block->magic = HEAP_MAGIC;
     new_block->size  = remaining;
     new_block->used  = 0;
@@ -200,6 +237,19 @@ static void coalesce_blocks(void) {
                 (uint8_t*)current + sizeof(heap_header_t) + current->size;
 
             if ((heap_header_t*)current_end == next) {
+#if HEAP_TRACE_MERGE
+                serial_lock();
+                serial_print("MERGE cur=0x");
+                serial_print_hex((uint64_t)current);
+                serial_print(" csz_before=0x");
+                serial_print_hex(current->size);
+                serial_print(" next=0x");
+                serial_print_hex((uint64_t)next);
+                serial_print(" nsz=0x");
+                serial_print_hex(next->size);
+                serial_print(" end=0x");
+                serial_print_hex((uint64_t)current_end);
+#endif
                 current->size += sizeof(heap_header_t) + next->size;
                 current->next = next->next;
 
@@ -207,6 +257,14 @@ static void coalesce_blocks(void) {
                     current->next->prev = current;
                 }
 
+#if HEAP_TRACE_MERGE
+                serial_print(" csz_after=0x");
+                serial_print_hex(current->size);
+                serial_print(" next_after=0x");
+                serial_print_hex((uint64_t)current->next);
+                serial_print("\n");
+                serial_unlock();
+#endif
                 continue;   /* re-check current against its new next */
             }
         }
@@ -306,7 +364,53 @@ void kfree(void* ptr) {
 
     block->used = 0;
     heap_used_bytes -= block->size;
+
+    /*
+     * The heap has no lock.  coalesce_blocks() and the validate below
+     * mutate and then read the SAME list, and a tick between them runs
+     * the timer's scheduler, which can call kmalloc/kfree and mutate
+     * the list out from under the validate.  That is what produced the
+     * 2026-10-18 HEAP-VALIDATE FAIL next_not_end: the validator read a
+     * block whose size was pre-merge while its next was post-merge --
+     * a state only an interleaved second kfree can create.
+     *
+     * Hold cli across coalesce AND validate, so the two see one list
+     * state.  Save and restore the caller's flag rather than a bare
+     * cli/sti: kfree is reached from contexts that must stay
+     * interrupts-off (sys_fork holds cli across process_create's
+     * allocations), and a bare sti here would re-enable them.
+     */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
     coalesce_blocks();
+
+    {
+        uint64_t bad = heap_validate();
+        if (bad != 0) {
+            /*
+             * Name the failing block AND its fields.  heap_validate
+             * returns the block it landed on; the field that is
+             * wrong says which check failed (magic / size / used /
+             * next / prev) and therefore which direction the
+             * overflow came from.  Read via the HHDM/VMA alias the
+             * heap is mapped at -- bad is a valid heap pointer.
+             */
+            heap_header_t* b = (heap_header_t*)bad;
+            serial_print("HEAP: corrupt after coalesce block=0x");
+            serial_print_hex(bad);
+            serial_print(" magic=0x"); serial_print_hex(b->magic);
+            serial_print(" size=0x");  serial_print_hex(b->size);
+            serial_print(" used=");    serial_print_dec(b->used);
+            serial_print(" next=0x");  serial_print_hex((uint64_t)b->next);
+            serial_print(" prev=0x");  serial_print_hex((uint64_t)b->prev);
+            serial_print(" end=0x");   serial_print_hex(
+                (uint64_t)b + sizeof(heap_header_t) + b->size);
+            serial_print("\n");
+        }
+    }
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
 size_t heap_used(void)  { return heap_used_bytes; }
@@ -365,6 +469,23 @@ void heap_stats(void) {
  * (nonzero).  Does not allocate, so it is safe to call when the heap
  * is suspected of being corrupt.
  * --------------------------------------------------------------------- */
+/* Instrumented return: print the failing check and the two values it
+ * compared, then return the block.  Gated so a healthy heap prints
+ * nothing.  This is the diagnostic that names WHICH invariant failed;
+ * the block address alone does not. */
+#define HEAP_FAIL(cur_, check_, exp_, got_)                              \
+    do {                                                                 \
+        serial_lock();                                                   \
+        serial_print("HEAP-VALIDATE FAIL check=");                       \
+        serial_print(check_);                                            \
+        serial_print(" block=0x"); serial_print_hex((uint64_t)(cur_));    \
+        serial_print(" exp=0x");   serial_print_hex((uint64_t)(exp_));    \
+        serial_print(" got=0x");   serial_print_hex((uint64_t)(got_));    \
+        serial_print("\n");                                              \
+        serial_unlock();                                                 \
+        return (uint64_t)(cur_);                                         \
+    } while (0)
+
 uint64_t heap_validate(void) {
     if (heap_start == 0 || heap_brk == 0) {
         /* Heap not initialized.  Treat as intact so selftest does not
@@ -373,36 +494,50 @@ uint64_t heap_validate(void) {
     }
 
     if (free_list == NULL) {
-        return heap_start;   /* non-zero: no blocks at all */
+        HEAP_FAIL(heap_start, "free_list_null", heap_start, free_list);
     }
 
     /* The first block must start at heap_start. */
     if ((uint64_t)free_list != heap_start) {
-        return (uint64_t)free_list;
+        HEAP_FAIL(free_list, "head_not_heapstart", heap_start, free_list);
     }
 
     heap_header_t* prev = NULL;
     heap_header_t* cur  = free_list;
 
     while (cur) {
-        if (cur->magic != HEAP_MAGIC)                    return (uint64_t)cur;
-        if (cur->used != 0 && cur->used != 1)            return (uint64_t)cur;
-        if ((uint64_t)cur < heap_start)                  return (uint64_t)cur;
-        if ((uint64_t)cur + sizeof(heap_header_t) > heap_brk) return (uint64_t)cur;
+        if (cur->magic != HEAP_MAGIC)
+            HEAP_FAIL(cur, "magic", HEAP_MAGIC, cur->magic);
+        if (cur->used != 0 && cur->used != 1)
+            HEAP_FAIL(cur, "used", 1, cur->used);
+        if ((uint64_t)cur < heap_start)
+            HEAP_FAIL(cur, "below_start", heap_start, (uint64_t)cur);
+        if ((uint64_t)cur + sizeof(heap_header_t) > heap_brk)
+            HEAP_FAIL(cur, "past_brk", heap_brk,
+                      (uint64_t)cur + sizeof(heap_header_t));
         if (cur->size > heap_brk - (uint64_t)cur - sizeof(heap_header_t))
-                                                         return (uint64_t)cur;
-        if (cur->prev != prev)                           return (uint64_t)cur;
+            HEAP_FAIL(cur, "size_overrun",
+                      heap_brk - (uint64_t)cur - sizeof(heap_header_t),
+                      cur->size);
+        if (cur->prev != prev)
+            HEAP_FAIL(cur, "prev_mismatch", (uint64_t)prev,
+                      (uint64_t)cur->prev);
 
         uint8_t* end = (uint8_t*)cur + sizeof(heap_header_t) + cur->size;
 
         if (cur->next) {
-            if (cur->next != (heap_header_t*)end)        return (uint64_t)cur;
-            if (cur->next->prev != cur)                  return (uint64_t)cur;
+            if (cur->next != (heap_header_t*)end)
+                HEAP_FAIL(cur, "next_not_end", (uint64_t)end,
+                          (uint64_t)cur->next);
+            if (cur->next->prev != cur)
+                HEAP_FAIL(cur, "next_prev_mismatch", (uint64_t)cur,
+                          (uint64_t)cur->next->prev);
         } else {
             /* Last block: its end must be exactly heap_brk, so no
                mapped byte is unaccounted for.  This is the invariant
                the old implementation violated. */
-            if ((uint64_t)end != heap_brk)               return (uint64_t)cur;
+            if ((uint64_t)end != heap_brk)
+                HEAP_FAIL(cur, "last_end_not_brk", heap_brk, (uint64_t)end);
         }
 
         prev = cur;
