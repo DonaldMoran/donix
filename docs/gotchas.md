@@ -1,3 +1,144 @@
+## A guard is not a fix; a fix closes the window the guard was checking across
+
+*Sessions 63–67.  The `C` resisted four sessions because each attempt
+added a guard instead of closing the window.*
+
+The `C` is `context_switch.asm`'s unknown-CS halt.  Four sessions
+tried four guards — a `RUNNING`-next refuse in
+`scheduler_switch_to`, a `next->rsp == 0` clear, a
+switch-to-self check in the tail, and the frame-top reserve.  Each
+converted a fatal halt into a different fatal halt, a hang, or a
+refused-every-dispatch loop.  None closed the `C`.
+
+**The window.**  `process_yield` popped `next` from the ready
+queue, did its checks with interrupts **on**, then dispatched.  A
+tick between the pop and the dispatch could turn the slot
+`READY→ZOMBIE`, and the dispatch used the stale value.  The guard
+that ran after the pop was a telescope pointed at the past.
+
+**The fix.**  Hold `cli` from before the pop through the dispatch,
+`sti` on every return.  The state cannot change between the check
+and the act because they are one critical section.
+
+**The rule.**  A guard whose check and act are not one critical
+section is not a guard.  It converts a bug into a different bug,
+which is why the `C` survived four of them.  When a guard "does
+not work," the question is not "which guard" — it is "what window
+is the guard checking across, and who can change the state in it."
+
+## An instrument on the failure path is signal; its absence is not proof
+
+*Session 68.  `HEAP: corrupt` named blocks that were consistent when
+read; only the merge trace showed the timing was wrong.*
+
+The heap's free-list cycle hang looked like a caller overflow:
+`magic` intact, `used` intact, `next` overwritten with a self-link.
+`heap_validate` returned blocks (`0x750`, `0x7C0`, `0x1840`) that,
+read, were each internally consistent — `end == next`, `prev`
+matching the walk.  The print named the block it *landed on*, not
+the invariant that failed.
+
+**What ended it.**  Two prints, in sequence.  First `heap_validate`
+printed which check failed and the two values it compared
+(`check=prev_mismatch exp=… got=…`).  Then `coalesce_blocks`
+printed its arithmetic on every merge.  The arithmetic was correct
+at every step.  **The list was not corrupt; `heap_validate` was
+reading a list an interleaved `kfree` was midway through mutating.**
+
+**The rule.**  A diagnostic that prints a block address is a claim
+about *where*; a diagnostic that prints the values it compared is a
+claim about *what*.  The second ends the mystery.  And a failure-path
+print that *stops* appearing is not proof the bug is fixed — it is
+proof it did not fire in that run.  The heap fix is "10000
+iterations clean," not "no cycle possible."
+
+## Two BSS symbols with the same name are two variables
+
+*Session 65.  `process_destroy` wrote one `current_process`; the
+other stayed stale.*
+
+`current_process` existed twice: `process.o` at
+`0xFFFFFFFF80287F50` and `scheduler.o` at `0xFFFFFFFF80307F70`, two
+distinct `b` symbols.  `process_destroy` did
+`if (current_process == pcb) current_process = NULL;` — writing
+process.c's copy only, leaving scheduler.c's pointing at the
+destroyed PCB.
+
+**The fix.**  Route the clear through `scheduler_set_current(NULL)`,
+which writes both.  It was the one confirmed single-copy write in
+the tree.
+
+**The rule.**  `nm` the object files when a global "does not stay
+cleared."  A name is not a variable; a file-local `static` in two
+translation units is two variables with one name, and a write to one
+is invisible to a reader of the other.  A guard that compares
+against "the" `current_process` is comparing against one of two.
+
+## Count in Python, not `grep`
+
+*Session 68.  Three edit scripts aborted on wrong counts; each abort
+was right, the check was wrong.*
+
+`grep -Fxc` requires a whole-line match — it missed a line that had
+four spaces of indent, and reported 0 for a string that was there.
+`grep -Fc` on a multi-line string is not a multi-line match: it
+matches each line of the pattern separately, and counted `}` 76
+times.  `grep -Fc 'scheduler_ready_queue_remove(pcb);'` counted the
+two pre-existing sites plus the four new ones — correct — but a
+three-line tail at two indentations matched only two of four.
+
+**The rule.**  `str.count` in Python is the only honest multi-line
+count.  Do the count in the edit script, not in a pre-check `grep`;
+abort on `count != 1` (or the expected number) **before** writing.
+And count the occurrences in the file, not from memory — the four
+failure exits were at two indents, and the "four" I expected was
+four sites with two different shapes.
+
+## A `case` default must apply to the argument, not just the match
+
+*Session 68.  `./run` with no argument printed `run: unknown mode ''`.*
+
+The dispatch was
+
+    case "${1:-sdl}" in
+        menu) ...
+        *) run_mode "$1" ;;
+    esac
+
+`"${1:-sdl}"` selects the `*)` branch when `$1` is empty — the
+default is in the *match*.  But `run_mode "$1"` passes the raw,
+empty `$1`, and `mode_qemu ""` returns "unknown mode".
+
+**The fix.**  `run_mode "${1:-$DEFAULT_MODE}"` — the default applies
+to the argument too.
+
+**The rule.**  `case "${1:-default}"` defaults only the thing the
+`case` tests.  The branch body still sees `$1`.  A default that
+works for the match and not for the use is the shape of a
+"works for `--help`, fails for no-arg" script.
+
+## A test-mode flag is part of the system
+
+*Session 68.  A correct `reboot` looked broken because QEMU was told
+not to honor it.*
+
+`handle_reboot_sequence` issued the keyboard-controller pulse and the
+ACPI reset port, and `reboot` from the kernel shell appeared to do
+nothing.  The kernel was correct: the `run` script's base carried
+`-no-reboot -no-shutdown`, so QEMU caught the guest reset and exited
+instead of rebooting.  Running QEMU without the pair reboots.
+
+**The rule.**  The test harness's flags are part of what is under
+test.  `-no-reboot` freezes at a fault (which is what every `C`/heap
+diagnosis run needs) and *also* swallows a legitimate reboot.  When
+a feature "does not work," check whether the harness disabled it
+before reading the kernel.
+
+**The shape.**  A flag chosen for diagnosis (freeze on fault) and a
+flag chosen for normal operation (reboot) are not the same run.
+The `run` script now splits them: `clean-nofreeze` (default, reboot
+works) and the freeze modes (diagnosis).
+
 ## The `C` line's five fields are named by the asm that prints them; decode them before proposing a fix
 
 *Session 65.  A method correction that would have saved the
