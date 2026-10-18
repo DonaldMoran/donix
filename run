@@ -1,51 +1,155 @@
 #!/usr/bin/env bash
 #
-# run — uncomment ONE line in the menu below, then ./run
+# run — build, stage the image, and launch QEMU.
 #
-
-menu() {
-    # Uncomment exactly one line. Never two.
-    #
-    # DUAL-DRIVE
-    # make clean && make && make runkernel64 > capture.txt
-    # make clean && make && make runkernel64-kvm > capture.txt
-    # make clean && make && make runkernel64-log > capture.txt
-    # make clean && make && make runkernel64-verbose > capture.txt
-    # make clean && make && make runkernel64-debug > capture.txt
-    # make clean && make && make runkernel64-headless > capture.txt
-    # make clean && make && make runkernel64-telnet > capture.txt
-    #
-    # SINGLE-DRIVE
-    # The top-level `make FAT_CONFIG=single` already builds the kernel with
-    # the single-drive config. The `runkernel64-single` target re-runs that
-    # same `make` (see the top-level Makefile), which is a no-op if nothing
-    # changed. So we skip the explicit second build here.
-    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-debug-log > capture.txt
-    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
-    # { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
-    # qemu-system-x86_64 -cpu max -drive file=/home/noneya/code/donix/05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -monitor none -d int -D qemu-int.log
-
-    # Active: KVM + host CPU, headless, single-drive, live tee to capture.txt.
-    # Replaces `make -C 05_boot_kernel64 run-kvm-single` (which used SDL;
-    # SDL was the source of the slowness on this host, not KVM).  The
-    # -no-reboot -no-shutdown pair freezes QEMU at a fault for reading,
-    # instead of rebooting or exiting.
-    # { make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor none -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
-    # { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
-    { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && qemu-system-x86_64 -drive file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display none -enable-kvm -cpu host -monitor unix:/tmp/donix-mon,server,nowait -s -no-reboot -no-shutdown ; } 2>&1 | tee capture.txt
-    :  # no-op so an empty body is valid
-}
+#   ./run              default: clean rebuild + SDL + GDB stub (clean-sdl)
+#   ./run menu         print the numbered menu, pick one
+#   ./run <name>       run a named mode directly (e.g. ./run headless)
+#   ./run help         list the modes
+#
+# Every mode:
+#   - builds (incrementally; clean-* modes run `make clean` first),
+#   - has the GDB stub on :1234, so a second terminal can attach,
+#   - writes EVERYTHING to capture.txt: the build output, the QEMU
+#     command, the serial console, and any -d log.  One file.
+#
+# GDB attach, any mode, any time:
+#     gdb -q 04_kernel_64bit/kernel.elf
+#     (gdb) target remote :1234
+#
+# The tick rate is `pit_init` in kmain.c.  It is a compiled constant
+# and is NOT a run-script option; edit kmain.c and rebuild.
 
 set -e
+set -o pipefail
 cd "$(dirname "$0")"
 
-CMD=$(sed -n '/^menu() {/,/^}/p' "$0" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' | grep -v '^menu()' | grep -v '^}' | head -1)
+KERNEL_DIR=04_kernel_64bit
+BOOT_DIR=05_boot_kernel64
+IMG="$BOOT_DIR/hdd-single.img"
+CAPTURE=capture.txt
 
-if [ -z "$CMD" ]; then
-    echo "run: no command uncommented."
-    echo "run: edit this file, uncomment one line inside the menu() function."
-    exit 2
-fi
+# Default mode.  clean-sdl rebuilds from scratch and opens SDL with the
+# GDB stub -- the "did my change break anything" run.
+DEFAULT_MODE=clean-sdl
 
-echo "run: $CMD"
-eval "$CMD"
+MODES=(sdl headless debug monitor int verbose clean-sdl clean-headless)
+
+# ---- build + stage ---------------------------------------------------
+build() {
+    local clean=$1
+    if [ "$clean" = "clean" ]; then
+        echo "run: make -C $KERNEL_DIR clean"
+        make -C "$KERNEL_DIR" clean
+    fi
+    echo "run: make -C $KERNEL_DIR FAT_CONFIG=single"
+    make -C "$KERNEL_DIR" FAT_CONFIG=single
+    echo "run: make -C $BOOT_DIR hdd-single.img"
+    make -C "$BOOT_DIR" hdd-single.img
+}
+
+# ---- QEMU ------------------------------------------------------------
+qemu_base() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -enable-kvm -cpu host \
+        -serial stdio \
+        -s \
+        -monitor none \
+        -no-reboot -no-shutdown
+}
+
+mode_qemu() {
+    local base; base=$(qemu_base)
+    case "$1" in
+        sdl)            echo "$base -display sdl" ;;
+        headless)       echo "$base -display none" ;;
+        debug)          echo "$base -display sdl -S" ;;
+        monitor)        echo "$base -display sdl -monitor unix:/tmp/donix-mon,server,nowait" ;;
+        int)            echo "$base -display none -d int" ;;
+        verbose)        echo "$base -display none -d guest_errors,int,cpu_reset" ;;
+        clean-sdl)      echo "$base -display sdl" ;;
+        clean-headless) echo "$base -display none" ;;
+        *) return 1 ;;
+    esac
+}
+
+mode_desc() {
+    case "$1" in
+        sdl)            echo "SDL window, incremental         fast rebuild + SDL" ;;
+        headless)       echo "no display, incremental        serial on stdio" ;;
+        debug)          echo "SDL, QEMU waits for gdb (-S)   break before boot" ;;
+        monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
+        int)            echo "no display, interrupt log      -d int (into capture.txt)" ;;
+        verbose)        echo "no display, full log           -d guest_errors,int,cpu_reset" ;;
+        clean-sdl)      echo "make clean + SDL               [default] full rebuild" ;;
+        clean-headless) echo "make clean + no display        full rebuild" ;;
+    esac
+}
+
+mode_clean() {
+    case "$1" in clean-*) echo clean ;; *) echo no ;; esac
+}
+
+# ---- menu ------------------------------------------------------------
+show_menu() {
+    echo "modes (all have GDB stub :1234, all write capture.txt):"
+    local i=1
+    for n in "${MODES[@]}"; do
+        printf "  %2d) %-15s %s\n" "$i" "$n" "$(mode_desc "$n")"
+        i=$((i+1))
+    done
+    printf "choose [1-%d]: " "${#MODES[@]}"
+}
+
+# ---- run -------------------------------------------------------------
+# The entire body -- echoes, build, QEMU -- is inside one `2>&1 | tee`,
+# so capture.txt is the full transcript, build output included.
+# `set -o pipefail` makes a failed `make` fail the pipeline, so
+# `set -e` stops the script before QEMU launches on a stale image.
+run_mode() {
+    local name=$1
+    local q c
+    q=$(mode_qemu "$name") || { echo "run: unknown mode '$name'"; exit 2; }
+    c=$(mode_clean "$name")
+    {
+        echo "run: mode=$name${c:+ (clean build)}"
+        echo "run: $(date '+%Y-%m-%d %H:%M:%S')"
+        build "$c"
+        echo "run: $q"
+        echo "run: capture -> $CAPTURE;  gdb: target remote :1234"
+        eval "$q"
+    } 2>&1 | tee "$CAPTURE"
+}
+
+# ---- main ------------------------------------------------------------
+# The default applies to BOTH the case match and the argument passed to
+# run_mode.  `case "${1:-$DEFAULT_MODE}"` alone was not enough: the old
+# `*) run_mode "$1"` passed the raw (empty) $1, hence "unknown mode ''".
+case "${1:-$DEFAULT_MODE}" in
+    menu)
+        show_menu
+        read -r n
+        if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt "${#MODES[@]}" ]; then
+            echo "run: invalid choice"
+            exit 2
+        fi
+        run_mode "${MODES[$((n-1))]}"
+        ;;
+    -h|--help|help)
+        echo "usage: ./run [menu|<mode>]"
+        echo "  ./run          default mode ($DEFAULT_MODE)"
+        echo "  ./run menu     show the numbered menu"
+        echo "  ./run <mode>   run a named mode"
+        echo
+        echo "modes (all have GDB stub :1234, all write capture.txt):"
+        for n in "${MODES[@]}"; do
+            printf "  %-15s %s\n" "$n" "$(mode_desc "$n")"
+        done
+        echo
+        echo "gdb: gdb -q 04_kernel_64bit/kernel.elf; target remote :1234"
+        ;;
+    *)
+        run_mode "${1:-$DEFAULT_MODE}"
+        ;;
+esac
