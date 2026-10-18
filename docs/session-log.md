@@ -1,3 +1,180 @@
+## Session 68 — the heap cycle is a race, not an overflow; two selftest fixes; `run`
+
+Six commits on `dev`, scratch-tagged, unpushed.  **Not a milestone
+on its own** — the close of `v0.6.13`.  The heap's free-list cycle
+hang was traced to an interleaved `kfree`, not a caller overflow;
+the kernel selftest's `[exception_de]` halt and its `fail_slot`
+queue leak were fixed; `run` was rewritten.
+
+| Tag | What |
+|---|---|
+| `20261018-heap-cycle-contained` | `find_free_block` bounded; `split_block` self-link guard; `kfree`'s coalesce+validate under `cli`. |
+| `20261018-handoff-release-section` | Handoff: `C` fixed, heap contained, the release procedure. |
+| `20261018-shell-fallback` | `process_exit` wakes the kernel shell as READY; falls to idle on refusal. |
+| `20261018-create-fail-queue-remove` | `process_create`'s four failure exits remove the PCB from the ready queue. |
+| `20261018-run-modes` | `run`: case-driven modes, every mode has GDB, `capture.txt` covers the build. |
+| `20261018-run-nofreeze` | Default `clean-nofreeze`: reboot works; freeze modes keep `-no-reboot`. |
+
+### The heap cycle
+
+**The hang.**  `kmalloc` spun forever with `IF` clear and `g_ticks`
+frozen.  GDB read the free-list block at the loop's `%rax`: `magic =
+0xDEADBEEFCAFEBABE`, `size = 0x20`, `used = 1`, `next = itself`.
+`find_free_block`'s unbounded walk followed the self-link.
+
+**First theory, wrong.**  The block looked like a caller overflow —
+`magic` intact, `used` intact, `next` overwritten — and the enriched
+`HEAP: corrupt` print named blocks `0x750`, `0x7C0`, `0x1840`.  But
+every block, read, was consistent: `end == next`, `prev` matching the
+walk.  `heap_validate` was returning blocks that were *fine when
+read*.
+
+**The instrument that ended it.**  Two prints, in sequence.  First
+`heap_validate` was made to print which check failed and the two
+values it compared (`HEAP-VALIDATE FAIL check=… exp=… got=…`); that
+named `prev_mismatch` and `next_not_end`.  Then `coalesce_blocks`
+was made to print its arithmetic on every merge (`MERGE cur=…
+csz_before=… next=… nsz=… csz_after=…`).  The arithmetic was
+correct at every step — `csz_after == csz_before + 0x30 + nsz`, every
+time.  **So the list was not corrupt; `heap_validate` was reading a
+list an interleaved `kfree` was midway through mutating.**
+
+**The fix.**  `find_free_block`'s walk is bounded; a cycle prints
+and returns NULL.  `split_block` refuses a self-link and a
+`new_block <= block`.  `kfree` holds `cli` across `coalesce_blocks()`
+and `heap_validate()`, caller flag saved/restored — the heap had no
+lock, and a tick's `kmalloc` could mutate the list between the two.
+
+**Verified.**  pipe7e 10000 iterations clean, no `HEAP:` lines, no
+hang, no `C`; canary 28/28, `test.sh` 57/57.  The run is faster than
+the corrupt runs — the allocator was spending time on the broken
+list.
+
+### `[exception_de]` halted the selftest
+
+The kernel selftest's fault children exit through `process_exit`'s
+kernel-shell fallback, which pre-set the shell to
+`PROC_STATE_RUNNING` before `scheduler_switch_to`.  The tail check
+(`state != READY` → refuse) refused it, the code below the call
+assumed it could not return, and `process_exit: no kernel shell to
+resume, halting` ran.
+
+Restructured: no shell → distinct message, halt (the only case with
+nothing to resume); shell `BLOCKED` → set **READY**, let the
+scheduler do the transition; switch refused or not `BLOCKED` →
+report the state and fall through to idle instead of halting.  The
+scheduler is now the sole writer of `READY→RUNNING`.
+
+### The `fail_slot` queue leak
+
+With the selftest running, the timer printed
+`TIMER-REFUSE: next pid=0 name=fail_slot rsp=0`.  `process_create`'s
+four failure exits made the PCB `UNUSED` but did not remove it from
+the ready queue — the one site left out, after `process_reclaim` and
+`process_destroy`.  Added `scheduler_ready_queue_remove(pcb)` to all
+four.  The invariant is now complete: every path that makes a PCB
+`UNUSED` removes it from the queue.
+
+### `run`
+
+The old `run` asked the user to uncomment one QEMU line and extracted
+it with `sed`/`grep`; it had no default worth the name, no GDB stub
+in the headless line, and the build output went to the terminal
+instead of the capture.  Rewritten: `./run` / `./run menu` /
+`./run <name>` / `./run help`; every mode has the stub on `:1234` and
+writes **everything** to `capture.txt` (the build, the QEMU command,
+the serial console); `set -o pipefail` stops before QEMU launches on
+a failed `make`.  The default is `clean-nofreeze`: full rebuild,
+SDL, no `-no-reboot -no-shutdown`, so `reboot` works.  The freeze
+modes keep the pair — that is what every `C`/heap diagnosis run used.
+
+### Verification
+
+`selftest` 18/18 (`exception_de`/`_pf`/`_gp` and `create_fail`
+included), `canary --full` 28/28, `test.sh` 57/57.  pipe7e 10000
+iterations clean.  The `TIMER-REFUSE ... fail_slot` line is gone;
+the `create_fail` rows still report no leak.  **The heap fix is
+"10000 iterations clean" and the race that produced the hang was
+read live — not a proof the allocator has no other cycle.**
+
+**Scratch tags kept:** the six above, local, not pushed.
+
+---
+
+## Session 67 — the `C` is fixed: hold `cli` across the pop-to-dispatch
+
+Four commits on `dev`, scratch-tagged, unpushed.  **The milestone's
+headline.**  The `C` was a check-then-act race between
+`process_yield`'s ready-queue pop and its dispatch; the fix holds
+`cli` across the sequence.
+
+| Tag | What |
+|---|---|
+| `20261016-destroy-both-current` | `process_destroy` clears both `current_process` copies via `scheduler_set_current`. |
+| `20261016-c-contained` | The top `SWITCH-DEAD` refuse; the `SW2_TRACE` gate. |
+| `20261016-tail-state-check` | The tail check refuses any non-READY next; restores `current_process`. |
+| `20261017-pipe7e-all-pass` | `process_yield` holds `cli` across pop-to-dispatch. |
+
+### The mechanism
+
+The 2026-10-16 SW2-trace run named the last step:
+`scheduler_switch_to` entered with `next->state ==
+PROC_STATE_ZOMBIE`, `next->rsp` pointing at a zeroed region, and the
+resume halted on the CS slot.  A zombie reached dispatch because
+`process_yield` popped `next` (READY), did its checks with
+interrupts **on**, then dispatched; a tick between the pop and the
+dispatch could turn the slot `READY→ZOMBIE`.  The SW2 trace showed
+the slot turning over between consecutive dispatches (pid 2850 READY
+then ZOMBIE, then 2851).
+
+### The fix
+
+`process_yield` holds `cli` from before `scheduler_ready_queue_next`
+through `scheduler_switch_to`, with `sti` on every return.
+`scheduler_switch_to`'s tail refuses any non-`READY` next and
+restores `current_process = prev`.  The top `SWITCH-DEAD` guard
+stays as the fast path.
+
+### The four wrong theories, recorded
+
+The version spent sessions 63–66 on the frame: the reserve
+(`67701df`, reverted `5587d70`), the `next->rsp = 0` clear (broke
+blocking; reverted), the switch-to-self guard in the tail (refused
+every dispatch; reverted), and the `current_process` dual-copy
+divergence (real, fixed, but not the holder — both copies agreed at
+the `C`).  The watchpoint named the churn, and the SW2 trace named
+the mechanism.  **The fix was not a guard; it was closing the window
+the guard was checking across.**
+
+### Verification
+
+pipe7e at `pit_init(100000)`: **PIPE7E-ALL-PASS**, 250000
+iterations, zero `SWITCH-DEAD`, zero `C`.  At `pit_init(100)`:
+canary 28/28, `test.sh` 57/57, pipe7e clean past 77500.  The two
+rates cover the two classes: 100 kHz stresses interleavings, 100 Hz
+covers the user-mode-preemption paths.
+
+**Scratch tags kept:** the four above, local, not pushed.
+
+---
+
+## Session 66 — the `C` is contained
+
+One commit on `dev`, scratch-tagged, unpushed.  **Not a fix** —
+containment.  `scheduler_switch_to` refuses a `ZOMBIE`/`TERMINATED`
+next before the assignment, and the `SW2-*` dispatch trace is gated
+behind `SW2_TRACE`.
+
+The 2026-10-16 run: five `SWITCH-DEAD` events in 24500 iterations at
+100 kHz, all on the same slot (`0xFFFFFFFF8027D530`), pid changing
+(9811, 11348, 18442, 20378, 24559), all `PIPE7E_HELPER` st=4.  The
+slot is reclaimed and reused; the reference is slot-specific.  The
+machine ran past the point every prior build died.
+
+**Scratch tag kept:** `20261016-c-contained`, local, not pushed.
+
+---
+
 ## Session 65 — the queue race closes; the `C` is two sites, not one
 
 *2026-10-14.  A full session: the queue-mutator race closed, the
