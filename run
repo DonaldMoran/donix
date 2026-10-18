@@ -2,7 +2,7 @@
 #
 # run — build, stage the image, and launch QEMU.
 #
-#   ./run              default: clean rebuild + SDL + GDB stub (clean-sdl)
+#   ./run              default: clean rebuild + SDL, no freeze (clean-nofreeze)
 #   ./run menu         print the numbered menu, pick one
 #   ./run <name>       run a named mode directly (e.g. ./run headless)
 #   ./run help         list the modes
@@ -17,6 +17,12 @@
 #     gdb -q 04_kernel_64bit/kernel.elf
 #     (gdb) target remote :1234
 #
+# FREEZE: every mode except nofreeze/clean-nofreeze carries
+# -no-reboot -no-shutdown, which freezes the guest at a fault so the
+# state can be read.  That is what every C/heap diagnosis run used.
+# nofreeze and clean-nofreeze drop the pair, so a guest reset (including
+# a triple fault) reboots, and `reboot` from the kernel shell works.
+#
 # The tick rate is `pit_init` in kmain.c.  It is a compiled constant
 # and is NOT a run-script option; edit kmain.c and rebuild.
 
@@ -29,11 +35,13 @@ BOOT_DIR=05_boot_kernel64
 IMG="$BOOT_DIR/hdd-single.img"
 CAPTURE=capture.txt
 
-# Default mode.  clean-sdl rebuilds from scratch and opens SDL with the
-# GDB stub -- the "did my change break anything" run.
-DEFAULT_MODE=clean-sdl
+# Default mode.  clean-nofreeze rebuilds from scratch, opens SDL, and
+# does NOT freeze on a fault -- `reboot` works, and a fault reboots
+# visibly.  The freeze modes (clean-sdl and the rest) remain for
+# diagnosis.
+DEFAULT_MODE=clean-nofreeze
 
-MODES=(sdl headless debug monitor int verbose clean-sdl clean-headless)
+MODES=(clean-nofreeze nofreeze sdl headless debug monitor int verbose clean-sdl clean-headless)
 
 # ---- build + stage ---------------------------------------------------
 build() {
@@ -49,19 +57,30 @@ build() {
 }
 
 # ---- QEMU ------------------------------------------------------------
+# Freeze base: -no-reboot -no-shutdown.  A fault stops the guest.
 qemu_base() {
     echo qemu-system-x86_64 \
         -drive "file=$IMG,format=raw,if=ide,index=0" \
         -enable-kvm -cpu host \
-        -serial stdio \
-        -s \
-        -monitor none \
+        -serial stdio -s -monitor none \
         -no-reboot -no-shutdown
+}
+
+# No-freeze base: the same, minus the pair.  A fault reboots, and
+# `reboot` works.
+qemu_base_nofreeze() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -enable-kvm -cpu host \
+        -serial stdio -s -monitor none
 }
 
 mode_qemu() {
     local base; base=$(qemu_base)
+    local nf;   nf=$(qemu_base_nofreeze)
     case "$1" in
+        clean-nofreeze) echo "$nf -display sdl" ;;
+        nofreeze)       echo "$nf -display sdl" ;;
         sdl)            echo "$base -display sdl" ;;
         headless)       echo "$base -display none" ;;
         debug)          echo "$base -display sdl -S" ;;
@@ -76,14 +95,16 @@ mode_qemu() {
 
 mode_desc() {
     case "$1" in
-        sdl)            echo "SDL window, incremental         fast rebuild + SDL" ;;
-        headless)       echo "no display, incremental        serial on stdio" ;;
-        debug)          echo "SDL, QEMU waits for gdb (-S)   break before boot" ;;
+        clean-nofreeze) echo "make clean + SDL, no freeze     fault reboots; reboot works [default]" ;;
+        nofreeze)       echo "SDL, no freeze                  fault reboots; reboot works" ;;
+        sdl)            echo "SDL window, incremental         fault freezes" ;;
+        headless)       echo "no display, incremental        fault freezes" ;;
+        debug)          echo "SDL, QEMU waits for gdb (-S)   fault freezes, break before boot" ;;
         monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
         int)            echo "no display, interrupt log      -d int (into capture.txt)" ;;
         verbose)        echo "no display, full log           -d guest_errors,int,cpu_reset" ;;
-        clean-sdl)      echo "make clean + SDL               [default] full rebuild" ;;
-        clean-headless) echo "make clean + no display        full rebuild" ;;
+        clean-sdl)      echo "make clean + SDL               fault freezes" ;;
+        clean-headless) echo "make clean + no display        fault freezes" ;;
     esac
 }
 
@@ -123,9 +144,6 @@ run_mode() {
 }
 
 # ---- main ------------------------------------------------------------
-# The default applies to BOTH the case match and the argument passed to
-# run_mode.  `case "${1:-$DEFAULT_MODE}"` alone was not enough: the old
-# `*) run_mode "$1"` passed the raw (empty) $1, hence "unknown mode ''".
 case "${1:-$DEFAULT_MODE}" in
     menu)
         show_menu
@@ -146,6 +164,10 @@ case "${1:-$DEFAULT_MODE}" in
         for n in "${MODES[@]}"; do
             printf "  %-15s %s\n" "$n" "$(mode_desc "$n")"
         done
+        echo
+        echo "freeze: every mode except clean-nofreeze/nofreeze carries"
+        echo "  -no-reboot -no-shutdown, so a fault stops the guest."
+        echo "  nofreeze modes drop the pair: a fault reboots, reboot works."
         echo
         echo "gdb: gdb -q 04_kernel_64bit/kernel.elf; target remote :1234"
         ;;
