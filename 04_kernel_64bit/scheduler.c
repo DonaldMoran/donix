@@ -607,16 +607,57 @@ void __attribute__((noreturn)) process_exit(void) {
         }
 
         if (exiting->entry_point >= KERNEL_BASE) {
+            /*
+             * A kernel diagnostic exited.  Resume the kernel shell,
+             * the `k`-branch shell that spawned it.  The shell was
+             * BLOCKED when it yielded to the diagnostic; waking it is
+             * the same shape as process_wake_parent_if_waiting: set
+             * READY, let scheduler_switch_to do the READY->RUNNING
+             * transition.  process_exit must NOT set RUNNING itself --
+             * that is the scheduler's invariant, and the tail check in
+             * scheduler_switch_to refuses a non-READY next by design.
+             * The old code pre-set RUNNING, which the tail check then
+             * refused, and the halt below ran.  (2026-10-18 selftest:
+             * "[exception_de] process_exit: no kernel shell to
+             * resume, halting".)
+             */
             pcb_t* shell = process_get_kernel_shell();
-            if (shell && shell->state == PROC_STATE_BLOCKED) {
-                shell->state = PROC_STATE_RUNNING;
+            if (!shell) {
+                /*
+                 * No shell was ever created -- the `k` branch never
+                 * ran.  Nothing to resume.  This is the only case that
+                 * halts: there is genuinely no process to return to.
+                 */
+                serial_print("process_exit: no kernel shell (never created), halting\n");
+                __asm__ volatile("cli");
+                while (1) __asm__ volatile("hlt");
+            }
+
+            if (shell->state == PROC_STATE_BLOCKED) {
+                shell->state = PROC_STATE_READY;
                 extern void scheduler_switch_to(pcb_t* next);
                 scheduler_switch_to(shell);
-                /* Not reached. */
+                /*
+                 * If scheduler_switch_to returned, the shell was not
+                 * dispatched: a scheduler refusal (the tail check), or
+                 * a state the check saw.  Do NOT halt -- idle is always
+                 * dispatchable, and the next keyboard IRQ wakes the
+                 * shell.  Report the state and fall through to the idle
+                 * fallback below.
+                 */
+                serial_lock();
+                serial_print("process_exit: shell not dispatched, state=");
+                serial_print_dec((uint64_t)shell->state);
+                serial_print(" -> idle\n");
+                serial_unlock();
+            } else {
+                serial_lock();
+                serial_print("process_exit: shell not BLOCKED, state=");
+                serial_print_dec((uint64_t)shell->state);
+                serial_print(" -> idle\n");
+                serial_unlock();
             }
-            serial_print("process_exit: no kernel shell to resume, halting\n");
-            __asm__ volatile("cli");
-            while (1) __asm__ volatile("hlt");
+            /* fall through to the idle fallback below */
         }
 
         /*
