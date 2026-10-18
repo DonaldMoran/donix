@@ -14,6 +14,31 @@
 #include "include/user_space.h"
 #include "ff.h"
 #include "interrupts.h"
+#include "include/trace.h"
+#include "include/race_probe.h"
+
+/* Last syscall number that entered syscall_dispatch.  Read by the
+ * fault handlers when a corrupted control target is reported, so
+ * the syscall that was in flight when the fault fired is known.
+ * Reset only by being overwritten by the next syscall. */
+volatile uint64_t g_last_syscall_num = (uint64_t)-1;
+
+/* Diagnostic for item 7e: snapshot of the user stack around
+ * g_user_rsp_save at syscall 14 (rt_sigprocmask) entry.  Dumped by
+ * isr14_handler's bad_target block so a fault at __restore_sigs's
+ * ret can be compared against the stack as it looked when the
+ * syscall was entered.  If the values match at fault time, the
+ * corruption predates the syscall; if they differ, something wrote
+ * to the user stack during the syscall.
+ * Diagnostic only. */
+extern volatile uint64_t g_user_rsp_save;
+uint64_t g_sys14_rsp_save;
+uint64_t g_sys14_slots[8];
+int      g_sys14_valid;
+
+volatile uint64_t g_pipe_stamp_counter = 0;
+volatile uint64_t g_last_fs_base = 0;
+volatile uint64_t g_arch_prctl_addr[32];
 
 typedef struct file_slot_s {
     uint32_t kind;
@@ -403,6 +428,12 @@ typedef struct pipe_s {
      */
     struct pcb* reader_waiting;
     struct pcb* writer_waiting;
+
+    /* Unique stamp written at creation.  Used by the P13 probe to
+     * detect a pipe_t that was freed and reallocated at the same
+     * address while a reader or writer was still blocked on it.
+     * Appended at the end so no existing offset moves. */
+    uint64_t stamp;
 } pipe_t;
 
 /* Set to 1 for one build to trace the fd lifecycle of ash's
@@ -1764,6 +1795,26 @@ static void put_pipe_ref(pipe_t* pipe) {
         pipe->refcount--;
         return;
     }
+    /* Do NOT free while either end is still open.  The
+     * refcount field counts live ENDS, but a close ordering
+     * across fork can drop it to 0 while an fd still holds an
+     * end -- the parent's read fd is open and the read-end slot
+     * has not been put, yet the write-end put already took
+     * refcount 2 to 1 and this call sees 1.  The open-end
+     * counts are the authoritative "is anyone still using this
+     * pipe" test.  Freeing here while readers_open or
+     * writers_open is nonzero is the lifetime bug the P13
+     * stamp probe proved: the freed pipe_t's address is reused
+     * by the next sys_pipe, and the pending close lands on the
+     * wrong object. */
+    if (pipe->readers_open > 0 || pipe->writers_open > 0) {
+        if (pipe->refcount > 0) pipe->refcount--;
+        return;
+    }
+    race_record(24, 0, (uint64_t)pipe,
+                ((uint64_t)pipe->readers_open << 32) |
+                (uint64_t)pipe->writers_open,
+                RACE_SITE_PIPE_FREE, 81);
     if (pipe->buf) kfree(pipe->buf);
     kfree(pipe);
 }
@@ -1803,20 +1854,87 @@ static void put_pipe_ref(pipe_t* pipe) {
  * inside its own cli region, so the pointer and the state stay
  * consistent.
  */
-static void pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
-    if (!waiter) return;
-    if (waiter->state != PROC_STATE_BLOCKED) return;
-    if (waiter->block_kind != kind) return;
+/* Returns 1 if the wake was delivered, 0 if the waiter was not
+ * in a state to receive it (NULL, not BLOCKED, or blocked for a
+ * different reason).  Callers MUST only clear the waiter field
+ * on a return of 1.  A no-op wake that still clears the field
+ * is a lost wakeup: the reader can be running (state = RUNNING
+ * after a hlt return) with reader_waiting still = self, so a
+ * close in that window no-ops on the state check, clears the
+ * field, and the next block publishes it only after the close
+ * has already given up. */
+static int pipe_wake_waiter(struct pcb* waiter, uint64_t kind) {
+    if (!waiter) return 0;
+    if (waiter->state != PROC_STATE_BLOCKED) return 0;
+    if (waiter->block_kind != kind) return 0;
 
     waiter->state      = PROC_STATE_READY;
     waiter->block_kind = BLOCK_KIND_NONE;
     scheduler_ready_queue_add(waiter);
+    return 1;
 }
 
 static void put_file_slot(file_slot_t* slot) {
     if (!slot) return;
-    if (slot->refcount > 1) {
-        slot->refcount--;
+    /* Record EVERY put_file_slot call on a pipe slot, before the
+     * early return, with the slot pointer, its refcount, its end
+     * flag, and the calling pid.  A slot that is put twice for a
+     * single fd reference shows as two records with the same slot
+     * pointer and refcounts 2 then 1 (or 1 then 0).  That is the
+     * double-put that drops readers_open to 0 while pipe7e still
+     * holds fd 3.  Slot 29 so it does not collide with anything. */
+    if (slot->kind == FILE_KIND_PIPE) {
+        pcb_t* _pp = process_get_current();
+        race_record(29, _pp ? _pp->pid : 0,
+                    (uint64_t)slot,
+                    ((uint64_t)slot->refcount << 32) |
+                    ((uint64_t)slot->end << 16) |
+                    ((uint64_t)slot->kind),
+                    RACE_SITE_PIPE_CLOSE, 60);
+    }
+    if (slot->kind == FILE_KIND_PIPE && slot->refcount > 1) {
+        race_p12_calls++;
+        race_p12_refcount_gt1++;
+        race_record(12, (uint64_t)slot->end,
+                    (uint64_t)slot->refcount,
+                    (uint64_t)slot->obj,
+                    RACE_SITE_PIPE_CLOSE, 1);
+    }
+    uint32_t _old_rc = __atomic_fetch_sub(&slot->refcount, 1,
+                                          __ATOMIC_SEQ_CST);
+    if (_old_rc > 1) {
+#if RACE_PROBE_PPS_VERBOSE
+        /*
+         * Diagnostic (PPS-early): this close took the early return,
+         * so the writers_open / readers_open decrement below did NOT
+         * run.  If the helper's fd 1 (the write end) reaches this
+         * path with refcount > 1, writers_open stays positive and
+         * the reader on the other end never sees EOF.  Bounded to
+         * 40 events.  Item 7d.
+         */
+        if (slot->kind == FILE_KIND_PIPE) {
+            static int _dbg_ret = 0;
+            if (_dbg_ret < 20000) {
+                _dbg_ret++;
+                pcb_t* _s = process_get_current();
+                pipe_t* _pp = (pipe_t*)slot->obj;
+                serial_lock();
+                serial_print("PPS-early pid=");
+                serial_print_dec(_s ? _s->pid : 0);
+                serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                serial_print(" end="); serial_print_dec(slot->end);
+                serial_print(" rc="); serial_print_dec(_old_rc);
+                if (_pp) {
+                    serial_print(" ro="); serial_print_dec(_pp->readers_open);
+                    serial_print(" wo="); serial_print_dec(_pp->writers_open);
+                    serial_print(" rw=0x"); serial_print_hex((uint64_t)_pp->reader_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)_pp);
+                }
+                serial_print("\n");
+                serial_unlock();
+            }
+        }
+#endif
         return;
     }
     if (slot->kind == FILE_KIND_FILE) {
@@ -1894,22 +2012,160 @@ static void put_file_slot(file_slot_t* slot) {
          * intermediate close in a dup'd chain.
          */
         pipe_t* pipe = (pipe_t*)slot->obj;
+        if (slot->end != PIPE_END_READ &&
+            slot->end != PIPE_END_WRITE) {
+            /* A pipe slot whose end flag is neither READ nor
+             * WRITE.  This is a slot whose end was clobbered by
+             * a reuse of its memory (see alloc_file_slot's end
+             * initialization and the DIR/PROC end = 0 writes).
+             * Do not guess which end this was: do not decrement
+             * either count, do not wake, and do not call
+             * put_pipe_ref -- freeing on a wrong guess strands
+             * the real reader.  Record it and fall through to
+             * freeing only the slot, leaving the pipe alive.
+             * A leak here is survivable; a lost wakeup is not. */
+            pcb_t* _bad = process_get_current();
+            race_record(30, _bad ? _bad->pid : 0,
+                        (uint64_t)slot,
+                        (uint64_t)slot->end,
+                        RACE_SITE_PIPE_CLOSE, 59);
+            kfree(slot);
+            return;
+        }
+        {
+            uint64_t _rb = (uint64_t)slot->refcount;
+            uint64_t _wb = (slot->end == PIPE_END_WRITE)
+                            ? (uint64_t)pipe->writers_open : 0;
+            uint64_t _wa = (slot->end == PIPE_END_WRITE)
+                            ? (uint64_t)pipe->reader_waiting : 0;
+            RACE_P12_SLOT((uint64_t)slot->end, _rb, 0, _wb, _wb, _wa);
+        }
         if (slot->end == PIPE_END_READ) {
             if (pipe->readers_open > 0) pipe->readers_open--;
+#if RACE_PROBE_PPS_VERBOSE
+            /*
+             * Diagnostic (PPS-close-read): the read end just reached
+             * refcount 0.  Print the resulting counts and whether a
+             * writer waiter was present.  Bounded to 40 events.
+             */
+            {
+                static int _dbg_rr = 0;
+                if (_dbg_rr < 20000) {
+                    _dbg_rr++;
+                    pcb_t* _s = process_get_current();
+                    serial_lock();
+                    serial_print("PPS-close-read pid=");
+                    serial_print_dec(_s ? _s->pid : 0);
+                    serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" ww=0x"); serial_print_hex((uint64_t)pipe->writer_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print("\n");
+                    serial_unlock();
+                }
+            }
+#endif
+            {
+                pcb_t* _sc = process_get_current();
+                RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
+                               ((uint64_t)pipe->readers_open << 32) |
+                               (uint64_t)pipe->writers_open,
+                               RACE_SITE_CLOSE_READ);
+            }
             if (pipe->readers_open == 0 && pipe->writer_waiting) {
-                pipe_wake_waiter(pipe->writer_waiting,
-                                 BLOCK_KIND_PIPE_WRITE);
-                pipe->writer_waiting = NULL;
+                if (pipe_wake_waiter(pipe->writer_waiting,
+                                     BLOCK_KIND_PIPE_WRITE)) {
+                    pipe->writer_waiting = NULL;
+                }
             }
         } else if (slot->end == PIPE_END_WRITE) {
             if (pipe->writers_open > 0) pipe->writers_open--;
+#if RACE_PROBE_PPS_VERBOSE
+            /*
+             * Diagnostic (PPS-close-write): the write end just reached
+             * refcount 0.  Print the resulting counts and whether a
+             * reader waiter was present.  If writers_open is 0 but
+             * reader_waiting is NULL, the reader has not yet blocked
+             * and will check writers_open itself under cli; if
+             * reader_waiting is set, the wake below fires.  Bounded
+             * to 40 events.  Item 7d.
+             */
+            {
+                static int _dbg_ww = 0;
+                if (_dbg_ww < 20000) {
+                    _dbg_ww++;
+                    pcb_t* _s = process_get_current();
+                    serial_lock();
+                    serial_print("PPS-close-write pid=");
+                    serial_print_dec(_s ? _s->pid : 0);
+                    serial_print(" slot=0x"); serial_print_hex((uint64_t)slot);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" rw=0x"); serial_print_hex((uint64_t)pipe->reader_waiting);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print("\n");
+                    serial_unlock();
+                }
+            }
+#endif
+            {
+                pcb_t* _sc = process_get_current();
+                RACE_P13_EVENT((uint64_t)pipe, _sc ? _sc->pid : 0,
+                               ((uint64_t)pipe->readers_open << 32) |
+                               (uint64_t)pipe->writers_open,
+                               RACE_SITE_CLOSE_WRITE);
+            }
             if (pipe->writers_open == 0 && pipe->reader_waiting) {
-                pipe_wake_waiter(pipe->reader_waiting,
-                                 BLOCK_KIND_PIPE_READ);
-                pipe->reader_waiting = NULL;
+                RACE_P13_EVENT((uint64_t)pipe, 0, 0,
+                               RACE_SITE_WRITE_WAKE);
+                if (pipe_wake_waiter(pipe->reader_waiting,
+                                     BLOCK_KIND_PIPE_READ)) {
+                }
+            } else if (pipe->writers_open == 0 &&
+                       (uint64_t)pipe == race_p13_watch_pipe) {
+                /* Lost close: writers_open hit 0 and there was no
+                 * reader waiter.  Record the pipe id (a), the
+                 * reader_waiting value at this moment (b), and the
+                 * pid of the process doing the close, so the ring
+                 * shows both this event and the reader's block
+                 * site, and we can compare their `a` values.  If
+                 * they differ, the read end and write end point
+                 * at different pipe_t objects. */
+                pcb_t* _self_close = process_get_current();
+                race_record(20,
+                            _self_close ? _self_close->pid : 0,
+                            (uint64_t)pipe,
+                            (uint64_t)pipe->reader_waiting,
+                            RACE_SITE_CLOSE_WRITE, 99);
+                race_record(21,
+                            _self_close ? _self_close->pid : 0,
+                            (uint64_t)pipe,
+                            pipe->stamp,
+                            RACE_SITE_CLOSE_WRITE, 98);
+                race_p13_wake_lost++;
             }
         }
-        put_pipe_ref(pipe);
+        /* Only drop the pipe's end-ref when BOTH ends have no
+         * open fds left.  The decrement above took one open-end
+         * count to 0; if the other is still nonzero, the pipe is
+         * still in use by a blocked or active peer and must not
+         * be freed.  When the second close arrives it runs this
+         * same branch and reaches the free at last. */
+        {
+            pcb_t* _self_g = process_get_current();
+            race_record(28, _self_g ? _self_g->pid : 0,
+                        (uint64_t)pipe,
+                        ((uint64_t)pipe->readers_open << 32) |
+                        (uint64_t)pipe->writers_open,
+                        RACE_SITE_CLOSE_WRITE,
+                        (uint64_t)slot->end);
+        }
+        if (pipe->readers_open == 0 && pipe->writers_open == 0) {
+            put_pipe_ref(pipe);
+        } else if (pipe->refcount > 0) {
+            pipe->refcount--;
+        }
     }
     kfree(slot);
 }
@@ -2058,6 +2314,7 @@ static int alloc_file_slot(file_slot_t** out_slot) {
     if (!slot) return -1;
     slot->kind     = 0;
     slot->refcount = 1;
+    slot->end      = 0;
     slot->obj      = NULL;
     slot->dir_path = NULL;
     self->file_table[fd] = slot;
@@ -2198,7 +2455,7 @@ long sys_fcntl(int fd, int cmd, unsigned long arg) {
             }
             if (newfd == -1) return -(long)EAGAIN_;
 
-            slot->refcount++;
+            __atomic_fetch_add(&slot->refcount, 1, __ATOMIC_SEQ_CST);
             self->file_table[newfd] = slot;
             FDTRACE({ serial_print("fcntl DUPFD fd="); serial_print_dec((uint64_t)fd);
                       serial_print(" min="); serial_print_dec((uint64_t)min);
@@ -2286,6 +2543,8 @@ long sys_pipe(int* user_pipefd) {
 
     pipe->buf = (uint8_t*)kmalloc(PIPE_DEFAULT_CAPACITY);
     if (!pipe->buf) {
+        race_record(24, self->pid, (uint64_t)pipe, 0xFFFFFFFF,
+                    RACE_SITE_PIPE_FREE, 82);
         kfree(pipe);
         return -(long)ENOMEM_;
     }
@@ -2298,6 +2557,11 @@ long sys_pipe(int* user_pipefd) {
     pipe->writers_open = 0;   /* set to 1 when the write end allocates */
     pipe->reader_waiting = NULL;
     pipe->writer_waiting = NULL;
+    pipe->stamp = ++g_pipe_stamp_counter;
+    race_record(23, self->pid, (uint64_t)pipe, pipe->stamp,
+                RACE_SITE_PIPE_CREATE, 80);
+    RACE_P13_EVENT((uint64_t)pipe, self->pid, pipe->stamp,
+                   RACE_SITE_PIPE_CREATE);
 
     /* 2. The two ends. */
     file_slot_t* rslot = NULL;
@@ -2690,11 +2954,13 @@ static long open_resolved(const char* in_path, int flags, int backend) {
             return fd;
         }
         kfree(dir_obj);
+        #if TRACE_OPEN
         serial_print("sys_open: f_opendir FAIL path=");
         serial_print(dir_path);
         serial_print(" dr=");
         serial_print_dec(dr);
         serial_print("\n");
+        #endif
         kfree(slot);
         self->file_table[fd] = NULL;
         return fatfs_errno(dr);
@@ -2752,6 +3018,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
         }
     }
 
+    #if TRACE_OPEN
     serial_print("sys_open: f_open FAIL path=");
     serial_print(local_path);
     serial_print(" flags=0x");
@@ -2761,6 +3028,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
     serial_print(" r=");
     serial_print_dec(r);
     serial_print("\n");
+    #endif
 
     kfree(file_obj);
     kfree(slot);
@@ -2894,15 +3162,16 @@ long sys_close(int fd) {
          */
         if (slot->end == PIPE_END_WRITE) {
             if (pipe->reader_waiting) {
-                pipe_wake_waiter(pipe->reader_waiting,
-                                 BLOCK_KIND_PIPE_READ);
-                pipe->reader_waiting = NULL;
+                if (pipe_wake_waiter(pipe->reader_waiting,
+                                     BLOCK_KIND_PIPE_READ)) {
+                }
             }
         } else if (slot->end == PIPE_END_READ) {
             if (pipe->writer_waiting) {
-                pipe_wake_waiter(pipe->writer_waiting,
-                                 BLOCK_KIND_PIPE_WRITE);
-                pipe->writer_waiting = NULL;
+                if (pipe_wake_waiter(pipe->writer_waiting,
+                                     BLOCK_KIND_PIPE_WRITE)) {
+                    pipe->writer_waiting = NULL;
+                }
             }
         }
     }
@@ -2960,7 +3229,7 @@ long sys_dup2(int oldfd, int newfd) {
     }
 
     /* Share the slot and take a new reference. */
-    old_slot->refcount++;
+    __atomic_fetch_add(&old_slot->refcount, 1, __ATOMIC_SEQ_CST);
     self->file_table[newfd] = old_slot;
 
     FDTRACE({ serial_print("dup2  old="); serial_print_dec((uint64_t)oldfd);
@@ -4345,7 +4614,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     /* ---- 1. Copy the path string. ---- */
     char path[USER_PATH_MAX];
     if (copy_user_string(path, sizeof(path), user_path) != 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: bad path pointer\n");
+        #endif
         __asm__ volatile("sti");
         return -(long)EFAULT_;
     }
@@ -4426,11 +4697,13 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     FRESULT fr = f_open(&file, exec_path, FA_READ | FA_OPEN_EXISTING);
 
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_open(");
         serial_print(path);
         serial_print(") -> ");
         serial_print_dec(fr);
         serial_print("\n");
+        #endif
         __asm__ volatile("sti");
         return fatfs_errno(fr);
     }
@@ -4439,7 +4712,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     UINT got = 0;
     fr = f_read(&file, &ehdr, sizeof(ehdr), &got);
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_read header failed\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4497,23 +4772,29 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         return -(long)ENOEXEC;
     }
     if (file_size > 4ULL * 1024 * 1024) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: file too large\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
     }
     uint8_t* elf_buf = (uint8_t*)kmalloc((size_t)file_size);
     if (!elf_buf) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: kmalloc failed for ");
         serial_print_dec((uint64_t)file_size);
         serial_print(" bytes\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOMEM_;
     }
     fr = f_lseek(&file, 0);
     if (fr != FR_OK) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: rewind failed\n");
+        #endif
         kfree(elf_buf); f_close(&file);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4525,9 +4806,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         if (want > 4096) want = 4096;
         fr = f_read(&file, elf_buf + total, want, &br);
         if (fr != FR_OK) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: read failed at offset ");
             serial_print_dec(total);
             serial_print("\n");
+            #endif
             kfree(elf_buf); f_close(&file);
             __asm__ volatile("sti");
             return -(long)EIO_;
@@ -4537,7 +4820,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
     f_close(&file);
     if (total != file_size) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: short read of file body\n");
+        #endif
         kfree(elf_buf);
         __asm__ volatile("sti");
         return -(long)EIO_;
@@ -4564,9 +4849,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (safe_copy_from_user(&user_str_va,
                                     (const char**)user_argv + argc,
                                     sizeof(user_str_va)) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] pointer\n");
+                #endif
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -4575,9 +4862,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (copy_user_string(argv_scratch[argc], EXEC_MAX_ARG_LEN,
                                  (const char*)user_str_va) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad argv[");
                 serial_print_dec(argc);
                 serial_print("] string\n");
+                #endif
                 kfree(elf_buf);
                 __asm__ volatile("sti");
                 return -(long)EFAULT_;
@@ -4599,7 +4888,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         envp_scratch = (char (*)[EXEC_MAX_ARG_LEN])
             kmalloc((size_t)EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN);
         if (!envp_scratch) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: kmalloc failed for envp snapshot\n");
+            #endif
             kfree(elf_buf);
             __asm__ volatile("sti");
             return -(long)ENOMEM_;
@@ -4610,9 +4901,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             if (safe_copy_from_user(&user_str_va,
                                     (const char**)user_envp + envc,
                                     sizeof(user_str_va)) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad envp[");
                 serial_print_dec(envc);
                 serial_print("] pointer\n");
+                #endif
                 kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
@@ -4622,9 +4915,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (copy_user_string(envp_scratch[envc], EXEC_MAX_ARG_LEN,
                                  (const char*)user_str_va) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: bad envp[");
                 serial_print_dec(envc);
                 serial_print("] string\n");
+                #endif
                 kfree(envp_scratch);
                 kfree(elf_buf);
                 __asm__ volatile("sti");
@@ -4664,7 +4959,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     uint64_t entry = elf_load_into_process(self, elf_buf);
     kfree(elf_buf);
     if (entry == 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: elf_load_into_process failed\n");
+        #endif
         __asm__ volatile("sti");
         sys_exit(-1);
         return -1;  /* unreachable */
@@ -4672,7 +4969,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     uint64_t new_user_stack_top = exec_alloc_user_stack(self);
     if (new_user_stack_top == 0) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: user stack alloc failed\n");
+        #endif
         __asm__ volatile("sti");
         sys_exit(-1);
         return -1;  /* unreachable */
@@ -4731,7 +5030,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             slen++;
 
             if (cursor + slen > argv_region_top) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: argv region overflow\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4741,9 +5042,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
                                       argv_scratch[i], slen) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: failed to write argv[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4759,7 +5062,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
             slen++;
 
             if (cursor + slen > argv_region_top) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: envp region overflow\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4769,9 +5074,11 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
             if (safe_copy_to_user_cr3(self->cr3, (void*)dst,
                                       envp_scratch[i], slen) != 0) {
+                #if TRACE_EXECVE_ERR
                 serial_print("sys_execve: failed to write envp[");
                 serial_print_dec(i);
                 serial_print("]\n");
+                #endif
                 kfree(envp_scratch);
                 __asm__ volatile("sti");
                 sys_exit(-1);
@@ -4796,7 +5103,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         if (safe_copy_to_user_cr3(self->cr3, (void*)array_base,
                                   array_data, array_bytes) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write argv array\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4814,7 +5123,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         if (safe_copy_to_user_cr3(self->cr3, (void*)envp_array_base,
                                   envp_data, envp_bytes) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write envp array\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4831,7 +5142,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         uint64_t argc_slot = (uint64_t)argc;
         if (safe_copy_to_user_cr3(self->cr3, (void*)rsp_init,
                                   &argc_slot, sizeof(argc_slot)) != 0) {
+            #if TRACE_EXECVE_ERR
             serial_print("sys_execve: failed to write argc\n");
+            #endif
             kfree(envp_scratch);
             __asm__ volatile("sti");
             sys_exit(-1);
@@ -4873,13 +5186,43 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     keyboard_buffer_flush();
 
-    serial_print("sys_execve: pid=");
-    serial_print_dec(self->pid);
-    serial_print(" entry=0x"); serial_print_hex(entry);
-    serial_print(" argc=");    serial_print_dec((uint64_t)argc);
-    serial_print(" rsp=0x");   serial_print_hex(rsp_init);
-    serial_print(" (");        serial_print(proc_name);
-    serial_print(")\n");
+    //serial_print("sys_execve: pid=");
+    //serial_print_dec(self->pid);
+    //serial_print(" entry=0x"); serial_print_hex(entry);
+    //serial_print(" argc=");    serial_print_dec((uint64_t)argc);
+    //serial_print(" rsp=0x");   serial_print_hex(rsp_init);
+    //serial_print(" (");        serial_print(proc_name);
+    //serial_print(")\n");
+    
+    /*
+     * TEMPORARY PACING SHIM -- NOT A FIX.  REMOVE WHEN THE FRAME
+     * BUG IS FIXED.
+     *
+     * This block replaces a serial_print that took about 5 ms of
+     * UART busy-wait.  That busy-wait was a timing cushion: it
+     * slowed the fork/exec/wait cycle enough that a frame-
+     * corruption bug on the syscall-return path stayed
+     * unreachable.  Removing the print exposes the bug (pipe7e
+     * faults at iteration 0; test.sh faults at row ~19).
+     *
+     * This loop reproduces the same ~5 ms of delay without
+     * emitting anything.  The iteration count is calibrated for
+     * this host and this build; it is not portable and it is not
+     * a substitute for fixing the bug.
+     *
+     * When the frame bug is fixed, DELETE THIS BLOCK.
+     * See tag 20261007-P5-only-repro for the target state.
+     */
+    //~ {
+        //~ volatile uint64_t _spin = 0;
+        //~ //for (uint64_t _i = 0; _i < 1000000ULL; _i++) {
+        //~ // for (uint64_t _i = 0; _i < 500000ULL; _i++) {
+        //~ for (uint64_t _i = 0; _i < 250000ULL; _i++) {
+        //~ //for (uint64_t _i = 0; _i < 125000ULL; _i++) {
+            //~ _spin += _i;
+        //~ }
+        //~ (void)_spin;
+    //~ }
 
     __asm__ volatile("sti");
     return 0;
@@ -4970,15 +5313,39 @@ long sys_wait4(long pid, int* user_status, int options) {
             return 0;
         }
 
+        /*
+         * Critical section: the block-store, the late re-scan, and
+         * the decision to yield must be atomic with respect to the
+         * waker.  A child that exits between the scan above and the
+         * yield calls process_wake_parent_if_waiting, which sees
+         * state == BLOCKED and re-adds us to the ready queue while
+         * we are still running.  The late re-scan below narrows
+         * that window but does not close it -- the re-scan is
+         * itself preemptible.  P1 caught the pair in the same tick
+         * (site=1 and site=2, tick 5383).  cli closes it: no tick
+         * can fire between the store and the yield, so the waker
+         * cannot run at all until process_yield, and by then the
+         * state is consistent.
+         *
+         * process_yield must run with interrupts ON; it does its
+         * own cli inside scheduler_switch_to.  The saved flags are
+         * restored before the yield, not after.
+         */
+        uint64_t saved_flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
         self->wait_pid = target;
+        RACE_P1_BLOCK(self->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAIT4_BLOCK);
+        RACE_P11_BLOCK(self->pid, target);
 
+        #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
         serial_print_dec(target == (uint64_t)-1 ? 0 : target);
         serial_print(" blocking\n");
+        #endif
         
         /*
          * Late re-scan.  A child may have exited between the scan above
@@ -5005,9 +5372,14 @@ long sys_wait4(long pid, int* user_status, int options) {
                 self->state = PROC_STATE_RUNNING;
                 self->block_kind = BLOCK_KIND_NONE;
                 self->wait_pid = 0;
+                __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
                 continue;
             }
         }
+        /* End of the critical section.  The state is BLOCKED and the
+         * waker has not run; restore interrupts before yielding. */
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
@@ -5015,6 +5387,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         serial_print(" yielding state=");
         serial_print_dec((uint64_t)self->state);
         serial_print("\n");
+        #endif
         
         process_yield();
     }
@@ -5165,10 +5538,31 @@ long sys_write(int fd, const void* buf, size_t count) {
             self->state      = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_PIPE_WRITE;
 
-            __asm__ volatile("sti");
-            __asm__ volatile("hlt");
-            /* Woken by pipe_wake_waiter via a reader's drain.
-             * Loop and re-check the free space. */
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
+            /* Block via process_yield, not sti; hlt.  See the
+             * reader block's note: sti; hlt leaves self->rsp at its
+             * last save, and the resume loads a stale frame. */
+            process_yield();
+            /* Resumed.  Reset state so the requeue guards (which test
+             * state == RUNNING) see us correctly, matching the reader
+             * block above. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Loop and re-check the free space. */
         }
 
         /* We hold the cli?  No -- the break above did sti.  From
@@ -5190,9 +5584,9 @@ long sys_write(int fd, const void* buf, size_t count) {
                 pipe->used += (uint32_t)done;
                 /* A reader may have been waiting while we copied. */
                 if (pipe->reader_waiting) {
-                    pipe_wake_waiter(pipe->reader_waiting,
-                                     BLOCK_KIND_PIPE_READ);
-                    pipe->reader_waiting = NULL;
+                    if (pipe_wake_waiter(pipe->reader_waiting,
+                                         BLOCK_KIND_PIPE_READ)) {
+                    }
                 }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
@@ -5203,9 +5597,14 @@ long sys_write(int fd, const void* buf, size_t count) {
         pipe->used += (uint32_t)done;
 
         /* Bytes are in the ring: wake a waiting reader, if any. */
+        RACE_P13_EVENT((uint64_t)pipe, self->pid, (uint64_t)done,
+                       RACE_SITE_WRITE_PUT);
         if (pipe->reader_waiting) {
-            pipe_wake_waiter(pipe->reader_waiting, BLOCK_KIND_PIPE_READ);
-            pipe->reader_waiting = NULL;
+            RACE_P13_EVENT((uint64_t)pipe, self->pid, 0,
+                           RACE_SITE_WRITE_WAKE);
+            if (pipe_wake_waiter(pipe->reader_waiting,
+                                 BLOCK_KIND_PIPE_READ)) {
+            }
         }
         return (long)done;
     }
@@ -5559,7 +5958,7 @@ long sys_read(int fd, void* buf, size_t count) {
         char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
         while (bytes_read < count) {
             __asm__ volatile("cli");
-            if (kbd_buffer_get(&c)) {
+            if (kbd_buffer_get_mux(&c)) {
                 __asm__ volatile("sti");
                 if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
                 else return -(long)EFAULT_;
@@ -5590,6 +5989,21 @@ long sys_read(int fd, void* buf, size_t count) {
             if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
             self->state = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_NONE;
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
             __asm__ volatile("sti"); __asm__ volatile("hlt");
         }
         return (long)bytes_read;
@@ -5616,6 +6030,62 @@ long sys_read(int fd, void* buf, size_t count) {
 
         for (;;) {
             __asm__ volatile("cli");
+            /*
+             * DO NOT clear pipe->reader_waiting here.
+             *
+             * This block used to do:
+             *     if (pipe->reader_waiting == self)
+             *         pipe->reader_waiting = NULL;
+             * with the comment "the reader owns this field."
+             *
+             * That clear was the lost-wakeup race.  The reader
+             * clears at the TOP of the loop and re-publishes at
+             * the BLOCK site further down, in a different cli
+             * section, with sti/hlt between them.  A writer that
+             * runs in that gap does:
+             *     if (pipe->reader_waiting) { wake; }
+             * sees NULL, does nothing, and the reader then
+             * re-publishes and blocks with no pending wake.  It
+             * sleeps until the next tick -- and the tick path
+             * skips it, because block_kind is not NONE -- until
+             * a later write that may miss the same window again.
+             *
+             * Measured on pipe7e 2026-10-14 (race ring, three
+             * dumps): P13 wake: 0 and P13 eof: 0 on every
+             * capture, P13 block == P13 create, and P12
+             * wake_no_waiter == writers_nonzero exactly.  The
+             * reader published itself for every pipe it created
+             * and was never once woken by the pipe wake path.
+             *
+             * The field is left set across wakeups.  The reader
+             * re-publishes at the block site on every iteration
+             * that is about to block.  A successful wake clears
+             * it (the waker's `if (pipe_wake_waiter(...))
+             * pipe->reader_waiting = NULL;`).  A stale pointer
+             * to a running reader is harmless: pipe_wake_waiter
+             * checks state == BLOCKED and refuses otherwise.
+             */
+            RACE_P13_EVENT((uint64_t)pipe, self->pid,
+                           ((uint64_t)pipe->used << 32) |
+                           (uint64_t)pipe->writers_open,
+                           RACE_SITE_READ_CHECK);
+#if RACE_PROBE_PPS_VERBOSE
+            {
+                static int _dbg_rb = 0;
+                if (_dbg_rb < 20000) {
+                    _dbg_rb++;
+                    serial_print("PPS-reader-check pid=");
+                    serial_print_dec(self->pid);
+                    serial_print(" pipe=0x"); serial_print_hex((uint64_t)pipe);
+                    serial_print(" used="); serial_print_dec(pipe->used);
+                    serial_print(" wo="); serial_print_dec(pipe->writers_open);
+                    serial_print(" ro="); serial_print_dec(pipe->readers_open);
+                    serial_print(" rc="); serial_print_dec(pipe->refcount);
+                    serial_print(" stamp="); serial_print_dec(pipe->stamp);
+                    serial_print("\n");
+                }
+            }
+#endif
             if (pipe->used > 0) {
                 __asm__ volatile("sti");
                 break;
@@ -5632,6 +6102,8 @@ long sys_read(int fd, void* buf, size_t count) {
              * blocking until EVERY write-end fd is closed.
              */
             if (pipe->writers_open == 0) {
+                RACE_P13_EVENT((uint64_t)pipe, self->pid, 0,
+                               RACE_SITE_READ_EOF);
                 __asm__ volatile("sti");
                 return 0;
             }
@@ -5644,9 +6116,80 @@ long sys_read(int fd, void* buf, size_t count) {
             pipe->reader_waiting = self;
             self->state      = PROC_STATE_BLOCKED;
             self->block_kind = BLOCK_KIND_PIPE_READ;
+            RACE_P13_READER_PID((uint64_t)pipe, self->pid);
+            RACE_P13_EVENT((uint64_t)pipe, self->pid, pipe->stamp,
+                           RACE_SITE_READ_BLOCK);
+            race_record(22, self->pid, (uint64_t)pipe,
+                        pipe->stamp, RACE_SITE_READ_BLOCK, 97);
+            race_p13_saw_block++;
 
-            __asm__ volatile("sti");
-            __asm__ volatile("hlt");
+            /* Re-check under the same cli.  The writers_open check
+             * at the top of this loop and the reader_waiting store
+             * just above are both inside this cli, but the WRITER's
+             * close path runs under its own cli in process_exit, and
+             * the two critical sections do not overlap.  If the last
+             * writer closed between the writers_open check and the
+             * reader_waiting store, the close path found
+             * reader_waiting == NULL and did not wake us.  This
+             * re-check catches that case: no writer left means EOF,
+             * not a block.  Structural close of the lost-wakeup
+             * window -- same shape as the wait4 late re-scan. */
+            if (pipe->writers_open == 0) {
+                pipe->reader_waiting = NULL;
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return 0;
+            }
+
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+            /*
+             * Block via process_yield, not sti; hlt.
+             *
+             * The sti; hlt form leaves self->rsp at its LAST SAVE --
+             * the frame from the previous context_switch -- which the
+             * stack has since moved past.  When a peer wakes us, the
+             * scheduler resumes from that stale frame and halts (the
+             * 'C').  The GPR slots saved above do not help: the
+             * resume needs a 20-slot frame at self->rsp, and sti; hlt
+             * builds none.
+             *
+             * process_yield does the right thing: it marks us BLOCKED
+             * (already done above), calls scheduler_switch_to, and
+             * context_switch builds a proper 20-slot resume frame and
+             * stores its base in self->rsp.  When the peer wakes us,
+             * we are resumed from that frame, back here.
+             *
+             * sys_wait4 blocks this way (process_yield at the
+             * BLOCK_KIND_WAITPID site); the pipe paths were the
+             * outlier.
+             */
+            process_yield();
+            /* Resumed.  Loop and re-check. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Do NOT clear pipe->reader_waiting here.  This
+             * return from hlt may be a timer wake, not a peer
+             * wake; clearing the waiter on a timer wake opens a
+             * window where a concurrent close finds
+             * reader_waiting == NULL and does not wake us, and
+             * we then re-block forever.  The waker clears the
+             * field on a successful wake; the reader re-publishes
+             * it on the next block.  Leaving it set is safe:
+             * pipe_wake_waiter checks state == BLOCKED, so a
+             * stale pointer to a running process is ignored. */
         }
 
         /* Copy what is available, then wake a waiting writer. */
@@ -5664,9 +6207,10 @@ long sys_read(int fd, void* buf, size_t count) {
                                   span) != 0) {
                 pipe->used -= (uint32_t)done;
                 if (pipe->writer_waiting) {
-                    pipe_wake_waiter(pipe->writer_waiting,
-                                     BLOCK_KIND_PIPE_WRITE);
-                    pipe->writer_waiting = NULL;
+                    if (pipe_wake_waiter(pipe->writer_waiting,
+                                         BLOCK_KIND_PIPE_WRITE)) {
+                        pipe->writer_waiting = NULL;
+                    }
                 }
                 return (done > 0) ? (long)done : -(long)EFAULT_;
             }
@@ -5678,8 +6222,10 @@ long sys_read(int fd, void* buf, size_t count) {
 
         /* Space freed: wake a waiting writer, if any. */
         if (pipe->writer_waiting) {
-            pipe_wake_waiter(pipe->writer_waiting, BLOCK_KIND_PIPE_WRITE);
-            pipe->writer_waiting = NULL;
+            if (pipe_wake_waiter(pipe->writer_waiting,
+                                 BLOCK_KIND_PIPE_WRITE)) {
+                pipe->writer_waiting = NULL;
+            }
         }
         return (long)done;
     }
@@ -6524,6 +7070,26 @@ typedef struct {
  * indefinitely; sixteen is generous and still bounded. */
 #define POLL_MAX_NFDS 16
 
+/*
+ * Console readability: PS/2 ring OR UART RX FIFO.
+ *
+ * Under -display none the PS/2 path never fires -- QEMU does
+ * not translate stdin to scancodes without a display window --
+ * so a poll that only checks kbd_buffer_has_data() blocks
+ * forever.  This is what busybox ash does at the prompt:
+ * poll(0, 1, -1), reported as SYS: num=7 in the dispatcher
+ * trace, never returns and no keystroke is ever seen.
+ *
+ * serial_rx_available() is non-consuming: it inspects the UART
+ * Line Status Register's Data Ready bit without reading the
+ * byte.  The subsequent read(2) still sees the byte through
+ * serial_rx_poll() via kbd_buffer_get_mux().
+ */
+static int console_has_data(void) {
+    if (kbd_buffer_has_data()) return 1;
+    return serial_rx_available();
+}
+
 long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
     kernel_pollfd_t* user_fds = (kernel_pollfd_t*)user_fds_arg;
 
@@ -6590,7 +7156,7 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                 pcb_t* self = process_get_current();
                 for (;;) {
                     __asm__ volatile("cli");
-                    if (kbd_buffer_has_data()) {
+                    if (console_has_data()) {
                         __asm__ volatile("sti");
                         break;
                     }
@@ -6613,6 +7179,21 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                     }
                     self->state = PROC_STATE_BLOCKED;
                     self->block_kind = BLOCK_KIND_NONE;
+            /* PROBE (session 61): save the live caller-saved
+             * registers before halting, so the ring-0 resume
+             * restores them instead of the stale pcb slots.
+             * See context-switch-block-design.md. */
+            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+
+
                     __asm__ volatile("sti");
                     __asm__ volatile("hlt");
                     /* Woken by irq1_handler ->
@@ -6622,7 +7203,7 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                 }
             }
 
-            if (kbd_buffer_has_data()) {
+            if (console_has_data()) {
                 revents |= POLLIN_;
                 ready++;
             }
@@ -6960,6 +7541,15 @@ static uint64_t mmap_find_free_slot(pcb_t* self, uint64_t rounded) {
 long sys_mmap(void* addr, size_t length, int prot, int flags,
               int fd, long offset) {
     (void)offset;
+    {
+        pcb_t* _s = process_get_current();
+        race_record(26, _s ? _s->pid : 0,
+                    (uint64_t)addr,
+                    ((uint64_t)length << 32) |
+                    ((uint64_t)(prot & 0xFFFF) << 16) |
+                    ((uint64_t)(flags & 0xFFFF)),
+                    RACE_SITE_PIPE_CREATE, 71);
+    }
 
     if (length == 0) return -(long)EINVAL_;
 
@@ -7065,6 +7655,8 @@ long sys_mmap(void* addr, size_t length, int prot, int flags,
         elf_add_page_to_pcb(self, phys);
     }
 
+    race_record(27, self->pid, (uint64_t)base, 0,
+                RACE_SITE_PIPE_CREATE, 72);
     return (long)base;
 }
 
@@ -7648,7 +8240,7 @@ long sys_fork(void) {
     for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
         file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
         if (!_slot) continue;
-        _slot->refcount++;
+        __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
         child->file_table[_fd] = _slot;
     }
 
@@ -7700,8 +8292,25 @@ void sys_exit(int status) {
 
 long sys_arch_prctl(int code, void* addr) {
     if (code == ARCH_SET_FS) {
-        wrmsr(0xC0000100, (uint64_t)addr);
         pcb_t* self = process_get_current();
+        if (self && self->pid < 32) {
+            g_arch_prctl_addr[self->pid] = (uint64_t)addr;
+        }
+        /* Record every ARCH_SET_FS: the pid, the addr musl
+         * passed, and what the MSR read back after the write.
+         * This names whether the kernel mangled the value or
+         * musl passed a wrong one.  Slot 25 so it survives the
+         * ring wrap that the fast P13 events cause. */
+        wrmsr(0xC0000100, (uint64_t)addr);
+        uint32_t _lo, _hi;
+        __asm__ volatile("rdmsr" : "=a"(_lo), "=d"(_hi)
+                         : "c"(0xC0000100u));
+        uint64_t _after = ((uint64_t)_hi << 32) | (uint64_t)_lo;
+        race_record(25,
+                    self ? self->pid : 0,
+                    (uint64_t)addr,
+                    _after,
+                    RACE_SITE_PIPE_CREATE, 70);
         if (self) self->fs_base = (uint64_t)addr;
         return 0;
     }
@@ -7718,6 +8327,19 @@ static void kernel_do_reboot(void) {
 uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+    g_last_syscall_num = num;
+    /* Record the calling process's %fs base at syscall entry.
+     * Done here in C, not in the asm stub: the asm stub has no
+     * scratch register free before the pushes, and rdmsr clobbers
+     * RAX/RDX/RCX, which hold the user's live values on entry
+     * (RCX in particular is the user return RIP, and clobbering it
+     * makes sysret return to the MSR number). */
+    {
+        uint32_t _lo, _hi;
+        __asm__ volatile("rdmsr" : "=a"(_lo), "=d"(_hi)
+                         : "c"(0xC0000100u));
+        g_last_fs_base = ((uint64_t)_hi << 32) | (uint64_t)_lo;
+    }
     (void)arg3; (void)arg4; (void)arg5;
 
     switch (num) {
@@ -7738,7 +8360,32 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
         case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-        case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+        // case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
+                case SYS_RT_SIGPROCMASK: {
+            /* Snapshot the user stack around g_user_rsp_save before
+             * the handler runs.  Diagnostic for item 7e only. */
+            uint64_t rs = g_user_rsp_save;
+            g_sys14_rsp_save = rs;
+            g_sys14_valid = 0;
+            {
+                pcb_t* _c = process_get_current();
+                if (_c && rs >= 0x8000000000ULL && rs < 0x8000100000ULL) {
+                    for (int i = 0; i < 8; i++) {
+                        uint64_t va = rs - 8 + (uint64_t)i * 8;
+                        uint64_t p = vmm_get_phys_from_cr3(_c->cr3, va);
+                        g_sys14_slots[i] = p
+                            ? *(uint64_t*)(HHDM_START + p)
+                            : 0xDEADBEEFCAFEBABEULL;
+                    }
+                    g_sys14_valid = 1;
+                }
+            }
+            return (uint64_t)sys_rt_sigprocmask((int)arg0,
+                                                (const void*)arg1,
+                                                (void*)arg2,
+                                                (size_t)arg3);
+        }
+        
         case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
         case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
         case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);

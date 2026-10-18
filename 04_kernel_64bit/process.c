@@ -8,6 +8,8 @@
 #include "include/user_space.h"
 #include "include/elf.h"
 #include "include/user_syscall.h"
+#include "include/trace.h"
+#include "include/race_probe.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -293,6 +295,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
         if (name) serial_print(name);
         else serial_print("unnamed");
         serial_print("\n");
+        /*
+         * A failed process_create must not leave the PCB on the
+         * ready queue, for the same reason process_reclaim and
+         * process_destroy remove theirs: the slot is going UNUSED,
+         * and a stale head/tail to it is a dispatch of a dead PCB.
+         * The 2026-10-18 selftest printed
+         *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+         * -- the timer finding the failed fail_slot PCB on the
+         * queue.  _remove is idempotent, so this is free on the
+         * normal path.
+         */
+        scheduler_ready_queue_remove(pcb);
         pcb->state = PROC_STATE_UNUSED;
         pcb->pid = 0;
         process_count--;
@@ -315,6 +329,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
                 process_cleanup_elf_pages(pcb);
                 process_free_clone(pcb->cr3);
                 pcb->cr3 = 0;
+                /*
+                 * A failed process_create must not leave the PCB on the
+                 * ready queue, for the same reason process_reclaim and
+                 * process_destroy remove theirs: the slot is going UNUSED,
+                 * and a stale head/tail to it is a dispatch of a dead PCB.
+                 * The 2026-10-18 selftest printed
+                 *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+                 * -- the timer finding the failed fail_slot PCB on the
+                 * queue.  _remove is idempotent, so this is free on the
+                 * normal path.
+                 */
+                scheduler_ready_queue_remove(pcb);
                 pcb->state = PROC_STATE_UNUSED;
                 pcb->pid = 0;
                 process_count--;
@@ -343,6 +369,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
                 process_cleanup_elf_pages(pcb);
                 process_free_clone(pcb->cr3);
                 pcb->cr3 = 0;
+                /*
+                 * A failed process_create must not leave the PCB on the
+                 * ready queue, for the same reason process_reclaim and
+                 * process_destroy remove theirs: the slot is going UNUSED,
+                 * and a stale head/tail to it is a dispatch of a dead PCB.
+                 * The 2026-10-18 selftest printed
+                 *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+                 * -- the timer finding the failed fail_slot PCB on the
+                 * queue.  _remove is idempotent, so this is free on the
+                 * normal path.
+                 */
+                scheduler_ready_queue_remove(pcb);
                 pcb->state = PROC_STATE_UNUSED;
                 pcb->pid = 0;
                 process_count--;
@@ -375,6 +413,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
         process_cleanup_elf_pages(pcb);
         process_free_clone(pcb->cr3);
         pcb->cr3 = 0;
+        /*
+         * A failed process_create must not leave the PCB on the
+         * ready queue, for the same reason process_reclaim and
+         * process_destroy remove theirs: the slot is going UNUSED,
+         * and a stale head/tail to it is a dispatch of a dead PCB.
+         * The 2026-10-18 selftest printed
+         *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+         * -- the timer finding the failed fail_slot PCB on the
+         * queue.  _remove is idempotent, so this is free on the
+         * normal path.
+         */
+        scheduler_ready_queue_remove(pcb);
         pcb->state = PROC_STATE_UNUSED;
         pcb->pid = 0;
         process_count--;
@@ -546,6 +596,48 @@ void process_fork_copy_frame(pcb_t* child, pcb_t* parent) {
 
     child->rsp = frame_base;
     child->rip = p_rip;
+
+#if RACE_PROBE_FORK_SLOT
+    /*
+     * 7e ordering instrument.  Prints the parent's and child's view of
+     * the slot the child's first post-syscall `ret` will pop: the user
+     * RSP the parent had at the fork syscall, resolved through each
+     * process's own cr3, and the 8 bytes at that address.  If the
+     * parent's slot is already 0xFFFFFFFF, the corruption predates the
+     * copy; if it is valid here and the child faults, the copy or a
+     * writer after it is at fault.  Diagnostic only; no behavior change.
+     * See docs/open-issues.md item 7e.
+     */
+    {
+        uint64_t _p_phys = vmm_get_phys_from_cr3(parent->cr3, p_rsp & ~0xFFFULL);
+        uint64_t _c_phys = vmm_get_phys_from_cr3(child->cr3,  p_rsp & ~0xFFFULL);
+        uint64_t _p_slot = 0, _c_slot = 0;
+        if (_p_phys) {
+            _p_slot = *(uint64_t*)(HHDM_START + _p_phys + (p_rsp & 0xFFF));
+        }
+        if (_c_phys) {
+            _c_slot = *(uint64_t*)(HHDM_START + _c_phys + (p_rsp & 0xFFF));
+        }
+        /*
+         * Print only when a slot is non-zero.  A clean fork leaves
+         * both slots at 0 (or a benign small value from the parent's
+         * startup path); the fork worth seeing is the one whose slot
+         * is neither.  Printing every fork saturates the serial
+         * console -- 181 identical lines at iter 0, twice observed --
+         * and slows the guest enough that pipe7e never reaches
+         * iter 1000.  Quiet on the clean path, loud on the
+         * interesting one.
+         */
+        if (_p_slot != 0 || _c_slot != 0) {
+            serial_print("7e-fork: p_rsp=0x");      serial_print_hex(p_rsp);
+            serial_print(" p_phys=0x");             serial_print_hex(_p_phys);
+            serial_print(" p_slot=0x");             serial_print_hex(_p_slot);
+            serial_print(" c_phys=0x");             serial_print_hex(_c_phys);
+            serial_print(" c_slot=0x");             serial_print_hex(_c_slot);
+            serial_print("\n");
+        }
+    }
+#endif
 }
 
 pcb_t* process_get_current(void) {
@@ -600,7 +692,10 @@ void process_wake_all_blocked(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (&pcb_pool[i] == g_kernel_shell_pcb) continue;
         if (pcb_pool[i].state != PROC_STATE_BLOCKED) continue;
-        if (pcb_pool[i].block_kind != BLOCK_KIND_NONE) continue;
+        if (pcb_pool[i].block_kind != BLOCK_KIND_NONE) {
+            RACE_P11_TICK_SKIP(pcb_pool[i].pid, pcb_pool[i].block_kind);
+            continue;
+        }
 
         /*
          * Skip if already on the ready queue.
@@ -644,22 +739,31 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
     uint64_t ppid = child ? child->parent_pid : 0;
 
     if (!child || child->parent_pid == 0) {
+        RACE_P11_WAKE_TRY(cpid, 0, 1, 0, 0, 0);
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" drop=a no_parent\n");
+        #endif
         return NULL;
     }
 
     pcb_t* parent = process_find_by_pid(child->parent_pid);
     if (!parent) {
+        RACE_P11_WAKE_TRY(cpid, ppid, 2, 0, 0, 0);
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
         serial_print_dec(ppid);
         serial_print(" drop=b no_pcb\n");
+        #endif
         return NULL;
     }
     if (parent->state != PROC_STATE_BLOCKED) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 3, parent->state,
+                          parent->block_kind, parent->wait_pid);
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -667,9 +771,13 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=c state=");
         serial_print_dec((uint64_t)parent->state);
         serial_print("\n");
+        #endif
         return NULL;
     }
     if (parent->block_kind != BLOCK_KIND_WAITPID) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 4, parent->state,
+                          parent->block_kind, parent->wait_pid);
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -677,6 +785,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=d kind=");
         serial_print_dec(parent->block_kind);
         serial_print("\n");
+        #endif
         return NULL;
     }
 
@@ -684,6 +793,9 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
        (wait for any child). */
     if (parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
+        RACE_P11_WAKE_TRY(cpid, parent->pid, 5, parent->state,
+                          parent->block_kind, parent->wait_pid);
+        #if TRACE_WAKE
         serial_print("WW: child=");
         serial_print_dec(cpid);
         serial_print(" parent=");
@@ -691,15 +803,21 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         serial_print(" drop=e wait=");
         serial_print_dec(parent->wait_pid);
         serial_print("\n");
+        #endif
         return NULL;
     }
 
+    #if TRACE_WAKE
     serial_print("WW: child=");
     serial_print_dec(cpid);
     serial_print(" parent=");
     serial_print_dec(parent->pid);
     serial_print(" wake=ok\n");
+    #endif
 
+    RACE_P1_WAKE(parent->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAKE_PARENT);
+    RACE_P11_WAKE_TRY(cpid, parent->pid, 0, parent->state,
+                      parent->block_kind, parent->wait_pid);
     parent->state = PROC_STATE_READY;
     parent->block_kind = BLOCK_KIND_NONE;
     parent->wait_pid = 0;
@@ -714,9 +832,11 @@ void process_dump_all(void) {
     serial_print("---  -------------------  -------  ----------  ----------\n");
     serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
     vga_print("=== PROCESS LIST ===\n");
     vga_print("PID  Name                State    Entry       Kernel Stack\n");
     vga_print("---  -------------------  -------  ----------  ----------\n");
+#endif
 
     for (int i = 0; i < MAX_PROCESSES; i++) {
         pcb_t* p = &pcb_pool[i];
@@ -748,6 +868,7 @@ void process_dump_all(void) {
         serial_print("\n");
         serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
         vga_print_dec_cur(p->pid); vga_print("  ");
         vga_print(p->name);
         for (int j = len; j < 18; j++) vga_print(" ");
@@ -758,13 +879,16 @@ void process_dump_all(void) {
         vga_print(" 0x"); vga_print_hex_cur(p->entry_point);
         vga_print(" 0x"); vga_print_hex_cur(p->kernel_stack_top);
         vga_print("\n");
+#endif
     }
 
     serial_lock();
     serial_print("=== END PROCESS LIST ===\n\n");
     serial_unlock();
 
+#if RACE_PROBE_DUMP_VGA
     vga_print("=== END PROCESS LIST ===\n");
+#endif
 }
 
 void process_test_clone(void) {
@@ -843,6 +967,27 @@ void process_reclaim(pcb_t* pcb) {
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
 
+    /*
+     * Remove the PCB from the ready queue before it is marked
+     * UNUSED.  process_destroy already does this; process_reclaim
+     * did not, and the asymmetry is a correctness bug on its own.
+     *
+     * A reclaimed PCB can still be the queue's tail: the exiting
+     * process was removed from the queue in process_exit, but a
+     * later rescan (timer !peek, timer !next, process_exit's
+     * rescan, process_yield's rescan) can re-add a zombie-shaped
+     * slot if it appears READY/RUNNING with links consistent.  The
+     * exact shape that leaves the tail pointing at a reclaimed PCB
+     * is not fully understood, but the defensive fix is right
+     * either way: no PCB should be on the ready queue while its
+     * state is UNUSED.
+     *
+     * scheduler_ready_queue_remove is idempotent -- it returns
+     * immediately if the PCB is off-queue -- so this costs nothing
+     * on the normal path.
+     */
+    scheduler_ready_queue_remove(pcb);
+
     pcb->state = PROC_STATE_UNUSED;
     pcb->pid = 0;
     /*
@@ -881,11 +1026,12 @@ void process_destroy(pcb_t* pcb) {
     pcb->in_signal_handler = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
-    if (current_process == pcb) current_process = NULL;
+    if (current_process == pcb) scheduler_set_current(NULL);
     serial_print("PROCESS: Process destroyed\n");
 }
 
 /* ABI LOCK COMPLIANCE VERIFICATION ASSERTS */
+_Static_assert(offsetof(pcb_t, state)            == 0x028, "context_switch.asm: state offset");
 _Static_assert(offsetof(pcb_t, cr3)              == 0x030, "context_switch.asm: cr3 offset");
 _Static_assert(offsetof(pcb_t, entry_point)      == 0x038, "context_switch.asm: entry_point offset");
 _Static_assert(offsetof(pcb_t, user_stack_top)   == 0x070, "context_switch.asm: user_stack_top offset");
@@ -907,3 +1053,4 @@ _Static_assert(offsetof(pcb_t, rax)              == 0x108, "context_switch.asm: 
 _Static_assert(offsetof(pcb_t, rsp)              == 0x110, "context_switch.asm: rsp offset");
 _Static_assert(offsetof(pcb_t, rip)              == 0x118, "context_switch.asm: rip offset");
 _Static_assert(offsetof(pcb_t, block_kind)       == 0x158, "context_switch.asm: block_kind offset");
+_Static_assert(offsetof(pcb_t, user_rsp)         == 0x610, "context_switch.asm: user_rsp offset");

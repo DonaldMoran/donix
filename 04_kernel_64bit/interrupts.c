@@ -3,6 +3,7 @@
 #include "include/keyboard.h"
 #include "include/interrupts.h"
 #include "include/serial.h"
+#include "include/race_probe.h"
 #include "include/process.h"
 #include "include/scheduler.h"
 #include "include/user_msr.h"
@@ -14,6 +15,10 @@
  * signature of a corrupted sysret target. */
 extern volatile uint64_t g_last_sysret_rcx;
 extern volatile uint64_t g_last_sysret_r11;
+extern volatile uint64_t g_user_rsp_save;
+extern volatile uint64_t g_last_syscall_num;
+extern volatile uint64_t g_last_fs_base;
+extern volatile uint64_t g_arch_prctl_addr[32];
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -224,13 +229,13 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
     pcb_t* self = process_get_current();
     if (!self) return;
 
-    serial_print("  --- user stack window [rsp-0x40 .. rsp+0x40] ---\n");
+    serial_print("  --- user stack window [rsp-0x200 .. rsp+0x200] ---\n");
     serial_print("  (fault_rsp = 0x"); serial_print_hex(fault_rsp); serial_print(")\n");
 
-    /* Signed offset so the loop can start below RSP.  -0x40 .. +0x40
+    /* Signed offset so the loop can start below RSP.  -0x200 .. +0x200
      * in 8-byte steps.  Note: fault_rsp - 0x40 may wrap if RSP is
      * near 0; that is the process's problem and we print garbage. */
-    for (int64_t off = -0x40; off <= 0x40; off += 8) {
+    for (int64_t off = -0x200; off <= 0x200; off += 8) {
         uint64_t slot_va = fault_rsp + (uint64_t)off;
 
         serial_print("    rsp");
@@ -284,7 +289,33 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
     g_ticks++;
+    race_p1_timer_dump();
     vga_cursor_tick();
+
+    /*
+     * Wake any process blocked on console input.
+     *
+     * Without this, a process blocked in sys_read or sys_poll on
+     * fd 0 only wakes when the PS/2 keyboard IRQ fires (irq1's
+     * handler calls process_wake_all_blocked).  On a headless
+     * boot with -serial stdio, there is no PS/2 traffic, so a
+     * process blocked in poll(0, ..., -1) sits in hlt forever
+     * even after a UART byte arrives -- the UART is polled, not
+     * interrupt-driven, so nothing tells the blocked process to
+     * re-check.
+     *
+     * The timer fires at 100 Hz, so this gives the blocked
+     * process a chance to re-check console_has_data() (which
+     * includes serial_rx_available) every 10 ms.  That is the
+     * latency cost of not having a UART RX interrupt; it is
+     * imperceptible for terminal input.
+     *
+     * process_wake_all_blocked skips processes whose block_kind
+     * is not BLOCK_KIND_NONE, so waitpid-blocked processes and
+     * the kernel shell are unaffected.  It is safe to call from
+     * IRQ context -- the PS/2 handler already does.
+     */
+    process_wake_all_blocked();
     #define SCHED_QUANTUM 2
 
     pcb_t* current = process_get_current();
@@ -341,6 +372,56 @@ timer_preempt_handler(uint64_t stack_pointer) {
         extern pcb_t* scheduler_ready_queue_peek_next(void);
         pcb_t* peek = scheduler_ready_queue_peek_next();
         if (!peek || peek->pid == 1) {
+            /*
+             * Diagnostic: the kernel-mode timer found the ready queue
+             * empty (or holding only idle).  No user process is
+             * runnable.  The TIMER-NO-NEXT / YIELD-TO-IDLE dumps
+             * cannot see this -- they fire only from the !next path
+             * below -- so a stall reached through THIS branch is
+             * silent.  Print the pool state once every 500 ticks
+             * (~5 s at 100 Hz), which is enough to name every
+             * process's state at the stall without flooding.
+             * Diagnostic only.  Item 7d.
+             */
+#if RACE_PROBE_IDLE_DUMP
+            static uint64_t _idle_dump_last = 0;
+            if (g_ticks - _idle_dump_last >= 60000) {
+                _idle_dump_last = g_ticks;
+                serial_lock();
+                serial_print("TIMER-IDLE-STALL t=");
+                serial_print_dec(g_ticks);
+                serial_print(" cur=");
+                serial_print_dec(current ? current->pid : 0);
+                serial_print(": queue empty, pool state:\n");
+                process_dump_all();
+                serial_unlock();
+                /* Ring dump for the race, on the failure path. */
+                race_probe_dump();
+            }
+#endif
+            /*
+             * Rescan the pool for a stranded READY process
+             * before returning to idle.  Without this, a
+             * process that was switched away from while
+             * RUNNING and left off the ready queue (state
+             * READY, not on-queue) is never dispatched: the
+             * timer checks the queue, finds it empty, and
+             * returns to idle every tick forever.  The 7e
+             * stall at t=5000 showed exactly this shape:
+             * PIPE7E_HELPER READY, off-queue, pipe7e
+             * BLOCKED bk=2 waiting for its next write.
+             *
+             * The user-mode path and process_yield both
+             * rescan; the kernel-mode timer branch did not.
+             * Item 7d. */
+            for (int _i = 0; _i < MAX_PROCESSES; _i++) {
+                pcb_t* _p = process_get_pcb(_i);
+                if (!_p) continue;
+                if (_p->pid == 1) continue;
+                if (_p->state != PROC_STATE_READY) continue;
+                if (scheduler_ready_queue_contains(_p)) continue;
+                scheduler_ready_queue_add(_p);
+            }
             return stack_pointer;
         }
 
@@ -370,6 +451,33 @@ timer_preempt_handler(uint64_t stack_pointer) {
     if (current->timeslice_ticks >= SCHED_QUANTUM) {
         current->timeslice_ticks = 0;
 
+        /*
+         * Refuse the switch when the tick interrupted a queue mutator.
+         *
+         * scheduler_ready_queue_add / _remove / _next save the
+         * caller's interrupt flag with pushfq/popfq and cli around
+         * the body.  The compiler's epilogue -- pop r15/r12/r14/rbx/
+         * rbp, then ret -- runs AFTER the popfq that restores IF, so
+         * a tick can land in those six instructions with interrupts
+         * ENABLED.  When it does, irq0_stub builds a frame at the
+         * live rsp, this handler saves current->rsp = stack_pointer,
+         * and returns next->rsp.  If next is the interrupted process,
+         * the resume loads that same frame and halts on its CS slot:
+         * the 'C' with next->rsp == $rsp and frame->rip inside
+         * scheduler_ready_queue_add (observed at +651, pop %r15).
+         *
+         * Refusing the switch leaves the mutator to finish; the next
+         * tick sees a consistent queue.  The range covers _add,
+         * race_record, _remove, _next, and the padding between them
+         * -- the whole queue-mutator region.  Re-check the addresses
+         * with nm after any rebuild: symbol addresses move.
+         */
+        if ((uint64_t)frame->rip >= (uint64_t)(uintptr_t)scheduler_ready_queue_add &&
+            (uint64_t)frame->rip <  (uint64_t)(uintptr_t)scheduler_ready_queue_empty) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
         // For user-mode current, save its frame now.
         if ((frame->cs & 3) == 3) {
             current->r15 = frame->r15; current->r14 = frame->r14;
@@ -381,13 +489,91 @@ timer_preempt_handler(uint64_t stack_pointer) {
             current->rcx = frame->rcx; current->rbx = frame->rbx;
             current->rax = frame->rax;
             current->rip = frame->rip;
-            current->rsp = stack_pointer;
+            /*
+             * Two fields, two consumers:
+             *
+             * pcb->user_rsp is the USER stack pointer, read by
+             * context_switch.asm's user-preempted save path
+             * (it pushes it into the resume frame's RSP slot).
+             *
+             * pcb->rsp is the KERNEL resume-frame base, which
+             * irq0_stub pops with POP_ALL_GPRS and iretqs from
+             * when timer_preempt_handler returns next->rsp.
+             * Without this write, a process last saved in user
+             * mode has a STALE pcb->rsp, and the next resume
+             * through irq0_stub pops a stale frame and #GPs in
+             * kernel mode with error 0x1FF0.
+             *
+             * session-61 wrote only user_rsp here, on the
+             * theory that pcb->rsp meant "kernel frame" and
+             * therefore should not be written from a user-mode
+             * preemption.  That is the wrong half: the
+             * preemption frame IS the kernel resume frame --
+             * irq0_stub's own pushed frame -- and both fields
+             * are read, by different paths, so both must be
+             * written.
+             */
+            /*
+             * user_rsp is the USER stack pointer -- it is read by
+             * context_switch.asm's user-preempted save path and pushed
+             * into the resume frame's RSP slot, which iretq loads with
+             * CS=0x33.  The value the CPU pushed on the CPL 3->0
+             * transition is frame->rsp (EXC_OFF_RSP = 19); stack_pointer
+             * is the kernel interrupt-frame base.  Writing stack_pointer
+             * here delivered a kernel address into a user-mode resume --
+             * Bug 1: user-mode #PF with kernel RSP, CR2 == RSP, err 0x5.
+             */
+            current->user_rsp = frame->rsp;
+            current->rsp      = stack_pointer;
         }
 
         // Pick next task.
         extern pcb_t* scheduler_ready_queue_next(void);
         pcb_t* next = scheduler_ready_queue_next();
+        /*
+         * Consecutive timer ticks that found the ready queue empty.
+         * Reset the moment a next task is found.  Boot transients
+         * empty the queue for a tick and then refill it; those must
+         * not consume the dump budget before pipe7e runs.  The dump
+         * below fires when the empty queue PERSISTS, which a stop
+         * does and a boot transient does not.  Item 7d.
+         */
+#if RACE_PROBE_IDLE_DUMP
+        /*
+         * The streak counter exists only under the gate.  With the
+         * gate off, nothing reads it, and declaring it outside the
+         * #if makes clang warn 'set but not used'.  Item 7d.
+         */
+        static int _7e_empty_streak = 0;
+        if (next) {
+            _7e_empty_streak = 0;
+        }
+#endif
         if (!next) {
+            /*
+             * Persistent-empty pool dump.  The idle state is reached
+             * here, in the timer path -- NOT through process_yield,
+             * which is where the earlier dump went (and never fired).
+             * This prints every PCB state the third consecutive tick
+             * the queue is empty, and every 256 ticks after, so the
+             * capture names whether the shell is BLOCKED (lost wake)
+             * or a process is stranded.  Boot transients never reach
+             * three ticks; a stop does.  Diagnostic only.
+             */
+#if RACE_PROBE_IDLE_DUMP
+            _7e_empty_streak++;
+            if (_7e_empty_streak == 3 ||
+                (_7e_empty_streak > 3 && (_7e_empty_streak % 256) == 0)) {
+                serial_lock();
+                serial_print("TIMER-NO-NEXT streak=");
+                serial_print_dec((uint64_t)_7e_empty_streak);
+                serial_print(": queue empty, pool state:\n");
+                process_dump_all();
+                serial_unlock();
+                /* Ring dump for the race, on the failure path. */
+                race_probe_dump();
+            }
+#endif
             if (current->pid == 1) {
                 current->timeslice_ticks = 0;
                 return stack_pointer;
@@ -396,6 +582,107 @@ timer_preempt_handler(uint64_t stack_pointer) {
             if (!next) {
                 return stack_pointer;
             }
+        }
+
+        /*
+         * timer: self-pick resumes current -- do not "switch" to it.
+         *
+         * scheduler_ready_queue_next() can pop `current`.  Its guard
+         * skips a RUNNING head, but a peer wake (process_wake_all_
+         * blocked, a pipe wake, a wait4 wake) can set
+         * current->state = READY between the pop and here, and the
+         * kernel-mode branch's pool rescan re-adds a stranded
+         * RUNNING current.  When next == current, the block below
+         * would set current->state = READY, re-add current, set
+         * next->state = RUNNING (the same process), and return
+         * next->rsp -- which is the frame THIS tick just saved at
+         * 0x110.  irq0_stub then does `mov rsp, rax` and pops its
+         * own frame: the 'C' halt, with N == R (next == the value
+         * in the RIP slot) and S a kernel stack address.
+         *
+         * 7fff450 guarded the scheduler_switch_to path; the timer
+         * does not call scheduler_switch_to -- it returns next->rsp
+         * directly -- so it needs its own check.
+         *
+         * A self-pick is a no-op switch: resume current's own frame,
+         * exactly as the current->pid == 1 early return above does.
+         */
+        if (next == current) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
+        /*
+         * Self-pick by VALUE: next->rsp is the frame THIS tick built.
+         *
+         * The identity check above (next == current) misses the case
+         * where next != current but next->rsp == stack_pointer.  That
+         * happens when the kernel-mode save above wrote
+         * <the interrupted process>->rsp = stack_pointer and the pop
+         * then returned that same PCB while `current` was a different
+         * process -- a stale or just-saved frame base pointing at the
+         * frame irq0_stub is standing on.  Resuming it pops that frame
+         * and halts on its CS slot.
+         *
+         * Observed at pit_init(250), pipe7e before iter 1000:
+         *
+         *   C
+         *   N=FFFFFFFF8027C810 R=00000080000FBFF0 S=0000000000400200
+         *   F=FFFFFFFF8027C810 P=FFFFFFFF8029B2E0
+         *
+         * N = PIPE7E_HELPER, N->rip = kfree + 1, N->rsp == $rsp.
+         *
+         * Checked BEFORE any side effect: no state change, no queue
+         * add, no cr3 switch.  A value self-pick is a no-op switch,
+         * like the identity self-pick.
+         */
+        if (next->rsp == stack_pointer) {
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
+        /*
+         * Refuse to resume a next whose rsp is 0.
+         *
+         * This is the timer path's counterpart to scheduler_switch_to's
+         * SWITCH-REFUSE.  irq0_stub resumes from the value this handler
+         * returns (`mov rsp, rax`), so a zero there executes with
+         * rsp = 0 -- a #GP, then a #DF, because isr13_stub's first
+         * PUSH faults.  scheduler_switch_to's refuse does not cover
+         * this path: the timer returns next->rsp directly instead of
+         * calling context_switch.
+         *
+         * Refusing here is placed BEFORE the CR3 switch, so
+         * `return stack_pointer` resumes `current` in current's own
+         * address space.  The refused process is requeued and picked
+         * up again once it has been saved.
+         */
+        if (next->pid != 1 &&
+            (next->rsp < next->kernel_stack_virt ||
+             next->rsp >= next->kernel_stack_virt + PROC_STACK_SIZE)) {
+            serial_lock();
+            serial_print("TIMER-REFUSE: next pid=");
+            serial_print_dec(next->pid);
+            serial_print(" name=");
+            serial_print(next->name);
+            serial_print(" rsp outside stack -> resume current\n");
+            serial_unlock();
+            current->timeslice_ticks = 0;
+            return stack_pointer;
+        }
+
+        if (next->rsp == 0) {
+            serial_lock();
+            serial_print("TIMER-REFUSE: next pid=");
+            serial_print_dec(next->pid);
+            serial_print(" name=");
+            serial_print(next->name);
+            serial_print(" rsp=0 -> resume current\n");
+            serial_unlock();
+            next->state = PROC_STATE_READY;
+            scheduler_ready_queue_add(next);
+            current->timeslice_ticks = 0;
+            return stack_pointer;
         }
 
         /* Only a RUNNING current goes back on the ready queue. A
@@ -441,6 +728,22 @@ timer_preempt_handler(uint64_t stack_pointer) {
 
         __asm__ volatile("mov %0, %%cr3" : : "r"(next->cr3));
 
+        /*
+         * Consume next->rsp: read it, clear it, return the read value.
+         *
+         * irq0_stub resumes from this value (`mov rsp, rax`), and the
+         * value names the interrupt frame this tick just built for
+         * next.  Clearing the field means the frame is consumed exactly
+         * once.  A process that is dispatched again before being saved
+         * then has next->rsp == 0, and scheduler_switch_to's
+         * SWITCH-REFUSE check catches it instead of resuming the stale
+         * frame (the 'C').
+         *
+         * This is the timer-path half of the clear that
+         * context_switch_resume does on its own resume path.  Without
+         * it, a process resumed by the timer kept a non-zero rsp, and
+         * the later stale-frame dispatch passed every check.
+         */
         return next->rsp;
     }
 
@@ -770,6 +1073,8 @@ void isr13_handler(exception_frame_t *frame) {
      */
     int bad_target = 0;
     if (fault_rip < 0x1000) bad_target = 1;
+    if (fault_rip == 0xFFFFFFFFULL) bad_target = 1;
+    if (fault_rip == 0xFFFFFFFFFFFFFFFFULL) bad_target = 1;
     if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
     if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
 
@@ -777,6 +1082,44 @@ void isr13_handler(exception_frame_t *frame) {
         serial_print("  *** corrupted control target ***\n");
         serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
         serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+        serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+        serial_print("  g_user_rsp_save : 0x"); serial_print_hex(g_user_rsp_save); serial_print("\n");
+        serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
+        /*
+         * 7e fault-time page read.  Walk the faulting process's own
+         * cr3 for g_user_rsp_save and for the slot a `ret` would pop
+         * there (g_user_rsp_save - 8), print the physical page each
+         * resolves to and the 8 bytes at each.  The fork instrument
+         * recorded the child's c_phys for the page backing the
+         * fork-time user RSP.  If the walk here gives the same
+         * physical page, the child kept its copy and a writer put
+         * 0xFFFFFFFF in the slot.  If it gives a different page, the
+         * mapping changed.  If the walk returns 0, the address is
+         * unmapped at fault time.  Diagnostic only.
+         */
+        {
+            pcb_t *_c = process_get_current();
+            if (_c) {
+                uint64_t _rsp_page  = g_user_rsp_save & ~0xFFFULL;
+                uint64_t _rsp_off   = g_user_rsp_save & 0xFFFULL;
+                uint64_t _slot_page = (g_user_rsp_save - 8) & ~0xFFFULL;
+                uint64_t _slot_off  = (g_user_rsp_save - 8) & 0xFFFULL;
+                uint64_t _rsp_phys  = vmm_get_phys_from_cr3(_c->cr3, _rsp_page);
+                uint64_t _slot_phys = vmm_get_phys_from_cr3(_c->cr3, _slot_page);
+                uint64_t _rsp_val   = 0, _slot_val = 0;
+                if (_rsp_phys)  _rsp_val  = *(uint64_t*)(HHDM_START + _rsp_phys  + _rsp_off);
+                if (_slot_phys) _slot_val = *(uint64_t*)(HHDM_START + _slot_phys + _slot_off);
+                serial_print("  7e-rsp  : rsp_page_phys=0x"); serial_print_hex(_rsp_phys);
+                serial_print(" rsp_val=0x");                 serial_print_hex(_rsp_val);
+                serial_print(" slot_page_phys=0x");           serial_print_hex(_slot_phys);
+                serial_print(" slot_val=0x");                 serial_print_hex(_slot_val);
+                serial_print("\n");
+                serial_print("  7e-cur  : pid=");  serial_print_dec(_c->pid);
+                serial_print(" cr3=0x");           serial_print_hex(_c->cr3);
+                serial_print(" rsp_virt=0x");      serial_print_hex(g_user_rsp_save);
+                serial_print("\n");
+            }
+        }
     }
     serial_print("  --- raw frame dump ---\n");
     for (int i = 0; i < 48; i++) {
@@ -806,6 +1149,7 @@ void isr13_handler(exception_frame_t *frame) {
     }
 
     if ((fault_cs & 3) == 3) {
+        race_p1_tick_dump();
         if (signal_maybe_redirect(frame, 4)) return;    /* SIGILL */
         fault_kill_current(0x0D);
     }
@@ -851,6 +1195,8 @@ void isr14_handler(exception_frame_t *frame) {
          * comment there for the three shapes. */
         int bad_target = 0;
         if (fault_rip < 0x1000) bad_target = 1;
+        if (fault_rip == 0xFFFFFFFFULL) bad_target = 1;
+        if (fault_rip == 0xFFFFFFFFFFFFFFFFULL) bad_target = 1;
         if (fault_rip >= 0x8010000000ULL && fault_rip < 0x8010400000ULL) bad_target = 1;
         if (fault_rip >= 0x8000000000ULL && fault_rip < 0x8000100000ULL) bad_target = 1;
 
@@ -858,6 +1204,28 @@ void isr14_handler(exception_frame_t *frame) {
             serial_print("  *** corrupted control target ***\n");
             serial_print("  last sysret rcx : 0x"); serial_print_hex(g_last_sysret_rcx); serial_print("\n");
             serial_print("  last sysret r11 : 0x"); serial_print_hex(g_last_sysret_r11); serial_print("\n");
+            serial_print("  last syscall num: "); serial_print_dec(g_last_syscall_num); serial_print("\n");
+            serial_print("  g_user_rsp_save : 0x"); serial_print_hex(g_user_rsp_save); serial_print("\n");
+            serial_print("  last fs_base    : 0x"); serial_print_hex(g_last_fs_base); serial_print("\n");
+            {
+                uint32_t _l, _h;
+                __asm__ volatile("rdmsr" : "=a"(_l), "=d"(_h)
+                                 : "c"(0xC0000100u));
+                uint64_t _cur = ((uint64_t)_h << 32) | (uint64_t)_l;
+                serial_print("  fs_base NOW     : 0x"); serial_print_hex(_cur); serial_print("\n");
+            }
+            {
+                pcb_t* _c = process_get_current();
+                if (_c) {
+                    serial_print("  pcb->fs_base    : 0x"); serial_print_hex(_c->fs_base); serial_print("\n");
+                    serial_print("  pcb pid/name    : "); serial_print_dec(_c->pid); serial_print(" "); serial_print(_c->name); serial_print("\n");
+                    if (_c->pid < 32) {
+                        serial_print("  arch_prctl addr : 0x"); serial_print_hex(g_arch_prctl_addr[_c->pid]); serial_print("\n");
+                    }
+                } else {
+                    serial_print("  pcb             : (null)\n");
+                }
+            }
         }
         serial_print("  CR3               : 0x"); serial_print_hex(cr3); serial_print("\n");
         serial_print("  Walk indices: pml4=");
@@ -1030,6 +1398,7 @@ void isr14_handler(exception_frame_t *frame) {
      * earlier in the function and never reaches this point.
      */
     if (error_code & 4) {
+        race_p1_tick_dump();
         if (signal_maybe_redirect(frame, 11)) return;   /* SIGSEGV */
         fault_kill_current(0x0E);
     }

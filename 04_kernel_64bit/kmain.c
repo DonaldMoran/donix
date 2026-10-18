@@ -22,6 +22,8 @@
 #include "include/ata.h"
 #include "include/fat_config.h"
 #include "ff.h"
+#include "include/trace.h"
+#include "include/race_probe.h"
 
 extern void pit_init(uint32_t freq);
 extern unsigned char test_program[];
@@ -34,6 +36,27 @@ static BootInfo *g_bootinfo = NULL;
 #define PRINT_BOTH_HEX(val) do { vga_print_hex_cur(val); serial_print_hex(val); } while(0)
 
 void enable_user_fsgsbase(void) {
+    /*
+     * CR4.FSGSBASE (bit 16) is only writable if the CPU advertises
+     * FSGSBASE in CPUID.(EAX=7,ECX=0):EBX[bit 0].  On a CPU that
+     * does not (e.g. QEMU's qemu64 model), writing bit 16 of CR4
+     * raises #GP and wedges the kernel before user_syscall_init
+     * runs.  -cpu max advertises the bit, which is why this only
+     * showed up when testing against a baseline CPU model.
+     *
+     * Check the feature bit and skip the CR4 write if absent.
+     */
+    uint32_t eax, ebx, ecx, edx;
+    eax = 7; ecx = 0;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(eax), "c"(ecx));
+
+    if (!(ebx & 1u)) {
+        serial_print("CPU: FSGSBASE not supported, skipping\n");
+        return;
+    }
+
     uint64_t cr4;
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     cr4 |= (1ULL << 16);
@@ -67,7 +90,23 @@ void test_process_entry(void) {
 
 extern void user_syscall_entry(void);
 
+static int cpu_has_syscall(void) {
+    /* CPUID.80000001h:EDX[11] = SYSCALL/SYSRET.  Without it,
+     * writing EFER.SCE #GPs, and user-mode entry via `syscall`
+     * is impossible regardless.  Fail loudly rather than hang. */
+    uint32_t eax = 0x80000001, ebx, ecx, edx;
+    __asm__ volatile("cpuid"
+                     : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(eax));
+    return (edx >> 11) & 1u;
+}
+
 void user_syscall_init(void) {
+    if (!cpu_has_syscall()) {
+        serial_print("CPU: SYSCALL/SYSRET not supported; cannot enter ring 3\n");
+        while (1) __asm__ volatile("hlt");
+    }
+
     uint64_t efer = rdmsr(0xC0000080);
     wrmsr(0xC0000080, efer | 1ULL);
     wrmsr(0xC0000081, ((uint64_t)0x23 << 48) | ((uint64_t)0x18 << 32));
@@ -1076,9 +1115,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.13\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.14\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.13 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.14 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1110,7 +1149,7 @@ static void handle_command(const char *cmd) {
     } else if (strcmp(cmd, "test") == 0) {
         vga_print("\n=== Exception Test ===\n  1 - #DE\n  2 - #PF\n  3 - #GP\nSelect: ");
         char c = 0;
-        while (!kbd_buffer_get(&c)) { asm volatile("hlt"); }
+        while (!kbd_buffer_get_mux(&c)) { asm volatile("hlt"); }
         vga_putc(c); vga_print("\n");
 
         if (c == '1') {
@@ -1202,6 +1241,13 @@ static void handle_command(const char *cmd) {
             if (p1) process_destroy(p1);
             if (p2) process_destroy(p2);
         }
+        vga_print("> ");
+    } else if (strcmp(cmd, "racedump") == 0) {
+#if RACE_PROBE_ANY
+        race_probe_dump();
+#else
+        vga_print("race probes disabled\n");
+#endif
         vga_print("> ");
     } else if (strcmp(cmd, "gdtdump") == 0) {
         gdt_dump(); vga_print("> ");
@@ -1313,11 +1359,11 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.13\n> ");
+    vga_print("donix v0.6.14\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
-        if (kbd_buffer_get(&c)) {
+        if (kbd_buffer_get_mux(&c)) {
             /*
              * Input bytes are the Unix terminal convention, matching
              * what keyboard.c delivers since session 31 and what every
@@ -1449,6 +1495,10 @@ void kmain(BootInfo *info) {
     g_bootinfo = info;
     vga_clear();
     serial_init();
+    /* pml4_addr debug: confirms the BootInfo values stage2 actually wrote. */
+    serial_print("BootInfo: pml4_addr=0x"); serial_print_hex(info->pml4_addr);
+    serial_print(" pml4_virt=0x"); serial_print_hex(info->pml4_virt);
+    serial_print("\n");
     
     validate_bootinfo(info);
        
@@ -1520,7 +1570,9 @@ void kmain(BootInfo *info) {
     }
 
     vga_clear();
+    #if TRACE_BOOT
     serial_print("Prompt: press 'k' for debug loop\n");
+    #endif
     vga_print("\nPress 'k' for kernel shell, else launching user shell...\n");
 
     {
@@ -1528,7 +1580,7 @@ void kmain(BootInfo *info) {
         uint64_t deadline = g_ticks + 200;
         char choice = 0;
         while (g_ticks < deadline) {
-            char c; if (kbd_buffer_get(&c)) { choice = c; break; }
+            char c; if (kbd_buffer_get_mux(&c)) { choice = c; break; }
             asm volatile("hlt");
         }
         if (choice == 'k' || choice == 'K') {
@@ -1563,13 +1615,43 @@ void kmain(BootInfo *info) {
             while (1) asm volatile("hlt");
         }
 
+        #if TRACE_BOOT
         serial_print("Shell: booting musl_sh from FAT\n");
+        #endif
 
         pcb_t* shell = process_create("musl_sh", 0x400000ULL, 0);
         if (!shell) {
             serial_print("PANIC: no shell PCB\n");
             kfree(fat_buf);
             while (1) asm volatile("hlt");
+        }
+
+        /*
+         * Set the shell's login directory to /root.
+         *
+         * Real Unix login(1) reads the user's home directory from
+         * /etc/passwd (root's is /root) and chdir's there before
+         * exec'ing the login shell.  donix skips init/login and
+         * spawns the shell directly, so the kernel does that work
+         * here.  The cwd survives execve (sys_execve does not
+         * clear pcb->cwd), so the busybox ash that musl_sh exec's
+         * inherits it, and `pwd` at the `#` prompt reports /root
+         * instead of /.
+         *
+         * Direct assignment to pcb->cwd, not sys_chdir: the shell
+         * is not yet the current process, and the FAT lookup
+         * sys_chdir would do is unnecessary.  If /root does not
+         * exist on the image, `ls` at the prompt will say so,
+         * which is a clearer diagnostic than a silent fallback.
+         */
+        {
+            static const char home[] = "/root";
+            int i = 0;
+            while (home[i] && i < (int)sizeof(shell->cwd) - 1) {
+                shell->cwd[i] = home[i];
+                i++;
+            }
+            shell->cwd[i] = '\0';
         }
 
         uint64_t shell_entry = load_elf_into_user_process(shell, fat_buf);

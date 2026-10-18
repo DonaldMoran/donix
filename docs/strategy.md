@@ -77,7 +77,7 @@ Design it knowing `/proc` and `/dev` are coming, but do not build
 the VFS they are commonly assumed to need.  See `ROADMAP.md`,
 "Make `/proc` possible."
 
-## Files that must not be touched
+## Files not to change without a specific tested reason
 
 Unless a specific tested problem requires it:
 - `process.c` -- especially `process_copy_kernel_frame`
@@ -88,6 +88,90 @@ Unless a specific tested problem requires it:
 
 (The prebuilt newlib `.a` files, `arc2/crt0.S`, `arc2/reent.c`,
 and `user_newlib_linker.ld` were removed at A5 step 7.)
+
+### The rule, applied -- session 63
+
+The list above is not a prohibition; it is a "slow down here"
+list.  Each entry can be changed, provided the change names a
+specific tested reason.  The 2026-10-12 cycle (session 63) is
+the largest single invocation of the rule since it was written,
+and the list of files and reasons is recorded here so a future
+reader can see what the rule was applied *to*.
+
+**`process.c` -- changed.**  `process_reclaim` did not remove the
+PCB from the ready queue before marking it `PROC_STATE_UNUSED`,
+so a reclaimed slot could remain the queue's tail.  The fix is
+one line (`scheduler_ready_queue_remove(pcb)`) plus a comment.
+**Tested reason:** the wait4 lost-wakeup counters
+(`P11 blocks: 542, wake_ok: 537, refused r3: 5255`) showed the
+wake path failing ~91% of the time on the pre-fix tree.  After
+the fix, `wake_ok` went to 99.3%.  The change is tested by the
+P11 counters themselves and by the canary.
+
+**`scheduler.c` -- changed, twice.**
+- `scheduler_reset` cleared the head and the tail but not each
+  PCB's `next`/`prev`, so a process that was on the queue when a
+  reset ran kept stale links.  `scheduler_ready_queue_contains`
+  used link presence as a proxy for membership, so the stale
+  links made it return true forever and `scheduler_ready_queue_add`
+  no-opped silently.  **Tested reason:** the fix closed a
+  stall shape observed at `qhead_after_add=0` after a call to
+  `add`.  Fixed by walking the queue in `contains` and by
+  clearing every PCB's links in `reset`.
+- `scheduler_ready_queue_add` self-linked a process when called
+  on a process that was already the queue's tail while the head
+  was NULL.  **Tested reason:** the Q-FIRST-BAD capture at
+  `t=27637` showed `head=0, tail=0xFFFFFFFF8027F6E8,
+  tailnext=0xFFFFFFFF8027F6E8` at the top of `add`.  Fixed by
+  healing the state (`tail = NULL` if head is NULL; refuse the
+  add if head is non-NULL) instead of self-linking.
+
+**`interrupts.c` -- changed.**  The kernel-mode timer branch
+handled the empty-ready-queue case by returning to idle without
+checking the pool, so a process stranded READY off-queue was
+never dispatched.  **Tested reason:** the `TIMER-IDLE-STALL` at
+`t=5000` showed `PIPE7E_HELPER READY, off-queue`, with the
+queue empty every tick.  Fixed by rescanning the pool before
+returning.  Also gated three success-path diagnostics behind
+`RACE_PROBE_*` defines and raised the `TIMER-IDLE-STALL` interval
+from 5000 to 60000 ticks; those are cleanup, not behavior.
+
+**`user_syscall.c` -- changed, in two places.**
+- `put_file_slot`'s pipe case: atomic increment/decrement on
+  `slot->refcount` replaces the plain read-modify-write.
+  **Tested reason:** the file_slot refcount was incremented by
+  `sys_fork` and decremented by `sys_close`/`close_all_files`,
+  with no atomicity.  Fixed by `__atomic_fetch_add`/`__atomic_fetch_sub`.
+- `sys_read`'s pipe branch: the reader clears its own publish
+  (`pipe->reader_waiting`) on wake; the wakers no longer clear
+  the field.  **Tested reason:** the 7e stall at `t=2877` showed
+  a waker's clear landing on the reader's fresh publish and
+  wiping it.  Fixed by moving the clear into the reader.
+
+**`user_syscall_entry.asm` -- changed.**  `sti` moved to just
+before `call syscall_dispatch`.  **Tested reason:** a `#GP` at
+`0x4041F8` was diagnosed as a `sti` between the stack switch and
+the pushes, with another process able to clobber
+`g_user_rsp_save` in the window.  Fixed by moving the `sti` after
+the pushes.
+
+**`context_switch.asm` -- not changed.**  It was read extensively
+during the cycle (its save/restore paths and its frame layout are
+the subject of the item 7e family), and multiple diagnostics
+were added around it in the scratch tree, but no change to its
+behavior was needed.  The rule held: the file was read, not
+edited.
+
+**`kmain.c` -- not changed.**  Same.
+
+**The rule, restated for the cycle.**  Every change to a file in
+the list was made in response to a **named capture**, not a
+suspicion: a `P11` counter, a `Q-FIRST-BAD` line, a
+`TIMER-IDLE-STALL` process list, a specific `t=NNNN` stall, a
+specific fault address.  Each change has one commit, one build,
+one boot.  If a future session wants to change one of these
+files, the pattern to follow is: name the capture, name the
+fix, one commit.
 
 ## A6 -- musl userland source tree (complete at `v0.6.0`)
 
@@ -102,8 +186,8 @@ Full A1-A6 narrative: `docs/migration-history.md`.
 
 - **Kernel shell:** `k` at boot prompt (`proclist`, `schstat`,
   `heapstat`, `selftest`, `fatls`, `elfload`).
-- **User shell:** `musl_sh`, launched automatically from the FAT
-  as `0:/MUSL_SH.ELF`.  Do not press `k`.  A FAT read failure is
+- **User shell:** `musl_sh`, launched automatically from the FAT.
+  Do not press `k`.  A FAT read failure is
   a serial PANIC.
 - **QEMU:** `make runkernel64-kvm-single` (fast),
   `make runkernel64-single` (TCG), `make logkernel64` (debug).

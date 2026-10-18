@@ -37,6 +37,24 @@ else
 FAT_CFLAGS := -DFAT_CONFIG_SINGLE_DRIVE=0
 endif
 
+# ------------------------------------------------------------------
+# FAT_CONFIG change detection.
+#
+# FAT_CONFIG_SINGLE_DRIVE is a -D flag on the compile line.  make has
+# no reason to rebuild when it changes, because no source or header
+# timestamp changes.  That is how you end up with kmain.o compiled
+# for single-drive and diskio.o for dual-drive in the same kernel.
+#
+# The stamp file below has a name that encodes the current choice.
+# Every object depends on it, so switching FAT_CONFIG changes the
+# stamp's timestamp and forces a full kernel rebuild.
+# ------------------------------------------------------------------
+FAT_CONFIG_STAMP := .fat_config_$(FAT_CONFIG)
+
+$(FAT_CONFIG_STAMP):
+	rm -f .fat_config_single .fat_config_dual
+	touch $@
+
 # Kernel CFLAGS - Added -Ifatfs here so all files can parse ff.h natively
 #
 # -MMD -MP writes a .d file next to each .o listing the headers that
@@ -46,6 +64,7 @@ endif
 # rebuild produces a kernel that is a mix of objects compiled against
 # two different header versions.
 CFLAGS  := -target x86_64-unknown-elf -ffreestanding -O2 -Wall -Wextra \
+	-march=x86-64 \
 	-mcmodel=kernel -fno-pic -mno-red-zone -mno-sse -mno-sse2 \
 	-mno-avx -mno-mmx -Iinclude -Ifatfs $(FAT_CFLAGS) \
 	-MMD -MP
@@ -54,6 +73,7 @@ CFLAGS  := -target x86_64-unknown-elf -ffreestanding -O2 -Wall -Wextra \
 # is already configured for x86_64-unknown-elf.  Same ABI as the
 # Clang kernel build, so the objects link together.
 FATFS_CFLAGS := -ffreestanding -O2 -Wall -Wextra \
+	-march=x86-64 \
 	-mcmodel=kernel -fno-pic -mno-red-zone -mno-sse -mno-sse2 \
 	-mno-avx -mno-mmx -Iinclude -Ifatfs $(FAT_CFLAGS) \
 	-MMD -MP
@@ -92,8 +112,10 @@ OBJS = entry.o ring3_entry.o kmain.o pmm.o vmm.o heap.o idt.o interrupts.o \
 	idt_load.o isr.o vga.o fb.o ter_u18n_data.o keyboard.o serial.o tss.o gdt.o \
 	elf.o test_program_data.o \
 	user_syscall.o user_syscall_entry.o process.o string.o scheduler.o \
-	context_switch.o ata.o \
+	context_switch.o ata.o race_probe.o \
 	fatfs/ff.o fatfs/ffunicode.o fatfs/diskio.o
+
+$(OBJS): $(FAT_CONFIG_STAMP)
 
 kernel.elf: $(OBJS)
 	$(LD) $(LDFLAGS) -T linker.ld -o kernel.elf $(OBJS)
@@ -226,6 +248,7 @@ user_syscall.o: user_syscall.c
 # ============================================================
 clean:
 	rm -f *.o *.bin *.elf *.d test_program test_program.bin test_program_data.c
+	rm -f .fat_config_single .fat_config_dual
 	rm -f ter_u18n_data.c
 	rm -f fatfs/*.o fatfs/*.d
 

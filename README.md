@@ -262,18 +262,25 @@ If you ever need to force a rebuild, delete `third_party/musl-src/` and
 ./run
 ```
 
-The `run` script is a menu. Open it in an editor, uncomment exactly one
-line inside the `menu()` function, and execute the script. It will:
+The `run` script builds and boots. The default mode is
+`clean-nofreeze`: it runs `make clean`, builds the kernel and the FAT
+image (compiling every musl userland binary, and busybox on first
+run), and boots QEMU in an SDL window with the GDB stub on `:1234`.
+Everything - the build output, the QEMU command line, the serial
+console - is written to `capture.txt`.
 
-1. `make clean`
-2. `make FAT_CONFIG=single` - build the kernel, single-drive layout
-3. `make -C 05_boot_kernel64 hdd-single.img` - build the FAT image,
-   which includes compiling every musl userland binary from source
-   and building busybox (first time only; the source is cached in
-   `third_party/busybox/` thereafter)
-4. Boot QEMU and capture the serial output to `capture.txt`
+`./run menu` prints a numbered list of modes: headless, `debug`
+(wait for GDB before boot), a QEMU monitor socket, `-d int` interrupt
+logging, and full-clean variants. `./run help` lists them.
+`./run <name>` runs one directly.
 
-The default uncommented line is the single-drive TCG configuration.
+Every mode has the GDB stub, so a second terminal can attach at any
+time:
+
+```sh
+gdb -q 04_kernel_64bit/kernel.elf
+(gdb) target remote :1234
+```
 
 **Interact with the OS in the QEMU window**, not the terminal. The
 terminal shows the kernel's serial log; the shell is on the emulated
@@ -297,13 +304,11 @@ image.
 
 ### Debugging
 
-```sh
-make logkernel64
-```
-
-Boots QEMU with `-d int,cpu_reset,guest_errors` and writes the log to
-`qemu_debug.log`. See the `run-*` and `logkernel64` targets in the
-top-level `Makefile` for other modes.
+The `run` modes are the documented path: `./run int` boots with
+`-d int` and writes the interrupt log into `capture.txt`; `./run
+headless` is the no-window build-and-boot; `./run debug` waits for
+GDB. The older top-level `make logkernel64` target still exists and
+writes `qemu_debug.log`. See `./run help` for the full list.
 
 ---
 

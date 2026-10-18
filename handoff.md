@@ -1,558 +1,309 @@
+# handoff.md
+
 Live state only. Read top to bottom when starting a session.
 This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-06 (session 59 closed: the 7e mechanism
-found by reading the disassembly and reproduced first-party; a real
-kernel defect surfaced and was fixed.  The docs are updated and the
-tree is clean.  **The next act is the `v0.6.13` bump** -- banner
-commit, drop the 22 `2026*` scratch tags, push, tag, merge.  Then
-item 12, signal delivery.)
+**Last updated:** 2026-10-18.  **The `C` is FIXED and the heap cycle
+hang is CONTAINED.**  pipe7e passes at 100 kHz (250000 iterations,
+zero events) and at 100 Hz (applet suite green, pipe7e clean); the
+heap ran 10000 iterations clean with no `HEAP:` lines.  Read "What was
+fixed" first, then "Releases" for the version-bump procedure, then
+"Next" for what remains.
 
-**Repo state -- run these; do not write it here.**  A header that
-names a commit or a tag count is wrong the moment the same commit
-lands, so this file does not carry one:
+**THE `C`, in one paragraph.**  `context_switch_resume` loads
+`next->rsp` and reads 20 slots as a resume frame.  The `C` fired when
+`next` was a ZOMBIE (a process that had called `process_exit` and was
+waiting to be reaped) whose slot had been reclaimed and reused, so
+`next->rsp` named a zeroed region, not a resume frame; the resume read
+CS = 0 and halted.  The selection came from a check-then-act race:
+`process_yield` popped `next` from the ready queue (READY), then did
+its checks with interrupts ON, then dispatched.  A tick between the
+pop and the dispatch could turn `next`'s slot READY->ZOMBIE, and the
+dispatch used the stale value.  Fixed by holding `cli` from before the
+pop through the dispatch, with `sti` on every return; the tail check
+in `scheduler_switch_to` (state != READY -> refuse, restore
+`current_process = prev`) is the atomic backstop.
 
-    git log --oneline -1            # HEAD
-    git status -sb                  # branch, dirty?, ahead/behind
-    git tag --list 'v*' | tail -1   # last milestone
-    git tag --list '2026*'          # live scratch tags
+**THE HEAP, in one paragraph.**  A corrupt free-list `next` that
+pointed at itself made `find_free_block`'s unbounded walk spin forever
+with interrupts off, hanging the kernel.  The cycle came from
+`coalesce_blocks` and `heap_validate` running on a list that an
+interleaved `kfree` (from a tick's scheduler) was mid-way through
+mutating.  The 2026-10-18 enriched trace proved the merge arithmetic
+is correct at every step; the "corruption" was the validator reading
+a transient.  Fixed by bounding the walk (a cycle returns NULL, not a
+hang), guarding `split_block` against a self-link, and holding `cli`
+across `coalesce_blocks()` + `heap_validate()` in `kfree`.  **There is
+no evidence of a caller overflow** -- the heap had a race, not an
+overflow.  The bounded walk and split guard remain as real protection
+against a future corruption.
 
-> **The rule this file carries forward, from session 52: an item
-> here that quotes an expected value is a claim.**  Session 51
-> filed item 7c as "`sha512sum` computes a WRONG digest for
-> `ABC`" with a value that turned out to be the SHA-512 of
-> lowercase `abc`.  Session 52 spent its time reading correct
-> code.  Sessions 53 through 58 falsified mechanism after
-> mechanism, each a plausible story read off a trace, each killed
-> by reading the source.  **Session 59's method was the
-> counter-example that paid off: every claim was checked against
-> the source, and the mechanism was found by *reading the
-> disassembly*, not by reasoning from a trace.**  The greps cost
-> seconds; the wrong readings cost sessions.  Read the walk, read
-> the disassembly, read the function -- not just its output.
+**What was fixed.**
 
-**The version history, in one line each:** `v0.6.6` pipes; `v0.6.7`
-a real shell and a framebuffer console; `v0.6.8` the `*at()` family;
-`v0.6.9` envp, the `/usr/bin` layout, the `execve` shim removal;
-`v0.6.10` a tail on `v0.6.9`; `v0.6.11` the pathname dispatch seam,
-`/proc` per-pid and `ps`, and the PMM zone-scan fix; **`v0.6.12` a
-correctness milestone** -- item 7 closed, `process_create`'s failure
-exits fixed, the exit-path page-table leak closed.  **No new
-subsystem in `v0.6.12`.**
+  `C` (tags `20261016-c-contained`, `20261016-destroy-both-current`,
+  `20261016-tail-state-check`, `20261017-pipe7e-all-pass`):
+  - `process_yield` holds `cli` from before `scheduler_ready_queue_next`
+    through `scheduler_switch_to` (`ef85962`).
+  - `scheduler_switch_to`'s tail: `state != PROC_STATE_READY` ->
+    refuse, restore `current_process = prev`, `sti`, return
+    (`e05d1fa`).
+  - `scheduler_switch_to`'s top: `state == ZOMBIE || TERMINATED` ->
+    refuse (tag `SWITCH-DEAD`).  `6f7344b`.  Fast path; the tail
+    check is the atomic one.
+  - `process_destroy` clears both `current_process` copies via
+    `scheduler_set_current` (`c2a3f89`).
 
-**`v0.6.13` is pending.**  Sessions 51 through 59 are untagged work
-on `dev`, after `v0.6.12`: the applet batches and the harness; item
-7c retracted; the zombie leak and the NX / non-canonical family; the
-fork-path sentinel leak; the `isr14` phys-mask fix; the vector-6
-`#UD` handler; the `exit_group` termination fix; `mmap_nx` and
-`sigsegv_probe`; the ELF loader's `PF_X` and page-0 fixes; and
-**session 59's headline -- the ash-side 7e mechanism found by
-reading and reproduced, and the `signal_maybe_redirect` re-entry
-guard.**  The bump is a whole procedure; see below.  **It is a
-decision, not a default.**
+  Selftest fixes (tags `20261018-shell-fallback`,
+  `20261018-create-fail-queue-remove`):
+  - `process_exit`'s kernel-shell fallback wakes the shell as
+    `READY` (not `RUNNING`), lets `scheduler_switch_to` do the
+    transition, and falls through to idle on refusal instead of
+    halting (`e9d6b7a`).  The old code pre-set `RUNNING`, which the
+    tail check refused, and `[exception_de]` halted the selftest.
+  - `process_create`'s four failure exits remove the PCB from the
+    ready queue before marking it `UNUSED` (`19719b7`).  The timer
+    found the failed `fail_slot` PCB on the queue and printed
+    `TIMER-REFUSE: next pid=0 name=fail_slot rsp=0`.
+    `process_reclaim` and `process_destroy` already did this; the
+    failure exits were the one site left out.
 
-Commits are named by tag only, never by SHA.  **Working tags
-(`YYYYMMDD-*`) are local scratch restore points** -- they exist while
-a milestone is being developed and are **dropped before the
-milestone is pushed**.  Only `v*` tags go to the remote and are
-permanent.  The commit record is `docs/session-log.md`; the commit
-message carries the narrative.  Once a scratch tag is dropped it
-resolves to nothing; do not cite one as if it were a stable
-reference.
+  Heap (tag `20261018-heap-cycle-contained`, `1c7fe91`):
+  - `find_free_block`: bounded walk; a cycle prints and returns NULL.
+  - `split_block`: refuses a self-link and a `new_block <= block`.
+  - `kfree`: `coalesce_blocks()` + `heap_validate()` under one `cli`,
+    caller flag saved/restored.
+  - Instrumentation: `heap_validate` prints `check=/exp=/got=`;
+    the corrupt print names the block's fields; `HEAP_TRACE_MERGE`
+    (default 0) traces the coalesce arithmetic.
 
-**A plain commit can exist with no tag.**  Session 45's `run:` fix
-is one.  Sessions 51 through 59's docs commits are the same.  Such
-commits ride along on `dev` until the next `v*` bump.  Do not invent
-a tag for one.
+**THE VERIFICATION.**
+  - `C`: pipe7e at `pit_init(100000)` -- **PIPE7E-ALL-PASS**,
+    250000 iterations, zero `SWITCH-DEAD`, zero `C`.  At
+    `pit_init(100)`: canary `--full` 28/28, `test.sh` 57/57, pipe7e
+    clean past 77500.
+  - Heap: pipe7e 10000 iterations clean (no `HEAP:` lines, no hang,
+    no `C`), canary `--full` 28/28, `test.sh` 57/57.  The run is
+    faster than the corrupt runs -- the allocator was spending time
+    on the broken list.
+  - Selftest: 18/18, `[exception_de]`/`[exception_pf]`/
+    `[exception_gp]` PASS, the kernel shell returns; the
+    `TIMER-REFUSE ... fail_slot` line is gone; the `create_fail`
+    rows still report no leak.
+  - The two rates cover the two classes: 100 kHz stresses
+    interleavings; 100 Hz covers the user-mode-preemption paths.
 
-**Note on commit messages, and on this file too:** a commit message
-is a claim, not a fact.  Read the diff, not the subject.  **This
-file's item text is the same kind of claim.**  Session 52 exists
-because session 51's item 7c was believed; sessions 53 through 58
-falsified a dozen mechanisms that were plausible stories read off a
-trace.  **Session 59 is the one where reading source first found the
-mechanism** -- `evaltree`'s missing restore was found in the
-disassembly, not in a trace.  **Session 59 also produced two wrong
-calls of the opposite kind, by this file's own rules: a section
-title and a commit subject were read instead of the body, and both
-were wrong.**  See "Gotchas worth reading," below.
+**NOT PROVEN.**  "Clean at both rates" is strong evidence, not proof.
+The runs are not a soak; a race that fires 1-in-500000 did not fire in
+these runs, which does not mean it cannot.  A multi-hour soak at
+100 Hz is the validation the fast run cannot give.
 
----
+**THE INVARIANT -- signals must honor it.**  `state`, `block_kind`,
+and ready-queue membership are changed only under `cli`; a dispatch's
+check and act are one critical section; a refused dispatch restores
+`current_process`.  Heap list mutation and validation are also one
+critical section.  Signals (open-issues item 12) are the first feature
+that adds an ASYNCHRONOUS state writer -- exactly the shape of the
+races just fixed.  Any signal delivery that changes a process's state
+from outside its own execution must follow this discipline.
 
-## Working style -- how this project gets changed
+**Repo state -- run these; do not write it here.**
+
+    cd /home/noneya/code/donix || exit 1
+    git log --oneline -8
+    git status -sb
+    git tag --list '2026101*'
+
+**Working style -- how this project gets changed**
 
 Read this before proposing any command block.
 
-**One change at a time.**  A "change" is a commit, verified before
-the next one starts.
+**One change at a time.** A "change" is a commit, verified before the
+next one starts.  **Verify by RUNNING, not by committing** -- build,
+run, see the behavior, THEN commit.
 
-**The state check comes before the command block.**  Every commit
-block starts with `git status` (or `git log`).  This is a rule
-because it was learned: a `git commit` was once written against an
-assumed state and landed wrong.
+**The state check comes before the command block.** Every command
+block starts with `git status -sb` (or `git log`).
 
-**Check the directory, too.**  Start every command block with
-`cd /home/noneya/code/donix || exit 1` and a `pwd`.
+**A command block is one paste -- write it to a file first.**
+`git add`, `git status`, `git commit`, and `git tag` belong in **one**
+block, with the message inline via heredoc.  **Do not paste a block
+with `cd ... || exit 1` into an interactive shell** -- the `exit`
+closes the terminal.  Write to `/tmp/<name>.sh` with
+`cat > ... <<'SCRIPT_EOF'`, then `bash /tmp/<name>.sh`.
 
-**A command block is one paste.**  `git add`, `git status`,
-`git commit`, and `git tag` belong in **one** block, with the commit
-message inline via heredoc.  Do not split a single operation.
+**Python edits with `count != 1` abort checks are the preferred edit
+style.**  **`set -e` at the top.**  **Idempotent edit scripts.**
+**Do the count check IN PYTHON (`str.count`), not with `grep`.**
+`grep -Fc` does not do multi-line matches; `grep -Fxc` requires a
+whole-line match.  Both produced false abort counts this session.
+`str.count` is the only honest multi-line count.
 
-**Two file-return styles.**
+**BEFORE ASSERTING A COUNT, count the occurrences in the file and
+write the expected number from that count, not from memory.**
 
-- **Small files:** return the complete file, four-backtick fenced.
-- **Large files:** return a unified-diff hunk or a copy-block
-  insertion, preceded by a bold **`WORK BEGINS HERE.`** marker.
-  The marker is load-bearing: before it, the assistant is
-  discussing; after it, the content is applyable.
+**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.**  Grep the
+file, confirm the count is 1 **and** the match is in the intended
+function.
 
-  **A whole-file return for a large file with non-ASCII content
-  re-encodes every non-ASCII character and shows up as a large
-  deletion count.**  For an **insertion**, check `git diff --stat`:
-  it should show **zero deletions**.  A full **replacement** of a
-  section correctly shows both.  **A third shape: a Python edit
-  with `count != 1` abort checks, which refuses to write if the
-  anchor doesn't match exactly once.**  That shape caught a real
-  ambiguity (an anchor matching twice) and wrote nothing.  Use it
-  for edits into large files.
+**A post-write check string must be copied from the `new` literal,
+not retyped.**
 
-**Ask for source you do not have.**  The assistant does not have
-direct file access.  Before patching a file it has not seen **in
-this session**, it must ask for that file.  Never guess.
+**Ask for source you do not have.**  Before patching a file it has
+not seen **in this session**, ask for it.  **Before writing an anchor,
+read the file with `cat -A` and quote the bytes.**
 
-**When editing a large file, quote the bytes.**  For an edit inside
-a big file, the instruction must quote the exact text being replaced
-and the exact text that replaces it, both copied from output the
-other side just pasted.  Read files with `cat -A` before writing
-anchors into them.
+**The build is TWO steps.**  `make -C 04_kernel_64bit
+FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
+hdd-single.img` builds the image.  Running only the second copies a
+STALE `kernel.bin`.  Always run both, and verify `kernel.elf` is newer
+than the source you edited.
 
-**A redirection binds to the last command in an `&&` chain.**
+**`nm` output moves between builds.**  Re-run `nm` before using any
+address.
 
-**A capture file is one run.  Truncate, do not append.**
+**A diagnostic on the SUCCESS path is noise.  A diagnostic on the
+FAILURE path is signal.**  `SW2-*`, `HEAP_TRACE_MERGE`, the
+`HEAP: corrupt` prints, and `heap_validate`'s check prints are
+success-or-transient-path; they are gated.  The refuse lines
+(`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`, `EXIT-REFUSE`) and
+the `C` report are failure-path (kept).
 
-**A build flag change does not trigger a rebuild unless the
-Makefile is a prerequisite.**
+**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT `-g`).
+Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028, `cr3`
+0x030, `entry_point` 0x038, `kernel_stack_virt` 0x048,
+`kernel_stack_top` 0x050, `rsp` 0x110, `rip` 0x118, `next` 0x120,
+`prev` 0x128, `block_kind` 0x158.  `sizeof(pcb_t)` = 0x618.
+**CONSIDER BUILDING WITH `-g`.**
 
-**Do not edit `third_party/`.**  The vendored sources there are
-gitignored and rebuilt by the toolchain.  **But read them freely** --
-session 59's mechanism was found by disassembling
-`third_party/busybox/busybox_unstripped` and grepping
-`busybox_unstripped.map`.  Read-only is the point.
+**Do not run `git reset --hard` without stashing first.  Do not edit
+`third_party/`.  Do not commit `kmain.c`'s `pit_init` knob -- the
+committed value is 100.  Do not call a race closed on one clean run.**
 
-**Hand-written `@@` hunk headers are a trap.**  Edit the file and
-let `git diff` produce the patch; always `git apply --check` before
-`git apply`.
+---
 
-**A diagnostic that runs on the fault path is part of the system.**
-A fault-path diagnostic reads memory and prints serial output inside
-an exception handler, and the extra time can widen a race's window.
-Gate a fault-path diagnostic to the addresses it is for; do not
-assume it is inert.
+## Releases
 
-**The push / merge / tag sequence** (used for every `v*` bump):
+**Before a release:** the scratch `2026MMDD-*` tags are annotated and
+are the source for the version summary.  Do not delete them until the
+`vX.Y.Z` tag is made and the summary is in the merge commit.
 
-    git tag -a vX.Y.Z -F - <<'EOF'
-    <annotation>
-    EOF
+**The release procedure** (from `vX.Y.Z` on `dev`):
 
-    git push origin dev && \
-    git push origin vX.Y.Z && \
-    git checkout main && \
-    git merge --no-ff dev -m "Merge dev into main for vX.Y.Z
+    git tag vX.Y.Z
+    git push origin dev
+    git push origin vX.Y.Z
+    git checkout main
+    git merge --no-ff dev -m "<version summary>"
+    git push origin main
+    git checkout dev
 
-    <merge narrative>" && \
-    git push origin main && \
-    git checkout dev && \
-    git status && \
-    git log --oneline -3
+`--no-ff` keeps the merge point in `main`'s history.  The summary is
+written from the scratch tags' annotations and the
+`vPREV..HEAD` commit log, in the project's voice.
 
-**Before this:** the banner bump is the **last** code commit; the
-session's `YYYYMMDD-*` scratch tags are **dropped**; and the
-session-log and handoff are written.  The tag is **annotated**; the
-merge is `--no-ff`.
+**Then drop the scratch tags:**
 
-**A version is not necessarily a milestone.**  **`v0.6.12` is a
-correctness milestone.**  **`v0.6.13` is a candidate** -- a
-mechanism found, reproduced, and a real kernel defect fixed -- and
-the work since `v0.6.12` is 60+ commits across applets, the zombie
-leak, the NX family, and the probes.  The bump is a **decision**,
-not a default.
+    git tag --list '2026*' > /tmp/scratch-tags.txt
+    for t in $(git tag --list '2026*'); do git tag -d "$t"; done
+
+(Local tags only; if any were pushed, `git push origin :refs/tags/<t>`
+for each.)
+
+**v0.6.13 is closed.**  The banner is bumped (`f1b4a21`,
+tag `20261018-v0614-bump`) and this is the first change under
+**v0.6.14**.  The release tag will be `v0.6.14`, covering
+sessions 60-68: the migration, the pipe/scheduler lost-wakeup and
+queue-mutator family, the `C`, the heap cycle, the selftest fixes,
+and the `run` rewrite.  The long-form narrative is the `v0.6.13`
+entry in `docs/version-history.md` (commit `033bd53`).
 
 ---
 
 ## What donix is
 
-A fork of dons-os. Goal: a Unix-like OS that runs static musl-linked
-binaries on the Linux x86_64 syscall ABI, natively. Newlib is gone.
-Userland is a tracked source tree at `userland/musl/`. Phase B
+A fork of dons-os.  Goal: a Unix-like OS that runs static musl-linked
+binaries on the Linux x86_64 ABI, natively.  Newlib is gone.
+Userland is a tracked source tree at `userland/musl/`.  Phase B
 (busybox) is well underway.
 
 Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
 
 ---
 
-## Tree on disk
+## Where we are
 
-One working copy.
+### CLOSED -- the `C` (stale-ZOMBIE dispatch) and the heap cycle hang
 
-- **Real project:** `/home/noneya/code/donix/`.  Tracked repository,
-  source of truth, where the `v*` tags live.
+Both fixed.  See "What was fixed" and "THE VERIFICATION" at the top.
+Do NOT re-walk the refuted paths below.
 
-The kernel C sources live in `04_kernel_64bit/`.  Verify by file
-name before editing.  `05_boot_kernel64/` holds the boot chain
-assembly and the image builder.
+### Next -- the highest-value work
 
-Scratch workspaces are **transient**.  Do not port from one without
-a build and test in the real tree.
+1. **A 100 Hz soak.**  The runs above are not a soak.  Let pipe7e or
+   the applet suite run for hours at `pit_init(100)` and confirm no
+   `C`, no `SWITCH-DEAD`, no `YIELD-REFUSE`, no `HEAP:`.  This is the
+   validation the fast run cannot give.
+2. **Signals (open-issues item 12).**  The first asynchronous state
+   writer.  Honor the invariant above.
+3. **Shebang + `/bin/sh`.**  `./script.sh` works via ash's `ENOEXEC`
+   fallback, but `/bin/sh` does not exist and `sys_execve` has no
+   `#!` handling.  Two parts: put `/bin/sh` on the image (copy of
+   busybox or a kernel alias -- a decision), and add `#!` parsing to
+   `sys_execve` with a recursion guard.  Not a bug -- a feature gap.
+4. The open-issues list (top 6, below).
 
-**Run command blocks from the repository root.**
+### Refuted -- do NOT re-walk
 
----
-
-## Where we are -- after session 59
-
-**The 7e mechanism is identified, reproduced, and the kernel defect
-it surfaced is fixed.  7e stays open because the bug is ash's.**
-The full narrative is `docs/session-log.md`, session 59, and
-`docs/open-issues.md` item 7e.  In one paragraph each:
-
-**The mechanism.**  `evaltree` stores a pointer to its own stack
-frame's `jmp_buf` into `globals+0x38` (`0x41C403`) and does not
-restore it on the normal return; its epilogue, `popstackmark`,
-`dotrap`, and `int_on` all read the field, none writes it.
-`redirectsafe` manages the same field, saving the old value on its
-own frame (`rsp+0x20`) and restoring from there -- so a stale
-`_longjmp` into a returned frame reads a dead slot.
-`raise_exception` (`0x415521`, 27 bytes) `_longjmp`s to
-`globals+0x38` with no liveness check.  A stale `%rsp` results.
-
-**The reproduction.**  `pipe7e_sjlj_stale` mirrors the shape
-first-party; phase 1 faults.  Fault #1: `RIP = 0x80000FBDBF` (a
-user stack address), `RSP = 0x34`, error `0x5`.  Fault #2: the
-handler on the garbage stack, `RIP = 0x400640`, `CR2 = 0x28`,
-error `0x7`.
-
-**The kernel defect the reproduction found.**
-`signal_maybe_redirect` had no re-entry guard, so a handler that
-itself faulted re-entered itself forever -- a live-lock.  Fixed
-with `in_signal_handler` on `pcb_t`, set when the redirect fires,
-cleared in **both** `process_reclaim` and `process_destroy`.
-`signal_handler[]` was also never cleared on teardown despite the
-comment; fixed in the same commit.
-
-**What this closes and what it does not.**  The **loop** is closed;
-7e will still fire in ash, now taking two faults and a kill
-instead of live-locking.  The bug is ash's and `third_party/` is
-not editable.  **The only donix-side path to making 7e stop
-costing whole runs is item 12** -- a real signal subsystem, so ash
-can catch the fault and continue.
-
-### The NX / non-canonical address family (session 54, unchanged)
-
-Four fixes, one mechanism: `vmm_get_phys*` strip `PT_NX`;
-`sys_mmap` honors `PROT_EXEC`; the huge-page split sets NX on the
-512 split PTEs, not the PDE; `pte_phys` strips both.  Every walk
-site in `vmm.c` uses `pte_phys`.
-
-### The fault model (session 54, unchanged)
-
-**`isr14_handler`'s walk does not halt.**  **`fault_signal` +
-`sys_wait4`:** a faulted child's wait status is a signal-kill
-encoding; busybox ash prints `Segmentation fault`.  **`g_last_sysret`**
-is wired.  User-mode faults are diagnosed and the process killed;
-the machine lives.
+- **The reserve / frame placement.**  `67701df` + `5587d70`.
+- **The `next->rsp = 0` clear.**  Broke blocking; reverted.
+- **The pipe-waiter fields as the `C`'s stale holder.**  The pipe7e
+  helper writes 2 bytes and never blocks, so they are never set.
+- **The `current_process` dual-copy divergence at the `C`.**  Both
+  copies agreed.  (The `process_destroy` fix is still correct.)
+- **A switch-to-self guard in `scheduler_switch_to`'s TAIL.**  It
+  fires after `current_process = next` and refuses every dispatch.
+  The tail check is `state != READY`, not `next == current_process`.
+- **A caller heap overflow.**  The enriched trace + the merge trace
+  proved the merge arithmetic correct; the "corruption" was an
+  interleaved `kfree`.  The heap had a race, not an overflow.
+- Do not re-open: item 7, item 7c, item 11, the session-48 zone scan,
+  the `fs_base` path, the `longjmp`/`setjmp` family.
 
 ---
 
-## NEXT SESSION
+## Open issues (top 6)
 
-**Item 12 -- signal delivery -- is the lead.**  `sys_rt_sigaction`
-is still a stub for every real signal.  Session 59's fix means
-`signal_handler[]` is per-process and cleared on teardown, and the
-redirect is guarded; what remains is the subsystem: a real
-`sys_rt_sigaction` reading the real `struct sigaction`, a raise on
-the fault path, an `rt_sigreturn` that restores the frame after the
-handler returns, a restorer trampoline, and a `SIGPIPE` raise on
-the `-EPIPE` write path.  Unblocks `kill`, ash job control, the
-Wayland `SIGBUS` path, and a real first-party `SIGSEGV` reproducer
-that **returns** from its handler.
+1. **`open-issues.md` item 12: signal delivery is a stub.**
+2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
+3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
+4. **`sys_gettimeofday` (99)** so `ps -l` works.
+5. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
+   process bug.
+6. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
 
-**Item 12 is a workstream, not a commit.**  Scope it first: the
-`struct sigaction` layout, the return-path frame, the restorer
-convention, the pending/blocked sets, the raise sites, the default
-actions, and cross-process delivery.  Write the design down before
-writing code.  A half-built signal subsystem is worse than the
-current honest stub.
-
-### The candidates, in order
-
-1. **Item 12 -- signal delivery.**  Largest; the only path to
-   making 7e stop costing runs; unblocks several.
-2. **`sys_gettimeofday` (96).**  A few lines from `g_ticks`, like
-   `sys_clock_gettime` (228).  Unlocks `ps -l`.  **Small,
-   patterned, independent.**  Note: the number is **96**, not 99;
-   the handoff carried 99 in error until session 59.
-3. **The `v0.6.13` bump.**  A whole procedure: banner commit, drop
-   the 22 `2026*` scratch tags, push, tag, merge.  **A decision,
-   not a default.**
-4. **Documenting the ash mechanism** for a third-party patch or a
-   workaround.  The donix side has no fix left for 7e.
-
-### If you would rather do something small and clean
-
-**`sys_gettimeofday` (96)** -- see above.  **`open("/proc/<pid>",
-O_DIRECTORY)`.**  **`/dev` as a listable directory.**  **More
-applets from the "still-off" table** -- the zero-syscall ones.
-
-### Do not
-
-Do not re-open item 7 (closed), item 11 (closed), or the session-48
-zone scan (fixed).  **Do not re-open the fork-sentinel leak.**
-**Do not re-litigate the five 7e mechanisms falsified in sessions
-56-57.**  **Do not re-open the "is the mmap window executable"
-question.**  **Do not trust a page walk's verdict without reading
-the walk.**  **Do not re-run the two `setjmp` probes to "check" --
-they pass; the mechanisms are falsified.**  Do not chase the
-intermittent family (7a, 7b) without a reproducer.  **Do not drop
-the older non-`2026*` tags.**  One change at a time.  Do not edit
-`third_party/` -- but do read it.
-
----
-
-## Busybox enablement -- state of play
-
-**Enabled and working:** `ps`, `pstree`, `stty`, `tty`, `gzip`,
-`gunzip`, plus batches 2 and 3.  `sha512sum` **works** -- item 7c was
-a test bug.  `find -not` **works with `!`**.
-
-### The rule
-
-**Enable an applet only when the syscalls it actually calls are
-implemented -- read the applet's source, do not guess from its
-name.**  A syscall that exists but cannot do its job is worse than
-a missing one.
-
-**A real applet finds real bugs.**  Session 52 is the
-counter-example: a real applet found a wrong test.
-
-**Do not edit `third_party/`.**
-
-### What each still-off applet needs
-
-Each row is a **cost estimate, not a prohibition**.
-
-| Config | Applet | Needs |
-|---|---|---|
-| `CONFIG_DIFF` | `diff` | `mmap` of files (non-anonymous) |
-| `CONFIG_CHMOD`/`CHOWN` | | FAT has no permissions/ownership |
-| `CONFIG_LN`/`LINK` | | FAT has no links |
-| `CONFIG_MOUNT`/`UMOUNT` | | no VFS |
-| `CONFIG_HALT`/`POWEROFF`/`REBOOT` | | item 12; no init, no ACPI |
-| `CONFIG_TAR`/`UNZIP`/`CPIO`/`BZIP2`/`XZ` | archives | `mkdirat`, `symlinkat`, `utimensat` storage, file-backed `mmap`, decompression |
-| `CONFIG_AWK` | `awk` | large |
-| `CONFIG_LESS`/`MORE` | pagers | raw-mode terminal control; `/dev/tty` does not exist |
-| `CONFIG_TOP` | `top` | `ps -l`-class fields (`gettimeofday`), a redraw loop |
-| `CONFIG_KILL` | `kill` | item 12 |
-| `CONFIG_NETWORKING` | | no network stack |
-| `CONFIG_ASH_JOB_CONTROL` | | item 12; item 13 |
-| `CONFIG_FEATURE_FANCY_SLEEP` | `sleep 0.1` | nothing -- the flag itself |
-
----
-
-## Canary state
-
-**Green as of session 57's carry-back** -- `canary` 15/15,
-`canary --full` 28/28, `selftest` 18/18, `test.sh` **57 passed, 0
-failed**.
-
-**`pipe_wake_probe.sh` completion varies per boot.**  The 7e family
-and the 7d lost-wakeup are racy.  **The completion rate is not a
-regression indicator on its own.**
-
-**Session 59 verified:** `pipe7e_stdio_sjlj` passes 20000;
-`pipe7e_stdio_heapjmp` passes 20000; `pipe7e_sjlj_stale` phase 1
-faults and is killed (two faults, no loop).
-
-**Regression tests (`userland/musl/tests/`, not canary rows):**
-
-    at_step1 at_step2 envp_step1 musl_exec2 fcntl_lowfd
-    readlink_errno proc_status proc_fd proc_dir proc_stat
-    proc_walk proc_walk_fds mmap_stress exec_churn
-    sha512_probe pipe7e mmap_nx sigsegv_probe pipe7e_stdio
-    pipe7e_stdio_sjlj pipe7e_stdio_heapjmp pipe7e_sjlj_stale
-
-**Pipe regression suite:** `pipe_step1 pipe_step2 pipe_step3
-pipe_step3b`.  Run when changing `sys_read`/`sys_write`/`sys_close`/
-`put_file_slot`/`sys_fork`/`sys_pipe` or adding a `FILE_KIND_*`.
-
-**`pipe7e` is the item-7e acceptance test.**  **`mmap_nx`** proves
-`sys_mmap`'s `PT_NX` gate.  **`sigsegv_probe`** lets a process catch
-its own fault.  **`pipe7e_stdio`** is the `x=$(cmd)` shape with
-`FILE *`.  **`pipe7e_stdio_sjlj` / `pipe7e_stdio_heapjmp`** test the
-`setjmp` shapes and pass.  **`pipe7e_sjlj_stale`** is the
-stale-`jmp_buf` reproduction and the acceptance test for the
-`signal_maybe_redirect` re-entry guard.
-
-**Run `pipe7e_sjlj_stale` when changing `signal_maybe_redirect`,
-`isr13_handler`, `isr14_handler`, or the `pcb_t` signal fields.**
-
-**The harness:** `test.sh` (staged at `/root/scripts/test.sh`),
-~58 rows, not a canary, takes minutes, passes now.
-
-**New ELFs must be added to both `USERLAND_ELFS` and the `mcopy_one`
-chain in `05_boot_kernel64/Makefile`.**
-
-**Do NOT add a bare `sh` row.**  There is no `/bin/sh`.
-
-**Expected noise:** no `Unknown syscall:` lines; no `[fd]` lines;
-the `FB:` line is expected.  `WW:` lines are the item-7d instrument.
-**A `Segmentation fault` line is expected** -- the honest
-exit-status change.  Multiple in a `pipe_wake_probe.sh` run are the
-7e family firing, each absorbed.
-
----
-
-## Open issues (top 6; full list in `docs/open-issues.md`)
-
-1. **`open-issues.md` item 7e: the control-transfer face.**  The
-   **mechanism is identified** on the ash side and reproduced; the
-   **kernel re-entry loop is fixed**.  7e stays open because the
-   stale-`jmp_buf` bug is ash's.  **No donix-side fix remains.**
-2. **`open-issues.md` item 12: signal delivery is a stub.**  The
-   largest target; unblocks `kill`, ash job control, the Wayland
-   `SIGBUS` path, and a real `SIGSEGV` reproducer.  **The next
-   session's lead.**
-3. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
-   Latent; the fix is a kernel feature.
-4. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-5. **`open-issues.md` item 9: no privilege model.**
-6. **`sys_gettimeofday` (96) is not implemented**, so `ps -l` is
-   off.  Small.  **Note: 96, not 99.**
-
-**Item 7 closed; item 7c retracted; item 7d fixed.**  **Item 11
-closed.**  **Item 7e: mechanism identified and reproduced; loop
-fixed; open because the bug is ash's.**
+Plus: **shebang + `/bin/sh`** (see Next), and **a 100 Hz soak**.
 
 ---
 
 ## State on disk
 
-**Real project root:** `/home/noneya/code/donix/`.
-
-**The FAT layout:**
-
-    /            HELLO-WORLD.TXT and other data
-    /bin         busybox
-    /usr/bin     the donix-native ELFs, staged BARE
-    /tmp         empty
-    /etc         passwd, group
-    /root        scripts/test.sh, scripts/pipe_wake_probe.sh
-    /home        empty
-    /dev         empty (a real FAT directory)
-    /var         empty
-
-- `configs/busybox.config` -- tracked canonical config.
-- `userland/musl/` -- tracked musl userland.  Session 59 added
-  `tests/pipe7e_stdio_sjlj.c`, `tests/pipe7e_stdio_heapjmp.c`,
-  `tests/pipe7e_sjlj_stale.c`; the Makefile unchanged.
-- `userland/scripts/` -- `test.sh`, `pipe_wake_probe.sh` (4000
-  iterations).
-- `third_party/{busybox,busybox-install,musl-src,musl-install}/`
-  -- gitignored; **read freely, do not write.**
-- `toolchain/{install_musl.sh,musl-gcc.sh}` -- tracked.
-- `capture.txt` -- gitignored, truncated per run.  Captures
-  preserved outside the tree survive a rebuild and do not dirty
-  the tracked tree.
-- `run` -- tracked; the build-and-capture fix.
-
-Kernel sources: `04_kernel_64bit/`.
+Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
+Scratch tags from the `C`/heap work (drop before release):
+`20261016-c-contained`, `20261016-destroy-both-current`,
+`20261016-tail-state-check`, `20261017-pipe7e-all-pass`,
+`20261018-heap-cycle-contained`.
+Earlier: `20261014-queue-race-closed`, `20261014-pipe7e-100k-clean`,
+`20261013-session-start`.
 
 ---
 
-## Where things live
+## One-line summary
 
-Not needed to start a session; ask for a file when the task needs
-it.
-
-- `docs/strategy.md`, `docs/gotchas.md`, `docs/session-log.md`,
-  `docs/open-issues.md`.
-- `docs/{CHECKLIST,MAINTENANCE,LLD_BUG_REPORT}.md`.
-- `ROADMAP.md`, `README.md` -- review at the next `v*` bump.
-- `run`.
-
----
-
-## The one-line summary
-
-**donix runs static musl-linked binaries on Linux x86_64 syscalls.
-Newlib is gone.  The userland is a tracked source tree at
-`userland/musl/`.  `v0.6.12` is a correctness milestone; `v0.6.13`
-is pending.  Session 51** built the applet batches and harness.
-**Session 52** retracted item 7c.  **Session 53** found the zombie
-leak.  **Session 54** closed item 11, fixed the NX family, made user
-faults honest.  **Session 55** closed the fork-sentinel leak.
-**Sessions 56-57** made three kernel fixes, built `mmap_nx` and
-`sigsegv_probe`, and falsified five mechanisms.  **Session 58**
-added the `fault_rip` walk (found to misread, retracted), fixed the
-ELF loader, wrote `pipe7e_stdio`.  **Session 59** wrote two
-`setjmp`/`longjmp` probes (both pass, falsifying two mechanisms);
-found the ash-side mechanism by reading the disassembly
-(`evaltree` never restores `globals+0x38` on its normal return, and
-`redirectsafe` restores the same field from a frame-local slot) and
-reproduced it first-party (`pipe7e_sjlj_stale`); and found and
-fixed a real kernel defect the reproduction surfaced
-(`signal_maybe_redirect` had no re-entry guard, so a handler that
-faulted looped forever; also `signal_handler[]` was never cleared
-on teardown).  **The next act is the `v0.6.13` bump; then the
-session-60 lead is item 12, signal delivery.**  See NEXT SESSION.
-One change at a time.**
-
----
-
-## How to use this file
-
-At session start, paste this file and say "Continue from here and
-request any files you need."  Run the four `git` commands -- they
-are the state; this file is the narrative.
-
-At session end, **rewrite the narrative.**  Do **not** write repo
-state.  New gotchas go to `docs/gotchas.md`; new commit rows go to
-`docs/session-log.md`; new open issues go to `docs/open-issues.md`.
-This file never grows.  Name commits by tag only.
-
-**When a session's findings change an earlier numbered step, edit
-the step in place.**
-
-**Before proposing any command block, read the "Working style"
-section at the top.**
-
-**Gotchas worth reading before the next change.**  "A fix with no
-test is indistinguishable from an unfixed defect."  "A test can
-encode an earlier version's behavior."  "A consumer inferred from
-behavior is not a consumer."  Session 49's: **a function that has
-never run is correct by inspection only.**  Session 51's two: **a
-whole-file return for a large non-ASCII file re-encodes it**; and
-**print the row marker before the row runs.**  Session 52's: **a
-test's expected value is a claim.**  Session 53's: **a diagnostic
-declared but never wired is not a diagnostic.**  Session 54's two:
-**a halt in a fault handler is a diagnostic that never runs**; and
-**put cleanup in the teardown, not each entry point.**  Session
-55's two: **a fork that overwrites a child's file table leaks per
-fork**; and **a captured fault is not a diagnosed one.**  Session
-57's two: **hand-written `@@` hunk headers are a trap**; and **a
-type's named fields are not what the pointer points at.**  Session
-58's two: **a page walk that descends through a supervisor level
-prints a confident wrong verdict**; and **a diagnostic on the fault
-path is part of the system.**  Session 59's three: **a Python edit
-with a `count != 1` abort check catches an ambiguous anchor and
-writes nothing -- use it for edits into large files; a handler on
-the fault path with a corrupt `rsp` cannot run, so a redirect
-without a re-entry guard loops forever -- guard it; and reading the
-disassembly found the mechanism a dozen trace-readings had
-missed.**  **And session 59's meta-gotcha: a section title is a
-claim about its body, and a commit subject is a claim about its
-diff -- read the body, read the diff, not the title and not the
-subject.  Session 59 made that mistake twice.**  **This file's item
-text is the same kind of claim.**
+**The `C` is FIXED (pop-to-dispatch `cli`, atomic tail check) and the
+heap cycle hang is CONTAINED (bounded walk, split guard,
+`cli`-across-coalesce-and-validate).  pipe7e passes at 100 kHz
+(250000, zero events) and at 100 Hz; the heap ran 10000 iterations
+clean.  Next: a 100 Hz soak, then signals -- honoring the invariant
+that state changes happen under `cli`.**

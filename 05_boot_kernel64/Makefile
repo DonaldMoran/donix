@@ -104,12 +104,62 @@ stage2.bin: stage2.asm
 musl-userland:
 	$(MAKE) -C $(USERLAND_DIR)
 
-hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland $(USERLAND_ELFS)
+hdd.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin fat.img musl-userland $(USERLAND_ELFS)
 	rm -f hdd.img
 	qemu-img create -f raw hdd.img 20M
 	dd if=boot.bin of=hdd.img conv=notrunc
 	dd if=stage2.bin of=hdd.img bs=512 seek=1 conv=notrunc
 	dd if=../04_kernel_64bit/kernel.bin of=hdd.img bs=512 seek=128 conv=notrunc
+
+# ------------------------------------------------------------------
+# fat.img - the second disk used by FAT_CONFIG=dual.
+#
+# A standalone FAT16 image with no offset: the FAT boot sector is at
+# LBA 0.  QEMU attaches this as the second IDE drive; diskio.c with
+# FAT_CONFIG_SINGLE_DRIVE=0 reads from it directly.
+# ------------------------------------------------------------------
+fat.img: musl-userland $(USERLAND_ELFS)
+	rm -f fat.img
+	qemu-img create -f raw fat.img 16M
+	mkfs.vfat -F 16 -n DONSOS fat.img
+	@echo "--- creating directories ---"
+	@for d in bin usr usr/bin tmp etc root root/scripts home dev var; do \
+	    mmd -i fat.img "::/$$d" 2>/dev/null || true; \
+	done
+	@for f in ../test-files/*; do \
+	    if [ -f "$$f" ]; then \
+	        echo "mcopy $$f"; \
+	        mcopy -i fat.img "$$f" ::/ ; \
+	    fi \
+	done
+	@echo "--- staging /etc/passwd and /etc/group ---"
+	@printf 'root:x:0:0:root:/root:/bin/sh\n' > /tmp/donix-passwd
+	@printf 'root:x:0:\n' > /tmp/donix-group
+	@mcopy -i fat.img /tmp/donix-passwd ::/etc/passwd
+	@mcopy -i fat.img /tmp/donix-group  ::/etc/group
+	@rm -f /tmp/donix-passwd /tmp/donix-group
+	@echo "--- staging userland ELFs ---"
+	@for f in $(USERLAND_ELFS); do \
+	    base=$$(basename "$$f" .elf | tr a-z A-Z); \
+	    echo "mcopy $$f -> ::/usr/bin/$$base"; \
+	    mcopy -i fat.img "$$f" "::/usr/bin/$$base" || exit 1; \
+	done
+	@echo "--- staging /root/scripts/ ---"
+	@for f in $(USERLAND_SCRIPTS)/*; do \
+	    if [ -f "$$f" ]; then \
+	        base=$$(basename "$$f"); \
+	        echo "mcopy $$f -> ::/root/scripts/$$base"; \
+	        mcopy -i fat.img "$$f" "::/root/scripts/$$base" || exit 1; \
+	    fi \
+	done
+	@echo "--- staging busybox at /bin/busybox ---"
+	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
+	    mcopy -i fat.img "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox"; \
+	else \
+	    echo "ERROR: busybox.elf missing"; exit 1; \
+	fi
+	@echo "--- fat.img contents ---"
+	@mdir -i fat.img ::/ || true
 
 hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland $(USERLAND_ELFS)
 	rm -f hdd-single.img
@@ -312,5 +362,5 @@ clean-logs:
 	rm -f serial.log qemu.log qemu_debug.log
 
 clean: clean-logs
-	rm -f boot.bin stage2.bin hdd.img hdd-single.img
+	rm -f boot.bin stage2.bin hdd.img hdd-single.img fat.img
 	$(MAKE) -C $(USERLAND_DIR) clean

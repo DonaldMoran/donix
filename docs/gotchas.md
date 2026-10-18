@@ -1,3 +1,635 @@
+## A guard is not a fix; a fix closes the window the guard was checking across
+
+*Sessions 63–67.  The `C` resisted four sessions because each attempt
+added a guard instead of closing the window.*
+
+The `C` is `context_switch.asm`'s unknown-CS halt.  Four sessions
+tried four guards — a `RUNNING`-next refuse in
+`scheduler_switch_to`, a `next->rsp == 0` clear, a
+switch-to-self check in the tail, and the frame-top reserve.  Each
+converted a fatal halt into a different fatal halt, a hang, or a
+refused-every-dispatch loop.  None closed the `C`.
+
+**The window.**  `process_yield` popped `next` from the ready
+queue, did its checks with interrupts **on**, then dispatched.  A
+tick between the pop and the dispatch could turn the slot
+`READY→ZOMBIE`, and the dispatch used the stale value.  The guard
+that ran after the pop was a telescope pointed at the past.
+
+**The fix.**  Hold `cli` from before the pop through the dispatch,
+`sti` on every return.  The state cannot change between the check
+and the act because they are one critical section.
+
+**The rule.**  A guard whose check and act are not one critical
+section is not a guard.  It converts a bug into a different bug,
+which is why the `C` survived four of them.  When a guard "does
+not work," the question is not "which guard" — it is "what window
+is the guard checking across, and who can change the state in it."
+
+## An instrument on the failure path is signal; its absence is not proof
+
+*Session 68.  `HEAP: corrupt` named blocks that were consistent when
+read; only the merge trace showed the timing was wrong.*
+
+The heap's free-list cycle hang looked like a caller overflow:
+`magic` intact, `used` intact, `next` overwritten with a self-link.
+`heap_validate` returned blocks (`0x750`, `0x7C0`, `0x1840`) that,
+read, were each internally consistent — `end == next`, `prev`
+matching the walk.  The print named the block it *landed on*, not
+the invariant that failed.
+
+**What ended it.**  Two prints, in sequence.  First `heap_validate`
+printed which check failed and the two values it compared
+(`check=prev_mismatch exp=… got=…`).  Then `coalesce_blocks`
+printed its arithmetic on every merge.  The arithmetic was correct
+at every step.  **The list was not corrupt; `heap_validate` was
+reading a list an interleaved `kfree` was midway through mutating.**
+
+**The rule.**  A diagnostic that prints a block address is a claim
+about *where*; a diagnostic that prints the values it compared is a
+claim about *what*.  The second ends the mystery.  And a failure-path
+print that *stops* appearing is not proof the bug is fixed — it is
+proof it did not fire in that run.  The heap fix is "10000
+iterations clean," not "no cycle possible."
+
+## Two BSS symbols with the same name are two variables
+
+*Session 65.  `process_destroy` wrote one `current_process`; the
+other stayed stale.*
+
+`current_process` existed twice: `process.o` at
+`0xFFFFFFFF80287F50` and `scheduler.o` at `0xFFFFFFFF80307F70`, two
+distinct `b` symbols.  `process_destroy` did
+`if (current_process == pcb) current_process = NULL;` — writing
+process.c's copy only, leaving scheduler.c's pointing at the
+destroyed PCB.
+
+**The fix.**  Route the clear through `scheduler_set_current(NULL)`,
+which writes both.  It was the one confirmed single-copy write in
+the tree.
+
+**The rule.**  `nm` the object files when a global "does not stay
+cleared."  A name is not a variable; a file-local `static` in two
+translation units is two variables with one name, and a write to one
+is invisible to a reader of the other.  A guard that compares
+against "the" `current_process` is comparing against one of two.
+
+## Count in Python, not `grep`
+
+*Session 68.  Three edit scripts aborted on wrong counts; each abort
+was right, the check was wrong.*
+
+`grep -Fxc` requires a whole-line match — it missed a line that had
+four spaces of indent, and reported 0 for a string that was there.
+`grep -Fc` on a multi-line string is not a multi-line match: it
+matches each line of the pattern separately, and counted `}` 76
+times.  `grep -Fc 'scheduler_ready_queue_remove(pcb);'` counted the
+two pre-existing sites plus the four new ones — correct — but a
+three-line tail at two indentations matched only two of four.
+
+**The rule.**  `str.count` in Python is the only honest multi-line
+count.  Do the count in the edit script, not in a pre-check `grep`;
+abort on `count != 1` (or the expected number) **before** writing.
+And count the occurrences in the file, not from memory — the four
+failure exits were at two indents, and the "four" I expected was
+four sites with two different shapes.
+
+## A `case` default must apply to the argument, not just the match
+
+*Session 68.  `./run` with no argument printed `run: unknown mode ''`.*
+
+The dispatch was
+
+    case "${1:-sdl}" in
+        menu) ...
+        *) run_mode "$1" ;;
+    esac
+
+`"${1:-sdl}"` selects the `*)` branch when `$1` is empty — the
+default is in the *match*.  But `run_mode "$1"` passes the raw,
+empty `$1`, and `mode_qemu ""` returns "unknown mode".
+
+**The fix.**  `run_mode "${1:-$DEFAULT_MODE}"` — the default applies
+to the argument too.
+
+**The rule.**  `case "${1:-default}"` defaults only the thing the
+`case` tests.  The branch body still sees `$1`.  A default that
+works for the match and not for the use is the shape of a
+"works for `--help`, fails for no-arg" script.
+
+## A test-mode flag is part of the system
+
+*Session 68.  A correct `reboot` looked broken because QEMU was told
+not to honor it.*
+
+`handle_reboot_sequence` issued the keyboard-controller pulse and the
+ACPI reset port, and `reboot` from the kernel shell appeared to do
+nothing.  The kernel was correct: the `run` script's base carried
+`-no-reboot -no-shutdown`, so QEMU caught the guest reset and exited
+instead of rebooting.  Running QEMU without the pair reboots.
+
+**The rule.**  The test harness's flags are part of what is under
+test.  `-no-reboot` freezes at a fault (which is what every `C`/heap
+diagnosis run needs) and *also* swallows a legitimate reboot.  When
+a feature "does not work," check whether the harness disabled it
+before reading the kernel.
+
+**The shape.**  A flag chosen for diagnosis (freeze on fault) and a
+flag chosen for normal operation (reboot) are not the same run.
+The `run` script now splits them: `clean-nofreeze` (default, reboot
+works) and the freeze modes (diagnosis).
+
+## The `C` line's five fields are named by the asm that prints them; decode them before proposing a fix
+
+*Session 65.  A method correction that would have saved the
+session's first three attempts.*
+
+`context_switch.asm`'s unknown-CS branch prints
+
+    C
+    N=<r12> R=<[rsp+78]> S=<[rsp+80]> F=<[rsp+88]> P=<[rsp+90]>
+
+The comment above the printer names each field.  The **test** is
+`S`, the CS slot: the halt fires because `S` is neither `0x18`
+nor `0x33`.  `R` is the RIP slot and is printed for context, not
+tested.  `N` is `r12`, the next PCB.
+
+**The rule.**  A diagnostic that prints five fields is a
+five-field claim.  Decode every field against the code that
+prints it before reading any of them as the fault.  This session
+read `R` as the fault (a "RIP holds a PCB pointer" story), then
+read `S` as zero from a GDB frame dump when the live `C` line
+said `S` was a kernel stack address — three stories, each killed
+by the field the code actually tests.
+
+**The signature.**  `N == R` in the `C` line means `next` equals
+the value in the frame's RIP slot — the self-dispatch
+signature.  `S` a kernel stack address and `P` zero means the
+frame base is a live stack frame, not a resume frame.
+
+## Two sites call `context_switch`; a guard at one is not a guard at both
+
+*Session 65.*
+
+`scheduler_switch_to` calls `context_switch(prev, next)` and can
+be guarded by a check on `next == current_process` and
+`next->state`.  `timer_preempt_handler` does **not** call
+`context_switch` — it returns `next->rsp` directly to
+`irq0_stub`, which does `mov rsp, rax`.  A guard added at
+`scheduler_switch_to` does not cover the timer path, and the
+timer path can pick `current` as `next` when a peer wake sets
+`current->state = READY` between the queue pop and the use.
+
+**The rule.**  Enumerate the callers of the primitive before
+guarding one of them.  `grep 'context_switch'` finds both; a
+guard written at the first is a guard at half the sites.  The
+same shape recurs at `process_exit`'s hand-off
+(`context_switch_no_save`), which is a third path.
+
+## `race_head[0]` is a write counter; the last-written index is `(race_head[0] - 1) % 256`
+
+*Session 65.*
+
+`race_record` does
+
+    uint64_t wr  = race_head[0];
+    uint64_t idx = wr % RACE_SLOTS;
+    ... write race_log[idx] ...
+    race_head[0] = wr + 1;
+
+So `race_head[0]` is the number of writes **completed**, and the
+last write landed at `(race_head[0] - 1) % RACE_SLOTS`, not
+`race_head[0] % RACE_SLOTS`.
+
+**The rule.**  A ring's head value is a count, not an index, when
+the increment happens after the write.  Read the write path to
+know which.  This session derived index 72 (wrong byte of the
+hex), then 137 (`% 256` of the count), before the **tick
+sequence** across the window named 136 — the record after which
+the tick drops from `0xFD4A0` to `0xFD47F`.  The tick sequence,
+not the arithmetic, was the check that caught it.
+
+**The complement.**  A ring's recency is **ring order**, not
+memory address.  "The last 64 entries" by address reads the
+stale tail when the ring has wrapped.
+
+## `process_initialize_pcb` memsets the PCB; `kernel_stack_slot_free` does not clear the stack
+
+*Session 65.*
+
+`process_initialize_pcb` does `memset(pcb, 0, sizeof(pcb_t))`, so
+a reused PCB carries no stale `rsp`, `rip`, `next`, `prev`, or
+GPR fields.  `kernel_stack_slot_free` clears the slot ownership
+and the PCB's pointers but **does not touch the 16 KB stack
+region**, so a reused slot carries the previous process's frames.
+
+**The rule.**  Two resources, two teardowns.  A reused PCB is
+clean; a reused stack is not.  A stale frame read from a reused
+slot looks like a live frame with wrong-kind values.  Clearing
+the stack in `kernel_stack_slot_free` is the missing teardown.
+
+## `preempt_frame_t` matches `PUSH_ALL_GPRS` exactly
+
+*Session 65.*
+
+`interrupts.c`'s `preempt_frame_t` declares `r15 … r8`, `rbp …
+rax`, `rip, cs, rflags, rsp, ss`.  `isr.asm`'s `PUSH_ALL_GPRS`
+pushes `rax` first and `r15` last, so `rsp` after the macro
+points at the `r15` slot, and the CPU's five slots land at
+`+0x78..+0x98`.  The struct and the macro agree slot for slot.
+
+**The rule.**  A frame-layout mismatch is a candidate only after
+the struct and the push order are compared.  This session
+considered a layout mismatch as the `C`'s cause; the comparison
+refuted it in two reads.
+
+## A critical section for a queue must cover the whole function, not just the link
+
+*Session 65.  The queue-mutator race.*
+
+`scheduler_ready_queue_add` had no `cli`.  The window is not only
+the link write — it is **between the guard and the write**, and
+it includes every early return.  A timer tick mid-add runs
+`process_wake_all_blocked`, which calls `_add` and `_remove`:
+one mutation nests inside another.
+
+**The rule.**  Wrap the whole function: save RFLAGS, `cli`, do
+the work, restore RFLAGS on **every** return path including the
+early ones.  A `cli` around only the link write leaves the guard
+and the walk unprotected, and the nested call is the producer.
+
+## A verification check with a wrong expected count makes a correct edit look broken
+
+*Session 65.  Three times in one session.*
+
+An edit script's post-write check asserts a count.  When the
+expected count is wrong, the check fails, the diff is correct,
+and the session spends a round trip on a non-bug.
+
+**The rule.**  Count occurrences in the tree before writing the
+expected count into the check.  `grep -c` the actual file; do
+not compute the count from the edit's intent.
+
+## A triple-quoted string in a Python edit must be closed before the next statement
+
+*Session 65.*
+
+A missing `""", 1)` produces a `SyntaxError`.  The tree is
+unchanged when a script fails this way — a `SyntaxError` means
+nothing ran — but the error consumes the next line, so the
+reported failure points at the wrong place.
+
+**The rule.**  Read the edit script's `SyntaxError` as "nothing
+ran."  Fix the string, re-run; do not debug the tree.
+
+## An `#if` block that gates a `static` variable leaves it unreferenced
+
+*Session 65.*
+
+`interrupts.c`'s `_7e_empty_streak` is incremented outside
+`#if RACE_PROBE_IDLE_DUMP` and read only inside it.  With the
+gate off, the compiler warns `set but not used`.  The build does
+not fail — there is no `-Werror`.
+
+**The rule.**  A warning from a gated block is not a failure.
+Leave it, or move the variable inside the gate; do not add
+`-Werror` to silence it.
+
+## A captured fault that is not written to disk is a run that has to be repeated
+
+*Session 65.*
+
+A `C` fired again with the site-1 guard in the tree, and the
+capture was lost.  The run has to be repeated to know the
+`N`/`R`/`S`/`F`/`P` values.
+
+**The rule.**  Before a long timing-sensitive run, redirect the
+serial to a file.  `capture.txt` is the file; one run per
+truncate.  A fault the terminal scrolled past is a fault with no
+record.
+
+---
+
+
+## A diagnostic on the success path is noise; on the failure path it is signal
+
+*Session 63.  The cleanup phase of the eight-fix cycle.  Not a
+bug -- a diagnostic-discipline rule that cost the cycle four
+full rebuild-and-boot cycles before it was named.*
+
+The scratch tree accumulated success-path diagnostics over six
+sessions of chasing two races: `PPS-early`, `PPS-close-read`,
+`PPS-close-write`, `PPS-reader-check` (four pipe prints), the
+`7e-queue #N` timer prints, the `7e-fork` slot check.  Every one
+of them fired during **normal operation** and printed to serial.
+By the end of the chase, the capture file from a `canary --full`
+run contained hundreds of lines of diagnostic output between the
+canary rows.
+
+The cleanup phase gated each of the success-path diagnostics
+behind a `RACE_PROBE_*` define and left them at 0.  The result:
+the same workload, same kernel fixes, produced a capture that was
+mostly the canary rows.  Nothing about the kernel's behavior
+changed; only its logging did.
+
+**The rule.**  A diagnostic added to a kernel is not free.  It
+costs serial bandwidth, it changes the timing of the system it
+is trying to observe, and it fills the capture with output that
+a reader has to skip past to find what is wrong.  A diagnostic
+that fires **only on the failure path** -- the fault handlers,
+the stall banners, the invariants that should never fire -- is
+worth keeping unconditional.  A diagnostic that fires on the
+**success path** -- per-operation counters, per-call prints, a
+print on every fork -- belongs behind a compile-time gate,
+default off, and is turned on only when chasing the specific bug
+it instruments.
+
+**The tell.**  A capture file where the canary rows or the
+workload's own output are a minority of the lines.  Or a stall
+that moves when a diagnostic is added or removed, because the
+diagnostic's serial I/O widened or narrowed a timing window.
+The stall point in this cycle's chase moved from ~180 to ~1900
+to ~5200 to ~7900 to ~20500 as diagnostics were added, and
+several of those moves correlated with the instrument, not with
+the fix.
+
+**The complement, and it is the other half of the rule.**  A
+diagnostic that fires on the failure path is signal, and it
+should be unconditional.  `TIMER-IDLE-STALL`, `TIMER-NO-NEXT`,
+`YIELD-TO-IDLE`, the fault frame dumps (`#GP`, `#PF`, `#UD`),
+the preemption ring -- each fires only when something is wrong,
+and each earned its place by naming a mechanism during the
+chase.  When the cleanup phase considered gating them, the rule
+was: they do not fire on a healthy boot, they are the entire
+value of a capture when the boot is not healthy, and they stay.
+
+**Where this shape recurs.**  Same family as "a diagnostic that
+saturates the serial console changes the timing of the system it
+is trying to observe" (session 62) and "a diagnostic declared
+but never wired is not a diagnostic" (session 53).  The session-
+62 entry is about a diagnostic that exists but perturbs; the
+session-53 entry is about a diagnostic that exists but does not
+fire.  This one is about the diagnostic that fires when it
+should not, and the fix is a gate, not a removal.
+
+## `set -e` at the top of a command block that edits and commits
+
+*Session 63.  An edit-script gotcha, and it produced an orphan
+commit that had to be reset.*
+
+The working style already says "a Python edit with a `count != 1`
+abort check catches an ambiguous anchor and writes nothing"
+(session 59).  The missing complement: **without `set -e` at the
+top of the command block, a Python script that aborts still lets
+the rest of the block run.**
+
+In this cycle, an edit block contained three Python scripts, each
+with its own `count != 1` guard, followed by `git add` and
+`git commit`.  The first two scripts ran and wrote their files.
+The third aborted on an ambiguous anchor.  The block continued:
+`git add` staged the two files that *had* been modified, and
+`git commit` committed a partial change.  The commit message
+described a change that was not in the commit.  The build failed
+on the next step, and the orphan commit had to be reset.
+
+**The rule.**  A command block that edits files and then commits
+them must start with `set -e` (and `set -o pipefail` if the
+block contains pipelines).  With `set -e`, a Python script that
+`sys.exit(1)`s aborts the whole block before the `git add` runs.
+Without it, the exit code is discarded -- Python's `sys.exit(1)`
+is a return from a subprocess, not a shell abort -- and the block
+proceeds to the commit.
+
+**The tell.**  A commit whose diff does not match its message, in
+a session that used an edit script.  Or: an edit block in which
+the only safe thing to do after a failed edit is to stop, and the
+block does not stop.
+
+**The safe shape.**
+
+    set -e
+    set -o pipefail
+    cd /path/to/repo || exit 1
+    git status -sb
+    python3 - <<'PYEOF'
+    ...
+    PYEOF
+    python3 - <<'PYEOF'
+    ...
+    PYEOF
+    git add <explicit files>
+    git status -sb
+    git commit -m '...'
+
+If any of the Python scripts aborts, the block aborts.  The
+`git add` never runs on a partially-edited tree.
+
+**Where this shape recurs.**  Same family as "a redirection binds
+to the last command in an `&&` chain" (session 45) and "the
+incremental kernel build can silently skip" (session 41): a
+command sequence whose *behavior* does not match what its syntax
+says.  In the `&&` case, a redirection scoped to one command and
+was read as scoping to the chain.  In the incremental-build case,
+`make` read a timestamp as content and skipped the rebuild.  Here,
+a shell reads a subprocess's exit code as optional and continues.
+In all three, the fix is to make the command do what it reads as
+doing -- wrap the chain, clean before rebuild, put `set -e` at
+the top -- and the lesson is the same: the command line is a
+claim, checked against its output.
+
+## An edit script's idempotency guard must cover every insertion
+
+*Session 63.  A tooling gotcha.  The same block was added twice
+because only the last insertion was guarded.*
+
+The working style for this project says a Python edit that adds a
+block must check whether the block already exists before adding
+it.  In this cycle, a script added three things to
+`scheduler.c`: a set of static variables, a small
+`q_check_after_mutator` inline function, and a
+`scheduler_dump_first_bad_head_null` function at the end of the
+file.  The script's idempotency guard was on the **last**
+insertion only:
+
+    if "scheduler_dump_first_bad_head_null" not in src:
+        src += """..."""
+    else:
+        print("NOTE: dumper already present, not re-adding")
+
+The script was run once, aborted partway through due to an
+ambiguous anchor on a different edit, and re-run.  On the second
+run, the guard on the dumper saw the string from the first run
+and correctly skipped re-adding it -- but the guard on the
+statics and the inline function did **not** exist, so those two
+were added a second time.  The file ended up with two
+definitions of `g_q_first_bad_head_null_tick` and two definitions
+of `q_check_after_mutator`.  The compiler would have refused it,
+but the script's exit code was clean and the tree looked
+plausible until `make` was run.
+
+**The rule.**  An idempotency guard must be a check on **every
+insertion the script makes**, not just the last one.  The pattern
+that scales is to wrap each insertion in an `if <unique marker>
+not in src:` test, where `<unique marker>` is a short string that
+appears only if that specific block is already present.  If the
+script adds two variables and a function, it needs three guards,
+one per insertion.
+
+**The tell.**  A script run twice in the same session, once after
+a failed run.  Or: a large insertion block with a single guard at
+the top or bottom, and multiple independent pieces inside it.
+
+**The safe shape.**
+
+    if "g_q_first_bad_head_null_tick" not in src:
+        src = src.replace(anchor, anchor + addition, 1)
+    if "q_check_after_mutator" not in src:
+        src = src.replace(anchor2, anchor2 + addition2, 1)
+    if "scheduler_dump_first_bad_head_null" not in src:
+        src += addition3
+
+Three checks, one per insertion.  Two of them abort silently on a
+second run (because the block is already there); the third guards
+the function that would produce a duplicate symbol.
+
+**Where this shape recurs.**  Same family as "a fix with no test
+is indistinguishable from an unfixed defect" (session 43): an
+artifact that is *present* but not *checked*.  The session-43 fix
+was present and correct and had never been run.  This is an
+insertion script that was correct for one run and wrong for two,
+because the guard covered one of its three insertions.  The check
+in both is the same: for a script or a fix, ask what a *second*
+invocation would do, not what the first one did.
+
+## `nm` output moves between builds; re-run it before every watchpoint
+
+*Session 63.  A diagnostic gotcha that cost two watchpoint runs.*
+
+The QEMU monitor and GDB take kernel symbol addresses from `nm`
+output.  A watchpoint armed on a specific address fires when the
+kernel writes to that address.  The working style says "`nm`
+output moves between builds -- re-run it before using any address
+from this file, a previous paste, or a commit message."
+
+In this cycle, a watchpoint was armed on `0xFFFFFFFF8030A378`,
+which `nm` had reported as `ready_queue_head` in an earlier
+build.  The kernel was rebuilt several times between the `nm`
+and the watchpoint.  In the current build, `ready_queue_head` had
+moved to `0xFFFFFFFF8030A4F8` -- 0x180 bytes higher, because the
+build had grown `.bss` by 0x180.  `0xFFFFFFFF8030A378` was a
+different variable, or padding.  The watchpoint was armed on the
+wrong address and never fired.
+
+The mistake surfaced only because a GDB session happened to
+disassemble the function that writes `ready_queue_head` and
+printed the correct address in a comment: `movq $0x0,
+0x1ed89a(%rip) # 0xffffffff8030a4f8 <ready_queue_head>`.  The
+address in the disassembly did not match the address the
+watchpoint had been armed on.  That is the only reason the
+mismatch was caught.
+
+**The rule.**  Re-run `nm 04_kernel_64bit/kernel.elf | sort`
+immediately before arming any watchpoint, and use the output
+from that run.  A watchpoint address from a previous paste, a
+previous session, or a comment is a claim about a previous
+build.  The current build is what the CPU is executing.
+
+**The tell.**  A watchpoint that does not fire when a write is
+expected, or that fires on an unexpected value.  Both are
+consistent with the address having moved.
+
+**The stronger habit.**  For any address used more than once in a
+session -- a watchpoint, a `p` command, an `x` command, a
+`grep`-based symbol lookup -- write it down *once*, at the
+moment it is verified against the current `nm`, and use that
+value for the rest of the session.  If the tree is rebuilt, the
+values are stale; verify them again.
+
+**Where this shape recurs.**  Same family as "a wrong constant
+propagated because it was consistent with itself" (session 39)
+and "a fix can make an earlier branch unreachable" (session 44):
+a value that was true when written and is checked by nothing.
+The PIT case was a wrong frequency in a comment; the branch case
+was a guard whose condition could not be true.  This is an
+address whose meaning changed when the file it referred to was
+rebuilt.  In all three, the check is the same: go to the source
+of truth -- the call site, the variable's assignment, the current
+`nm` output -- not to a copy from earlier.
+
+## A script that trusts a hand-written conflict resolution must verify the resolution applied
+
+*Session 63.  A cherry-pick-script gotcha.  The same conflict
+arose twice in the same session, with the same resolution, and
+the script did not check that the resolution ran.*
+
+The cherry-pick script for the eight-fix cycle handled two known
+conflicts (`e3705d4`, `c3e5c97`) by matching the conflict text
+with a Python regex and replacing it with the correct content.
+The pattern was:
+
+    cherry c3e5c97 yes || {
+        python3 - <<'PYEOF'
+        # ... resolve conflicts ...
+        PYEOF
+        git add file
+        GIT_EDITOR=true git cherry-pick --continue
+    }
+
+The `|| { ... }` branch runs only when `cherry` returns non-zero
+(conflict).  Inside, the Python script resolves the conflicts,
+`git add` stages the file, and `cherry-pick --continue` finalizes
+the commit.  If the Python script's `count != 1` guard fires (an
+ambiguous anchor), it `sys.exit(1)`s -- and **because the block is
+inside an `||`, `set -e` does not abort the shell**.  The block
+continues to `git add` and `git cherry-pick --continue`.  If the
+file still has conflict markers, `--continue` fails, and the
+script aborts.  That is the loud path.
+
+The quiet path is worse: if the Python script **wrote the file**
+but the resolution was subtly wrong (a marker left behind, a
+section duplicated), `git add` stages the wrong content and
+`cherry-pick --continue` succeeds, committing a bad resolution.
+The script proceeds to the next cherry-pick, and the bad
+resolution is only discovered when the build fails.
+
+**The rule.**  A script that resolves a conflict by rewriting the
+file must verify the rewrite succeeded *before* `git add`.  At
+minimum, grep for the conflict markers (`<<<<<<<`, `=======`,
+`>>>>>>>`) and abort if any remain.  Better: assert that the
+conflict region no longer exists and the replacement text does.
+The pattern:
+
+    python3 - <<'PYEOF'
+    # ... resolve ...
+    if "<<<<<<<" in src or ">>>>>>>" in src:
+        print("ABORT: markers remain")
+        sys.exit(1)
+    PYEOF
+    if grep -q '<<<<<<<' file; then
+        echo "ABORT: markers remain after resolve"
+        exit 5
+    fi
+    git add file
+    GIT_EDITOR=true git cherry-pick --continue
+
+The `grep` is the belt-and-suspenders for the case where the
+Python script exits 0 but did not write (a silent no-op).
+
+**The tell.**  A cherry-pick script with a conflict-resolution
+branch, where the resolution step has no post-rewrite check.  Or:
+a cherry-pick that "succeeds" and then fails on the build with a
+conflict marker in the file.
+
+**Where this shape recurs.**  Same family as "a test's expected
+value is a claim" (session 52) and "a fix with no test is
+indistinguishable from an unfixed defect" (session 43): a
+correctness claim that is checked by nothing.  The session-52
+case had a wrong constant the test never checked.  This one has
+a resolution step the script never verified.  In both, the
+missing thing is a check on the artifact the step produced -- the
+test's expected value, the script's written file -- not a check
+on the process that produced it.
+
 ## A fork that overwrites a child's file table leaks per fork
 
 *Session 55 (`sys_fork`'s inherited fds), commit `2fc7fde`, scratch
@@ -1841,3 +2473,47 @@ session reaches for `objdump` earlier.
 **The tell.**  A dozen falsified mechanisms from traces, and no
 progress.  That is the signal to stop reading traces and start
 reading code.
+
+## A race presents as memory corruption; there is no store to find
+
+*Session 62.  The method correction that closes a multi-session
+detour.*
+
+A race and a deterministic defect present **the same way on a
+trace**: a wrong value in a slot, a `ret` to a bad address.  The
+difference is that a deterministic defect has a **writer** to
+find, and a race does not -- the wrong value is the correct value
+for a different interleaving.  So "what wrote this value?" is the
+right question for one and the wrong question for the other, and
+the trace cannot tell you which you have.
+
+The rate curve is the discriminator.  **When a symptom appears
+only above a tick rate, do not hunt the writer.**  Session 62
+spent six hypotheses on writers -- a `dup2` refcount undercount,
+an exit-path fd leak, a pipe use-after-free, a cancellation
+unwind -- and every one was refuted by reading the source.  The
+reads that mattered established an **ordering**: the `cli`-closed
+block/wake paths, and the `g_user_rsp_save` subtraction that
+proved the kernel return path correct.  **Instrument the
+ordering, not the store.**
+
+**The complement, and it is a caution.**  A race can reproduce
+byte-identically when one ordering wins nearly every time, so a
+reproducible fault does not by itself rule the race out.  Three
+100 Hz runs produced identical fault state -- same CR2, RIP,
+RSP, `g_user_rsp_save`, stack window.  That is worth naming as
+an open question (why is the losing order always the same?), not
+as a refutation.
+
+## A comment is a claim about its code
+
+*Session 62.*
+
+`user_syscall.c:5210` says the `wait4` late re-scan "is itself
+preemptible" -- the code runs the re-scan **inside the `cli`**.
+`interrupts.c`'s stack-window comment still said `-0x40` after
+the loop became `-0x200`.
+
+**The rule.**  Read the body, not the comment above it.  A stale
+comment is worse than none, because it sends the next reader down
+a path the code does not have.

@@ -218,6 +218,20 @@ typedef struct pcb {
      * slot starts clean.
      */
     int in_signal_handler;
+
+    /*
+     * The user stack pointer at the last user-mode entry.
+     *
+     * pcb->rsp is the KERNEL resume-frame base (both save paths in
+     * context_switch.asm write it that way).  The user-preempted
+     * save path needs the USER stack pointer, and reading pcb->rsp
+     * for it delivered a kernel value into a user-mode resume.
+     *
+     * PLACED AT THE END, after in_signal_handler, so no asserted
+     * offset moves.  context_switch.asm reads it by offset; the
+     * _Static_assert in process.c pins that offset.
+     */
+    uint64_t user_rsp;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)
@@ -256,14 +270,18 @@ void process_cleanup_elf_pages(pcb_t* pcb);
  * and that context_switch.asm restores.  The child's %rax is 0, so
  * fork() returns 0 in the child.
  *
- * Only the callee-saved registers are copied from the parent's
- * frame.  The caller-saved registers (rax, rcx, rdx, rsi, rdi, r8,
- * r9, r10, r11) were either clobbered by the syscall argument
- * shuffling or are the caller's responsibility to save.  This is a
- * deliberate first-cut limitation: it differs from Linux, which
- * preserves all registers except %rax.  If a future test fails
- * because a register has an unexpected value after fork, this is
- * the first place to look.
+ * The frame carries every GPR the child needs to resume in user mode:
+ * the six callee-saved registers (rbx, rbp, r12-r15) plus rdi, rsi,
+ * rdx, r8, r9 and r10.  The last six are caller-saved under the C ABI,
+ * but the syscall ABI is stricter -- only rcx and r11 are
+ * architecturally clobbered -- and compilers rely on the others
+ * surviving.  musl's fork wrapper caches the TLS base in rdx across
+ * the syscall and writes through it after the child resumes; without
+ * the parent's rdx, the child faults at CR2 = 0x98.  rcx holds the
+ * user RIP and r11 the user RFLAGS; both are written into the frame
+ * from the parent's saved values.  rax is 0, so fork() returns 0 in
+ * the child.  This matches Linux's syscall-ABI guarantee that every
+ * register but rax survives a syscall into the child.
  */
 void process_fork_copy_frame(pcb_t* child, pcb_t* parent);
 void process_reclaim(pcb_t* pcb);

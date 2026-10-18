@@ -1,44 +1,177 @@
 #!/usr/bin/env bash
 #
-# run — uncomment ONE line in the menu below, then ./run
+# run — build, stage the image, and launch QEMU.
 #
-
-menu() {
-    # Uncomment exactly one line. Never two.
-    #
-    # DUAL-DRIVE
-    # make clean && make && make runkernel64 > capture.txt
-    # make clean && make && make runkernel64-kvm > capture.txt
-    # make clean && make && make runkernel64-log > capture.txt
-    # make clean && make && make runkernel64-verbose > capture.txt
-    # make clean && make && make runkernel64-debug > capture.txt
-    # make clean && make && make runkernel64-headless > capture.txt
-    # make clean && make && make runkernel64-telnet > capture.txt
-    #
-    # SINGLE-DRIVE
-    # The top-level `make FAT_CONFIG=single` already builds the kernel with
-    # the single-drive config. The `runkernel64-single` target re-runs that
-    # same `make` (see the top-level Makefile), which is a no-op if nothing
-    # changed. So we skip the explicit second build here.
-    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-debug-log > capture.txt
-    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single > capture.txt
-        { make -C 04_kernel_64bit clean && make -C 04_kernel_64bit FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-single ; } 2>&1 | tee capture.txt
-    # qemu-system-x86_64 -cpu max -drive file=/home/noneya/code/donix/05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0 -serial stdio -display sdl -monitor none -d int -D qemu-int.log
-    # make clean && make FAT_CONFIG=single && make -C 05_boot_kernel64 hdd-single.img && make -C 05_boot_kernel64 run-kvm-single > capture.txt
-
-    :  # no-op so an empty body is valid
-}
+#   ./run              default: clean rebuild + SDL, no freeze (clean-nofreeze)
+#   ./run menu         print the numbered menu, pick one
+#   ./run <name>       run a named mode directly (e.g. ./run headless)
+#   ./run help         list the modes
+#
+# Every mode:
+#   - builds (incrementally; clean-* modes run `make clean` first),
+#   - has the GDB stub on :1234, so a second terminal can attach,
+#   - writes EVERYTHING to capture.txt: the build output, the QEMU
+#     command, the serial console, and any -d log.  One file.
+#
+# GDB attach, any mode, any time:
+#     gdb -q 04_kernel_64bit/kernel.elf
+#     (gdb) target remote :1234
+#
+# FREEZE: every mode except nofreeze/clean-nofreeze carries
+# -no-reboot -no-shutdown, which freezes the guest at a fault so the
+# state can be read.  That is what every C/heap diagnosis run used.
+# nofreeze and clean-nofreeze drop the pair, so a guest reset (including
+# a triple fault) reboots, and `reboot` from the kernel shell works.
+#
+# The tick rate is `pit_init` in kmain.c.  It is a compiled constant
+# and is NOT a run-script option; edit kmain.c and rebuild.
 
 set -e
+set -o pipefail
 cd "$(dirname "$0")"
 
-CMD=$(sed -n '/^menu() {/,/^}/p' "$0" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' | grep -v '^menu()' | grep -v '^}' | head -1)
+KERNEL_DIR=04_kernel_64bit
+BOOT_DIR=05_boot_kernel64
+IMG="$BOOT_DIR/hdd-single.img"
+CAPTURE=capture.txt
 
-if [ -z "$CMD" ]; then
-    echo "run: no command uncommented."
-    echo "run: edit this file, uncomment one line inside the menu() function."
-    exit 2
-fi
+# Default mode.  clean-nofreeze rebuilds from scratch, opens SDL, and
+# does NOT freeze on a fault -- `reboot` works, and a fault reboots
+# visibly.  The freeze modes (clean-sdl and the rest) remain for
+# diagnosis.
+DEFAULT_MODE=clean-nofreeze
 
-echo "run: $CMD"
-eval "$CMD"
+MODES=(clean-nofreeze nofreeze sdl headless debug monitor int verbose clean-sdl clean-headless)
+
+# ---- build + stage ---------------------------------------------------
+build() {
+    local clean=$1
+    if [ "$clean" = "clean" ]; then
+        echo "run: make -C $KERNEL_DIR clean"
+        make -C "$KERNEL_DIR" clean
+    fi
+    echo "run: make -C $KERNEL_DIR FAT_CONFIG=single"
+    make -C "$KERNEL_DIR" FAT_CONFIG=single
+    echo "run: make -C $BOOT_DIR hdd-single.img"
+    make -C "$BOOT_DIR" hdd-single.img
+}
+
+# ---- QEMU ------------------------------------------------------------
+# Freeze base: -no-reboot -no-shutdown.  A fault stops the guest.
+qemu_base() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -enable-kvm -cpu host \
+        -serial stdio -s -monitor none \
+        -no-reboot -no-shutdown
+}
+
+# No-freeze base: the same, minus the pair.  A fault reboots, and
+# `reboot` works.
+qemu_base_nofreeze() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -enable-kvm -cpu host \
+        -serial stdio -s -monitor none
+}
+
+mode_qemu() {
+    local base; base=$(qemu_base)
+    local nf;   nf=$(qemu_base_nofreeze)
+    case "$1" in
+        clean-nofreeze) echo "$nf -display sdl" ;;
+        nofreeze)       echo "$nf -display sdl" ;;
+        sdl)            echo "$base -display sdl" ;;
+        headless)       echo "$base -display none" ;;
+        debug)          echo "$base -display sdl -S" ;;
+        monitor)        echo "$base -display sdl -monitor unix:/tmp/donix-mon,server,nowait" ;;
+        int)            echo "$base -display none -d int" ;;
+        verbose)        echo "$base -display none -d guest_errors,int,cpu_reset" ;;
+        clean-sdl)      echo "$base -display sdl" ;;
+        clean-headless) echo "$base -display none" ;;
+        *) return 1 ;;
+    esac
+}
+
+mode_desc() {
+    case "$1" in
+        clean-nofreeze) echo "make clean + SDL, no freeze     fault reboots; reboot works [default]" ;;
+        nofreeze)       echo "SDL, no freeze                  fault reboots; reboot works" ;;
+        sdl)            echo "SDL window, incremental         fault freezes" ;;
+        headless)       echo "no display, incremental        fault freezes" ;;
+        debug)          echo "SDL, QEMU waits for gdb (-S)   fault freezes, break before boot" ;;
+        monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
+        int)            echo "no display, interrupt log      -d int (into capture.txt)" ;;
+        verbose)        echo "no display, full log           -d guest_errors,int,cpu_reset" ;;
+        clean-sdl)      echo "make clean + SDL               fault freezes" ;;
+        clean-headless) echo "make clean + no display        fault freezes" ;;
+    esac
+}
+
+mode_clean() {
+    case "$1" in clean-*) echo clean ;; *) echo no ;; esac
+}
+
+# ---- menu ------------------------------------------------------------
+show_menu() {
+    echo "modes (all have GDB stub :1234, all write capture.txt):"
+    local i=1
+    for n in "${MODES[@]}"; do
+        printf "  %2d) %-15s %s\n" "$i" "$n" "$(mode_desc "$n")"
+        i=$((i+1))
+    done
+    printf "choose [1-%d]: " "${#MODES[@]}"
+}
+
+# ---- run -------------------------------------------------------------
+# The entire body -- echoes, build, QEMU -- is inside one `2>&1 | tee`,
+# so capture.txt is the full transcript, build output included.
+# `set -o pipefail` makes a failed `make` fail the pipeline, so
+# `set -e` stops the script before QEMU launches on a stale image.
+run_mode() {
+    local name=$1
+    local q c
+    q=$(mode_qemu "$name") || { echo "run: unknown mode '$name'"; exit 2; }
+    c=$(mode_clean "$name")
+    {
+        echo "run: mode=$name${c:+ (clean build)}"
+        echo "run: $(date '+%Y-%m-%d %H:%M:%S')"
+        build "$c"
+        echo "run: $q"
+        echo "run: capture -> $CAPTURE;  gdb: target remote :1234"
+        eval "$q"
+    } 2>&1 | tee "$CAPTURE"
+}
+
+# ---- main ------------------------------------------------------------
+case "${1:-$DEFAULT_MODE}" in
+    menu)
+        show_menu
+        read -r n
+        if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt "${#MODES[@]}" ]; then
+            echo "run: invalid choice"
+            exit 2
+        fi
+        run_mode "${MODES[$((n-1))]}"
+        ;;
+    -h|--help|help)
+        echo "usage: ./run [menu|<mode>]"
+        echo "  ./run          default mode ($DEFAULT_MODE)"
+        echo "  ./run menu     show the numbered menu"
+        echo "  ./run <mode>   run a named mode"
+        echo
+        echo "modes (all have GDB stub :1234, all write capture.txt):"
+        for n in "${MODES[@]}"; do
+            printf "  %-15s %s\n" "$n" "$(mode_desc "$n")"
+        done
+        echo
+        echo "freeze: every mode except clean-nofreeze/nofreeze carries"
+        echo "  -no-reboot -no-shutdown, so a fault stops the guest."
+        echo "  nofreeze modes drop the pair: a fault reboots, reboot works."
+        echo
+        echo "gdb: gdb -q 04_kernel_64bit/kernel.elf; target remote :1234"
+        ;;
+    *)
+        run_mode "${1:-$DEFAULT_MODE}"
+        ;;
+esac

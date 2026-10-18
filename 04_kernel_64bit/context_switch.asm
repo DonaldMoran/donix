@@ -24,8 +24,120 @@ global context_switch
 
 %define KERNEL_BASE 0xFFFFFFFF80000000
 
+; EMIT_HEX reg -- emit the 16 hex digits of `reg` to COM1 (0x3F8),
+; most-significant nibble first.  Register-only: no call, no push,
+; no stack use.  Clobbers rax, rcx, rdx.  Does NOT touch rsp or r12,
+; so a caller on the unknown-CS halt path can emit several slots in
+; a row without losing the frame it is reporting.
+;
+; Unrolled deliberately: a loop needs a variable shift count and a
+; nibble counter, both of which want registers the caller may be
+; using.  16 unrolled steps use only rax, rcx, rdx and leave rsp,
+; r12, rbx, rsi, rdi, r8-r15 alone.
+;
+; %1 is a register (r12, rbx, rax, ...).  It is not modified: each
+; step copies it into rcx before shifting.
+%macro EMIT_HEX 1
+    mov rcx, %1
+%assign %%i 60
+%rep 16
+    mov rax, rcx
+    shr rax, %%i
+    and eax, 0x0F
+    add eax, 0x30               ; '0'
+    cmp eax, 0x39               ; '9'
+    lea edx, [eax + 7]          ; letter case: '0'..'9' -> 'A'..'F' is +7
+    cmova eax, edx              ; if eax > '9', take the letter case
+    mov dx, 0x3F8
+    out dx, al
+%assign %%i (%%i - 4)
+%endrep
+%endmacro
+
 ; void context_switch(pcb_t* prev, pcb_t* next)
+; void context_switch_no_save(pcb_t* prev, pcb_t* next)
+;
+; A hand-off entry point for a caller that is NOT coming back --
+; process_exit's tail.  It shares context_switch's prologue and
+; resume side but skips the entire save block, so no resume frame
+; is built and no pcb field of `prev` is written.
+;
+; WHY THIS EXISTS.  context_switch's save paths build a resume
+; frame whose RIP is either [rsp + 48] (the caller's return
+; address -- the ring0_save path) or prev->rip (the user-preempted
+; path).  Both are correct for a caller that expects to be resumed
+; at the instruction after `call context_switch`.  process_exit
+; does NOT: it is __attribute__((noreturn)), and the instruction
+; after its `call context_switch` is the `while(1) hlt` guard the
+; compiler emits as the noreturn fallback.  Saving a resume frame
+; there produces a well-formed kernel frame whose RIP is the hlt
+; guard.  The frame is not malformed; the resume point is wrong.
+; If such a process is ever resumed -- by a rescan, a self-switch,
+; or a slot reuse that did not overwrite the frame -- it resumes
+; at the guard and stops.
+;
+; WHAT IT DOES NOT DO.  It does not write prev->rsp, prev->cr3, or
+; the prev GPR slots.  It does not consult prev at all (rdi is
+; ignored).  The exiting process is about to have its PCB reclaimed
+; or reaped; nothing reads those fields again.
+;
+; WHY IT IS SAFE.  The resume side (context_switch_resume) reads
+; ONLY `next`: cr3 at [r12 + 0x30], frame base at [r12 + 0x110],
+; and the frame at that base.  It never reads prev.  So skipping
+; the save side leaves next's resume byte-identical to
+; context_switch's, and prev is simply not written.
+;
+; WHY THIS IS NOT FRAMING (c).  (c) added a conditional jump to
+; the resume label from INSIDE ring0_save, so it reached the
+; resume label with a different stack depth and register state
+; than the normal path -- the prologue's six pushes plus the save
+; block's own pushes, with r15 live.  (c) made pipe7e worse.  This
+; entry point reaches the resume side by the SAME path
+; `context_switch(NULL, next)` already takes: the prologue's six
+; pushes, `mov r12, rsi`, then the jump to the resume label.  That
+; path already runs today -- process_init's first dispatch of idle
+; has prev == NULL and goes through it -- so it is exercised code,
+; not a new depth.  r12 (next) is the only register the resume
+; side needs, and the prologue sets it.
+;
+; WHAT THE PROLOGUE'S SIX PUSHES ARE FOR HERE.  On the switch-to-
+; next path they are ABANDONED, not balanced: the pop_frame path
+; pops the 15-GPR resume frame and iretqs, and the six prologue
+; pushes are left on the stack of the process being left behind.
+; They are balanced only on the restore_and_return path
+; (next == NULL), which is what `context_switch(NULL, next)` uses
+; today.  Pushing them here costs six stores and no correctness;
+; it keeps this entry point reaching the resume side by the
+; identical path.
+;
+; Callers: process_exit (scheduler.c).  Do not call this from a
+; site that expects to be resumed -- use context_switch.
+noop_switch:
+    ret
+
+global context_switch_no_save
+context_switch_no_save:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rsi            ; r12 = next
+    ; rdi (prev) is deliberately ignored.
+    jmp context_switch_resume
+
 context_switch:
+    ; prev == next: asked to switch to the process already on the CPU.
+    ; There is nothing to save and nothing to resume.  Saving here writes
+    ; next->rsp = the live rsp, and the resume side then loads next->rsp
+    ; and reads the live C stack as a 20-slot frame -- the 'C' halt, with
+    ; next->rsp == $rsp, next->state RUNNING, and the frame's CS slot a
+    ; stack address.  Return to the caller with its registers untouched.
+    ; This guard is BEFORE the prologue pushes, so it must not jump to
+    ; .restore_and_return (which pops six registers that were never pushed).
+    cmp rdi, rsi
+    je noop_switch
     push rbp
     push rbx
     push r12
@@ -36,7 +148,7 @@ context_switch:
     mov r12, rsi            ; r12 = next
 
     test rdi, rdi
-    jz .skip_save
+    jz context_switch_resume
 
     ; r15 = prev (scratch; real r15 value is reloaded from PCB slot).
     mov r15, rdi
@@ -56,8 +168,14 @@ context_switch:
     jae .ring0_save
 
     ; --- USER-PREEMPTED SAVE PATH ---
+    ;
+    ; RSP here is the USER stack pointer, not pcb->rsp.  pcb->rsp
+    ; (0x110) is the KERNEL resume-frame base -- both save paths
+    ; write it that way, and reading it here delivered a kernel
+    ; address to a user-mode resume.  pcb->user_rsp (0x610) is
+    ; written by the user-mode preemption paths in interrupts.c.
     push qword 0x2B                     ; SS       [0x98]
-    push qword [r15 + 0x110]            ; RSP      [0x90]
+    push qword [r15 + 0x610]            ; RSP      [0x90]  <- pcb->user_rsp
     push qword 0x202                    ; RFLAGS   [0x88]
     push qword 0x33                     ; CS       [0x80]
     mov rax, [r15 + 0x118]              ; prev->rip
@@ -86,7 +204,7 @@ context_switch:
     mov [r15 + 0x110], rsp              ; prev->rsp = frame base
     mov rax, cr3
     mov [r15 + 0x30], rax
-    jmp .skip_save
+    jmp context_switch_resume
 
     ; --- RING-0 SAVE PATH ---
 .ring0_save:
@@ -135,9 +253,9 @@ context_switch:
     mov [r15 + 0x110], rsp              ; prev->rsp = frame base
     mov rax, cr3
     mov [r15 + 0x30], rax
-    ; fall through to .skip_save
+    ; fall through to context_switch_resume
 
-.skip_save:
+context_switch_resume:
     test r12, r12
     jz .restore_and_return
 
@@ -167,6 +285,15 @@ context_switch:
     ; (0x33) resumes. Only the validation of RIP differs by CS, and
     ; only because a mismatch there is a strong indicator of frame
     ; corruption.
+    ; Load the frame base and CONSUME it: clear next->rsp in the
+    ; same instruction window.  A process that is dispatched without
+    ; a fresh save then has rsp == 0, and the check below refuses it
+    ; instead of resuming a stale frame.  The stale-frame resume is
+    ; the 'C': the resume loads a frame base left by an earlier save
+    ; (when this PCB was prev), reads the live stack as a 20-slot
+    ; frame, and halts on the CS slot.  See the bad-frame capture:
+    ; next->rsp == $rsp, the CS slot held prev's PCB pointer, and
+    ; next->state was RUNNING.
     mov rsp, [r12 + 0x110]
 
     mov rbx, [rsp + 0x80]               ; saved CS
@@ -175,10 +302,95 @@ context_switch:
     cmp rbx, 0x33
     je .frame_cs_user
 
-    ; Unknown CS: emit 'C' and halt.
+    ; Unknown CS: the resume frame's CS slot is neither 0x18 nor 0x33.
+    ; Emit a one-line report and halt.  rsp already points at the
+    ; garbage frame, so nothing here calls a C function or pushes;
+    ; raw out to COM1, register-only, and rsp/r12 are preserved.
+    ;
+    ; Format:  C\nN=<r12> R=<[rsp+78]> S=<[rsp+80]> F=<[rsp+88]> P=<[rsp+90]>\n
+    ; N is the next pcb the scheduler picked (name it in gdb with
+    ; x/s N+8).  R is the saved RIP slot, S the bad CS slot, F the
+    ; RFLAGS slot, P the saved RSP slot.
     mov dx, 0x3F8
     mov al, 'C'
     out dx, al
+    mov al, 0x0A
+    out dx, al
+    mov al, 'N'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX r12
+    mov al, ' '
+    out dx, al
+    mov al, 'R'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x78]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'S'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x80]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'F'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x88]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 'P'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x90]
+    EMIT_HEX rbx
+    mov al, 0x0A
+    out dx, al
+
+    ; Extended self-describing report: name the PCB and its fields
+    ; so the capture does not need a GDB attach.  r12 = next (the
+    ; PCB the resume was asked to dispatch).  Offsets from pcb_t:
+    ;   0x000 pid, 0x028 state, 0x110 rsp, 0x118 rip
+    ; Format per line:  <letter><field>=<16 hex><space>...
+    mov rbx, [r12 + 0x000]
+    mov al, 'I'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x028]
+    mov al, 'T'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x110]
+    mov al, 'X'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov rbx, [r12 + 0x118]
+    mov al, 'Y'
+    out dx, al
+    mov al, '='
+    out dx, al
+    EMIT_HEX rbx
     mov al, 0x0A
     out dx, al
     hlt

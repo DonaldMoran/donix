@@ -653,3 +653,7 @@ int main(void) {
   `path = "0:/" + argv[0] + ".ELF"` unless `argv[0]` already
   contains `:/`.
 
+---
+
+Continues in [`version-history.md`](version-history.md) from
+`v0.6.7`.

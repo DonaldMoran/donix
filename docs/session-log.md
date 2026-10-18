@@ -1,3 +1,525 @@
+## Session 68 — the heap cycle is a race, not an overflow; two selftest fixes; `run`
+
+Six commits on `dev`, scratch-tagged, unpushed.  **Not a milestone
+on its own** — the close of `v0.6.13`.  The heap's free-list cycle
+hang was traced to an interleaved `kfree`, not a caller overflow;
+the kernel selftest's `[exception_de]` halt and its `fail_slot`
+queue leak were fixed; `run` was rewritten.
+
+| Tag | What |
+|---|---|
+| `20261018-heap-cycle-contained` | `find_free_block` bounded; `split_block` self-link guard; `kfree`'s coalesce+validate under `cli`. |
+| `20261018-handoff-release-section` | Handoff: `C` fixed, heap contained, the release procedure. |
+| `20261018-shell-fallback` | `process_exit` wakes the kernel shell as READY; falls to idle on refusal. |
+| `20261018-create-fail-queue-remove` | `process_create`'s four failure exits remove the PCB from the ready queue. |
+| `20261018-run-modes` | `run`: case-driven modes, every mode has GDB, `capture.txt` covers the build. |
+| `20261018-run-nofreeze` | Default `clean-nofreeze`: reboot works; freeze modes keep `-no-reboot`. |
+
+### The heap cycle
+
+**The hang.**  `kmalloc` spun forever with `IF` clear and `g_ticks`
+frozen.  GDB read the free-list block at the loop's `%rax`: `magic =
+0xDEADBEEFCAFEBABE`, `size = 0x20`, `used = 1`, `next = itself`.
+`find_free_block`'s unbounded walk followed the self-link.
+
+**First theory, wrong.**  The block looked like a caller overflow —
+`magic` intact, `used` intact, `next` overwritten — and the enriched
+`HEAP: corrupt` print named blocks `0x750`, `0x7C0`, `0x1840`.  But
+every block, read, was consistent: `end == next`, `prev` matching the
+walk.  `heap_validate` was returning blocks that were *fine when
+read*.
+
+**The instrument that ended it.**  Two prints, in sequence.  First
+`heap_validate` was made to print which check failed and the two
+values it compared (`HEAP-VALIDATE FAIL check=… exp=… got=…`); that
+named `prev_mismatch` and `next_not_end`.  Then `coalesce_blocks`
+was made to print its arithmetic on every merge (`MERGE cur=…
+csz_before=… next=… nsz=… csz_after=…`).  The arithmetic was
+correct at every step — `csz_after == csz_before + 0x30 + nsz`, every
+time.  **So the list was not corrupt; `heap_validate` was reading a
+list an interleaved `kfree` was midway through mutating.**
+
+**The fix.**  `find_free_block`'s walk is bounded; a cycle prints
+and returns NULL.  `split_block` refuses a self-link and a
+`new_block <= block`.  `kfree` holds `cli` across `coalesce_blocks()`
+and `heap_validate()`, caller flag saved/restored — the heap had no
+lock, and a tick's `kmalloc` could mutate the list between the two.
+
+**Verified.**  pipe7e 10000 iterations clean, no `HEAP:` lines, no
+hang, no `C`; canary 28/28, `test.sh` 57/57.  The run is faster than
+the corrupt runs — the allocator was spending time on the broken
+list.
+
+### `[exception_de]` halted the selftest
+
+The kernel selftest's fault children exit through `process_exit`'s
+kernel-shell fallback, which pre-set the shell to
+`PROC_STATE_RUNNING` before `scheduler_switch_to`.  The tail check
+(`state != READY` → refuse) refused it, the code below the call
+assumed it could not return, and `process_exit: no kernel shell to
+resume, halting` ran.
+
+Restructured: no shell → distinct message, halt (the only case with
+nothing to resume); shell `BLOCKED` → set **READY**, let the
+scheduler do the transition; switch refused or not `BLOCKED` →
+report the state and fall through to idle instead of halting.  The
+scheduler is now the sole writer of `READY→RUNNING`.
+
+### The `fail_slot` queue leak
+
+With the selftest running, the timer printed
+`TIMER-REFUSE: next pid=0 name=fail_slot rsp=0`.  `process_create`'s
+four failure exits made the PCB `UNUSED` but did not remove it from
+the ready queue — the one site left out, after `process_reclaim` and
+`process_destroy`.  Added `scheduler_ready_queue_remove(pcb)` to all
+four.  The invariant is now complete: every path that makes a PCB
+`UNUSED` removes it from the queue.
+
+### `run`
+
+The old `run` asked the user to uncomment one QEMU line and extracted
+it with `sed`/`grep`; it had no default worth the name, no GDB stub
+in the headless line, and the build output went to the terminal
+instead of the capture.  Rewritten: `./run` / `./run menu` /
+`./run <name>` / `./run help`; every mode has the stub on `:1234` and
+writes **everything** to `capture.txt` (the build, the QEMU command,
+the serial console); `set -o pipefail` stops before QEMU launches on
+a failed `make`.  The default is `clean-nofreeze`: full rebuild,
+SDL, no `-no-reboot -no-shutdown`, so `reboot` works.  The freeze
+modes keep the pair — that is what every `C`/heap diagnosis run used.
+
+### Verification
+
+`selftest` 18/18 (`exception_de`/`_pf`/`_gp` and `create_fail`
+included), `canary --full` 28/28, `test.sh` 57/57.  pipe7e 10000
+iterations clean.  The `TIMER-REFUSE ... fail_slot` line is gone;
+the `create_fail` rows still report no leak.  **The heap fix is
+"10000 iterations clean" and the race that produced the hang was
+read live — not a proof the allocator has no other cycle.**
+
+**Scratch tags kept:** the six above, local, not pushed.
+
+---
+
+## Session 67 — the `C` is fixed: hold `cli` across the pop-to-dispatch
+
+Four commits on `dev`, scratch-tagged, unpushed.  **The milestone's
+headline.**  The `C` was a check-then-act race between
+`process_yield`'s ready-queue pop and its dispatch; the fix holds
+`cli` across the sequence.
+
+| Tag | What |
+|---|---|
+| `20261016-destroy-both-current` | `process_destroy` clears both `current_process` copies via `scheduler_set_current`. |
+| `20261016-c-contained` | The top `SWITCH-DEAD` refuse; the `SW2_TRACE` gate. |
+| `20261016-tail-state-check` | The tail check refuses any non-READY next; restores `current_process`. |
+| `20261017-pipe7e-all-pass` | `process_yield` holds `cli` across pop-to-dispatch. |
+
+### The mechanism
+
+The 2026-10-16 SW2-trace run named the last step:
+`scheduler_switch_to` entered with `next->state ==
+PROC_STATE_ZOMBIE`, `next->rsp` pointing at a zeroed region, and the
+resume halted on the CS slot.  A zombie reached dispatch because
+`process_yield` popped `next` (READY), did its checks with
+interrupts **on**, then dispatched; a tick between the pop and the
+dispatch could turn the slot `READY→ZOMBIE`.  The SW2 trace showed
+the slot turning over between consecutive dispatches (pid 2850 READY
+then ZOMBIE, then 2851).
+
+### The fix
+
+`process_yield` holds `cli` from before `scheduler_ready_queue_next`
+through `scheduler_switch_to`, with `sti` on every return.
+`scheduler_switch_to`'s tail refuses any non-`READY` next and
+restores `current_process = prev`.  The top `SWITCH-DEAD` guard
+stays as the fast path.
+
+### The four wrong theories, recorded
+
+The version spent sessions 63–66 on the frame: the reserve
+(`67701df`, reverted `5587d70`), the `next->rsp = 0` clear (broke
+blocking; reverted), the switch-to-self guard in the tail (refused
+every dispatch; reverted), and the `current_process` dual-copy
+divergence (real, fixed, but not the holder — both copies agreed at
+the `C`).  The watchpoint named the churn, and the SW2 trace named
+the mechanism.  **The fix was not a guard; it was closing the window
+the guard was checking across.**
+
+### Verification
+
+pipe7e at `pit_init(100000)`: **PIPE7E-ALL-PASS**, 250000
+iterations, zero `SWITCH-DEAD`, zero `C`.  At `pit_init(100)`:
+canary 28/28, `test.sh` 57/57, pipe7e clean past 77500.  The two
+rates cover the two classes: 100 kHz stresses interleavings, 100 Hz
+covers the user-mode-preemption paths.
+
+**Scratch tags kept:** the four above, local, not pushed.
+
+---
+
+## Session 66 — the `C` is contained
+
+One commit on `dev`, scratch-tagged, unpushed.  **Not a fix** —
+containment.  `scheduler_switch_to` refuses a `ZOMBIE`/`TERMINATED`
+next before the assignment, and the `SW2-*` dispatch trace is gated
+behind `SW2_TRACE`.
+
+The 2026-10-16 run: five `SWITCH-DEAD` events in 24500 iterations at
+100 kHz, all on the same slot (`0xFFFFFFFF8027D530`), pid changing
+(9811, 11348, 18442, 20378, 24559), all `PIPE7E_HELPER` st=4.  The
+slot is reclaimed and reused; the reference is slot-specific.  The
+machine ran past the point every prior build died.
+
+**Scratch tag kept:** `20261016-c-contained`, local, not pushed.
+
+---
+
+## Session 65 — the queue race closes; the `C` is two sites, not one
+
+*2026-10-14.  A full session: the queue-mutator race closed, the
+`C` at `iter 80500` traced to two dispatch sites, and both files
+rewritten to a live-list shape.*
+
+**The headline: `c85d074` closed the queue-mutator race.**
+`scheduler_ready_queue_add` had no `cli` and is called with
+interrupts on from `process_yield`, so a timer tick mid-add ran
+`process_wake_all_blocked`, which calls `_add` and `_remove` —
+one queue mutation nested inside another, leaving a tail move
+with no matching clear.  The fix wraps `_add`, `_remove`, and
+`_next` in save-flags/`cli`/restore-flags: each whole function
+is one critical section, and every early return restores the
+interrupt flag.  Verified: `bad_tail_next = 0` across 3,098,489
+P8 checks in a `pipe7e` run that reached `iter 80500` (before
+the fix: 500+ over 100,000 iterations).
+
+**The tag:** `20261014-queue-race-closed` on `3eb1d61`.
+
+### The `C` at iter 80500
+
+`pipe7e` reached `iter 80500` and hit `context_switch.asm`'s
+unknown-CS halt:
+
+    C
+    N=FFFFFFFF8027C7D0 R=FFFFFFFF8027C7D0 S=FFFFFFFF8029B2A0
+    F=FFFFFFFF8011B895 P=0000000000000000
+
+The `C` printer's five fields are `N=<r12>` (the next PCB),
+`R=<[rsp+0x78]>` (the RIP slot), `S=<[rsp+0x80]>` (the CS slot —
+**the test**), `F=<[rsp+0x88]>` (RFLAGS), `P=<[rsp+0x90]>` (RSP).
+The halt fires because `S` is neither `0x18` nor `0x33`.
+
+Here `N == R`: `next` is `C7D0` and the frame's RIP slot holds
+`C7D0`.  `S` is a kernel stack address, `F` is `process_exit+757`,
+`P` is 0 — the values of `context_switch`'s own locals on the
+stack, not a resume frame.  The dispatch was
+`context_switch(next, next)`: `prev == next`.
+
+### Two sites, two guards
+
+**Site 1 — `scheduler_switch_to`.**  Its self-switch check at
+function entry reads `current_process` with interrupts on.  A
+timer tick between the check and the `cli` can set
+`current_process = next`.  **`7fff450`** adds a second
+`next == current_process` re-check inside the `cli`, before the
+RUNNING guard.  **It did not close the `C`** — it fired again on
+a run with the fix in the tree (capture lost); a later run was
+clean.
+
+**Site 2 — `timer_preempt_handler`.**  The timer does not call
+`scheduler_switch_to`; it returns `next->rsp` directly to
+`irq0_stub`, which does `mov rsp, rax`.  `scheduler_ready_queue_next()`
+can pop `current`: its guard skips a RUNNING head, but a peer wake
+can set `current->state = READY` between the pop and the use, and
+the kernel-mode branch's pool rescan re-adds a stranded RUNNING
+`current`.  When `next == current`, the quantum block set
+`current->state = READY`, re-added `current`, set
+`next->state = RUNNING` (the same process), and returned
+`next->rsp` — the frame this tick had just saved.  `irq0_stub`
+popped its own frame.  **`e21ebf0`** adds a `next == current`
+guard that resumes `current`'s own frame as a no-op switch.
+
+**Both guards are unverified at the time of writing** — the
+`pipe7e` run that decides them is in progress.
+
+### Closed this session, in order
+
+| Commit | Subject |
+|---|---|
+| `7aaaafd` | `pipe: remove the reader's self-clear of pipe->reader_waiting` |
+| `d3c7f20` | `sched: RUNNING-next guard must be inside the cli, not before it` |
+| `c85d074` | `sched: _add, _remove, _next are critical sections` |
+| `3eb1d61` | `diag: gate the empty-queue dumps behind RACE_PROBE_IDLE_DUMP` |
+| `7fff450` | `sched: re-check next == current_process inside the cli` |
+| `e21ebf0` | `sched: timer self-pick resumes current, does not switch to it` |
+| `03af23a` | `docs: open-issues is a live list; next thing is the two-site C` |
+
+The four dispatch guards from the same span —
+`8dc47cf`, `85da375`, `e7e3e6b`, `d7d8c40` — are the site-1
+history before `7fff450`.
+
+### What was verified
+
+| Test | Result |
+|---|---|
+| `bad_tail_next` across a `pipe7e` to `iter 80500` | 0 in 3,098,489 P8 checks |
+| `pipe7e` to `iter 80500`, post-`e21ebf0` | in progress |
+| `test.sh` | pending the run |
+| `canary --full` | pending the run |
+
+### Files rewritten
+
+`open-issues.md` was rewritten from a 1143-line historical
+document to a live list of open issues only; the closed items
+(Bug 1, Bug 2, 7d, 11, 7c, 7, the `user_rsp` writer) and the
+historical writeups were dropped.  `handoff.md` was rewritten to
+the 2026-10-14 state.  This file and `gotchas.md` follow.
+
+### The method correction this session earned
+
+The `C`'s five fields were decoded against the asm that prints
+them only at the **end** of the session, after three successive
+"the fix is here" stories (the pipe-reader loop-back, a
+`sys_read` loop-back, a timer-frame copy).  The `N == R` shape
+in the actual `C` line named the real mechanism on the first
+read; the work was in decoding the five fields against the
+`context_switch.asm` printer, which the first message of the
+session already contained.  Recorded as a gotcha.
+
+---
+
+
+## Session 63 — the eight fixes and five cleanups, applied to donix
+
+One documentation session plus the cherry-pick it records.  **Not
+a milestone in the usual sense**: no new feature, no new applet,
+no `v*` tag.  The session brought `donix` forward by eight
+correctness fixes and five diagnostic cleanups that had been
+developed and verified in a scratch tree (`testme`), and it
+verified that the result is byte-identical to the scratch tree.
+
+**The headline: `donix` now contains the eight fixes and five
+cleanups from the 2026-10-10/11/12 cycle.**  The 7e pipe wake
+race, the wait4 lost wakeup, and the ready-queue self-link are
+closed.  The canary passes 28/28 in the common case.  Two bugs
+remain open; see `handoff.md`.
+
+### The 14 commits, in order
+
+| Commit | Subject |
+|---|---|
+| `93333cb` | `user_syscall: atomic RMW on file_slot_t.refcount` |
+| `0248d63` | `user_syscall: pipe_wake_waiter returns success; gate field clear` |
+| `f457ec8` | `user_syscall_entry: move sti to just before call syscall_dispatch` |
+| `2fb368a` | `interrupts: rescan pool in kernel-mode timer before idling` |
+| `32917a9` | `scheduler: reset clears pcb links; contains walks the queue` |
+| `f5fbfd8` | `pipe: reader clears its own publish; wakers leave the field set` |
+| `7273457` | `process_reclaim: remove PCB from ready queue before UNUSED` |
+| `8afa84d` | `scheduler: heal {head=NULL, tail=process} instead of self-linking` |
+| `2353c5c` | `scheduler: drop sched4_record call from self-tail heal (testme-only diagnostic)` |
+| `cdbf7bc` | `cleanup: silence three compiler warnings (unused fn, shift count, unused var)` |
+| `1e93d26` | `cleanup: remove 7e-queue success-path diagnostic from timer` |
+| `d411eda` | `cleanup: gate PPS-* pipe diagnostics behind RACE_PROBE_PPS_VERBOSE (default 0)` |
+| `6eb9b27` | `cleanup: gate process_dump_all VGA half; lengthen TIMER-IDLE-STALL to 10 min` |
+| `60d29e8` | `cleanup: gate 7e-fork behind RACE_PROBE_FORK_SLOT (probe gates unchanged)` |
+
+That is 8 fixes plus 1 fold-in (`2353c5c` drops a `testme`-only
+reference that `8afa84d` carried) plus 5 cleanups.
+
+### How the cherry-picks were developed
+
+The eight fixes and five cleanups were authored and verified in
+`/home/noneya/code/testme`, a scratch clone of `donix`.  The
+`testme` tree accumulated diagnostics that were **not** meant for
+`donix`: the `sched4_record` ring, the `PPS-*` pipe prints, the
+`7e-queue` timer prints, the `7e-fork` slot check, the `RESCAN`
+report.  The cycle's task was to separate the fixes from the
+diagnostics and bring only the fixes forward.
+
+**Two cherry-picks conflicted.**  Both were resolved by hand:
+
+- **`e3705d4`** (`interrupts: rescan pool in kernel-mode timer
+  before idling`).  One conflict region, a
+  `{head=NULL, tail=process}`-shaped take-theirs.  The commit also
+  carried a **broken C string literal** —
+  `serial_print(": queue empty, pool state:\n");` had a real
+  newline byte where the two-character `\n` escape should be.
+  The literal was correct in the `testme` working tree (a later
+  commit had replaced the whole region), but the commit itself
+  shipped it broken.  Fixed during the resolution.
+- **`c3e5c97`** (`pipe: reader clears its own publish; wakers
+  leave the field set`).  Five conflict regions.  Four were
+  "delete `pipe->reader_waiting = NULL;` at a waker site" (the
+  `c3e5c97` fix), each turning into an empty success branch.  One
+  was the substantive reader-side change in `sys_read`'s pipe
+  loop: the reader clears its own publish, and the wakers do not.
+
+**`cfff858`** (`scheduler: heal {head=NULL, tail=process} instead
+of self-linking`) was cherry-picked clean and then followed by
+`2353c5c`, a small commit dropping a `sched4_record` call that
+`cfff858` had carried because the diagnostic existed only in
+`testme`.
+
+**The five cleanups** were applied as direct edits, one commit
+each, on top of the eight fixes:
+
+- `cdbf7bc` — three compiler warnings: `static void race_record`
+  → `static inline`, `RACE_P12_SLOT` shifts cast to `uint64_t`,
+  an unused `pcb_t* head` local deleted.
+- `1e93d26` — the `7e-queue #N` block in `timer_preempt_handler`
+  removed (it fired on the first eight preemptions of every
+  boot).
+- `d411eda` — the four `PPS-*` pipe prints gated behind
+  `RACE_PROBE_PPS_VERBOSE`, default 0.
+- `6eb9b27` — the VGA half of `process_dump_all` gated behind
+  `RACE_PROBE_DUMP_VGA`, default 0; the `TIMER-IDLE-STALL`
+  interval raised from 5000 to 60000 ticks so it fires on a
+  10-minute stall, not a between-rows idle moment.
+- `60d29e8` — the `7e-fork` slot check gated behind
+  `RACE_PROBE_FORK_SLOT`, default 0.
+
+### The script
+
+The cherry-pick sequence was proven reproducible by
+`apply-fixes-to-donix.sh`, a self-contained shell script.  Given
+a fresh copy of `donix` at `5537465`, the script produces the
+patched state in one run.  The proof is the tree hash: a fresh
+`cp -a donix` plus the script yields
+
+    aaa2ad3659ef039ff13a8be32f1717127935cace
+
+which is the same tree hash as the scratch tree that was developed
+by hand.  Two independent paths, one identical result.
+
+The script's commits have different SHAs than the ones in this
+log (committer timestamps differ between the two runs) but
+identical subjects and identical trees.  The SHAs in the table
+above are `donix`'s, produced by running the script against the
+real `donix`.
+
+### What was verified
+
+| Test | Result |
+|---|---|
+| Kernel build after every commit | `make -C 04_kernel_64bit FAT_CONFIG=single` exit 0, no warnings |
+| Tree hash vs `patch_donix` | identical (`aaa2ad3659ef039ff13a8be32f1717127935cace`) |
+| Canary `--full` | 28/28 passed on the patched tree |
+| `pipe7e` | **not re-tested** on the patched tree (see below) |
+
+The kernel builds with no warnings.  The `race_probe.h` gates
+P1, P8, P11, P12, P13 are on (they fire only at stall); PPS,
+DUMP_VGA, FORK_SLOT are off.  `RACE_PROBE_ANY` is 1.
+
+### The two bugs that remain
+
+**Bug 1 — user-mode #PF with kernel RSP (verified).**  A
+user-mode page fault at user RIP `0x40786B` with `%rsp` holding
+a kernel stack address (`0xFFFFFFFF802A2640`), CR2 =
+`RSP + 0x98`, error code `0x5`.  The fault dump is in
+`capture-fork-rsp-fault-20261012.txt`.  It fired once in
+`canary --full` on the row `echo hi | wc`; the next run with the
+same binary passed 28/28.  Timing-dependent.
+
+**Bug 2 — the pipe7e stall (not re-tested).**  The last `pipe7e`
+run was on a build that predated the cleanups and stalled at
+iteration ~20500 with the helper `RUNNING` at its ELF entry
+`0x40022B` (its `_start`) and the reader blocked in a pipe read.
+Whether the patched tree still stalls is **unknown**.  That
+verification is the first thing the next session does.
+
+### What this session did not do
+
+- **The reference docs were not brought to current state.**
+  `open-issues.md` still records items 7d and 7e as open, and
+  item 7e's writeup frames the pipe wake race as an unsolved
+  race.  Both are closed by this cycle.  The reference docs will
+  be updated in a documentation pass.
+- **The pipe7e verification was not run.**  See Bug 2 above.
+- **The `testme` scratch tree was not deleted.**  It is still at
+  `/home/noneya/code/testme`; the next session boots
+  `patch_donix` and `testme` in parallel to compare.
+- **No `v*` tag was applied.**  The session is not a milestone;
+  the next milestone bump comes after the remaining bugs are
+  closed.
+
+### The meta-lesson, for the record
+
+This cycle's most expensive mistake was in a handoff written
+before this one.  The previous handoff's lead — "the execve-to-
+run handoff" — had been dropped from a rewrite without a note,
+because a stall (the user-RSP #PF) had been found and the pipe7e
+stall was thought closed by the eight fixes.  It was not
+re-tested.  **The lesson:** do not write a handoff that claims a
+bug is closed based on a test that was never run on the final
+tree.  The pipe7e verification is now the first action of the
+next session, and the current `handoff.md` says so explicitly.
+
+---
+
+## Session 62 — the 7e fault reproduces identically at 100 Hz; the kernel return path cleared
+
+*(Sessions 60 and 61 are recorded in the handoff and the commit
+messages, not in this file; the log's previous heading is Session
+59.)*
+
+The whole session ran at `pit_init(100)`.  Three runs of `pipe7e`
+produced **byte-identical fault state**: CR2 `0xFFFFFFFF`, faulting
+RIP `0xFFFFFFFF`, error `0x14`, RSP `0x80000FBF90`,
+`g_user_rsp_save` `0x80000FBF88` (difference `0x8`), CR3
+`0x32D000`, pid 4, and the same user-stack window down to the
+`"Pe7epip"` / `"WD=/root"` strings at `rsp+0x70`/`0x78` and the
+doubled saved frame at `rsp-0x20` and `rsp-0x1C0`.
+
+**The race stands.  It is not memory corruption, and the next
+session must not treat it as such.**  A race presents as a wrong
+value in a slot, and there is no store to find: the wrong value is
+the correct value for a different interleaving.  Do not hunt the
+writer.  Instrument the ordering.
+
+**The instrument that produced the session's durable result.**
+`g_user_rsp_save` was added to both fault handlers (3 insertions,
+0 deletions) and `global g_user_rsp_save` to
+`user_syscall_entry.asm` (1 insertion); the user-stack window was
+widened from `-0x40..+0x40` to `-0x200..+0x200`.  On three runs,
+`RSP - g_user_rsp_save == 8` -- exactly the relation for a `ret`
+immediately after a `syscall`.  **The kernel returns to the correct
+RIP and the correct RSP.  The corruption is in the user-stack
+contents.**
+
+**The disassembly corrections.**  `pipe7e.elf` links no
+`longjmp`/`setjmp` -- the handoff's `_longjmp(buf, 1)` mechanism is
+not this binary's.  `__syscall_cp_c` is a bare syscall thunk with
+no cancellation branch.  `0x400CF2` is `__restore_sigs`'s
+post-`rt_sigprocmask` `ret`; `0x4041F8` is `__syscall_cp_c`'s
+`ret` -- two thunks, not one, correcting the item text's pairing.
+
+**Six mechanisms refuted by reading the source:** `longjmp`/
+`setjmp` (not in the binary); cancellation unwind (bare thunk);
+signal frame (signals not delivered, `user_syscall.c:5387,5392,
+6512,7604`); the `wait4` re-scan window (the re-scan is inside the
+`cli`; the comment is stale); `dup2` refcount undercount
+(`sys_dup2` bumps it); the exit-path fd leak (`close_all_files`
+uses `put_file_slot`); the pipe use-after-free (`put_pipe_ref` is
+gated on `readers_open`/`writers_open`).
+
+**The end-of-session 10 Hz check.**  One run, clean past 3000
+`pipe7e` iterations.  At 100 Hz the same binary faults within the
+first iterations.
+
+**Next act.**  Instrument the `fork` stack-copy ordering: print
+`parent->rsp`, `parent->user_stack_virt`, `parent->user_stack_top`
+at fork time and compare against `child->rsp`.  The copy range
+(`user_syscall.c:7940`, `EAGER_COPY_REGION(parent->user_stack_virt,
+parent->user_stack_top)`) is set once and not updated as the stack
+grows.  Two numbers, not a store hunt.
+
+**Instrument now in the tree.**  Wide user-stack window in
+`dump_user_stack_window`; `g_user_rsp_save` in both `bad_target`
+blocks; `global g_user_rsp_save` in `user_syscall_entry.asm`.
+No tag, no bump.
+
+---
+
 ## Session 59 — the `setjmp`/`longjmp` probes, and the ash mechanism found and reproduced
 
 **Session open.**  Three code commits so far on `dev`, scratch-tagged

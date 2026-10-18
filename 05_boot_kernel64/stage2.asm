@@ -291,6 +291,8 @@ start:
     mov dword [e820_count], 0
 
 e820_loop:
+    cmp word [e820_count], 64
+    jae e820_done
     mov eax, 0xE820
     mov ecx, 24
     mov edx, 0x534D4150
@@ -329,8 +331,12 @@ pm_entry:
     mov ds, ax
     mov es, ax
     mov ss, ax
-;   mov esp, 0x90000
-    mov esp, 0x1FFF0
+    ; Stack for the 32-bit window between here and long_mode_entry.
+    ; 0x1FFF0 sat just below staging B (0x20000), so a few pushes
+    ; would stomp PASS 3's first bytes.  0x7C00 is where the boot
+    ; sector used to live; it is dead now, above the IVT/BDA, and
+    ; well clear of both staging areas.
+    mov esp, 0x7C00
     
     mov eax, cr4
     or  eax, 1 << 5
@@ -471,7 +477,7 @@ bootinfo:
     dq 0x00100000
     dq 0x00100000 + KERNEL_TOTAL_BYTES
     dq pml4
-    dq 0xFFFFFF7FBFDFE000
+    dq 0xFFFFFF0000000000    ; PML4 index 510 recursive base (510 << 39, sign-extended)
     dq 0
     dd 0
     dd 0

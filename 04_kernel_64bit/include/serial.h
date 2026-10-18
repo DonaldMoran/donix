@@ -46,4 +46,16 @@ void serial_write(const char* buf, size_t count);
 void serial_lock(void);
 void serial_unlock(void);
 
+
+/* Non-blocking UART RX.  Returns the next byte from the serial
+ * port, or -1 if none is available.  Used by the console input
+ * multiplexer so -serial stdio is interactive. */
+int serial_rx_poll(void);
+
+
+/* Non-consuming UART readiness check.  Returns 1 if a byte is
+ * waiting in the RX FIFO, 0 otherwise.  sys_poll uses this to
+ * report POLLIN without consuming the byte read(2) will fetch. */
+int serial_rx_available(void);
+
 #endif
