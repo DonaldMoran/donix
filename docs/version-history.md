@@ -1,5 +1,223 @@
 # Version history
 
+## v0.6.13 — the `7e` mechanism, the `C`, and the heap cycle
+
+**A diagnosis milestone, twice over.**  The version opened with the
+`7e` control-flow-to-data family traced to its mechanism in
+`third_party/`, and closed with the `C` — four sessions of framing
+theories, then the watchpoint, then the pop-to-dispatch fix — and a
+heap free-list cycle that turned out to be an interleaved `kfree`,
+not an overflow.  Almost nothing here is a feature.  What shipped
+is the removal of three long-standing races and the record that
+made each removable.
+
+### The `7e` mechanism (sessions 51–59)
+
+**What the family was.**  A busybox process makes a correct
+syscall, `sysret` returns cleanly, and the process transfers control
+to a data value.  Four sessions of mechanisms were proposed and
+falsified.  Session 59 read the disassembly and named it:
+
+`evaltree` (`0x41C403`) stores a pointer to its own stack frame's
+`jmp_buf` into `globals+0x38` and does not restore it on the normal
+return — its epilogue, `popstackmark`, `dotrap`, and `int_on` all
+read the field, none writes it.  `redirectsafe` manages the same
+field on its own frame; a stale `_longjmp` into a returned frame
+reads a dead slot.  `raise_exception` (`0x415521`, 27 bytes)
+`_longjmps` to `globals+0x38` with no liveness check.
+
+**The instrument.**  `pipe7e_sjlj_stale` mirrors the shape and
+faults first-party.  It is the reproduction the tag's annotation
+records: fault #1 at RIP `0x80000FBDBF` (a user stack address),
+RSP `0x34`, error `0x5`; fault #2 in the handler on the garbage
+stack, RIP `0x400640`, CR2 `0x28`, error `0x7`.
+
+**What the chase fixed in the kernel.**  `signal_maybe_redirect`
+had no re-entry guard, so a handler that itself faulted re-entered
+itself forever — a live-lock.  Fixed with `in_signal_handler` on
+`pcb_t`, set when the redirect fires, cleared in `process_reclaim`
+and `process_destroy`.  `signal_handler[]` was also never cleared
+on teardown despite its comment; fixed in the same commit.
+
+### The migration and the pipe/scheduler race family (sessions 60–65)
+
+**The migration.**  donix was brought up to date from `testme`
+(thirteen commits, fast-forwarded onto `dev`), and session 61's
+kernel fixes cherry-picked on top: the `pcb->rsp`/`user_rsp` split,
+the caller-saved register save at the pipe block point, and the
+user-mode save writing both fields.  A grep proved both mechanisms
+lived on `dev` — the ring-0 save read 15 slots and wrote 6, and
+`pcb->rsp` served both "kernel resume frame" and "user stack
+pointer."
+
+**The lost wakeup.**  `pipe_wake_waiter` silently no-opped when
+the waiter was not `BLOCKED`, and every caller cleared the waiter
+field unconditionally.  The reader's hlt-return set `RUNNING` and
+left `reader_waiting = self` in place; a close in that window
+no-opped, the caller nulled the field, and the reader re-blocked
+with no one to wake it.  Fixed by returning success from
+`pipe_wake_waiter` and gating the field clear on it
+(`20261011-pipe-wake`).  The subsequent fix removed the reader's
+own top-of-loop clear entirely — it reopened the same window
+(`20261014-pipe7e-100k-clean`, `7aaaafd`).
+
+**The queue-mutator race.**  `_add`, `_remove`, and `_next` were
+not critical sections; a tick could land in the middle of a queue
+mutation and leave the tail advanced without the matching clear.
+Fixed by making the three functions `pushfq`/`cli` critical
+sections (`c85d074`, `20261014-queue-race-closed`).  The queue's
+`contains()` walked the queue instead of using link presence as a
+membership proxy, and `scheduler_reset` cleared every PCB's links
+(`20261011-queue-reset-fix`).
+
+**The strand-rescan family (item 7d).**  A process left `READY`
+and off the queue was never dispatched: the timer's kernel-mode
+branch printed `TIMER-IDLE-STALL` and returned to idle every tick.
+The rescan was added to the timer, `process_exit`, and
+`process_yield` (`20261011-timer-rescan`).  A `RUNNING` process
+was also being re-added by the rescans; the three now skip
+non-`READY` (`6f7344b`'s session work).
+
+**The self-switch guards.**  `scheduler_ready_queue_next` skips
+any `RUNNING` head; `scheduler_switch_to` refuses a `RUNNING`
+next inside its `cli` (`d3c7f20`); the timer's self-pick resumes
+`current` instead of switching (`e21ebf0`, `359c895`).  These
+closed reachable self-picks; they are not the `C` fix.
+
+### The `C` (sessions 66–67)
+
+**Four sessions of the wrong theory.**  The `C` is
+`context_switch.asm`'s unknown-CS halt.  It fired in four shapes,
+and the version tried the reserve/`FRAME_RESERVE` fix
+(`67701df`, reverted `5587d70`), the `next->rsp = 0` clear (broke
+blocking; reverted), and the switch-to-self guard in the tail
+(refused every dispatch; reverted).  All were about the frame.
+None was the bug.
+
+**The mechanism.**  The 2026-10-16 SW2-trace run named the last
+step: `scheduler_switch_to` was entered with
+`next->state == PROC_STATE_ZOMBIE`, `next->rsp` pointing at a
+zeroed region, and the resume halted on the CS slot.  A zombie
+reached dispatch because `process_yield` popped `next` (READY),
+did its checks with interrupts **on**, and dispatched; a tick
+between the pop and the dispatch could turn the slot
+`READY→ZOMBIE`, and the dispatch used the stale value.  The
+slot was reclaimed and reused between consecutive dispatches
+(the SW2 trace showed pid 2850 READY then ZOMBIE, then 2851).
+
+**The fix.**  `process_yield` holds `cli` from before
+`scheduler_ready_queue_next` through `scheduler_switch_to`
+(`ef85962`), with `sti` on every return.  `scheduler_switch_to`'s
+tail refuses any non-`READY` next and restores
+`current_process = prev` (`e05d1fa`).  The top `SWITCH-DEAD`
+guard (`6f7344b`) stays as the fast path.  `process_destroy`
+clears both `current_process` copies via `scheduler_set_current`
+(`c2a3f89`) — the one confirmed single-copy write.
+
+**Verified.**  pipe7e at `pit_init(100000)` — PIPE7E-ALL-PASS,
+250000 iterations, zero `SWITCH-DEAD`, zero `C`.  At
+`pit_init(100)`: `canary --full` 28/28, `test.sh` 57/57, pipe7e
+clean past 77500.
+
+### The heap cycle (session 68)
+
+**The hang.**  `kmalloc` spun forever with `IF` clear and
+`g_ticks` frozen: a free-list block whose `next` pointed at
+itself.  The unbounded walk in `find_free_block` followed it.
+
+**The mechanism — a race, not an overflow.**  The enriched trace
+and the coalesce arithmetic trace together proved the merge
+arithmetic correct at every step.  The "corruption" was
+`heap_validate` running on a list that an interleaved `kfree`
+(from a tick's scheduler) was midway through mutating.  The heap
+had a race.
+
+**The fix.**  `find_free_block`'s walk is bounded; a cycle prints
+and returns NULL (`1c7fe91`).  `split_block` refuses a self-link
+and a `new_block <= block`.  `kfree` holds `cli` across
+`coalesce_blocks()` and `heap_validate()`, caller flag
+saved/restored.  The heap instrumentation (`heap_validate`'s
+`check=`/`exp=`/`got=`, the enriched corrupt print,
+`HEAP_TRACE_MERGE`) is gated, default off.
+
+**Verified.**  pipe7e 10000 iterations clean, no `HEAP:` lines,
+no hang; canary 28/28, `test.sh` 57/57.  The run is faster than
+the corrupt runs — the allocator was spending time on the broken
+list.
+
+### The selftest regression and the queue asymmetry (session 68)
+
+**The shell fallback.**  `process_exit`'s kernel-shell fallback
+pre-set the shell to `PROC_STATE_RUNNING` before calling
+`scheduler_switch_to`, whose tail check refuses a non-`READY`
+next.  The switch was refused, the halt path ran, and
+`[exception_de]` halted the selftest.  Restructured: set
+`READY`, let the scheduler do the transition, fall through to
+idle on refusal instead of halting (`e9d6b7a`).
+
+**The failed-create queue.**  `process_create`'s four failure
+exits made the PCB `UNUSED` but did not remove it from the ready
+queue.  The timer found it — `TIMER-REFUSE: next pid=0
+name=fail_slot rsp=0` — and refused it.  Containment held, but a
+dead PCB on the queue is a queue bug.  Added
+`scheduler_ready_queue_remove` to all four exits (`19719b7`).
+The invariant is now complete: every path that makes a PCB
+`UNUSED` removes it from the queue — `process_reclaim`,
+`process_destroy`, and the failure exits.
+
+### The run script (session 68)
+
+`run` was a comment/uncomment menu extracted with `sed`/`grep`:
+no default worth the name, no GDB stub in the headless line, and
+the build output went to the terminal instead of the capture.
+Rewritten (`81f5a3c`): `./run` / `./run menu` / `./run <name>` /
+`./run help`, every mode has the GDB stub on `:1234` and writes
+**everything** to `capture.txt` — the build output, the QEMU
+command, the serial console.  `set -o pipefail` makes a failed
+`make` fail the pipeline before QEMU launches on a stale image.
+The default is `clean-nofreeze`: full rebuild, SDL, no
+`-no-reboot -no-shutdown`, so `reboot` works.  The freeze modes
+(`clean-sdl` and the rest) keep the pair — that is what every
+`C`/heap diagnosis run used.
+
+### The milestone's own lesson
+
+**A guard is not a fix, and a fix is not a guard.**  The `C`
+resisted four sessions because each attempt added a guard
+(refuse a `RUNNING` next, refuse `rsp == 0`, reserve the frame
+top) and each guard converted a fatal halt into a different
+fatal halt or a hang.  The fix was not a guard at all — it was
+closing the window the guard was checking across.  A guard that
+runs *after* the state can change is not a guard; it is a
+telescope pointed at the past.  The tail check is correct because
+it is inside the same `cli` as the dispatch.  Everything else was
+a theory about the frame that the watchpoint disproved.
+
+The second lesson is the heap's: **an instrument on the failure
+path is signal, and its absence is not proof.**  `HEAP: corrupt
+at kfree` fired on blocks that were consistent when read, and the
+enriched print named the field; only the merge trace showed the
+arithmetic was right and the *timing* was wrong.  The diagnostic
+that ends a mystery is the one that prints the values it compared,
+not the one that prints a block address.
+
+### Verification
+
+Both boot paths, every commit: `selftest` 17/17 rising to 18/18
+(the `exception_*` and `create_fail` rows), `canary` 15/15,
+`canary --full` 28/28, `test.sh` 57/57.  pipe7e: 250000
+iterations at 100 kHz (PIPE7E-ALL-PASS, zero events) and clean
+past 77500 at 100 Hz.  The heap: 10000 iterations clean, no
+`HEAP:` lines.  No `#PF`, no `#DF`, no `#GP`, no
+`Unknown syscall:`, no `PMM: WARNING - Double free`.
+
+**What is open.**  7e stays open in `third_party/` (ash's stale
+`jmp_buf`); the kernel-side faces are closed.  Item 12 (signal
+delivery) is the path to making 7e stop costing whole runs and
+the `SIGPIPE` gap.  Items 10 and 13 remain.  The heap had a race,
+not an overflow — the bounded walk and split guard remain as
+protection against a future corruption that no run has produced.
+
 ### donix `v0.6.7` through `v0.6.12`
 
 This continues [`migration-history.md`](migration-history.md),
