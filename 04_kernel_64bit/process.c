@@ -295,6 +295,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
         if (name) serial_print(name);
         else serial_print("unnamed");
         serial_print("\n");
+        /*
+         * A failed process_create must not leave the PCB on the
+         * ready queue, for the same reason process_reclaim and
+         * process_destroy remove theirs: the slot is going UNUSED,
+         * and a stale head/tail to it is a dispatch of a dead PCB.
+         * The 2026-10-18 selftest printed
+         *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+         * -- the timer finding the failed fail_slot PCB on the
+         * queue.  _remove is idempotent, so this is free on the
+         * normal path.
+         */
+        scheduler_ready_queue_remove(pcb);
         pcb->state = PROC_STATE_UNUSED;
         pcb->pid = 0;
         process_count--;
@@ -317,6 +329,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
                 process_cleanup_elf_pages(pcb);
                 process_free_clone(pcb->cr3);
                 pcb->cr3 = 0;
+                /*
+                 * A failed process_create must not leave the PCB on the
+                 * ready queue, for the same reason process_reclaim and
+                 * process_destroy remove theirs: the slot is going UNUSED,
+                 * and a stale head/tail to it is a dispatch of a dead PCB.
+                 * The 2026-10-18 selftest printed
+                 *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+                 * -- the timer finding the failed fail_slot PCB on the
+                 * queue.  _remove is idempotent, so this is free on the
+                 * normal path.
+                 */
+                scheduler_ready_queue_remove(pcb);
                 pcb->state = PROC_STATE_UNUSED;
                 pcb->pid = 0;
                 process_count--;
@@ -345,6 +369,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
                 process_cleanup_elf_pages(pcb);
                 process_free_clone(pcb->cr3);
                 pcb->cr3 = 0;
+                /*
+                 * A failed process_create must not leave the PCB on the
+                 * ready queue, for the same reason process_reclaim and
+                 * process_destroy remove theirs: the slot is going UNUSED,
+                 * and a stale head/tail to it is a dispatch of a dead PCB.
+                 * The 2026-10-18 selftest printed
+                 *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+                 * -- the timer finding the failed fail_slot PCB on the
+                 * queue.  _remove is idempotent, so this is free on the
+                 * normal path.
+                 */
+                scheduler_ready_queue_remove(pcb);
                 pcb->state = PROC_STATE_UNUSED;
                 pcb->pid = 0;
                 process_count--;
@@ -377,6 +413,18 @@ pcb_t* process_create(const char* name, uint64_t entry_point, uint64_t flags) {
         process_cleanup_elf_pages(pcb);
         process_free_clone(pcb->cr3);
         pcb->cr3 = 0;
+        /*
+         * A failed process_create must not leave the PCB on the
+         * ready queue, for the same reason process_reclaim and
+         * process_destroy remove theirs: the slot is going UNUSED,
+         * and a stale head/tail to it is a dispatch of a dead PCB.
+         * The 2026-10-18 selftest printed
+         *   TIMER-REFUSE: next pid=0 name=fail_slot rsp=0
+         * -- the timer finding the failed fail_slot PCB on the
+         * queue.  _remove is idempotent, so this is free on the
+         * normal path.
+         */
+        scheduler_ready_queue_remove(pcb);
         pcb->state = PROC_STATE_UNUSED;
         pcb->pid = 0;
         process_count--;
