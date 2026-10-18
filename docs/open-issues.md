@@ -1,6 +1,6 @@
 # Open issues
 
-**Last updated: 2026-10-14** (HEAD `7fff450`).  This file lists
+**Last updated: 2026-10-18** (HEAD `3b8d13c`).  This file lists
 **only open issues**.  Closed items are removed, not struck
 through; their history is in `git log` and `docs/session-log.md`.
 An item appears here only while it is a defect, a missing
@@ -10,52 +10,6 @@ Read top to bottom.  The numbered items are the long-standing
 list; the un-numbered entries below them are smaller and were
 filed later.  Numbers are stable — a closed number is retired,
 not reused.
-
----
-
-## The next thing
-
-**Fix the `C`.  This is the task, not a description.**
-
-The `C` is `context_switch.asm`'s unknown-CS halt; the test is
-the `S` field (the CS slot).  Four shapes fire at
-`pit_init(250)`; all four are one root.
-
-**The root:** the timer frame is built at the kernel C stack's
-live `rsp`.  The C stack's unwind pops through the frame's
-slots.  The frame must be moved to a region the unwind cannot
-reach.
-
-**The failed attempt:** `67701df` reserved `FRAME_RESERVE` at the
-top of each kernel stack and moved `TSS.RSP0` and
-`g_syscall_stack_top` down.  It broke the first `musl_sh`
-`wait4` (a `#PF` with `CR2 = 0`, RIP 0, RSP 0) because
-`sys_execve`'s offsets and **`sys_wait4`'s** frame offsets were
-written for the old `top - N` layout and were not all moved.
-Reverted in `5587d70`.
-
-**The fix:** move the timer frame into a reserve the C stack
-cannot reach, and move **every** offset that anchors at
-`kernel_stack_top` with it.  The sites:
-  - `user_syscall_entry.asm` (relative to `rsp`; follows the
-    start move).
-  - `process_create` (`top - 0xA0`).
-  - `process_fork_copy_frame` (`top - 0xA0`, reads at `-56`,
-    `-64`, `-72`).
-  - `sys_execve`'s `ktop[-7]`, `ktop[-9]`, `ktop[-12]`.
-  - **`sys_execve`'s full frame layout -- NOT YET READ.**  The
-    reserve moved `ktop` but the entry's pushes are at
-    `ktop - 88`; `ktop[-7]` is off by 24.  `sys_wait4` was
-    checked and has no absolute-offset read.
-  - the 14 `tss_set_*` call sites (one edit in `tss.c`).
-  - `irq0_stub`'s kernel-mode copy of the 20-slot frame into the
-    reserve.
-
-**The four guards** (`7fff450`, `e21ebf0`, `63c44ff`, `359c895`)
-stay.  They closed reachable self-picks; they are not the fix.
-
-**The queue-mutator race is closed** (`c85d074`, tagged
-`20261014-queue-race-closed` on `3eb1d61`).
 
 ---
 
@@ -181,6 +135,28 @@ signal delivery as item 12 plus the job-control surface
 (process groups, a controlling terminal, `tcsetpgrp`).  Not
 small.
 
+**14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
+works only because busybox ash falls back on `ENOEXEC` and runs
+`sh script.sh`.  The kernel's `sys_execve` opens the file, checks
+for ELF magic, finds `#!`, prints `sys_execve: not an ELF file`,
+and returns `-ENOEXEC`; there is no shebang handling.  And
+`/bin/sh` does not exist on the image — `/bin` contains only
+`busybox`.
+
+Both must land together: `#!` parsing in `sys_execve` (read the
+first line, build argv `[interp, optional_arg, script, ...]`,
+recurse with a depth guard) **and** an interpreter on the image
+(a copy of busybox at `/bin/sh`, or a kernel alias — a decision,
+not a one-liner).  Fixing only the kernel gives `ENOENT` instead
+of `ENOEXEC`, still a fallback.  Fixing only `/bin/sh` does
+nothing, because the kernel never looks at the shebang.
+
+This is a **feature gap**, not a bug: `./test.sh` runs, and the
+printed line is the kernel correctly reporting that the script is
+not an ELF.  It becomes a defect when a script's interpreter is
+not a shell (e.g. `#!/usr/bin/python`), where there is no
+fallback.
+
 ---
 
 ## Un-numbered open items
@@ -205,27 +181,19 @@ instrument — a first-party reproduction of the `find` sequence,
 or a kernel-side `#GP` handler trace — before it is guessed at.
 It is not the same fault as 7a and must not be folded into 7a.
 
-**Item 7e — the intermittent `#GP`/`#PF` control-flow family.**
-Its kernel-side faces are closed; the remaining face is in
-`third_party`.  The pipe-wake face closed by `c3e5c97`; the
-heap-corruption face closed by `2fc7fde`; the pipe-reader
-lost-wakeup face closed by `7aaaafd`; the `test.sh` row-30 `C`
-closed by `d3c7f20`; the four dispatch guards (`8dc47cf`,
-`85da375`, `e7e3e6b`, `d7d8c40`).
-
-What remains: **ash's stale `jmp_buf`.**  `evaltree` stores a
-pointer to its own stack frame's `jmp_buf` into `globals+0x38`
-and restores it only on the `longjmp`-return path, not on the
-normal return.  `raise_exception` then `_longjmp`s to that global
-with no liveness check.  First-party reproduction:
-`pipe7e_sjlj_stale` (`/usr/bin/PIPE7E_SJLJ_STALE`).  **The
-mechanism is `third_party/`'s and is not editable.**
-
-A real kernel defect surfaced from this chase and is fixed:
-`signal_maybe_redirect` had no re-entry guard, so a handler that
-faulted looped; fixed with `in_signal_handler` and clears in
-`process_reclaim` / `process_destroy`.  `signal_handler[]` was
-also never cleared on teardown; it is now.
+**Item 7e — ash's stale `jmp_buf`.**  The kernel-side faces of
+7e are closed (the pipe-wake face by `c3e5c97`; the
+heap-corruption face by `2fc7fde`; the pipe-reader lost-wakeup
+face by `7aaaafd`; the `test.sh` row-30 `C` by `d3c7f20`; the
+four dispatch guards by `8dc47cf`, `85da375`, `e7e3e6b`,
+`d7d8c40`; the `C` itself by `ef85962`).  What remains is
+`third_party`: `evaltree` stores a pointer to its own stack
+frame's `jmp_buf` into `globals+0x38` and restores it only on
+the `longjmp`-return path, not on the normal return.
+`raise_exception` then `_longjmp`s to that global with no
+liveness check.  First-party reproduction: `pipe7e_sjlj_stale`
+(`/usr/bin/PIPE7E_SJLJ_STALE`).  **The mechanism is
+`third_party/`'s and is not editable.**
 
 **`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc`
 is a listable directory; `/dev` is not.  `ls /dev`, `ls /dev/`,
@@ -271,22 +239,22 @@ reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
 small syscall from `g_ticks`, like `clock_gettime`.
 
 **A live pipe slot's `end` field is 0; no writer is in the
-source.**  A `file_slot_t` of kind `FILE_KIND_PIPE` was captured
-with `refcount = 2` and `slot->end = 0`, at a fixed kernel-heap
-address.  `PIPE_END_READ` is 1 and `PIPE_END_WRITE` is 2; `0` is
-neither.  The three writes to a pipe slot's `end` in
-`user_syscall.c` all write 1 or 2, never 0.  The writer is not in
-the source.
+source.**  Latent, not active.  A `file_slot_t` of kind
+`FILE_KIND_PIPE` was captured with `refcount = 2` and
+`slot->end = 0`, at a fixed kernel-heap address.  `PIPE_END_READ`
+is 1 and `PIPE_END_WRITE` is 2; `0` is neither.  The three writes
+to a pipe slot's `end` in `user_syscall.c` all write 1 or 2,
+never 0.  The writer is not in the source.
 
 The observable consequence is closed: `put_file_slot` refuses to
 free a pipe when a slot's `end` is neither READ nor WRITE — it
 records the event, frees the slot, and leaves the pipe alive.  A
-leak is survivable; a lost wakeup is not.
-
-**Root cause, open.**  Next step: a guard-band.  Write a magic
-value to `slot->end` at slot creation and check it at every
-`put_file_slot`; the window between the last good read and the
-first bad one names where the write landed.
+leak is survivable; a lost wakeup is not.  No reproduction since
+the 2026-10-14 work.  If it recurs, the next step is a
+guard-band: write a magic value to `slot->end` at slot creation
+and check it at every `put_file_slot`; the window between the
+last good read and the first bad one names where the write
+landed.
 
 **`exec_free_and_unmap_user_pages` walks a fixed 1 MB brk
 window.**  `user_syscall.c:4358` lists the brk region as
@@ -297,18 +265,6 @@ whose `brk_virt` has grown past `0x8000300000` forks a child
 that has pages the exec cleanup will neither unmap nor free.
 Leak, not corruption.  Extend the cleanup row to the live bound,
 or walk `elf_page_list` and unmap by VA from the list itself.
-
-**A process's kernel C stack can overwrite a resume frame built
-at a fixed offset from `kernel_stack_top`.**  `process_create`
-and `process_fork_copy_frame` build frames at
-`kernel_stack_top - 0xA0`.  The process's kernel C stack grows
-down from `kernel_stack_top`, so a deep syscall path
-(`syscall_dispatch` → `sys_read` → pipe loop) can reach and
-overwrite `[kernel_stack_top - 0xA0, kernel_stack_top)`.  This
-is structural, not a bug in any one writer, and it is not
-exercised by the current `iter 80500` `C` (which is the
-`context_switch(next, next)` case).  Worth a separate
-investigation before a deep-enough workload finds it.
 
 ---
 
