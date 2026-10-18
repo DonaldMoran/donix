@@ -55,6 +55,20 @@ against a future corruption.
   - `process_destroy` clears both `current_process` copies via
     `scheduler_set_current` (`c2a3f89`).
 
+  Selftest fixes (tags `20261018-shell-fallback`,
+  `20261018-create-fail-queue-remove`):
+  - `process_exit`'s kernel-shell fallback wakes the shell as
+    `READY` (not `RUNNING`), lets `scheduler_switch_to` do the
+    transition, and falls through to idle on refusal instead of
+    halting (`e9d6b7a`).  The old code pre-set `RUNNING`, which the
+    tail check refused, and `[exception_de]` halted the selftest.
+  - `process_create`'s four failure exits remove the PCB from the
+    ready queue before marking it `UNUSED` (`19719b7`).  The timer
+    found the failed `fail_slot` PCB on the queue and printed
+    `TIMER-REFUSE: next pid=0 name=fail_slot rsp=0`.
+    `process_reclaim` and `process_destroy` already did this; the
+    failure exits were the one site left out.
+
   Heap (tag `20261018-heap-cycle-contained`, `1c7fe91`):
   - `find_free_block`: bounded walk; a cycle prints and returns NULL.
   - `split_block`: refuses a self-link and a `new_block <= block`.
@@ -73,6 +87,10 @@ against a future corruption.
     no `C`), canary `--full` 28/28, `test.sh` 57/57.  The run is
     faster than the corrupt runs -- the allocator was spending time
     on the broken list.
+  - Selftest: 18/18, `[exception_de]`/`[exception_pf]`/
+    `[exception_gp]` PASS, the kernel shell returns; the
+    `TIMER-REFUSE ... fail_slot` line is gone; the `create_fail`
+    rows still report no leak.
   - The two rates cover the two classes: 100 kHz stresses
     interleavings; 100 Hz covers the user-mode-preemption paths.
 
@@ -193,9 +211,13 @@ written from the scratch tags' annotations and the
 (Local tags only; if any were pushed, `git push origin :refs/tags/<t>`
 for each.)
 
-The current version is **v0.6.13**.  The next bump is **v0.6.14**,
-covering sessions 62-68: the pipe/scheduler lost-wakeup and
-queue-mutator family, the `C`, and the heap cycle hang.
+**v0.6.13 is closed.**  The banner is bumped (`f1b4a21`,
+tag `20261018-v0614-bump`) and this is the first change under
+**v0.6.14**.  The release tag will be `v0.6.14`, covering
+sessions 60-68: the migration, the pipe/scheduler lost-wakeup and
+queue-mutator family, the `C`, the heap cycle, the selftest fixes,
+and the `run` rewrite.  The long-form narrative is the `v0.6.13`
+entry in `docs/version-history.md` (commit `033bd53`).
 
 ---
 
