@@ -22,6 +22,12 @@ migration) and [`docs/dons-os-history.md`](docs/dons-os-history.md)
 
 ## Done — Phases A through B, v0.6.12
 
+**v0.6.13 closed the pipe/scheduler race family, the `C`, and the
+heap free-list cycle.**  The narrative is the `v0.6.13` entry in
+[`docs/version-history.md`](docs/version-history.md) and the
+`v0.6.13` tag; it is not repeated here, per this file's rule that
+completed milestones live in the log and the tag annotations.
+
 For the record, so this file does not re-plan finished work:
 
 - **Phase A** — boot chain, long mode, paging, heap, scheduler, ELF
@@ -135,6 +141,11 @@ is scheduled.
 2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
   ordinary file, hidden entirely inside the seam.  See
   `open-issues.md` item 8.
+3. **Shebang (`#!`) and `/bin/sh`.**  `./script.sh` works only via
+  ash's `ENOEXEC` fallback; the kernel has no `#!` handling and
+  `/bin` has no `sh`.  Both must land together: `#!` parsing in
+  `sys_execve` and an interpreter on the image.  See
+  `open-issues.md` item 14.
 3. **`ln`, `link`, `readlink` with real targets**, and archive
   symlink restoration (`tar`, `unzip`).
 4. **A mount framework**, if and when a second filesystem exists.
@@ -174,10 +185,10 @@ value.
 
 ### Testing infrastructure
 
-- **Boot-time self-test mode** (`-DSELFTEST`).  A self-test suite
-  already runs at boot (17 checks, GDT/TSS/PMM/VMM/heap/NX/ATA/
-  FatFs/exceptions); making it a build-flag mode would let a normal
-  boot skip it.
+- **Self-test mode** (`-DSELFTEST`).  A self-test suite runs from
+  the `k` kernel shell (18 checks: GDT/TSS/PMM/VMM/heap/NX/ATA/
+  FatFs/exceptions/create-fail); making it a build-flag mode would
+  let a normal boot skip it.
 - **`make test` target** — headless boot + serial grep.
 - **Scripted canary** — diff `capture.txt` against a known-good log.
 
