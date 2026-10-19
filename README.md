@@ -88,7 +88,7 @@ That's the point. That's the whole point.
   `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
   `clear`, `basename`, `dirname`, `unlink`, `ttysize`, `tty`,
   `stty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
-  `printenv` - run
+  `printenv`, `bc`, `dc`, `diff`, `du`, `awk` - run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the
@@ -191,10 +191,13 @@ image, driven by `configs/busybox.config`. The source is cloned into
 `third_party/busybox/` (gitignored). **Network access is required on
 first run** - it clones from `https://git.busybox.net/busybox`. The
 tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
-`CONFIG_FEATURE_SH_STANDALONE=y`, `CONFIG_PS=y` (with
+`CONFIG_FEATURE_EDITING_FANCY_PROMPT=y`,
+`CONFIG_FEATURE_SH_STANDALONE=y`, `CONFIG_FEATURE_HUMAN_READABLE=y`,
+`CONFIG_READLINK=y`, `CONFIG_LONG_OPTS=y`, `CONFIG_PS=y` (with
 `CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, and
 `CONFIG_FEATURE_VI_WIN_RESIZE=y` (so `vi` fills the framebuffer
-console).
+console). It also enables the `bc`, `dc`, `diff`, `du`, and `awk`
+applets.
 
 ---
 
