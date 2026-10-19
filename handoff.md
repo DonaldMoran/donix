@@ -106,7 +106,7 @@ check and act are one critical section; a refused dispatch restores
 critical section.  Signals (open-issues item 12) are the first feature
 that adds an ASYNCHRONOUS state writer -- exactly the shape of the
 races just fixed.  Any signal delivery that changes a process's state
-from outside its own execution must follow this discipline.
+from outside its own execution must follow this discipline.  The durable statement is in `docs/contract.md`; this paragraph is the summary.
 
 **Repo state -- run these; do not write it here.**
 
