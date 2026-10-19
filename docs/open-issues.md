@@ -197,6 +197,9 @@ liveness check.  First-party reproduction: `pipe7e_sjlj_stale`
 (`/usr/bin/PIPE7E_SJLJ_STALE`).  **The mechanism is
 `third_party/`'s and is not editable.**
 
+**`realpath` and path canonicalization do not resolve `..`.**  `realpath /root` prints `/root` and `realpath /root/scripts` prints `/root/scripts`, but any path with a `..` component fails: `realpath /root/scripts/../scripts` prints
+`realpath: /root/scripts/../scripts: No such file or directory`.  The resolver appears to stat the literal `..` entry rather than canonicalizing it, and FatFs's `..` lookup does not satisfy that.  Confirmed pre-existing: `CONFIG_REALPATH=y` was already set, and `test.sh` is 57/57 before and after the 2026-10-19 busybox batch.  This is a shared-resolve-path defect -- the same path the VFS (the item-8 seam) will own -- so the VFS work should fix it, and any `..`-dependent caller (`find`, `cd -P`, build scripts, future symlink targets) is exposed until then.  It is not a busybox bug; do not enable `CONFIG_LN`/symlinks expecting this to work.
+
 **`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc`
 is a listable directory; `/dev` is not.  `ls /dev`, `ls /dev/`,
 and `ls dev` all fail with `ENOENT`.  Adding it is the same
