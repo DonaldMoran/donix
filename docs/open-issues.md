@@ -210,6 +210,8 @@ established.  This is what would let `tty` and `null` appear in
 `ls /dev`, and it is the prerequisite for `/dev/tty` and
 `/dev/urandom`.
 
+**`ls` long options are unavailable in the pinned BusyBox 1.36.1.**  `CONFIG_LONG_OPTS=y` is set, but `ls --color=auto`, `ls --help`, `ls --full-time`, and `ls --group-directories-first` all fail with `ls: unrecognized option: -`.  The `ls` applet registers no long-option table in this source snapshot: the applet's long-option registration is gated behind `FEATURE_LS_COLOR` rather than `LONG_OPTS` (the bug upstream fixed in 2017 by changing `IF_FEATURE_LS_COLOR(applet_long_options = ls_longopts;)` to `IF_LONG_OPTS(applet_long_options = ls_longopts;)`).  `third_party/` is read-only, so this cannot be fixed in-tree.  Workaround: use short options (`-l`, `-F`, `-R`, `-h`), which work and are verified by `test.sh` and the batch-1 smoke run.  If long `ls` options are ever wanted, the pinned source needs the 2017 fix.  Not a kernel bug and not a batch-1 regression.
+
 **`st_rdev` is 0 on device nodes.**  `ls -l /dev/console` prints
 `0, 0` for the major/minor column; a real Unix prints `4, 0`.
 `fill_kstat_as_chardev` sets `st_dev` and `st_ino` but not
