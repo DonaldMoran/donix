@@ -90,7 +90,7 @@ That's the point. That's the whole point.
   `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
   `clear`, `basename`, `dirname`, `unlink`, `ttysize`, `tty`,
   `stty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
-  `printenv`, `bc`, `dc`, `diff`, `du`, `awk` - run
+  `printenv`, `bc`, `dc`, `diff`, `du`, `awk`, `tar` - run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the
