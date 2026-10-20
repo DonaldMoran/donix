@@ -174,6 +174,10 @@
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
 #define SYS_GETGROUPS       115
+#define SYS_CHMOD            90
+#define SYS_FCHMOD           91
+#define SYS_CHOWN            92
+#define SYS_FCHOWN           93
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217
