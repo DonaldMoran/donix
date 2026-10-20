@@ -4117,6 +4117,35 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
     }
 }
 
+/*
+ * The FatFs fstat operation, moved out of sys_fstat_body.  Given
+ * an open file or directory slot, produce and copy the kstat.
+ * FatFs has no f_stat-on-an-open-FIL, so size comes from f_size()
+ * and the DIR-vs-FILE bit from the slot kind.
+ */
+static long fat_fstat(file_slot_t* slot, kernel_stat_t* st,
+                      void* user_stat) {
+    FILINFO fno;
+    for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+    if (slot->kind == FILE_KIND_FILE) {
+        FIL* f = (FIL*)slot->obj;
+        fno.fsize   = (FSIZE_t)f_size(f);
+        fno.fattrib = 0;   /* not AM_DIR */
+    } else if (slot->kind == FILE_KIND_DIR) {
+        fno.fattrib = AM_DIR;
+        fno.fsize   = 0;
+    } else {
+        return -(long)EBADF_;
+    }
+
+    fill_kstat_from_filinfo(st, &fno);
+
+    if (safe_copy_to_user(user_stat, st, sizeof(*st)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 static long sys_fstat_body(int fd, void* user_stat) {
     if (!user_stat) return -(long)EFAULT_;
 
@@ -4194,30 +4223,8 @@ static long sys_fstat_body(int fd, void* user_stat) {
         return 0;
     }
 
-    if (slot->kind == FILE_KIND_FILE) {
-        FIL* f = (FIL*)slot->obj;
-        /*
-         * FatFs does not expose an f_stat-on-an-open-FIL.  The
-         * information we need is available directly from the FIL:
-         * f_size() for the byte size, and the file is by definition
-         * not a directory.  Fill the FILINFO fields we use and let
-         * fill_kstat_from_filinfo do the rest.
-         */
-        fno.fsize   = (FSIZE_t)f_size(f);
-        fno.fattrib = 0;   /* not AM_DIR */
-    } else if (slot->kind == FILE_KIND_DIR) {
-        fno.fattrib = AM_DIR;
-        fno.fsize   = 0;
-    } else {
-        return -(long)EBADF_;
-    }
-
-    fill_kstat_from_filinfo(&st, &fno);
-
-    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -(long)EFAULT_;
-    }
-    return 0;
+    /* FAT file or directory: the FatFs fstat. */
+    return fat_fstat(slot, &st, user_stat);
 }
 
 /*
@@ -4286,6 +4293,27 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * without touching FatFs.  Before commit 2, the DEV decision was
  * made by path_is_devnull(); the PROC decision is new in commit 3.
  */
+/*
+ * The FatFs stat operation, moved out of stat_resolved.  Takes a
+ * stripped FatFs-form path, stats it, fills and copies the kstat.
+ * Returns 0 or a negative errno.
+ */
+static long fat_stat_path(const char* path, void* user_stat) {
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+
+    kernel_stat_t st;
+    fill_kstat_from_filinfo(&st, &fno);
+
+    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 static long stat_resolved(const char* abs_path, void* user_stat,
                           int backend) {
     if (!user_stat) return -(long)EFAULT_;
@@ -4463,19 +4491,7 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
-    FILINFO fno;
-    FRESULT r = f_stat_with_retry(path, &fno);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
-    }
-
-    kernel_stat_t st;
-    fill_kstat_from_filinfo(&st, &fno);
-
-    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -(long)EFAULT_;
-    }
-    return 0;
+    return fat_stat_path(path, user_stat);
 }
 
 /*
