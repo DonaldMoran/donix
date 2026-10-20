@@ -5,135 +5,48 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-20.  **The `C` is FIXED, the heap cycle hang
-is CONTAINED, and busybox batch 1 + five applets are in.**  pipe7e
-passed at 100 kHz (250000 iterations, zero events) and a >3.5-hour
-100 Hz soak passed clean; the heap ran 10000 iterations clean with no
-`HEAP:` lines.  `test.sh` is 57/57 and the busybox applets `bc`, `dc`,
-`diff`, `du`, `awk` are enabled and verified by running them.  Read
-"The concurrency contract" first, then "Where we are", then "Next".
+**Last updated:** 2026-10-20.  **THE VFS IS DONE.  `v0.6.16` is the
+VFS release.**  Every path syscall reaches its filesystem through the
+mount table (`mount_driver(backend)->op(...)`); the resolver is
+`vfs_resolve(path, follow_final)`; symlinks work end to end.  `test.sh`
+is 57/57 and `canary --full` is 28/28, verified from `/` on a freshly
+built image.  Read "The concurrency contract" in `docs/contract.md`
+before touching shared state, then "Where we are".
 
-**THE `C`, in one paragraph.**  `context_switch_resume` loads
-`next->rsp` and reads 20 slots as a resume frame.  The `C` fired when
-`next` was a ZOMBIE (a process that had called `process_exit` and was
-waiting to be reaped) whose slot had been reclaimed and reused, so
-`next->rsp` named a zeroed region, not a resume frame; the resume read
-CS = 0 and halted.  The selection came from a check-then-act race:
-`process_yield` popped `next` from the ready queue (READY), then did
-its checks with interrupts ON, then dispatched.  A tick between the
-pop and the dispatch could turn `next`'s slot READY->ZOMBIE, and the
-dispatch used the stale value.  Fixed by holding `cli` from before the
-pop through the dispatch, with `sti` on every return; the tail check
-in `scheduler_switch_to` (state != READY -> refuse, restore
-`current_process = prev`) is the atomic backstop.
+**WHAT THE VFS IS NOW, in one paragraph.**  `g_mounts` maps `/`
+(FAT), `/dev`, and `/proc` to `fs_driver_t` vtables: `unlink`,
+`rename`, `mkdir`, `open`, `stat`, `access`.  `resolve_at` became
+`vfs_resolve`, which canonicalizes the path, selects the mount by
+longest prefix on a component boundary, and -- when `follow_final` is
+1 -- follows a `DONIX_LINK:` marker (an ordinary FAT file whose first
+line is `DONIX_LINK:<target>`), capped at 8 hops (`-ELOOP`).  Every
+path syscall calls `vfs_resolve` and then the mount's operation; no
+syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
+`g_dev_table` with `(major, minor, ino, read, write)`; `/dev/null` is
+1,3; `console` 5,1; `tty` 5,0; `zero` 1,5; `urandom` 1,9.
+`st_dev`/`st_ino` are identity, `st_rdev` is the device number.
 
-**THE HEAP, in one paragraph.**  A corrupt free-list `next` that
-pointed at itself made `find_free_block`'s unbounded walk spin forever
-with interrupts off, hanging the kernel.  The cycle came from
-`coalesce_blocks` and `heap_validate` running on a list that an
-interleaved `kfree` (from a tick's scheduler) was mid-way through
-mutating.  The 2026-10-18 enriched trace proved the merge arithmetic
-is correct at every step; the "corruption" was the validator reading
-a transient.  Fixed by bounding the walk (a cycle returns NULL, not a
-hang), guarding `split_block` against a self-link, and holding `cli`
-across `coalesce_blocks()` + `heap_validate()` in `kfree`.  **There is
-no evidence of a caller overflow** -- the heap had a race, not an
-overflow.  The bounded walk and split guard remain as real protection
-against a future corruption.
+**WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
+file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
+`sys_gettimeofday` (99); signals (contract's async-writer design);
+shebang + `/bin/sh`.  `tar` is **disabled** in busybox: its creation
+path writes an empty archive and exits 0, so it was turned off rather
+than shipped broken.
 
-**THE CONCURRENCY CONTRACT.**  `docs/contract.md` is the durable
-statement; this file summarizes it.  A shared-state mutation and the
-check that authorizes it are one critical section; a refused dispatch
-restores `current_process`.  `state`, `block_kind`, and ready-queue
-membership are changed only under `cli`.  Heap list mutation and
-validation are one critical section; file-slot refcounts and the
-`put_file_slot`/`sys_close` pipe-wake coupling are the VFS's version
-of the same rule.  **Signals are the first ASYNCHRONOUS state writer**
--- the exact shape of the races just fixed -- and must be designed
-against `docs/contract.md` before code lands.  Read that file before
-touching signals or the VFS.
+**THE SCRATCH TAGS** are development restore points, not release
+artifacts: `20261020-proc-path-fold`, `20261020-proc-entries`,
+`20261020-proc-realpath`, `20261020-vfs-mount-table`,
+`20261020-vfs-dev-dir`, `20261020-vfs-dev-driver`,
+`20261020-vfs-dev-zero-urandom`.  Do not drop them until the `v0.6.16`
+tag and merge summary exist.
 
-**What was fixed.**
+**WHERE WE ARE.**  `v0.6.15` is released.  `v0.6.16` (this VFS release)
+is tagged and merging.  The working tree is `dev`.
 
-  `C` (tags `20261016-c-contained`, `20261016-destroy-both-current`,
-  `20261016-tail-state-check`, `20261017-pipe7e-all-pass`):
-  - `process_yield` holds `cli` from before `scheduler_ready_queue_next`
-    through `scheduler_switch_to` (`ef85962`).
-  - `scheduler_switch_to`'s tail: `state != PROC_STATE_READY` ->
-    refuse, restore `current_process = prev`, `sti`, return
-    (`e05d1fa`).
-  - `scheduler_switch_to`'s top: `state == ZOMBIE || TERMINATED` ->
-    refuse (tag `SWITCH-DEAD`).  `6f7344b`.  Fast path; the tail
-    check is the atomic one.
-  - `process_destroy` clears both `current_process` copies via
-    `scheduler_set_current` (`c2a3f89`).
-
-  Selftest fixes (tags `20261018-shell-fallback`,
-  `20261018-create-fail-queue-remove`):
-  - `process_exit`'s kernel-shell fallback wakes the shell as
-    `READY` (not `RUNNING`), lets `scheduler_switch_to` do the
-    transition, and falls through to idle on refusal instead of
-    halting (`e9d6b7a`).  The old code pre-set `RUNNING`, which the
-    tail check refused, and `[exception_de]` halted the selftest.
-  - `process_create`'s four failure exits remove the PCB from the
-    ready queue before marking it `UNUSED` (`19719b7`).  The timer
-    found the failed `fail_slot` PCB on the queue and printed
-    `TIMER-REFUSE: next pid=0 name=fail_slot rsp=0`.
-    `process_reclaim` and `process_destroy` already did this; the
-    failure exits were the one site left out.
-
-  Heap (tag `20261018-heap-cycle-contained`, `1c7fe91`):
-  - `find_free_block`: bounded walk; a cycle prints and returns NULL.
-  - `split_block`: refuses a self-link and a `new_block <= block`.
-  - `kfree`: `coalesce_blocks()` + `heap_validate()` under one `cli`,
-    caller flag saved/restored.
-  - Instrumentation: `heap_validate` prints `check=/exp=/got=`;
-    the corrupt print names the block's fields; `HEAP_TRACE_MERGE`
-    (default 0) traces the coalesce arithmetic.
-
-  Busybox (tags `20261019-busybox-batch1`,
-  `20261019-busybox-applets`, `20261019-readme-current`):
-  - Batch 1: fancy prompt (`\w` in `PS1`), `readlink` (+follow),
-    `ls` filetypes/timestamps/sort/recursive, human-readable sizes,
-    long options.  Verified 57/57.
-  - Five applets enabled and verified by running them on the booted
-    image: `bc`, `dc`, `diff`, `du`, `awk`.  `test.sh` 57/57.
-  - `docs/contract.md` added (`963f4b8`); handoff points at it
-    (`a93991c`).
-  - Process lesson: enable busybox applets ONE AT A TIME from a clean
-    baseline and rebuild; stacking several config changes in one build
-    tree leaves stale `built-in.o` / `applet_tables.h` and produces a
-    binary missing the new applets.
-
-**THE VERIFICATION.**
-  - `C`: pipe7e at `pit_init(100000)` -- **PIPE7E-ALL-PASS**,
-    250000 iterations, zero `SWITCH-DEAD`, zero `C`.  At
-    `pit_init(100)`: canary `--full` 28/28, `test.sh` 57/57, pipe7e
-    clean past 77500.
-  - Heap: pipe7e 10000 iterations clean (no `HEAP:` lines, no hang,
-    no `C`), canary `--full` 28/28, `test.sh` 57/57.  The run is
-    faster than the corrupt runs -- the allocator was spending time
-    on the broken list.
-  - Soak: pipe7e `pit_init(100)`, 250000 iterations, >3.5 hours,
-    **PIPE7E-ALL-PASS**, zero `C`/`SWITCH-DEAD`/`YIELD-REFUSE`/`HEAP:`.
-    Recorded in `docs/open-issues.md` 7b.
-  - Selftest: 18/18, `[exception_de]`/`[exception_pf]`/
-    `[exception_gp]` PASS, the kernel shell returns; the
-    `TIMER-REFUSE ... fail_slot` line is gone; the `create_fail`
-    rows still report no leak.
-  - The two rates cover the two classes: 100 kHz stresses
-    interleavings; 100 Hz covers the user-mode-preemption paths.
-
-**NOT PROVEN.**  "Clean at both rates" is strong evidence, not proof.
-The runs are not proof a 1-in-N race cannot fire; the soak is strong
-evidence, not closure.  Do not call a race closed on one clean run.
-
-**Repo state -- run these; do not write it here.**
-
-    cd /home/noneya/code/donix || exit 1
-    git log --oneline -8
-    git status -sb
-    git tag --list '2026101*'
+**NEXT.**  Signals (open-issues 12; design against `docs/contract.md`
+first -- they are the first asynchronous state writer), then
+`sys_gettimeofday` (99, so `ps -l` works), then shebang + `/bin/sh`,
+then file-backed `mmap`, then `mount(2)`.
 
 **Working style -- how this project gets changed**
 
@@ -240,7 +153,7 @@ are local objects; once they exist, the scratch tags may be dropped.
 Do not use `git push --tags` -- it would push the scratch tags.  Push
 `vX.Y.Z` by name.
 
-**Current release state.**  **`v0.6.14` is released.**  Work is now
+**Current release state.**  **`v0.6.15` is released; `v0.6.16` (the VFS) is tagged and merging.**  Work is now
 pre-**`v0.6.15`**.  The scratch tags `20261019-*` (7b investigation,
 busybox batch 1, the five applets, README) are the source for the
 `v0.6.15` summary; the bump is the maintainer's decision.  Do not

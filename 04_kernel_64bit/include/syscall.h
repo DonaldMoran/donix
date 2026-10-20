@@ -165,6 +165,7 @@
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
 #define SYS_UNLINK          87
+#define SYS_SYMLINK         88
 #define SYS_READLINK        89
 #define SYS_GETUID          102
 #define SYS_GETGID          104

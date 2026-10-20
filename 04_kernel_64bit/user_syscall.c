@@ -81,6 +81,30 @@ static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
 static long access_resolved(const char* abs_path, int backend);
+/* Defined below, in the path-resolution section.  vfs_resolve
+ * (which is above it) calls it; the symlink follow needs both it
+ * and donix_link_target / DONIX_LINK_MAX declared here. */
+static int vfs_resolve_once(int dirfd, const char* path,
+                            char* out, size_t cap,
+                            int* backend_out);
+#define DONIX_LINK_MAX    256
+static int donix_link_target(const char* fat_path,
+                             char* out, size_t cap);
+/* Defined below, in the sys_chdir section.  Used earlier by
+ * sys_readlink to answer existence for synthesized /proc paths,
+ * and by sys_chdir for the same shapes.  One enum, one definition. */
+enum proc_shape {
+    PROC_SHAPE_NONE = 0,
+    PROC_SHAPE_DIR_LIVE,
+    PROC_SHAPE_DIR_DEAD,
+    PROC_SHAPE_FILE_LIVE,
+    PROC_SHAPE_FILE_DEAD,
+};
+static enum proc_shape proc_entry_shape(const char* r);
+/* Defined below, in the path-resolution section.  resolve_at
+ * calls it before path_backend so the backend is chosen from
+ * the canonical path, not the raw one (contract VFS rule 4). */
+static int vfs_canonicalize_abs(char* p, size_t cap);
 /* Defined below, in the safe-copy section.  proc_readlink (above
  * that definition) calls it. */
 static int safe_copy_to_user(void* user_dest, const void* kernel_src,
@@ -133,6 +157,8 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENOEXEC  8
 #define ECHILD   10
 #define EINVAL_  22
+#define EROFS_   30   /* read-only filesystem (Linux EROFS) */
+#define ELOOP_   40   /* too many symbolic links (Linux ELOOP) */
 #define EPIPE_   32
 #define ERANGE_  34
 #define ENAMETOOLONG_ 36
@@ -217,6 +243,10 @@ static char g_write_bounce[WRITE_CHUNK];
  * warranted, gets designed against two devices instead of one.
  */
 #define FILE_KIND_DEV_NULL 5
+/* One kind for every character device; the slot's obj is a row in
+ * g_dev_table (a dev_driver_t), so read/write/stat dispatch through
+ * (major, minor) and the row's function pointers. */
+#define FILE_KIND_DEV 8
 
 /*
  * A character device that is stat-able but not openable.
@@ -281,7 +311,7 @@ static char g_write_bounce[WRITE_CHUNK];
  * slot whose tag is one of the PID_* values; for a fixed entry it
  * returns the entry, which is what the read path wants anyway.
  *
- * PROC_DIR_SENTINEL (below) is a DIR slot, not a PROC file slot,
+ * SYNTH_DIR_SENTINEL (below) is a DIR slot, not a PROC file slot,
  * and never goes through these.
  */
 #define PROC_OBJ_TAG(obj)  ((uint32_t)((uintptr_t)(obj) & 0xFF))
@@ -300,7 +330,7 @@ static char g_write_bounce[WRITE_CHUNK];
  *
  * It is a non-NULL sentinel that no real DIR* can be.
  */
-#define PROC_DIR_SENTINEL ((void*)(uintptr_t)0xFFFFFFFFFFFFFF01ULL)
+#define SYNTH_DIR_SENTINEL ((void*)(uintptr_t)0xFFFFFFFFFFFFFF01ULL)
 
 /*
  * Which backend owns a resolved path.  THE SEAM.
@@ -536,6 +566,7 @@ typedef struct {
 #define KSTAT_IFREG  0100000
 #define KSTAT_IFDIR  0040000
 #define KSTAT_IFCHR  0020000   /* character device; /dev/null */
+#define KSTAT_IFLNK  0120000   /* symbolic link; DONIX_LINK marker */
 
 /*
  * True if `p` names the FAT root directory.
@@ -575,12 +606,89 @@ static int path_is_root(const char* p) {
  * "console".  The match is by full component, so "/dev/nullx" does
  * not match "null"; see dev_lookup.
  */
-static const struct {
+/*
+ * A character device driver.  A device is not a kind: it is a
+ * (major, minor) pair and a pair of operations, exactly as Unix
+ * models it.  open() returns one FILE_KIND_DEV slot carrying a
+ * pointer to the row; read/write dispatch through it; stat
+ * reports (major, minor) as st_rdev.  Adding a device is a row
+ * with two functions, not a clause at eight call sites.
+ *
+ * Linux's char-device majors for these: /dev/null 1:3,
+ * /dev/zero 1:5, /dev/urandom 1:9, /dev/tty 5:0,
+ * /dev/console 5:1.  The console sentinel on fds 0/1/2 is not
+ * a /dev path and keeps its own (1,1) pair -- musl's ttyname
+ * gate depends on it.
+ */
+typedef struct dev_driver {
     const char* name;
-    uint32_t    kind;
-} g_dev_table[] = {
-    { "null",    FILE_KIND_DEV_NULL },
-    { "console", FILE_KIND_DEV_CHAR },
+    uint8_t     major;   /* st_rdev major */
+    uint8_t     minor;   /* st_rdev minor */
+    uint16_t    ino;     /* st_ino identity; st_dev is 1 for DEV.
+                          * console and tty share 1 -- the console
+                          * sentinel on fds 0/1/2 uses (1,1), and
+                          * musl's ttyname compares that pair. */
+    long      (*read)(void* buf, size_t n);
+    long      (*write)(const void* buf, size_t n);
+} dev_driver_t;
+
+static long dev_null_read(void* buf, size_t n) {
+    (void)buf; (void)n; return 0;   /* always EOF */
+}
+static long dev_null_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;      /* always accepted */
+}
+
+/* /dev/zero: reads fill zeros; writes are accepted and discarded. */
+static long dev_zero_read(void* buf, size_t n) {
+    for (size_t i = 0; i < n; i++) ((uint8_t*)buf)[i] = 0;
+    return (long)n;
+}
+static long dev_zero_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;
+}
+
+/*
+ * /dev/urandom.  xorshift64*, seeded from rdtsc at first use.
+ * NON-CRYPTOGRAPHIC: adequate for /dev/urandom on a single-user
+ * system (shuffles, temporary names, jitter), NOT for keys,
+ * tokens, or anything an attacker's guess would compromise.
+ * A real CSPRNG is a separate, larger change; the name /dev/urandom
+ * promises non-blocking, and that is what this delivers.
+ */
+static uint64_t g_urandom_state;
+static long dev_urandom_read(void* buf, size_t n) {
+    if (g_urandom_state == 0) {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        g_urandom_state = ((uint64_t)hi << 32) | lo;
+        if (g_urandom_state == 0) g_urandom_state = 0x9E3779B97F4A7C15ULL;
+    }
+    uint8_t* p = (uint8_t*)buf;
+    size_t i = 0;
+    while (i < n) {
+        uint64_t x = g_urandom_state;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        g_urandom_state = x;
+        uint64_t v = x * 0x2545F4914F6CDD1DULL;
+        for (int k = 0; k < 8 && i < n; k++, i++) p[i] = (uint8_t)(v >> (k * 8));
+    }
+    return (long)n;
+}
+static long dev_urandom_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;   /* Linux accepts and discards */
+}
+
+/* tty/console forward to the console path implemented below. */
+static long console_read(void* buf, size_t n);
+static long console_write(const void* buf, size_t n);
+
+static const dev_driver_t g_dev_table[] = {
+    { "null",    1, 3, 2, dev_null_read,    dev_null_write    },
+    { "zero",    1, 5, 3, dev_zero_read,    dev_zero_write    },
+    { "urandom", 1, 9, 4, dev_urandom_read, dev_urandom_write },
+    { "console", 5, 1, 1, console_read,     console_write     },
+    { "tty",     5, 0, 1, console_read,     console_write     },
 };
 #define G_DEV_TABLE_LEN (sizeof(g_dev_table) / sizeof(g_dev_table[0]))
 
@@ -605,18 +713,18 @@ static const struct {
  * device is not the device).  No libc string functions, matching
  * this file's convention.
  */
-static uint32_t dev_lookup(const char* abs_path) {
-    if (abs_path[0] != '/') return 0;
+static const dev_driver_t* dev_lookup(const char* abs_path) {
+    if (abs_path[0] != '/') return NULL;
 
     /* Skip "/dev/". */
     const char* p = abs_path + 1;
     if (!(p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == '/')) {
-        return 0;
+        return NULL;
     }
     const char* name = p + 4;   /* after "dev/" */
 
     /* Empty component: "/dev/" alone is not a device. */
-    if (name[0] == '\0') return 0;
+    if (name[0] == '\0') return NULL;
 
     for (size_t i = 0; i < G_DEV_TABLE_LEN; i++) {
         const char* entry = g_dev_table[i].name;
@@ -626,10 +734,10 @@ static uint32_t dev_lookup(const char* abs_path) {
          * (either at the string end or at a '/' -- but a '/' means
          * there is more path, so only '\0' counts). */
         if (entry[j] == '\0' && name[j] == '\0') {
-            return g_dev_table[i].kind;
+            return &g_dev_table[i];
         }
     }
-    return 0;
+    return NULL;
 }
 
 /*
@@ -1417,22 +1525,264 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * No libc string functions, matching this file's convention (see
  * the comment on dev_lookup).  Manual compare.
  */
+/*
+ * The mount table.  THE SEAM's data.
+ *
+ * Each entry maps a mount point to a backend.  path_backend does
+ * a LONGEST-PREFIX match on a component boundary: a mount M
+ * matches abs_path when abs_path starts with M.path and the next
+ * character is '/' or end-of-string.  So "/dev" matches "/dev"
+ * and "/dev/null" but NOT "/devices", and the deepest matching
+ * mount wins.  "/" is the root mount and is the fallback, so a
+ * path that matches nothing else still resolves to a backend.
+ *
+ * Adding a backend is a row here, not a clause in path_backend.
+ * That is contract VFS rule 1: one mount table, one place the
+ * mapping lives.
+ *
+ * This table is static and const.  Nothing mutates it at runtime,
+ * so no lock is needed: contract VFS rule 1's critical section is
+ * for DYNAMIC mount-table mutation (a real mount(2)), which does
+ * not exist yet.  When it does, that commit makes this array
+ * mutable, adds an init, and holds cli across the mutation -- and
+ * it will be a different, larger change.
+ *
+ * Order is irrelevant: longest match wins, so the entries may be
+ * listed in any order.  Do not register duplicate paths.
+ */
+/*
+ * The mount's operations.  A filesystem is reached by its
+ * driver, not by a backend test at the call site.  This is the
+ * Unix dispatch: the syscall looks up the mount and calls the
+ * operation.
+ *
+ * fat_driver points at the extracted FatFs operations.
+ * dev_driver and proc_driver are the synthesized /dev and /proc
+ * mounts: they share the read-only unlink/rename/mkdir (those
+ * are -EROFS, the truthful answer for a write on a read-only
+ * mount, where the old code fell through to FatFs and got a
+ * misleading one) and have their own open/stat/access handlers.
+ *
+ * Only unlink/rename/mkdir are here so far.  open/stat/access
+ * join when their FatFs bodies are extracted (vfsM2b) and the
+ * syscalls are moved behind the same pointer (vfsM4).
+ */
+typedef struct fs_driver {
+    long (*unlink)(const char* in_path, int want_dir, const char* tag);
+    long (*rename)(const char* old_path, const char* new_path);
+    long (*mkdir) (const char* local_path);
+    long (*open)  (const char* in_path, const char* local_path,
+                   int flags);
+    long (*stat)  (const char* path, void* user_stat);
+    long (*access)(const char* path);
+} fs_driver_t;
+
+static long fat_unlink_body(const char* local_path, int want_dir,
+                            const char* tag);
+static long fat_rename(const char* old_path, const char* new_path);
+static long fat_mkdir(const char* local_path);
+static long fat_open(const char* in_path, const char* local_path,
+                     int flags);
+static long dev_open(const char* in_path, const char* local_path,
+                     int flags);
+static long dev_stat(const char* abs_path, void* user_stat);
+static long dev_access(const char* abs_path);
+static long proc_open(const char* in_path, const char* local_path,
+                      int flags);
+static long proc_stat(const char* abs_path, void* user_stat);
+static long proc_access(const char* abs_path);
+static long fat_stat_path(const char* path, void* user_stat);
+static long fat_access(const char* path);
+
+static const fs_driver_t fat_driver = {
+    fat_unlink_body, fat_rename, fat_mkdir,
+    fat_open, fat_stat_path, fat_access,
+};
+
+/* /dev and /proc are read-only synthesized mounts. */
+static long ro_unlink(const char* in_path, int want_dir, const char* tag) {
+    (void)in_path; (void)want_dir; (void)tag; return -(long)EROFS_;
+}
+static long ro_rename(const char* old_path, const char* new_path) {
+    (void)old_path; (void)new_path; return -(long)EROFS_;
+}
+static long ro_mkdir(const char* local_path) {
+    (void)local_path; return -(long)EROFS_;
+}
+static const fs_driver_t dev_driver = {
+    ro_unlink, ro_rename, ro_mkdir,
+    dev_open, dev_stat, dev_access,
+};
+static const fs_driver_t proc_driver = {
+    ro_unlink, ro_rename, ro_mkdir,
+    proc_open, proc_stat, proc_access,
+};
+
+static const struct {
+    const char* path;      /* absolute mount point, no trailing '/' */
+    int         backend;   /* BACKEND_* */
+    const fs_driver_t* driver;  /* the operation vtable */
+} g_mounts[] = {
+    { "/",     BACKEND_FAT,  &fat_driver },
+    { "/dev",  BACKEND_DEV,  &dev_driver },
+    { "/proc", BACKEND_PROC, &proc_driver },
+};
+#define G_MOUNTS_LEN (sizeof(g_mounts) / sizeof(g_mounts[0]))
+
+/* The operation vtable for a mount, by backend tag.  Every
+ * syscall that dispatches through a driver uses this; the
+ * backend tag from resolve_at names the mount, and the mount
+ * names its driver.  FAT is the fallback because "/" always
+ * matches and it is FAT. */
+static const fs_driver_t* mount_driver(int backend) {
+    for (size_t i = 0; i < G_MOUNTS_LEN; i++) {
+        if (g_mounts[i].backend == backend) return g_mounts[i].driver;
+    }
+    return &fat_driver;
+}
+
+/*
+ * The seam's decision.  Given an absolute Unix-form path, return
+ * which backend owns it, by longest matching mount point.
+ *
+ * This is the ONLY place the mapping lives.  A second copy of
+ * "does this path start with /dev or /proc" is the failure mode
+ * docs/strategy.md names -- do not add one.  When a later session
+ * wants a new backend, it adds a row to g_mounts and a handler; it
+ * does not touch the syscalls.
+ *
+ * The comparison is by COMPONENT, not by bare prefix: "/dev" and
+ * "/dev/null" match, "/devices/x" does not, because after "dev"
+ * comes 'i', not '/' or end-of-string.  A plain prefix compare of
+ * "/dev" would wrongly match "/devices".
+ *
+ * Called only on paths that came from resolve_at, which are
+ * absolute, so abs_path[0] == '/' is guaranteed by the caller.
+ * The guard below is defensive, not load-bearing: a non-absolute
+ * path is treated as FAT, which is the pre-seam behavior.
+ *
+ * No libc string functions, matching this file's convention (see
+ * the comment on dev_lookup).  Manual compare.
+ */
 static int path_backend(const char* abs_path) {
     if (abs_path[0] != '/') return BACKEND_FAT;
 
-    const char* p = abs_path + 1;
+    int best = -1;          /* index of the longest matching mount */
+    size_t best_len = 0;
 
-    /* "dev" followed by '/' or end-of-string. */
-    if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' &&
-        (p[3] == '/' || p[3] == '\0')) {
-        return BACKEND_DEV;
+    for (size_t i = 0; i < G_MOUNTS_LEN; i++) {
+        const char* m = g_mounts[i].path;
+        size_t mlen = 0;
+        while (m[mlen]) mlen++;
+
+        size_t k = 0;
+        while (k < mlen && abs_path[k] == m[k]) k++;
+        if (k != mlen) continue;
+
+        char next = abs_path[mlen];
+        if (next != '/' && next != '\0') continue;
+
+        if (mlen >= best_len) {
+            best = (int)i;
+            best_len = mlen;
+        }
     }
-    /* "proc" followed by '/' or end-of-string. */
-    if (p[0] == 'p' && p[1] == 'r' && p[2] == 'o' && p[3] == 'c' &&
-        (p[4] == '/' || p[4] == '\0')) {
-        return BACKEND_PROC;
+
+    if (best < 0) return BACKEND_FAT;   /* unreachable: "/" always matches */
+    return g_mounts[best].backend;
+}
+
+/*
+ * Canonicalize an absolute Unix-form path in place: fold '.' and
+ * '..' components and collapse repeated '/'.  This is the VFS
+ * rule-4 canonicalizer -- the one place '..' is handled, so
+ * realpath, cd -P, find, and future symlink targets all see the
+ * same folded path (docs/open-issues.md, realpath item).
+ *
+ * Lexical only.  Symlinks do not exist yet (open-issues item 8),
+ * so there is nothing to follow; when they land, following happens
+ * here or just above, not in individual syscalls.
+ *
+ * A path whose first byte is not '/' is left untouched and
+ * reported success.  The FatFs drive form ("0:/FOO") reaches
+ * resolve_at's AT_FDCWD branch via resolve_against_cwd's
+ * pass-through, and path_backend already classifies it as FAT;
+ * folding it would corrupt the drive prefix.  So the fold is a
+ * no-op for anything not starting with '/'.
+ *
+ * A trailing '/' is preserved (one, and not at root) when the
+ * input had one.  resolve_at's dirfd branches preserve a
+ * dir_path's trailing slash, and the fold must not introduce a
+ * distinction between "sub/" and "sub" that the resolver did
+ * not previously make.
+ *
+ * Returns 0 on success, -1 if the folded result would not fit in
+ * cap (the caller maps that to -ENAMETOOLONG, the resolver's
+ * existing overflow mapping).
+ */
+static int vfs_canonicalize_abs(char* p, size_t cap) {
+    if (!p || cap < 2) return -1;
+    if (p[0] != '/') return 0;   /* not Unix-absolute: leave it */
+
+    /* Build the folded result in a scratch buffer, then copy
+     * back.  USER_PATH_MAX is the caller's cap; a path already
+     * fits in out, so a same-sized scratch is enough. */
+    char tmp[USER_PATH_MAX];
+    size_t in = 0;
+    size_t out = 0;
+    int trailing_slash = 0;
+
+    /* Detect a trailing slash on the input (not at root). */
+    {
+        size_t len = 0;
+        while (p[len]) len++;
+        if (len > 1 && p[len - 1] == '/') trailing_slash = 1;
     }
-    return BACKEND_FAT;
+
+    tmp[out++] = '/';
+
+    while (p[in]) {
+        /* Skip separators. */
+        while (p[in] == '/') in++;
+        if (!p[in]) break;
+
+        /* Find component bounds. */
+        size_t start = in;
+        while (p[in] && p[in] != '/') in++;
+        size_t clen = in - start;
+
+        /* '.' -> skip. */
+        if (clen == 1 && p[start] == '.') continue;
+
+        /* '..' -> pop the last component (never above root). */
+        if (clen == 2 && p[start] == '.' && p[start + 1] == '.') {
+            if (out > 1) {
+                out--;                       /* drop trailing '/' */
+                while (out > 1 && tmp[out - 1] != '/') out--;
+            }
+            continue;
+        }
+
+        /* Ordinary component: '/' + component. */
+        if (out > 1 && tmp[out - 1] != '/') {
+            if (out + 1 >= cap) return -1;
+            tmp[out++] = '/';
+        }
+        for (size_t k = 0; k < clen; k++) {
+            if (out + 1 >= cap) return -1;
+            tmp[out++] = p[start + k];
+        }
+    }
+
+    if (trailing_slash && out > 1) {
+        if (out + 1 >= cap) return -1;
+        tmp[out++] = '/';
+    }
+
+    tmp[out] = '\0';
+    if (out + 1 > cap) return -1;
+    for (size_t k = 0; k <= out; k++) p[k] = tmp[k];
+    return 0;
 }
 
 /*
@@ -1471,12 +1821,78 @@ static int path_backend(const char* abs_path) {
  * A dir slot's stored path is already absolute ("/", "/bin"), so
  * cases 4 and 5 produce an absolute result directly.
  */
-static int resolve_at(int dirfd, const char* path,
-                      char* out, size_t cap,
-                      int* backend_out) {
+/*
+ * vfs_resolve: the one path resolver every path-taking syscall
+ * calls.  Named for what docs/contract.md VFS rule 4 calls it;
+ * this was resolve_at.
+ *
+ * follow_final is the symlink argument: 1 means "resolve the last
+ * component too" (open, stat, execve, chdir, mkdir, unlink,
+ * rename), 0 means "do not" (lstat, readlink, fstatat with
+ * AT_SYMLINK_NOFOLLOW).  There are no symlinks yet, so the
+ * argument is accepted and ignored; the symlink commit is what
+ * makes it load-bearing, and it will be a change to this
+ * function's body, not to its callers.
+ */
+/*
+ * vfs_resolve: the one path resolver every path-taking syscall
+ * calls (docs/contract.md VFS rule 4).
+ *
+ * Resolves the path once with vfs_resolve_once, then, when
+ * follow_final is 1, follows symbolic links: a FAT file whose
+ * first line is "DONIX_LINK:<target>" is a link.  An absolute
+ * target replaces the whole path; a relative target replaces the
+ * link's own last component, which is Unix.  The loop is capped
+ * at 8 hops so a link cycle is -ELOOP, not a hang.
+ *
+ * follow_final 0 means "do not follow the last component":
+ * that is what readlink and lstat pass, and it returns the link
+ * itself.
+ */
+static int vfs_resolve(int dirfd, const char* path,
+                       char* out, size_t cap,
+                       int* backend_out, int follow_final) {
+    int r = vfs_resolve_once(dirfd, path, out, cap, backend_out);
+    if (r != 0 || !follow_final) return r;
+
+    for (int depth = 0; depth < 8; depth++) {
+        if (backend_out && *backend_out != BACKEND_FAT) return 0;
+        char fat[USER_PATH_MAX];
+        if (path_copy(fat, sizeof(fat), out) != 0) return -(long)ENAMETOOLONG_;
+        strip_dot_prefix(fat);
+        char tgt[DONIX_LINK_MAX];
+        if (!donix_link_target(fat, tgt, sizeof(tgt))) return 0;
+
+        if (tgt[0] == '/') {
+            if (path_copy(out, cap, tgt) != 0) return -(long)ENAMETOOLONG_;
+        } else {
+            size_t slash = 0, i = 0;
+            while (out[i]) { if (out[i] == '/') slash = i; i++; }
+            size_t o = slash + 1;
+            if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
+            for (size_t k = 0; tgt[k]; k++) {
+                if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
+                out[o++] = tgt[k];
+            }
+            out[o] = '\0';
+        }
+        if (vfs_canonicalize_abs(out, cap) != 0) return -(long)ENAMETOOLONG_;
+        if (backend_out) *backend_out = path_backend(out);
+    }
+    return -(long)ELOOP_;
+}
+
+/* One resolution pass: no link following.  vfs_resolve below
+ * wraps this with the follow loop. */
+static int vfs_resolve_once(int dirfd, const char* path,
+                            char* out, size_t cap,
+                            int* backend_out) {
     /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
     if (path_is_absolute(path)) {
         if (path_copy(out, cap, path) != 0) return -(long)ENAMETOOLONG_;
+        if (vfs_canonicalize_abs(out, cap) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
         if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
@@ -1501,6 +1917,9 @@ static int resolve_at(int dirfd, const char* path,
              */
             return -(long)ENAMETOOLONG_;
         }
+        if (vfs_canonicalize_abs(out, cap) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
         if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
@@ -1520,6 +1939,9 @@ static int resolve_at(int dirfd, const char* path,
      * reaching here. */
     if (path[0] == '\0') {
         if (path_copy(out, cap, slot->dir_path) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
+        if (vfs_canonicalize_abs(out, cap) != 0) {
             return -(long)ENAMETOOLONG_;
         }
         if (backend_out) *backend_out = path_backend(out);
@@ -1545,6 +1967,9 @@ static int resolve_at(int dirfd, const char* path,
         out[o++] = path[i];
     }
     out[o] = '\0';
+    if (vfs_canonicalize_abs(out, cap) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
     if (backend_out) *backend_out = path_backend(out);
     return 0;
 }
@@ -1592,6 +2017,33 @@ static long fatfs_errno(FRESULT r) {
 }
 
 /* Fill a kernel_stat_t describing the FAT root as a directory. */
+/* PROC st_ino allocation.  Every synthesized /proc path must
+ * report a distinct, stable (st_dev, st_ino): realpath uses the
+ * pair to tell entries apart and to detect loops, and with every
+ * entry at (0,0) it rejects /proc/<pid> as a duplicate of /proc.
+ * st_dev stays 0 for PROC (DEV uses 1). */
+#define PROC_INO_ROOT       ((uint64_t)1)
+#define PROC_INO_SELF       ((uint64_t)2)
+#define PROC_INO_PID_BASE   ((uint64_t)0x100000)
+#define PROC_INO_ENTRY_BASE ((uint64_t)0x200000)
+
+static uint64_t proc_ino(uint64_t pid, uint32_t tag) {
+    return PROC_INO_PID_BASE + (pid << 2) + (uint64_t)tag;
+}
+
+/* Parse the pid out of an absolute "/proc/<digits>" form.
+ * Returns 0 for any other shape; 0 is not a live pid. */
+static uint64_t strtou64_after_proc(const char* p) {
+    if (!(p[0]=='/' && p[1]=='p' && p[2]=='r' && p[3]=='o'
+          && p[4]=='c' && p[5]=='/')) return 0;
+    p += 6;
+    uint64_t v = 0; int n = 0;
+    while (*p >= '0' && *p <= '9') { v = v*10 + (uint64_t)(*p-'0'); p++; n++; }
+    if (n == 0) return 0;
+    if (*p != '\0' && !(*p == '/' && p[1] == '\0')) return 0;
+    return v;
+}
+
 static void fill_kstat_as_root(kernel_stat_t* st) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
     st->st_nlink   = 1;
@@ -1637,8 +2089,23 @@ static void fill_kstat_as_chardev(kernel_stat_t* st,
  * This is what /proc/self/status reports: a regular file, mode
  * 0444 (read-only), with a size that is the entry's maximum text
  * length.  See proc_entry_size. */
-static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
+/* Fill a kernel_stat_t describing a symbolic link: mode
+ * S_IFLNK | 0777, size = the target's length (which is what
+ * Linux reports for a link, not the file size), one link.  The
+ * target bytes are not in the kstat; readlink returns them. */
+static void fill_kstat_as_link(kernel_stat_t* st, uint64_t target_len) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFLNK | 0777;
+    st->st_size    = (int64_t)target_len;
+    st->st_blocks  = 0;
+}
+
+static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry,
+                               uint64_t ino) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_ino     = ino;
     st->st_nlink   = 1;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFREG | 0444;
@@ -1652,8 +2119,9 @@ static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
  * fill_kstat_from_filinfo uses for a real FAT directory; this
  * helper exists separately because a PROC directory has no
  * FILINFO. */
-static void fill_kstat_as_dir(kernel_stat_t* st) {
+static void fill_kstat_as_dir(kernel_stat_t* st, uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_ino     = ino;
     st->st_nlink   = 2;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFDIR | 0555;
@@ -1943,24 +2411,19 @@ static void put_file_slot(file_slot_t* slot) {
     } else if (slot->kind == FILE_KIND_DIR) {
         /*
          * A synthesized PROC directory (open_resolved) has no
-         * DIR* behind it -- obj is PROC_DIR_SENTINEL.  Do not
+         * DIR* behind it -- obj is SYNTH_DIR_SENTINEL.  Do not
          * f_closedir or kfree it.  dir_path is still a real
          * kmalloc'd string and is freed either way.
          */
-        if (slot->obj != PROC_DIR_SENTINEL) {
+        if (slot->obj != SYNTH_DIR_SENTINEL) {
             f_closedir((DIR*)slot->obj);
             kfree(slot->obj);
         }
         if (slot->dir_path) kfree(slot->dir_path);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
-    } else if (slot->kind == FILE_KIND_DEV_NULL) {
-        /* obj is NULL; nothing to close or free. */
-    } else if (slot->kind == FILE_KIND_DEV_CHAR) {
-        /* obj is NULL; nothing to close or free.  Unreachable
-         * today -- open_resolved refuses this kind -- but the
-         * case is here so the switch is total.  A future commit
-         * that opens /dev/console reaches it. */
+    } else if (slot->kind == FILE_KIND_DEV) {
+        /* obj points at a g_dev_table row; nothing to free. */
     } else if (slot->kind == FILE_KIND_PROC) {
         /*
          * obj is the PROC_ENTRY_* value cast to a pointer, not an
@@ -2642,191 +3105,22 @@ long sys_pipe(int* user_pipefd) {
  * -ENOENT for unknown /dev and /proc paths before the seam as
  * well.
  */
-static long open_resolved(const char* in_path, int flags, int backend) {
+/*
+ * The FatFs open operation, moved verbatim out of
+ * open_resolved.  Takes the resolved absolute path, the stripped
+ * FatFs-form path, and the raw Linux flags; allocates the slot,
+ * decides DIR vs FILE, and owns its own cleanup on every error
+ * path (kfree(slot) + clear file_table[fd] before returning a
+ * negative errno).  The caller has no cleanup.
+ *
+ * The f_open -> f_opendir fallback (a directory opened without
+ * O_DIRECTORY) is FatFs-specific and lives here, inside the open
+ * operation, not at the call site.
+ */
+static long fat_open(const char* in_path, const char* local_path,
+                     int flags) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EFAULT_;
-
-    /*
-     * DEV backend.  The match is against the UNSTRIPPED resolved
-     * path (in_path), because dev_lookup expects the leading '/'
-     * form and the strip below has not run yet.
-     *
-     * If the path is a known device, return its slot and be done.
-     * If not -- "/dev/tty" before commit 4, "/dev" alone, or
-     * anything else under /dev -- fall through to the FAT path.
-     */
-    if (backend == BACKEND_DEV) {
-        uint32_t kind = dev_lookup(in_path);
-        if (kind == FILE_KIND_DEV_NULL) {
-            file_slot_t* dslot = NULL;
-            int dfd = alloc_file_slot(&dslot);
-            if (dfd == -1) return -(long)EIO_;
-            dslot->kind = kind;
-            /* obj stays NULL; refcount is 1 from alloc_file_slot. */
-            FDTRACE({ serial_print("open  dev -> fd=");
-                      serial_print_dec((uint64_t)dfd);
-                      serial_print(" kind=");
-                      serial_print_dec((uint64_t)kind); });
-            return dfd;
-        }
-        /*
-         * A DEV table entry that is stat-able but not openable --
-         * /dev/console in commit 4.  Refuse it rather than
-         * producing a slot with no read/write behavior.  Linux
-         * allows open("/dev/console"); donix does not yet, and
-         * the honest answer is ENOENT rather than a slot that
-         * misbehaves the first time someone reads from it.
-         *
-         * When a future commit makes it openable, this is the
-         * branch that changes, and that commit adds the
-         * read/write cases at the same time.
-         */
-        if (kind == FILE_KIND_DEV_CHAR) {
-            return -(long)ENOENT_;
-        }
-        /* Unknown /dev entry: fall through to FAT. */
-    }
-
-    /*
-     * PROC backend.  Same shape as DEV: match on the unstripped
-     * resolved path, return a FILE_KIND_PROC slot whose obj is the
-     * PROC_ENTRY_* value cast to a pointer, or fall through.
-     */
-    if (backend == BACKEND_PROC) {
-        /*
-         * /proc and /proc/self are directories, not table
-         * entries.  A FILE_KIND_DIR slot is required so
-         * sys_getdents64's get_file_slot(fd, FILE_KIND_DIR)
-         * accepts the fd; the obj is PROC_DIR_SENTINEL rather
-         * than a DIR*, because there is no FatFs directory
-         * behind it.  put_file_slot knows not to f_closedir it.
-         *
-         * dir_path is still the absolute Unix-form path, so an
-         * *at() syscall with this fd as dirfd resolves relative
-         * names against /proc or /proc/self.
-         */
-        int is_proc_root = (in_path[0] == '/' && in_path[1] == 'p'
-                            && in_path[2] == 'r' && in_path[3] == 'o'
-                            && in_path[4] == 'c' && in_path[5] == '\0');
-        int is_proc_self = (in_path[0] == '/' && in_path[1] == 'p'
-                            && in_path[2] == 'r' && in_path[3] == 'o'
-                            && in_path[4] == 'c' && in_path[5] == '/'
-                            && in_path[6] == 's' && in_path[7] == 'e'
-                            && in_path[8] == 'l' && in_path[9] == 'f'
-                            && in_path[10] == '\0');
-        if (is_proc_root || is_proc_self) {
-            file_slot_t* dslot = NULL;
-            int dfd = alloc_file_slot(&dslot);
-            if (dfd == -1) return -(long)EIO_;
-            dslot->kind = FILE_KIND_DIR;
-            dslot->obj  = PROC_DIR_SENTINEL;
-            dslot->end  = 0;   /* readdir cursor: not yet drained */
-            size_t plen = 0;
-            while (in_path[plen]) plen++;
-            dslot->dir_path = (char*)kmalloc(plen + 1);
-            if (dslot->dir_path) {
-                for (size_t i = 0; i <= plen; i++)
-                    dslot->dir_path[i] = in_path[i];
-            }
-            FDTRACE({ serial_print("open  proc dir -> fd=");
-                      serial_print_dec((uint64_t)dfd);
-                      serial_print(" path=");
-                      serial_print(in_path); });
-            return dfd;
-        }
-
-        /*
-         * /proc/<pid>/stat -- a per-pid synthesized file.  The
-         * pid is in the path, so it cannot be a fixed table key;
-         * parse it here and encode (pid, tag) in the slot's obj
-         * (see PROC_OBJ_MAKE).  Only "stat" today; "status" is
-         * the next commit and adds a second tail check.
-         */
-        {
-            const char* q = in_path;
-            /* must start with "/proc/" */
-            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
-                && q[4]=='c' && q[5]=='/') {
-                q += 6;
-                /*
-                 * The component is either a run of digits or the
-                 * literal "self".  "self" resolves to the process
-                 * doing the open, which is what Linux does -- the
-                 * kernel resolves it, not the caller.  libbb and
-                 * musl both open the literal string, and so does
-                 * the test.
-                 */
-                uint64_t pid = 0;
-                int ok_component = 0;
-                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
-                    pcb_t* me = process_get_current();
-                    if (me) { pid = me->pid; ok_component = 1; }
-                    q += 4;
-                } else {
-                    int ndig = 0;
-                    while (*q >= '0' && *q <= '9') {
-                        pid = pid * 10 + (uint64_t)(*q - '0');
-                        q++; ndig++;
-                    }
-                    ok_component = (ndig > 0);
-                }
-                int is_stat = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
-                int is_status = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
-                    && q[6]=='s' && q[7]=='\0');
-                int is_cmdline = (ok_component
-                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
-                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
-                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
-                if (is_stat || is_status || is_cmdline) {
-                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
-                    file_slot_t* sslot = NULL;
-                    int sfd = alloc_file_slot(&sslot);
-                    if (sfd == -1) return -(long)EIO_;
-                    sslot->kind = FILE_KIND_PROC;
-                    sslot->obj  = PROC_OBJ_MAKE(pid,
-                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
-                                   : is_status ? PROC_ENTRY_PID_STATUS
-                                               : PROC_ENTRY_PID_STAT);
-                    sslot->end  = 0;   /* read cursor: not yet drained */
-                    FDTRACE({ serial_print("open  proc ");
-                              serial_print(is_cmdline ? "cmdline"
-                                          : is_status ? "status"
-                                                      : "stat");
-                              serial_print(" -> fd=");
-                              serial_print_dec((uint64_t)sfd);
-                              serial_print(" pid=");
-                              serial_print_dec(pid); });
-                    return sfd;
-                }
-            }
-        }
-
-        uint32_t entry = proc_lookup(in_path);
-        if (entry != PROC_ENTRY_NONE) {
-            file_slot_t* pslot = NULL;
-            int pfd = alloc_file_slot(&pslot);
-            if (pfd == -1) return -(long)EIO_;
-            pslot->kind = FILE_KIND_PROC;
-            pslot->obj  = (void*)(uintptr_t)entry;
-            pslot->end  = 0;   /* read cursor: not yet drained */
-            /* refcount is 1 from alloc_file_slot. */
-            FDTRACE({ serial_print("open  proc -> fd=");
-                      serial_print_dec((uint64_t)pfd);
-                      serial_print(" entry=");
-                      serial_print_dec((uint64_t)entry); });
-            return pfd;
-        }
-    }
-
-    char local_path[USER_PATH_MAX];
-    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
-    strip_dot_prefix(local_path);
 
     file_slot_t* slot = NULL;
     int fd = alloc_file_slot(&slot);
@@ -3039,6 +3333,411 @@ static long open_resolved(const char* in_path, int flags, int backend) {
 }
 
 /*
+ * A DEV operation returns BACKEND_NOT_MINE when the path is not a
+ * known /dev entry, so the caller falls through to the next
+ * backend (FAT).  That is the same fall-through the inline DEV
+ * branch has always had; it is made explicit here so the
+ * handler can live in the mount table.  Any other value is a
+ * real result (an fd, an errno, or 0).
+ */
+#define BACKEND_NOT_MINE  ((long)-123456789L)
+
+static long dev_open(const char* in_path, const char* local_path,
+                     int flags) {
+    (void)local_path; (void)flags;
+    /* /dev itself: a synthesized directory. */
+    int is_dev_root = (in_path[0]=='/' && in_path[1]=='d'
+                       && in_path[2]=='e' && in_path[3]=='v'
+                       && (in_path[4]=='\0'
+                           || (in_path[4]=='/' && in_path[5]=='\0')));
+    if (is_dev_root) {
+        file_slot_t* dslot = NULL;
+        int dfd = alloc_file_slot(&dslot);
+        if (dfd == -1) return -(long)EIO_;
+        dslot->kind = FILE_KIND_DIR;
+        dslot->obj  = SYNTH_DIR_SENTINEL;
+        dslot->end  = 0;
+        dslot->dir_path = (char*)kmalloc(5);
+        if (dslot->dir_path) {
+            dslot->dir_path[0]='/'; dslot->dir_path[1]='d';
+            dslot->dir_path[2]='e'; dslot->dir_path[3]='v';
+            dslot->dir_path[4]='\0';
+        }
+        return dfd;
+    }
+    const dev_driver_t* d = dev_lookup(in_path);
+    if (d) {
+        file_slot_t* dslot = NULL;
+        int dfd = alloc_file_slot(&dslot);
+        if (dfd == -1) return -(long)EIO_;
+        dslot->kind = FILE_KIND_DEV;
+        dslot->obj  = (void*)d;
+        FDTRACE({ serial_print("open  dev -> fd=");
+                  serial_print_dec((uint64_t)dfd);
+                  serial_print(" dev=");
+                  serial_print(d->name); });
+        return dfd;
+    }
+    return BACKEND_NOT_MINE;   /* unknown /dev entry: try FAT */
+}
+
+static long dev_stat(const char* abs_path, void* user_stat) {
+    const dev_driver_t* d = dev_lookup(abs_path);
+    if (d) {
+        kernel_stat_t st;
+        fill_kstat_as_chardev(&st, 1, d->ino);
+        st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
+    return BACKEND_NOT_MINE;
+}
+
+static long dev_access(const char* abs_path) {
+    return dev_lookup(abs_path) != NULL ? 0 : BACKEND_NOT_MINE;
+}
+
+/*
+ * The PROC backend's open, moved out of open_resolved: /proc and
+ * /proc/self dir slots, /proc/<pid> dir slots, the per-pid files,
+ * and the proc_lookup table entry.  Returns an fd, a negative
+ * errno, or BACKEND_NOT_MINE for an unknown /proc path, which the
+ * caller resolves to FAT.
+ */
+static long proc_open(const char* in_path, const char* local_path,
+                      int flags) {
+    (void)local_path; (void)flags;
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+    {
+        /*
+         * /proc and /proc/self are directories, not table
+         * entries.  A FILE_KIND_DIR slot is required so
+         * sys_getdents64's get_file_slot(fd, FILE_KIND_DIR)
+         * accepts the fd; the obj is SYNTH_DIR_SENTINEL rather
+         * than a DIR*, because there is no FatFs directory
+         * behind it.  put_file_slot knows not to f_closedir it.
+         *
+         * dir_path is still the absolute Unix-form path, so an
+         * *at() syscall with this fd as dirfd resolves relative
+         * names against /proc or /proc/self.
+         */
+        int is_proc_root = (in_path[0] == '/' && in_path[1] == 'p'
+                            && in_path[2] == 'r' && in_path[3] == 'o'
+                            && in_path[4] == 'c' && in_path[5] == '\0');
+        int is_proc_self = (in_path[0] == '/' && in_path[1] == 'p'
+                            && in_path[2] == 'r' && in_path[3] == 'o'
+                            && in_path[4] == 'c' && in_path[5] == '/'
+                            && in_path[6] == 's' && in_path[7] == 'e'
+                            && in_path[8] == 'l' && in_path[9] == 'f'
+                            && in_path[10] == '\0');
+        if (is_proc_root || is_proc_self) {
+            file_slot_t* dslot = NULL;
+            int dfd = alloc_file_slot(&dslot);
+            if (dfd == -1) return -(long)EIO_;
+            dslot->kind = FILE_KIND_DIR;
+            dslot->obj  = SYNTH_DIR_SENTINEL;
+            dslot->end  = 0;   /* readdir cursor: not yet drained */
+            size_t plen = 0;
+            while (in_path[plen]) plen++;
+            dslot->dir_path = (char*)kmalloc(plen + 1);
+            if (dslot->dir_path) {
+                for (size_t i = 0; i <= plen; i++)
+                    dslot->dir_path[i] = in_path[i];
+            }
+            FDTRACE({ serial_print("open  proc dir -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" path=");
+                      serial_print(in_path); });
+            return dfd;
+        }
+
+        /*
+         * /proc/<pid>/stat -- a per-pid synthesized file.  The
+         * pid is in the path, so it cannot be a fixed table key;
+         * parse it here and encode (pid, tag) in the slot's obj
+         * (see PROC_OBJ_MAKE).  Only "stat" today; "status" is
+         * the next commit and adds a second tail check.
+         */
+        {
+            const char* q = in_path;
+            /* must start with "/proc/" */
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                /*
+                 * The component is either a run of digits or the
+                 * literal "self".  "self" resolves to the process
+                 * doing the open, which is what Linux does -- the
+                 * kernel resolves it, not the caller.  libbb and
+                 * musl both open the literal string, and so does
+                 * the test.
+                 */
+                uint64_t pid = 0;
+                int ok_component = 0;
+                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
+                    pcb_t* me = process_get_current();
+                    if (me) { pid = me->pid; ok_component = 1; }
+                    q += 4;
+                } else {
+                    int ndig = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        pid = pid * 10 + (uint64_t)(*q - '0');
+                        q++; ndig++;
+                    }
+                    ok_component = (ndig > 0);
+                }
+                int is_stat = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
+                int is_status = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
+                    && q[6]=='s' && q[7]=='\0');
+                int is_cmdline = (ok_component
+                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
+                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
+                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
+                if (is_stat || is_status || is_cmdline) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    file_slot_t* sslot = NULL;
+                    int sfd = alloc_file_slot(&sslot);
+                    if (sfd == -1) return -(long)EIO_;
+                    sslot->kind = FILE_KIND_PROC;
+                    sslot->obj  = PROC_OBJ_MAKE(pid,
+                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                                   : is_status ? PROC_ENTRY_PID_STATUS
+                                               : PROC_ENTRY_PID_STAT);
+                    sslot->end  = 0;   /* read cursor: not yet drained */
+                    FDTRACE({ serial_print("open  proc ");
+                              serial_print(is_cmdline ? "cmdline"
+                                          : is_status ? "status"
+                                                      : "stat");
+                              serial_print(" -> fd=");
+                              serial_print_dec((uint64_t)sfd);
+                              serial_print(" pid=");
+                              serial_print_dec(pid); });
+                    return sfd;
+                }
+                /* /proc/<pid> itself: the per-pid directory.
+                 * realpath opens each component, so this must
+                 * succeed or realpath /proc/<pid>/<file> fails
+                 * at the intermediate.  obj is the sentinel
+                 * (a synthesized dir has no FatFs DIR*); the
+                 * pid is carried in dir_path, as for /proc and
+                 * /proc/self.  put_file_slot already skips
+                 * f_closedir for the sentinel and frees
+                 * dir_path, so no new case is needed there. */
+                int is_pid_dir = (ok_component && q[0] == '\0');
+                if (is_pid_dir) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    /* /proc/ + up to 20 digits + NUL. */
+                    char nbuf[24]; int t = 0; uint64_t v = pid;
+                    if (v == 0) nbuf[t++] = '0';
+                    else { while (v) { nbuf[t++] = (char)('0'+(v%10)); v/=10; } }
+                    size_t plen = 6 + (size_t)t;   /* "/proc/" + digits */
+                    char* dpath = (char*)kmalloc(plen + 1);
+                    if (!dpath) return -(long)ENOMEM_;
+                    dpath[0]='/'; dpath[1]='p'; dpath[2]='r';
+                    dpath[3]='o'; dpath[4]='c'; dpath[5]='/';
+                    for (int k = 0; k < t; k++) dpath[6 + k] = nbuf[t - 1 - k];
+                    dpath[plen] = '\0';
+                    file_slot_t* dslot = NULL;
+                    int dfd = alloc_file_slot(&dslot);
+                    if (dfd == -1) { kfree(dpath); return -(long)EIO_; }
+                    dslot->kind = FILE_KIND_DIR;
+                    dslot->obj  = SYNTH_DIR_SENTINEL;
+                    dslot->end  = 0;
+                    dslot->dir_path = dpath;
+                    FDTRACE({ serial_print("open  proc piddir -> fd=");
+                              serial_print_dec((uint64_t)dfd); });
+                    return dfd;
+                }
+            }
+        }
+
+        uint32_t entry = proc_lookup(in_path);
+        if (entry != PROC_ENTRY_NONE) {
+            file_slot_t* pslot = NULL;
+            int pfd = alloc_file_slot(&pslot);
+            if (pfd == -1) return -(long)EIO_;
+            pslot->kind = FILE_KIND_PROC;
+            pslot->obj  = (void*)(uintptr_t)entry;
+            pslot->end  = 0;   /* read cursor: not yet drained */
+            /* refcount is 1 from alloc_file_slot. */
+            FDTRACE({ serial_print("open  proc -> fd=");
+                      serial_print_dec((uint64_t)pfd);
+                      serial_print(" entry=");
+                      serial_print_dec((uint64_t)entry); });
+            return pfd;
+        }
+    }
+    return BACKEND_NOT_MINE;   /* unknown /proc entry: try FAT */
+}
+
+/*
+ * The PROC backend's stat, moved out of stat_resolved: the
+ * /proc, /proc/self, and /proc/<pid> dir cases (each with its
+ * identity ino), the per-pid stat/status/cmdline files, and the
+ * proc_lookup table entries.  Returns 0, a negative errno, or
+ * BACKEND_NOT_MINE for an unknown /proc path, which the caller
+ * resolves to FAT.
+ */
+static long proc_stat(const char* abs_path, void* user_stat) {
+    {
+        int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '\0');
+        int is_proc_self = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '/'
+                            && abs_path[6] == 's' && abs_path[7] == 'e'
+                            && abs_path[8] == 'l' && abs_path[9] == 'f'
+                            && abs_path[10] == '\0');
+
+        /*
+         * is_proc_pid_dir: "/proc/<digits>" or "/proc/<digits>/".
+         * Digits only -- "self" is handled above, and a name with
+         * any other character is not a per-pid directory.
+         */
+        int is_proc_pid_dir = 0;
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                int ndig = 0;
+                while (*q >= '0' && *q <= '9') { q++; ndig++; }
+                if (ndig > 0 && *q == '\0') is_proc_pid_dir = 1;
+                else if (ndig > 0 && q[0] == '/' && q[1] == '\0')
+                    is_proc_pid_dir = 1;
+            }
+        }
+
+        if (is_proc_root || is_proc_self || is_proc_pid_dir) {
+            uint64_t dino = is_proc_root ? PROC_INO_ROOT
+                          : is_proc_self ? PROC_INO_SELF
+                          : proc_ino(strtou64_after_proc(abs_path),
+                                     PROC_ENTRY_NONE);
+            kernel_stat_t st;
+            fill_kstat_as_dir(&st, dino);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        /*
+         * /proc/<pid>/stat: same pattern open_resolved accepts.
+         * Report a regular file with a plausible size.  The same
+         * minimal parse; "status" is the next commit.
+         */
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                /* Same component rule as open_resolved: digits or
+                 * the literal "self" (resolved to this process). */
+                uint64_t pid = 0;
+                int ok_component = 0;
+                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
+                    pcb_t* me = process_get_current();
+                    if (me) { pid = me->pid; ok_component = 1; }
+                    q += 4;
+                } else {
+                    int ndig = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        pid = pid * 10 + (uint64_t)(*q - '0');
+                        q++; ndig++;
+                    }
+                    ok_component = (ndig > 0);
+                }
+                int is_stat = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
+                int is_status = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
+                    && q[6]=='s' && q[7]=='\0');
+                int is_cmdline = (ok_component
+                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
+                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
+                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
+                if (is_stat || is_status || is_cmdline) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    uint32_t ptag = is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                                   : is_status ? PROC_ENTRY_PID_STATUS
+                                               : PROC_ENTRY_PID_STAT;
+                    kernel_stat_t st;
+                    fill_kstat_as_proc(&st, ptag, proc_ino(pid, ptag));
+                    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                        return -(long)EFAULT_;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        uint32_t entry = proc_lookup(abs_path);
+        if (entry != PROC_ENTRY_NONE) {
+            kernel_stat_t st;
+            fill_kstat_as_proc(&st, entry, PROC_INO_ENTRY_BASE + (uint64_t)entry);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+    }
+    return BACKEND_NOT_MINE;   /* unknown /proc entry: try FAT */
+}
+
+static long proc_access(const char* abs_path) {
+    return proc_lookup(abs_path) != PROC_ENTRY_NONE
+        ? 0 : BACKEND_NOT_MINE;
+}
+
+static long open_resolved(const char* in_path, int flags, int backend) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+
+    /*
+     * DEV backend.  The match is against the UNSTRIPPED resolved
+     * path (in_path), because dev_lookup expects the leading '/'
+     * form and the strip below has not run yet.
+     *
+     * If the path is a known device, return its slot and be done.
+     * If not -- "/dev/tty" before commit 4, "/dev" alone, or
+     * anything else under /dev -- fall through to the FAT path.
+     */
+    if (backend == BACKEND_DEV) {
+        long r = mount_driver(BACKEND_DEV)->open(in_path, NULL, flags);
+        if (r != BACKEND_NOT_MINE) return r;
+        /* Unknown /dev entry: fall through to FAT. */
+    }
+
+    /*
+     * PROC backend.  Same shape as DEV: match on the unstripped
+     * resolved path, return a FILE_KIND_PROC slot whose obj is the
+     * PROC_ENTRY_* value cast to a pointer, or fall through.
+     */
+    if (backend == BACKEND_PROC) {
+        long r = mount_driver(BACKEND_PROC)->open(in_path, NULL, flags);
+        if (r != BACKEND_NOT_MINE) return r;
+        /* Unknown /proc entry: fall through to FAT. */
+    }
+
+    char local_path[USER_PATH_MAX];
+    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    strip_dot_prefix(local_path);
+
+    return mount_driver(BACKEND_FAT)->open(in_path, local_path, flags);
+}
+
+/*
  * Linux x86_64 open(2) -- syscall 2.
  *
  * open(path, flags) is openat(AT_FDCWD, path, flags).  Both funnel
@@ -3059,7 +3758,7 @@ long sys_open(const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return open_resolved(resolved, flags, backend);
@@ -3087,7 +3786,7 @@ long sys_openat(int dirfd, const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return open_resolved(resolved, flags, backend);
@@ -3312,31 +4011,20 @@ long sys_dup(int fd) {
  * the line that turns into a hang, and the fix is a lock or a
  * per-volume flag, not cli.
  */
-static long unlink_body(const char* in_path, int want_dir,
-                        const char* tag) {
-    char local_path[USER_PATH_MAX];
-    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
-    strip_dot_prefix(local_path);
-
-    /* The root is a directory that cannot be removed, whatever the
-     * caller meant.  Synthesize the answer rather than handing "."
-     * or "0:/" to f_stat, which rejects them.  No shared state is
-     * touched, so this runs before the critical section. */
-    if (path_is_root(local_path)) {
-        return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
-    }
-
-    /* --- critical section: stat and unlink must be atomic --- */
+/*
+ * The FatFs unlink operation: stat-then-unlink, one critical
+ * section, moved verbatim out of unlink_body so a mount handler
+ * can reach it.  The pushfq/cli ... pushq/popfq save/restore on
+ * every path is the original and MUST NOT be altered here: that
+ * is contract VFS rule 1 (check and act are one critical section)
+ * and it is why rm and rmdir are race-free against a timer IRQ.
+ * A change to it is a separate commit with its own soak.
+ */
+static long fat_unlink_body(const char* local_path, int want_dir,
+                            const char* tag) {
     uint64_t saved_flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
 
-    /*
-     * Type check.  f_stat_with_retry resolves bare names the same
-     * way stat does, so `rm foo` and `rmdir foo` see the same object
-     * the caller would stat.
-     */
     FILINFO fno;
     FRESULT sr = f_stat_with_retry(local_path, &fno);
     if (sr != FR_OK) {
@@ -3369,6 +4057,25 @@ static long unlink_body(const char* in_path, int want_dir,
     return 0;
 }
 
+static long unlink_body(const char* in_path, int want_dir,
+                        const char* tag, int backend) {
+    char local_path[USER_PATH_MAX];
+    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    strip_dot_prefix(local_path);
+
+    /* The root is a directory that cannot be removed, whatever the
+     * caller meant.  Synthesize the answer rather than handing "."
+     * or "0:/" to f_stat, which rejects them.  No shared state is
+     * touched, so this runs before the critical section. */
+    if (path_is_root(local_path)) {
+        return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
+    }
+
+    return mount_driver(backend)->unlink(in_path, want_dir, tag);
+}
+
 /*
  * Linux x86_64 unlink(2) -- syscall 87.
  *
@@ -3392,11 +4099,10 @@ long sys_unlink(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return unlink_body(resolved, 0, "sys_unlink");
+    return unlink_body(resolved, 0, "sys_unlink", backend);
 }
 
 /*
@@ -3423,11 +4129,10 @@ long sys_rmdir(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return unlink_body(resolved, 1, "sys_rmdir");
+    return unlink_body(resolved, 1, "sys_rmdir", backend);
 }
 
 /*
@@ -3467,12 +4172,11 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
-    (void)backend;
 
     int want_dir = (flags & AT_REMOVEDIR_) != 0;
-    return unlink_body(resolved, want_dir, "sys_unlinkat");
+    return unlink_body(resolved, want_dir, "sys_unlinkat", backend);
 }
 
 /*
@@ -3511,6 +4215,22 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
  * resolved path overflows, otherwise the FatFs errno mapping
  * (FR_NO_FILE -> -ENOENT, FR_EXIST -> -EPERM, etc.).
  */
+/* The FatFs rename operation, moved out of sys_rename.  Takes the
+ * already-stripped FatFs-form paths. */
+static long fat_rename(const char* old_path, const char* new_path) {
+    FRESULT r = f_rename(old_path, new_path);
+    if (r != FR_OK) {
+        serial_print("sys_rename: f_rename FAIL old=");
+        serial_print(old_path);
+        serial_print(" new=");
+        serial_print(new_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 long sys_rename(const char* user_oldpath, const char* user_newpath) {
     pcb_t* self = process_get_current();
     if (!self || !user_oldpath || !user_newpath) return -(long)EFAULT_;
@@ -3533,12 +4253,13 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
      * resolver as every other path syscall; the tag is unused
      * here and discarded. */
     int backend;
-    int rr = resolve_at(AT_FDCWD_, old_path, old_resolved,
-                        sizeof(old_resolved), &backend);
+    /* rename operates on both entries, not their targets: 0. */
+    int rr = vfs_resolve(AT_FDCWD_, old_path, old_resolved,
+                        sizeof(old_resolved), &backend, 0);
     if (rr != 0) return rr;
     (void)backend;
-    rr = resolve_at(AT_FDCWD_, new_path, new_resolved,
-                    sizeof(new_resolved), &backend);
+    rr = vfs_resolve(AT_FDCWD_, new_path, new_resolved,
+                    sizeof(new_resolved), &backend, 0);
     if (rr != 0) return rr;
     (void)backend;
 
@@ -3564,17 +4285,7 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
     strip_dot_prefix(old_path);
     strip_dot_prefix(new_path);
 
-    FRESULT r = f_rename(old_path, new_path);
-    if (r != FR_OK) {
-        serial_print("sys_rename: f_rename FAIL old=");
-        serial_print(old_path);
-        serial_print(" new=");
-        serial_print(new_path);
-        serial_print(" r="); serial_print_dec(r);
-        serial_print("\n");
-        return fatfs_errno(r);
-    }
-    return 0;
+    return mount_driver(backend)->rename(old_path, new_path);
 }
 
 /*
@@ -3613,6 +4324,15 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
  * ever needs -EEXIST, change fatfs_errno's FR_EXIST case to
  * -(long)17 at that time.
  */
+/* The FatFs mkdir operation, moved out of sys_mkdir. */
+static long fat_mkdir(const char* local_path) {
+    FRESULT r = f_mkdir(local_path);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 long sys_mkdir(const char* path, int mode) {
     (void)mode;
 
@@ -3625,8 +4345,8 @@ long sys_mkdir(const char* path, int mode) {
         return -(long)EFAULT_;
     }
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local_path, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local_path, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
     {
@@ -3647,11 +4367,7 @@ long sys_mkdir(const char* path, int mode) {
         return -(long)ENOENT_;
     }
 
-    FRESULT r = f_mkdir(local_path);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
-    }
-    return 0;
+    return mount_driver(backend)->mkdir(local_path);
 }
 
 /*
@@ -3687,6 +4403,35 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
     }
 }
 
+/*
+ * The FatFs fstat operation, moved out of sys_fstat_body.  Given
+ * an open file or directory slot, produce and copy the kstat.
+ * FatFs has no f_stat-on-an-open-FIL, so size comes from f_size()
+ * and the DIR-vs-FILE bit from the slot kind.
+ */
+static long fat_fstat(file_slot_t* slot, kernel_stat_t* st,
+                      void* user_stat) {
+    FILINFO fno;
+    for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+    if (slot->kind == FILE_KIND_FILE) {
+        FIL* f = (FIL*)slot->obj;
+        fno.fsize   = (FSIZE_t)f_size(f);
+        fno.fattrib = 0;   /* not AM_DIR */
+    } else if (slot->kind == FILE_KIND_DIR) {
+        fno.fattrib = AM_DIR;
+        fno.fsize   = 0;
+    } else {
+        return -(long)EBADF_;
+    }
+
+    fill_kstat_from_filinfo(st, &fno);
+
+    if (safe_copy_to_user(user_stat, st, sizeof(*st)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 static long sys_fstat_body(int fd, void* user_stat) {
     if (!user_stat) return -(long)EFAULT_;
 
@@ -3711,11 +4456,11 @@ static long sys_fstat_body(int fd, void* user_stat) {
         return 0;
     }
 
-    if (slot->kind == FILE_KIND_DEV_NULL) {
-        /* Character device, like Linux's /dev/null.  Nothing calls
-         * fstat on an open devnull fd yet; this keeps the answer
-         * correct if something does. */
-        fill_kstat_as_chardev(&st, 1, 2);
+    if (slot->kind == FILE_KIND_DEV) {
+        const dev_driver_t* d = (const dev_driver_t*)slot->obj;
+        if (!d) return -(long)EBADF_;
+        fill_kstat_as_chardev(&st, 1, d->ino);
+        st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
@@ -3725,38 +4470,47 @@ static long sys_fstat_body(int fd, void* user_stat) {
     if (slot->kind == FILE_KIND_PROC) {
         /* Synthesized file: report S_IFREG | 0444, st_size is the
          * entry's maximum text length (see proc_entry_size). */
-        uint32_t entry = (uint32_t)(uintptr_t)slot->obj;
-        fill_kstat_as_proc(&st, entry);
+        uint32_t entry = PROC_OBJ_TAG(slot->obj);
+        uint64_t pino = PROC_OBJ_PID(slot->obj)
+            ? proc_ino(PROC_OBJ_PID(slot->obj), entry)
+            : PROC_INO_ENTRY_BASE + (uint64_t)entry;
+        fill_kstat_as_proc(&st, entry, pino);
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
         return 0;
     }
 
-    if (slot->kind == FILE_KIND_FILE) {
-        FIL* f = (FIL*)slot->obj;
-        /*
-         * FatFs does not expose an f_stat-on-an-open-FIL.  The
-         * information we need is available directly from the FIL:
-         * f_size() for the byte size, and the file is by definition
-         * not a directory.  Fill the FILINFO fields we use and let
-         * fill_kstat_from_filinfo do the rest.
-         */
-        fno.fsize   = (FSIZE_t)f_size(f);
-        fno.fattrib = 0;   /* not AM_DIR */
-    } else if (slot->kind == FILE_KIND_DIR) {
-        fno.fattrib = AM_DIR;
-        fno.fsize   = 0;
-    } else {
-        return -(long)EBADF_;
+    /*
+     * A synthesized /proc directory (/proc, /proc/self,
+     * /proc/<pid>): report the SAME (st_dev, st_ino) and mode
+     * that stat_resolved reports for the same path.  realpath
+     * fstats the fd it opened and compares the identity against
+     * the stat it did on the path; if they disagree it rejects
+     * the component.  The generic FILE_KIND_DIR branch below
+     * calls fill_kstat_from_filinfo, which reports (0,0) --
+     * correct for a FAT dir, wrong for a synthesized one.
+     */
+    if (slot->kind == FILE_KIND_DIR && slot->obj == SYNTH_DIR_SENTINEL) {
+        const char* dp = slot->dir_path ? slot->dir_path : "/proc";
+        uint64_t dino = PROC_INO_ROOT;
+        if (dp[0]=='/' && dp[1]=='p' && dp[2]=='r' && dp[3]=='o'
+            && dp[4]=='c' && dp[5]=='/' && dp[6]=='s' && dp[7]=='e'
+            && dp[8]=='l' && dp[9]=='f' && dp[10]=='\0') {
+            dino = PROC_INO_SELF;
+        } else {
+            uint64_t dpid = strtou64_after_proc(dp);
+            if (dpid) dino = proc_ino(dpid, PROC_ENTRY_NONE);
+        }
+        fill_kstat_as_dir(&st, dino);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
     }
 
-    fill_kstat_from_filinfo(&st, &fno);
-
-    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -(long)EFAULT_;
-    }
-    return 0;
+    /* FAT file or directory: the FatFs fstat. */
+    return fat_fstat(slot, &st, user_stat);
 }
 
 /*
@@ -3825,8 +4579,29 @@ static FRESULT f_stat_with_retry(const char* path, FILINFO* out_fno) {
  * without touching FatFs.  Before commit 2, the DEV decision was
  * made by path_is_devnull(); the PROC decision is new in commit 3.
  */
+/*
+ * The FatFs stat operation, moved out of stat_resolved.  Takes a
+ * stripped FatFs-form path, stats it, fills and copies the kstat.
+ * Returns 0 or a negative errno.
+ */
+static long fat_stat_path(const char* path, void* user_stat) {
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+
+    kernel_stat_t st;
+    fill_kstat_from_filinfo(&st, &fno);
+
+    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 static long stat_resolved(const char* abs_path, void* user_stat,
-                          int backend) {
+                          int backend, int follow_final) {
     if (!user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
@@ -3860,166 +4635,39 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      * -ENOENT for unknown /dev paths before commit 2 as well.
      */
     if (backend == BACKEND_DEV) {
-        uint32_t kind = dev_lookup(abs_path);
-        if (kind == FILE_KIND_DEV_NULL) {
-            kernel_stat_t st;
-            fill_kstat_as_chardev(&st, 1, 2);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
-        if (kind == FILE_KIND_DEV_CHAR) {
-            /* /dev/console: S_IFCHR, (st_dev, st_ino) = (1, 1),
-             * matching the console sentinel's fstat. */
-            kernel_stat_t st;
-            fill_kstat_as_chardev(&st, 1, 1);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
+        long r = mount_driver(BACKEND_DEV)->stat(abs_path, user_stat);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
-    /*
-     * PROC backend.  Same shape as DEV.
-     */
+    /* PROC backend.  Same shape as DEV. */
     if (backend == BACKEND_PROC) {
-        /*
-         * /proc, /proc/self, and /proc/<pid> report as
-         * directories.  The first two are the paths
-         * open_resolved accepts; /proc/<pid> is here because
-         * libbb's procps_scan stats it, not opens it.
-         *
-         * procps_scan (with PSSCAN_UIDGID, which ps's default
-         * flag set and pstree's both have) builds "/proc/<pid>/"
-         * -- with a trailing slash -- and calls stat() on it:
-         *
-         *     if (stat(filename, &sb)) continue;
-         *
-         * If that stat fails, every entry is skipped, which is
-         * exactly the "header but no rows" symptom.  The bare
-         * pid form is accepted too, because a caller may stat
-         * either.
-         *
-         * This commit handles stat only.  open("/proc/<pid>")
-         * is the follow-up; ps does not need it.
-         */
-        int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
-                            && abs_path[2] == 'r' && abs_path[3] == 'o'
-                            && abs_path[4] == 'c' && abs_path[5] == '\0');
-        int is_proc_self = (abs_path[0] == '/' && abs_path[1] == 'p'
-                            && abs_path[2] == 'r' && abs_path[3] == 'o'
-                            && abs_path[4] == 'c' && abs_path[5] == '/'
-                            && abs_path[6] == 's' && abs_path[7] == 'e'
-                            && abs_path[8] == 'l' && abs_path[9] == 'f'
-                            && abs_path[10] == '\0');
-
-        /*
-         * is_proc_pid_dir: "/proc/<digits>" or "/proc/<digits>/".
-         * Digits only -- "self" is handled above, and a name with
-         * any other character is not a per-pid directory.
-         */
-        int is_proc_pid_dir = 0;
-        {
-            const char* q = abs_path;
-            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
-                && q[4]=='c' && q[5]=='/') {
-                q += 6;
-                int ndig = 0;
-                while (*q >= '0' && *q <= '9') { q++; ndig++; }
-                if (ndig > 0 && *q == '\0') is_proc_pid_dir = 1;
-                else if (ndig > 0 && q[0] == '/' && q[1] == '\0')
-                    is_proc_pid_dir = 1;
-            }
-        }
-
-        if (is_proc_root || is_proc_self || is_proc_pid_dir) {
-            kernel_stat_t st;
-            fill_kstat_as_dir(&st);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
-        /*
-         * /proc/<pid>/stat: same pattern open_resolved accepts.
-         * Report a regular file with a plausible size.  The same
-         * minimal parse; "status" is the next commit.
-         */
-        {
-            const char* q = abs_path;
-            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
-                && q[4]=='c' && q[5]=='/') {
-                q += 6;
-                /* Same component rule as open_resolved: digits or
-                 * the literal "self" (resolved to this process). */
-                uint64_t pid = 0;
-                int ok_component = 0;
-                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
-                    pcb_t* me = process_get_current();
-                    if (me) { pid = me->pid; ok_component = 1; }
-                    q += 4;
-                } else {
-                    int ndig = 0;
-                    while (*q >= '0' && *q <= '9') {
-                        pid = pid * 10 + (uint64_t)(*q - '0');
-                        q++; ndig++;
-                    }
-                    ok_component = (ndig > 0);
-                }
-                int is_stat = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
-                int is_status = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
-                    && q[6]=='s' && q[7]=='\0');
-                int is_cmdline = (ok_component
-                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
-                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
-                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
-                if (is_stat || is_status || is_cmdline) {
-                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
-                    kernel_stat_t st;
-                    fill_kstat_as_proc(&st,
-                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
-                                   : is_status ? PROC_ENTRY_PID_STATUS
-                                               : PROC_ENTRY_PID_STAT);
-                    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                        return -(long)EFAULT_;
-                    }
-                    return 0;
-                }
-            }
-        }
-
-        uint32_t entry = proc_lookup(abs_path);
-        if (entry != PROC_ENTRY_NONE) {
-            kernel_stat_t st;
-            fill_kstat_as_proc(&st, entry);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
+        long r = mount_driver(BACKEND_PROC)->stat(abs_path, user_stat);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
-    FILINFO fno;
-    FRESULT r = f_stat_with_retry(path, &fno);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
+    /*
+     * A DONIX_LINK marker with follow_final == 0 (lstat): report
+     * S_IFLNK with st_size = target length.  follow_final == 1
+     * already followed in vfs_resolve, so the path is the target
+     * and this does not apply.
+     */
+    if (!follow_final && backend == BACKEND_FAT) {
+        char tgt[DONIX_LINK_MAX];
+        if (donix_link_target(path, tgt, sizeof(tgt))) {
+            size_t tlen = 0;
+            while (tgt[tlen]) tlen++;
+            kernel_stat_t st;
+            fill_kstat_as_link(&st, tlen);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
     }
 
-    kernel_stat_t st;
-    fill_kstat_from_filinfo(&st, &fno);
-
-    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-        return -(long)EFAULT_;
-    }
-    return 0;
+    return mount_driver(BACKEND_FAT)->stat(path, user_stat);
 }
 
 /*
@@ -4082,10 +4730,12 @@ long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved),
+                         &backend, follow_final);
     if (rr != 0) return rr;
 
-    return stat_resolved(resolved, user_stat, backend);
+    return stat_resolved(resolved, user_stat, backend, follow_final);
 }
 
 /*
@@ -4132,6 +4782,20 @@ long sys_lstat(const char* user_path, void* user_stat) {
  * entry "exists" and returns 0 without touching FatFs; an unknown
  * /dev or /proc path falls through, as before.
  */
+/*
+ * The FatFs access operation, moved out of access_resolved.  A
+ * path exists on FAT iff f_stat succeeds; donix tracks no UNIX
+ * permission bits, so the mode is irrelevant.
+ */
+static long fat_access(const char* path) {
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 static long access_resolved(const char* abs_path, int backend) {
     char path[USER_PATH_MAX];
     if (path_copy(path, sizeof(path), abs_path) != 0) {
@@ -4152,26 +4816,19 @@ static long access_resolved(const char* abs_path, int backend) {
 
     /* DEV backend: a known device exists. */
     if (backend == BACKEND_DEV) {
-        if (dev_lookup(abs_path) != 0) {
-            return 0;
-        }
+        long r = mount_driver(BACKEND_DEV)->access(abs_path);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
     /* PROC backend: a known entry exists. */
     if (backend == BACKEND_PROC) {
-        if (proc_lookup(abs_path) != PROC_ENTRY_NONE) {
-            return 0;
-        }
+        long r = mount_driver(BACKEND_PROC)->access(abs_path);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
-    FILINFO fno;
-    FRESULT r = f_stat_with_retry(path, &fno);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
-    }
-    return 0;
+    return mount_driver(BACKEND_FAT)->access(path);
 }
 
 /*
@@ -4205,8 +4862,8 @@ long sys_access(const char* user_path, int mode) {
         return -(long)EFAULT_;
     }
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     return access_resolved(resolved, backend);
 }
@@ -4247,6 +4904,7 @@ long sys_access(const char* user_path, int mode) {
  * AT_EACCESS set, saw the wrong resolution.
  */
 long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
     (void)mode;
     (void)flags;
 
@@ -4259,7 +4917,7 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4298,6 +4956,7 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
  */
 long sys_utimensat(int dirfd, const char* path, const void* times,
                    int flags) {
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
     (void)times;
 
     if (!path) return -(long)EFAULT_;
@@ -4324,7 +4983,7 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4380,11 +5039,88 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
  *            -ENOENT for a missing path, -EFAULT for a bad user
  *            pointer, -ENAMETOOLONG for an over-long path.
  *
- * The path is resolved with resolve_at(AT_FDCWD, ...) so it obeys
+ * The path is resolved with vfs_resolve(AT_FDCWD, ...) so it obeys
  * the process cwd, exactly as sys_unlink and sys_access do.  No
  * dirfd: readlink(2) has none (readlinkat(2), 267, is the dirfd
  * form, and donix does not implement it).
  */
+/*
+ * A symbolic link on donix is an ordinary FAT file whose first
+ * line is "DONIX_LINK:<target>\n".  FAT has no symlink bit, so
+ * the marker lives in the file content; this helper reads it.
+ * Returns 1 and copies the target into out, or 0 if the file is
+ * not a marker.  The target is stored verbatim: a relative one
+ * resolves against the link's own directory at follow time.
+ */
+#define DONIX_LINK_PREFIX "DONIX_LINK:"
+static int donix_link_target(const char* fat_path,
+                             char* out, size_t cap) {
+    FIL f;
+    if (f_open(&f, fat_path, FA_READ) != FR_OK) return 0;
+    char buf[DONIX_LINK_MAX + 1];
+    UINT got = 0;
+    FRESULT fr = f_read(&f, buf, DONIX_LINK_MAX, &got);
+    f_close(&f);
+    if (fr != FR_OK || got < 11) return 0;
+    const char* pfx = DONIX_LINK_PREFIX;
+    for (int i = 0; i < 11; i++) if (buf[i] != pfx[i]) return 0;
+    size_t n = 0;
+    for (UINT i = 11; i < got && buf[i] != '\n'; i++) {
+        if (n + 1 >= cap) return 0;
+        out[n++] = buf[i];
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+/*
+ * Linux x86_64 symlink(2) -- syscall 88.
+ *
+ * Creates a symbolic link by writing a DONIX_LINK marker file.
+ * The target is stored verbatim; a relative target resolves
+ * against the link's directory when followed.  The link path
+ * must not already exist (FA_CREATE_NEW -> -EEXIST), as Unix.
+ */
+long sys_symlink(const char* user_target, const char* user_linkpath) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_target || !user_linkpath) return -(long)EFAULT_;
+
+    char target[DONIX_LINK_MAX];
+    char linkpath[USER_PATH_MAX];
+    if (copy_user_string(target, sizeof(target), user_target) != 0)
+        return -(long)EFAULT_;
+    if (copy_user_string(linkpath, sizeof(linkpath), user_linkpath) != 0)
+        return -(long)EFAULT_;
+
+    char resolved[USER_PATH_MAX];
+    int backend;
+    int rr = vfs_resolve(AT_FDCWD_, linkpath, resolved,
+                         sizeof(resolved), &backend, 0);
+    if (rr != 0) return rr;
+
+    char fat_path[USER_PATH_MAX];
+    if (path_copy(fat_path, sizeof(fat_path), resolved) != 0)
+        return -(long)ENAMETOOLONG_;
+    strip_dot_prefix(fat_path);
+
+    FIL f;
+    FRESULT fr = f_open(&f, fat_path, FA_WRITE | FA_CREATE_NEW);
+    if (fr != FR_OK) return fatfs_errno(fr);
+
+    char line[DONIX_LINK_MAX + 16];
+    size_t n = 0;
+    const char* pfx = DONIX_LINK_PREFIX;
+    while (*pfx) line[n++] = *pfx++;
+    for (size_t i = 0; target[i]; i++) line[n++] = target[i];
+    line[n++] = '\n';
+
+    UINT wrote = 0;
+    fr = f_write(&f, line, (UINT)n, &wrote);
+    f_close(&f);
+    if (fr != FR_OK || wrote != (UINT)n) return -(long)EIO_;
+    return 0;
+}
+
 long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     if (!user_path || !buf) return -(long)EFAULT_;
 
@@ -4395,7 +5131,7 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
 
     /*
@@ -4408,12 +5144,49 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     if (backend == BACKEND_PROC) {
         long rl = proc_readlink(resolved, buf, bufsiz);
         if (rl != PROC_READLINK_NOT_MINE) return rl;
+        /*
+         * Not a self/fd symlink.  Answer existence exactly from
+         * the same shape helper sys_chdir uses: a live synthesized
+         * entry exists and is not a link (-EINVAL, which is what
+         * musl's realpath keys on to mean "descend"); a
+         * well-formed but dead /proc/<pid> does not exist
+         * (-ENOENT).  The previous fallthrough went through
+         * access_resolved, which does not know the synthesized
+         * shapes and returned -ENOENT for live entries too, so
+         * realpath aborted at the first /proc component.
+         */
+        switch (proc_entry_shape(resolved)) {
+        case PROC_SHAPE_DIR_LIVE:
+        case PROC_SHAPE_FILE_LIVE:
+            return -(long)EINVAL_;
+        case PROC_SHAPE_DIR_DEAD:
+        case PROC_SHAPE_FILE_DEAD:
+            return -(long)ENOENT_;
+        default:
+            break;   /* not a synthesized shape: fall through */
+        }
+    }
+
+    /* A DONIX_LINK marker: readlink returns its target. */
+    if (backend == BACKEND_FAT) {
+        char fat_path[USER_PATH_MAX];
+        if (path_copy(fat_path, sizeof(fat_path), resolved) == 0) {
+            strip_dot_prefix(fat_path);
+            char tgt[DONIX_LINK_MAX];
+            if (donix_link_target(fat_path, tgt, sizeof(tgt))) {
+                size_t tlen = 0;
+                while (tgt[tlen]) tlen++;
+                if (tlen > bufsiz) return -(long)EINVAL_;
+                if (safe_copy_to_user(buf, tgt, tlen) != 0) {
+                    return -(long)EFAULT_;
+                }
+                return (long)tlen;
+            }
+        }
     }
 
     /* Validate the path exists, so a missing path is -ENOENT and a
-     * present one is -EINVAL (not a symlink).  access_resolved does
-     * exactly this check and returns 0 / -ENOENT; reuse its shape
-     * rather than duplicating the root-alias and stat logic. */
+     * present one is -EINVAL (not a symlink). */
     long exists = access_resolved(resolved, backend);
     if (exists != 0) return exists;   /* -ENOENT, or -ENAMETOOLONG */
 
@@ -4653,8 +5426,8 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     {
         char resolved[USER_PATH_MAX];
         int backend;
-        int rr = resolve_at(AT_FDCWD_, path, resolved,
-                            sizeof(resolved), &backend);
+        int rr = vfs_resolve(AT_FDCWD_, path, resolved,
+                            sizeof(resolved), &backend, 1);
         if (rr != 0) {
             __asm__ volatile("sti");
             return rr;
@@ -5396,6 +6169,65 @@ long sys_wait4(long pid, int* user_status, int options) {
 // ============================================================
 // IO
 // ============================================================
+/*
+ * The console write/read implementation, shared by fds 0/1/2 (a
+ * FILE_KIND_CONSOLE slot) and /dev/tty and /dev/console (a
+ * FILE_KIND_DEV slot whose row points here).  One implementation,
+ * three callers.
+ *
+ * The bodies are moved verbatim from sys_write's fd-1/2 branch and
+ * sys_read's fd-0 branch.  The cli/sti/hlt sequence, the pid-1
+ * branch, and the nine-register save in console_read are the
+ * original and MUST NOT be altered here: that is the blocking
+ * discipline this project has paid for races in (the C, the pipe
+ * lost-wakeup).  A change to those lines is a different commit
+ * with its own soak, not a side effect of sharing the code.
+ */
+static long console_write(const void* buf, size_t count) {
+    size_t remaining = count;
+    const uint8_t* user_ptr = (const uint8_t*)buf;
+    while (remaining > 0) {
+        size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
+        if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
+            return -(long)EFAULT_;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            char c = g_write_bounce[i];
+            serial_putc(c); vga_putc(c);
+        }
+        user_ptr += chunk; remaining -= chunk;
+    }
+    return (long)count;
+}
+
+static long console_read(void* buf, size_t count) {
+    pcb_t* self = process_get_current();
+    char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
+    while (bytes_read < count) {
+        __asm__ volatile("cli");
+        if (kbd_buffer_get_mux(&c)) {
+            __asm__ volatile("sti");
+            if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
+            else return -(long)EFAULT_;
+            break;
+        }
+        if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
+        self->state = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_NONE;
+        __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+        __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+        __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+        __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+        __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+        __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+        __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+        __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+        __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+        __asm__ volatile("sti"); __asm__ volatile("hlt");
+    }
+    return (long)bytes_read;
+}
+
 long sys_write(int fd, const void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
@@ -5420,31 +6252,21 @@ long sys_write(int fd, const void* buf, size_t count) {
      */
     file_slot_t* std_slot = get_file_slot_any(fd);
 
-    /* /dev/null: accept and discard.  Returns count, as Linux does
-     * for a successful write to /dev/null. */
+    /* Character device: dispatch through the row's write.  For
+     * /dev/null this accepts and discards, returning count, as
+     * Linux does. */
     {
         file_slot_t* dn = get_file_slot_any(fd);
-        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
-            return (long)count;
+        if (dn && dn->kind == FILE_KIND_DEV) {
+            const dev_driver_t* d = (const dev_driver_t*)dn->obj;
+            if (!d || !d->write) return -(long)EBADF_;
+            return d->write(buf, count);
         }
     }
 
     if ((fd == 1 || fd == 2) &&
         (!std_slot || std_slot->kind == FILE_KIND_CONSOLE)) {
-        size_t remaining = count;
-        const uint8_t* user_ptr = (const uint8_t*)buf;
-        while (remaining > 0) {
-            size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
-            if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
-                return -(long)EFAULT_;
-            }
-            for (size_t i = 0; i < chunk; i++) {
-                char c = g_write_bounce[i];
-                serial_putc(c); vga_putc(c);
-            }
-            user_ptr += chunk; remaining -= chunk;
-        }
-        return (long)count;
+        return console_write(buf, count);
     }
 
     /*
@@ -5851,8 +6673,10 @@ long sys_read(int fd, void* buf, size_t count) {
      * paths so a devnull slot is never mistaken for either. */
     {
         file_slot_t* dn = get_file_slot_any(fd);
-        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
-            return 0;
+        if (dn && dn->kind == FILE_KIND_DEV) {
+            const dev_driver_t* d = (const dev_driver_t*)dn->obj;
+            if (!d || !d->read) return -(long)EBADF_;
+            return d->read(buf, count);
         }
     }
 
@@ -5955,58 +6779,7 @@ long sys_read(int fd, void* buf, size_t count) {
 
     if (fd == 0 &&
         (!fd0_slot || fd0_slot->kind == FILE_KIND_CONSOLE)) {
-        char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
-        while (bytes_read < count) {
-            __asm__ volatile("cli");
-            if (kbd_buffer_get_mux(&c)) {
-                __asm__ volatile("sti");
-                if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
-                else return -(long)EFAULT_;
-                /*
-                 * Return as soon as at least one byte has been copied.
-                 *
-                 * POSIX read(2) on a terminal returns when at least
-                 * one byte is available; it does not block until
-                 * count bytes have been accumulated.  The previous
-                 * behavior (loop until bytes_read == count) made
-                 * musl's read(0, line, 255) wait for 255 keystrokes
-                 * before returning, which is not how any Unix
-                 * program expects stdin to behave.  The newlib
-                 * shell never noticed because it reads 1 byte at a
-                 * time (count == 1), so the loop exited on the
-                 * first byte anyway.
-                 *
-                 * The byte is NOT echoed here.  Users of this path
-                 * that want their input echoed (musl_sh, the kernel
-                 * shell) do the echoing themselves.  busybox ash
-                 * with FEATURE_EDITING=y also echoes itself via
-                 * lineedit.c.  Echoing here as well would
-                 * double-echo every keystroke for whichever of
-                 * those programs was currently reading.
-                 */
-                break;
-            }
-            if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
-            self->state = PROC_STATE_BLOCKED;
-            self->block_kind = BLOCK_KIND_NONE;
-            /* PROBE (session 61): save the live caller-saved
-             * registers before halting, so the ring-0 resume
-             * restores them instead of the stale pcb slots.
-             * See context-switch-block-design.md. */
-            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
-            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
-            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
-            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
-            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
-            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
-            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
-            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
-            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
-
-
-            __asm__ volatile("sti"); __asm__ volatile("hlt");
-        }
-        return (long)bytes_read;
+        return console_read(buf, count);
     }
 
     /*
@@ -6840,6 +7613,66 @@ long sys_getcwd(char* buf, unsigned long size) {
 #define ENOTDIR_ 20
 #endif
 
+/*
+ * What shape a resolved /proc path is.  One definition, three
+ * callers (sys_chdir, sys_readlink, and any future one), so the
+ * "is this /proc/<pid>" test cannot drift between syscalls.
+ *
+ * NONE       not a synthesized /proc path (FAT, DEV, etc.)
+ * DIR_LIVE   /proc, /proc/self, /proc/<live pid>  -- a directory
+ * DIR_DEAD   /proc/<dead pid>                     -- well-formed
+ * FILE_LIVE  /proc/<live pid>/{stat,status,cmdline}
+ * FILE_DEAD  /proc/<dead pid>/{stat,status,cmdline}
+ *
+ * A path of the shape /proc/x/y that is neither a known file nor
+ * a pid is NONE; the caller falls through to FatFs, which is
+ * what produced ENOENT for unknown /proc paths before the seam.
+ */
+
+static enum proc_shape proc_entry_shape(const char* r) {
+    if (!r) return PROC_SHAPE_NONE;
+    if (!(r[0]=='/' && r[1]=='p' && r[2]=='r' && r[3]=='o'
+          && r[4]=='c')) return PROC_SHAPE_NONE;
+    if (r[5] == '\0') return PROC_SHAPE_DIR_LIVE;   /* /proc */
+    if (r[5] != '/') return PROC_SHAPE_NONE;
+
+    const char* c = r + 6;
+    uint64_t pid = 0;
+    int is_self = (c[0]=='s' && c[1]=='e' && c[2]=='l'
+                   && c[3]=='f');
+    if (is_self) {
+        pcb_t* me = process_get_current();
+        if (!me) return PROC_SHAPE_NONE;
+        pid = me->pid;
+        c += 4;
+    } else {
+        int ndig = 0;
+        while (*c >= '0' && *c <= '9') {
+            pid = pid * 10 + (uint64_t)(*c - '0');
+            c++; ndig++;
+        }
+        if (ndig == 0) return PROC_SHAPE_NONE;
+    }
+
+    int live = process_find_by_pid(pid) != NULL;
+
+    if (c[0] == '\0') {
+        return live ? PROC_SHAPE_DIR_LIVE : PROC_SHAPE_DIR_DEAD;
+    }
+    if (c[0] != '/') return PROC_SHAPE_NONE;
+    c++;
+    int is_stat = (c[0]=='s' && c[1]=='t' && c[2]=='a'
+                   && c[3]=='t' && c[4]=='\0');
+    int is_status = (c[0]=='s' && c[1]=='t' && c[2]=='a'
+                     && c[3]=='t' && c[4]=='u' && c[5]=='s'
+                     && c[6]=='\0');
+    int is_cmdline = (c[0]=='c' && c[1]=='m' && c[2]=='d'
+                      && c[3]=='l' && c[4]=='i' && c[5]=='n'
+                      && c[6]=='e' && c[7]=='\0');
+    if (!(is_stat || is_status || is_cmdline)) return PROC_SHAPE_NONE;
+    return live ? PROC_SHAPE_FILE_LIVE : PROC_SHAPE_FILE_DEAD;
+}
+
 long sys_chdir(const char* user_path) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) return -(long)EFAULT_;
@@ -6881,10 +7714,40 @@ long sys_chdir(const char* user_path) {
      */
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, path, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, path, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
+
+    /*
+     * chdir: synthesized PROC directory.
+     *
+     * A /proc, /proc/self, or /proc/<pid> path is a directory
+     * by stat_resolved's PROC branch, but it has no FatFs DIR*
+     * and no FAT directory entry, so the f_stat_with_retry
+     * validation below would call f_stat("proc") and get
+     * FR_NO_PATH -> ENOENT.  Trust the same three shapes
+     * stat_resolved trusts, store the resolved absolute path
+     * as cwd, and skip FatFs.  /proc/<pid>/<file> is a FILE
+     * and must not be accepted here; the shape test below
+     * requires the path to END at the pid.
+     */
+    if (backend == BACKEND_PROC) {
+        enum proc_shape sh = proc_entry_shape(resolved);
+        if (sh == PROC_SHAPE_DIR_LIVE) {
+            size_t o = 0;
+            for (size_t i = 0; resolved[i] && o < sizeof(self->cwd) - 1; i++) {
+                self->cwd[o++] = resolved[i];
+            }
+            self->cwd[o] = '\0';
+#if DEBUG_CHDIR
+            serial_print("sys_chdir: synthesized PROC dir, cwd='");
+            serial_print(self->cwd);
+            serial_print("'\n");
+#endif
+            return 0;
+        }
+    }
 
     /*
      * FAT form: strip the leading '/' and "./" components that
@@ -7869,6 +8732,7 @@ long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
 #define DT_UNKNOWN 0
 #define DT_REG     8
 #define DT_DIR     4
+#define DT_CHR     2
 
 #define GETDENTS64_HDR 19
 #define GETDENTS64_MAXREC (GETDENTS64_HDR + 256)
@@ -7893,7 +8757,72 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
      * /proc/self is a leaf (ps reads its stat/status, never its
      * directory); its readdir returns 0 immediately.
      */
-    if (slot->obj == PROC_DIR_SENTINEL) {
+    if (slot->obj == SYNTH_DIR_SENTINEL && slot->dir_path) {
+        /* A /proc/<digits> dir_path is a per-pid directory;
+         * /proc and /proc/self fall through to the block
+         * below, which is unchanged. */
+        const char* dp = slot->dir_path;
+        int is_pid_dir = (dp[0]=='/' && dp[1]=='p' && dp[2]=='r'
+                          && dp[3]=='o' && dp[4]=='c' && dp[5]=='/'
+                          && dp[6] >= '0' && dp[6] <= '9');
+        if (is_pid_dir) {
+            static const char* const pid_entries[3] = {
+                "stat", "status", "cmdline" };
+            if (slot->end >= 3) return 0;
+            const char* nm = pid_entries[slot->end];
+            slot->end++;
+            size_t nlen = 0; while (nm[nlen]) nlen++;
+            size_t reclen = GETDENTS64_HDR + nlen + 1;
+            reclen = (reclen + 7) & ~(size_t)7;
+            if (reclen > count) return -(long)EINVAL_;
+            uint8_t entbuf[GETDENTS64_MAXREC];
+            uint8_t* p = entbuf;
+            *(uint64_t*)(p + 0)  = 0;
+            *(int64_t*)(p + 8)   = 0;
+            *(uint16_t*)(p + 16) = (uint16_t)reclen;
+            p[18] = DT_REG;
+            for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = nm[i];
+            p[GETDENTS64_HDR + nlen] = '\0';
+            for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+            if (safe_copy_to_user(dirp, entbuf, reclen) != 0)
+                return -(long)EFAULT_;
+            return (long)reclen;
+        }
+    }
+
+    /*
+     * Synthesized /dev directory: list g_dev_table, one entry
+     * per call.  slot->end is the cursor (index into the
+     * table); a value >= G_DEV_TABLE_LEN ends the directory.
+     * Keyed on dir_path == "/dev" so the /proc blocks below
+     * are untouched.
+     */
+    if (slot->obj == SYNTH_DIR_SENTINEL && slot->dir_path
+        && slot->dir_path[0]=='/' && slot->dir_path[1]=='d'
+        && slot->dir_path[2]=='e' && slot->dir_path[3]=='v'
+        && slot->dir_path[4]=='\0') {
+        if (slot->end >= G_DEV_TABLE_LEN) return 0;
+        const char* nm = g_dev_table[slot->end].name;
+        slot->end++;
+        size_t nlen = 0; while (nm[nlen]) nlen++;
+        size_t reclen = GETDENTS64_HDR + nlen + 1;
+        reclen = (reclen + 7) & ~(size_t)7;
+        if (reclen > count) return -(long)EINVAL_;
+        uint8_t entbuf[GETDENTS64_MAXREC];
+        uint8_t* p = entbuf;
+        *(uint64_t*)(p + 0)  = 0;
+        *(int64_t*)(p + 8)   = 0;
+        *(uint16_t*)(p + 16) = (uint16_t)reclen;
+        p[18] = DT_CHR;
+        for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = nm[i];
+        p[GETDENTS64_HDR + nlen] = '\0';
+        for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+        if (safe_copy_to_user(dirp, entbuf, reclen) != 0)
+            return -(long)EFAULT_;
+        return (long)reclen;
+    }
+
+    if (slot->obj == SYNTH_DIR_SENTINEL) {
         /*
          * Synthesized /proc directory entries.
          *
@@ -8409,6 +9338,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
 
+        case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
         case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
         case SYS_GETUID:          return (uint64_t)sys_getuid();
         case SYS_GETGID:          return (uint64_t)sys_getgid();

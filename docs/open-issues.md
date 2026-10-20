@@ -1,6 +1,6 @@
 # Open issues
 
-**Last updated: 2026-10-18** (HEAD `3b8d13c`).  This file lists
+**Last updated: 2026-10-20** (HEAD `v0.6.16`).  This file lists
 **only open issues**.  Closed items are removed, not struck
 through; their history is in `git log` and `docs/session-log.md`.
 An item appears here only while it is a defect, a missing
@@ -32,25 +32,6 @@ and does not check `write` — none has been found.
 Fixing this means implementing signal delivery (item 12).  Same
 subsystem a Wayland `wl_shm` client needs for `SIGBUS` on buffer
 overrun.  Doing it once serves both.
-
-**8.  Symlinks: recorded design, not scheduled — and buildable.**
-FAT16 has no native symlink storage, and donix is committed to
-FAT.  The correct frame is Unix semantics, not FAT storage: if
-`ln -s`, `readlink`, `realpath`, and archive restoration all
-behave correctly, the kernel is semantically correct.
-
-The encoding is a magic marker in an ordinary file — e.g.
-`DONIX_LINK:/usr/bin/busybox` — hidden entirely inside the
-pathname dispatch seam.  Do not implement standalone symlink
-handling in individual syscalls (`open`, `stat`, `lstat`,
-`execve`, `chdir`, `access`); that is the technical debt the
-seam exists to prevent.  The seam exists (session 44), so this
-is buildable as the seam's next consumer.
-
-Payoff when it lands: `ln`, `link`, `readlink` with real
-targets, `realpath` correctness, `tar`/`unzip` link restoration,
-and the quiet assumptions (`/bin/sh -> busybox`) that many
-configure scripts make.
 
 **9.  No privilege model: uid/gid are 0 for every process.**
 No per-process uid/euid split, no setuid bit (FAT has no mode
@@ -161,6 +142,15 @@ fallback.
 
 ## Un-numbered open items
 
+**`tar` is disabled in the busybox build.**  Its creation path
+writes an empty archive (1024 zero bytes), skips every member
+with "file is the archive; skipping", and exits 0.  It was
+turned off rather than shipped reporting success on a failed
+operation.  Link restoration through `tar` is unverified and is
+a busybox-source task; the VFS symlink work is verified directly
+by `ln -s`, `readlink`, `readlink -f`, `stat`, `ls -l`, and
+`unlink`.
+
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
 closed.  The `20261003-vmm-map-diag` instrumentation (the three
@@ -197,41 +187,7 @@ liveness check.  First-party reproduction: `pipe7e_sjlj_stale`
 (`/usr/bin/PIPE7E_SJLJ_STALE`).  **The mechanism is
 `third_party/`'s and is not editable.**
 
-**`realpath` and path canonicalization do not resolve `..`.**  `realpath /root` prints `/root` and `realpath /root/scripts` prints `/root/scripts`, but any path with a `..` component fails: `realpath /root/scripts/../scripts` prints
-`realpath: /root/scripts/../scripts: No such file or directory`.  The resolver appears to stat the literal `..` entry rather than canonicalizing it, and FatFs's `..` lookup does not satisfy that.  Confirmed pre-existing: `CONFIG_REALPATH=y` was already set, and `test.sh` is 57/57 before and after the 2026-10-19 busybox batch.  This is a shared-resolve-path defect -- the same path the VFS (the item-8 seam) will own -- so the VFS work should fix it, and any `..`-dependent caller (`find`, `cd -P`, build scripts, future symlink targets) is exposed until then.  It is not a busybox bug; do not enable `CONFIG_LN`/symlinks expecting this to work.
-
-**`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc`
-is a listable directory; `/dev` is not.  `ls /dev`, `ls /dev/`,
-and `ls dev` all fail with `ENOENT`.  Adding it is the same
-directory shape `/proc` got: a synthesized entry list in
-`sys_getdents64`, and an `open_resolved`/`stat_resolved` branch
-for the prefix.  The mechanism is proven and the pattern is
-established.  This is what would let `tty` and `null` appear in
-`ls /dev`, and it is the prerequisite for `/dev/tty` and
-`/dev/urandom`.
-
 **`ls` long options are unavailable in the pinned BusyBox 1.36.1.**  `CONFIG_LONG_OPTS=y` is set, but `ls --color=auto`, `ls --help`, `ls --full-time`, and `ls --group-directories-first` all fail with `ls: unrecognized option: -`.  The `ls` applet registers no long-option table in this source snapshot: the applet's long-option registration is gated behind `FEATURE_LS_COLOR` rather than `LONG_OPTS` (the bug upstream fixed in 2017 by changing `IF_FEATURE_LS_COLOR(applet_long_options = ls_longopts;)` to `IF_LONG_OPTS(applet_long_options = ls_longopts;)`).  `third_party/` is read-only, so this cannot be fixed in-tree.  Workaround: use short options (`-l`, `-F`, `-R`, `-h`), which work and are verified by `test.sh` and the batch-1 smoke run.  If long `ls` options are ever wanted, the pinned source needs the 2017 fix.  Not a kernel bug and not a batch-1 regression.
-
-**`st_rdev` is 0 on device nodes.**  `ls -l /dev/console` prints
-`0, 0` for the major/minor column; a real Unix prints `4, 0`.
-`fill_kstat_as_chardev` sets `st_dev` and `st_ino` but not
-`st_rdev`.  Cosmetic: `tty` does not read it.
-
-**No `/dev` directory.**  `ttyname(3)` names the console —
-`readlink("/proc/self/fd/0")` returns `/dev/console` and the
-`(st_dev, st_ino)` match passes, so `tty` prints `/dev/console`.
-But `/dev` is not a directory, so `readdir` on it fails;
-`/dev/tty` and `/dev/urandom` do not exist; and
-`/dev/console` is stat-able but not openable
-(`open("/dev/console")` returns `-ENOENT`).
-
-**`open("/proc/<pid>", O_DIRECTORY)` is not done.**  `ps`
-*stats* the per-pid directory; it does not *open* it.
-`ls /proc/1` and `opendir("/proc/1")` would need
-`open_resolved` to accept the same two paths `stat_resolved`
-now does, producing a `FILE_KIND_DIR` slot with
-`PROC_DIR_SENTINEL` — the mechanism already built for `/proc`
-itself.  Small.
 
 **A nonexistent pid stats as a directory.**  `stat("/proc/999999/")`
 reports `S_IFDIR` rather than `ENOENT`, because the check is on
