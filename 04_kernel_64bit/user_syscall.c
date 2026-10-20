@@ -1810,15 +1810,30 @@ static int vfs_canonicalize_abs(char* p, size_t cap) {
  * A dir slot's stored path is already absolute ("/", "/bin"), so
  * cases 4 and 5 produce an absolute result directly.
  */
-static int resolve_at(int dirfd, const char* path,
-                      char* out, size_t cap,
-                      int* backend_out) {
+/*
+ * vfs_resolve: the one path resolver every path-taking syscall
+ * calls.  Named for what docs/contract.md VFS rule 4 calls it;
+ * this was resolve_at.
+ *
+ * follow_final is the symlink argument: 1 means "resolve the last
+ * component too" (open, stat, execve, chdir, mkdir, unlink,
+ * rename), 0 means "do not" (lstat, readlink, fstatat with
+ * AT_SYMLINK_NOFOLLOW).  There are no symlinks yet, so the
+ * argument is accepted and ignored; the symlink commit is what
+ * makes it load-bearing, and it will be a change to this
+ * function's body, not to its callers.
+ */
+static int vfs_resolve(int dirfd, const char* path,
+                       char* out, size_t cap,
+                       int* backend_out, int follow_final) {
+    (void)follow_final;   /* no symlinks yet; see the header */
     /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
     if (path_is_absolute(path)) {
         if (path_copy(out, cap, path) != 0) return -(long)ENAMETOOLONG_;
-        if (vfs_canonicalize_abs(out, cap) != 0)
-        return -(long)ENAMETOOLONG_;
-    if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
+        if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -1842,9 +1857,10 @@ static int resolve_at(int dirfd, const char* path,
              */
             return -(long)ENAMETOOLONG_;
         }
-        if (vfs_canonicalize_abs(out, cap) != 0)
-        return -(long)ENAMETOOLONG_;
-    if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
+        if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -1865,9 +1881,10 @@ static int resolve_at(int dirfd, const char* path,
         if (path_copy(out, cap, slot->dir_path) != 0) {
             return -(long)ENAMETOOLONG_;
         }
-        if (vfs_canonicalize_abs(out, cap) != 0)
-        return -(long)ENAMETOOLONG_;
-    if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0) {
+            return -(long)ENAMETOOLONG_;
+        }
+        if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -3667,7 +3684,7 @@ long sys_open(const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return open_resolved(resolved, flags, backend);
@@ -3695,7 +3712,7 @@ long sys_openat(int dirfd, const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return open_resolved(resolved, flags, backend);
@@ -4008,7 +4025,7 @@ long sys_unlink(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return unlink_body(resolved, 0, "sys_unlink", backend);
@@ -4038,7 +4055,7 @@ long sys_rmdir(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return unlink_body(resolved, 1, "sys_rmdir", backend);
@@ -4081,7 +4098,7 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     int want_dir = (flags & AT_REMOVEDIR_) != 0;
@@ -4162,12 +4179,12 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
      * resolver as every other path syscall; the tag is unused
      * here and discarded. */
     int backend;
-    int rr = resolve_at(AT_FDCWD_, old_path, old_resolved,
-                        sizeof(old_resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, old_path, old_resolved,
+                        sizeof(old_resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
-    rr = resolve_at(AT_FDCWD_, new_path, new_resolved,
-                    sizeof(new_resolved), &backend);
+    rr = vfs_resolve(AT_FDCWD_, new_path, new_resolved,
+                    sizeof(new_resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
 
@@ -4253,8 +4270,8 @@ long sys_mkdir(const char* path, int mode) {
         return -(long)EFAULT_;
     }
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local_path, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local_path, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
     {
@@ -4618,7 +4635,7 @@ long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return stat_resolved(resolved, user_stat, backend);
@@ -4748,8 +4765,8 @@ long sys_access(const char* user_path, int mode) {
         return -(long)EFAULT_;
     }
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     return access_resolved(resolved, backend);
 }
@@ -4802,7 +4819,7 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4867,7 +4884,7 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4923,7 +4940,7 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
  *            -ENOENT for a missing path, -EFAULT for a bad user
  *            pointer, -ENAMETOOLONG for an over-long path.
  *
- * The path is resolved with resolve_at(AT_FDCWD, ...) so it obeys
+ * The path is resolved with vfs_resolve(AT_FDCWD, ...) so it obeys
  * the process cwd, exactly as sys_unlink and sys_access do.  No
  * dirfd: readlink(2) has none (readlinkat(2), 267, is the dirfd
  * form, and donix does not implement it).
@@ -4938,7 +4955,7 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
 
     /*
@@ -5217,8 +5234,8 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     {
         char resolved[USER_PATH_MAX];
         int backend;
-        int rr = resolve_at(AT_FDCWD_, path, resolved,
-                            sizeof(resolved), &backend);
+        int rr = vfs_resolve(AT_FDCWD_, path, resolved,
+                            sizeof(resolved), &backend, 1);
         if (rr != 0) {
             __asm__ volatile("sti");
             return rr;
@@ -7505,8 +7522,8 @@ long sys_chdir(const char* user_path) {
      */
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = resolve_at(AT_FDCWD_, path, resolved,
-                        sizeof(resolved), &backend);
+    int rr = vfs_resolve(AT_FDCWD_, path, resolved,
+                        sizeof(resolved), &backend, 1);
     if (rr != 0) return rr;
     (void)backend;
 
