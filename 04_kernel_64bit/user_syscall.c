@@ -1545,12 +1545,12 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * Unix dispatch: the syscall looks up the mount and calls the
  * operation.
  *
- * fat_driver points at the extracted FatFs operations.  ro_driver
- * is what /dev and /proc use: they are synthesized, read-only
- * mounts, so unlink/rename/mkdir there are -EROFS rather than a
- * fall-through to FatFs.  (Today such a call fell through and
- * got a misleading answer; -EROFS is the truthful one, and it is
- * what Linux returns for a write on a read-only mount.)
+ * fat_driver points at the extracted FatFs operations.
+ * dev_driver and proc_driver are the synthesized /dev and /proc
+ * mounts: they share the read-only unlink/rename/mkdir (those
+ * are -EROFS, the truthful answer for a write on a read-only
+ * mount, where the old code fell through to FatFs and got a
+ * misleading one) and have their own open/stat/access handlers.
  *
  * Only unlink/rename/mkdir are here so far.  open/stat/access
  * join when their FatFs bodies are extracted (vfsM2b) and the
@@ -1576,6 +1576,10 @@ static long dev_open(const char* in_path, const char* local_path,
                      int flags);
 static long dev_stat(const char* abs_path, void* user_stat);
 static long dev_access(const char* abs_path);
+static long proc_open(const char* in_path, const char* local_path,
+                      int flags);
+static long proc_stat(const char* abs_path, void* user_stat);
+static long proc_access(const char* abs_path);
 static long fat_stat_path(const char* path, void* user_stat);
 static long fat_access(const char* path);
 
@@ -1594,21 +1598,13 @@ static long ro_rename(const char* old_path, const char* new_path) {
 static long ro_mkdir(const char* local_path) {
     (void)local_path; return -(long)EROFS_;
 }
-static long ro_open(const char* in_path, const char* local_path, int flags) {
-    (void)in_path; (void)local_path; (void)flags; return -(long)EROFS_;
-}
-static long ro_stat(const char* path, void* user_stat) {
-    (void)path; (void)user_stat; return -(long)EROFS_;
-}
-static long ro_access(const char* path) {
-    (void)path; return -(long)EROFS_;
-}
-static const fs_driver_t ro_driver = {
-    ro_unlink, ro_rename, ro_mkdir, ro_open, ro_stat, ro_access,
-};
 static const fs_driver_t dev_driver = {
     ro_unlink, ro_rename, ro_mkdir,
     dev_open, dev_stat, dev_access,
+};
+static const fs_driver_t proc_driver = {
+    ro_unlink, ro_rename, ro_mkdir,
+    proc_open, proc_stat, proc_access,
 };
 
 static const struct {
@@ -1618,7 +1614,7 @@ static const struct {
 } g_mounts[] = {
     { "/",     BACKEND_FAT,  &fat_driver },
     { "/dev",  BACKEND_DEV,  &dev_driver },
-    { "/proc", BACKEND_PROC, &ro_driver  },
+    { "/proc", BACKEND_PROC, &proc_driver },
 };
 #define G_MOUNTS_LEN (sizeof(g_mounts) / sizeof(g_mounts[0]))
 
@@ -3246,14 +3242,14 @@ static long fat_open(const char* in_path, const char* local_path,
 }
 
 /*
- * A DEV operation returns DEV_NOT_MINE when the path is not a
+ * A DEV operation returns BACKEND_NOT_MINE when the path is not a
  * known /dev entry, so the caller falls through to the next
  * backend (FAT).  That is the same fall-through the inline DEV
  * branch has always had; it is made explicit here so the
  * handler can live in the mount table.  Any other value is a
  * real result (an fd, an errno, or 0).
  */
-#define DEV_NOT_MINE  ((long)-123456789L)
+#define BACKEND_NOT_MINE  ((long)-123456789L)
 
 static long dev_open(const char* in_path, const char* local_path,
                      int flags) {
@@ -3291,7 +3287,7 @@ static long dev_open(const char* in_path, const char* local_path,
                   serial_print(d->name); });
         return dfd;
     }
-    return DEV_NOT_MINE;   /* unknown /dev entry: try FAT */
+    return BACKEND_NOT_MINE;   /* unknown /dev entry: try FAT */
 }
 
 static long dev_stat(const char* abs_path, void* user_stat) {
@@ -3305,38 +3301,26 @@ static long dev_stat(const char* abs_path, void* user_stat) {
         }
         return 0;
     }
-    return DEV_NOT_MINE;
+    return BACKEND_NOT_MINE;
 }
 
 static long dev_access(const char* abs_path) {
-    return dev_lookup(abs_path) != NULL ? 0 : DEV_NOT_MINE;
+    return dev_lookup(abs_path) != NULL ? 0 : BACKEND_NOT_MINE;
 }
 
-static long open_resolved(const char* in_path, int flags, int backend) {
+/*
+ * The PROC backend's open, moved out of open_resolved: /proc and
+ * /proc/self dir slots, /proc/<pid> dir slots, the per-pid files,
+ * and the proc_lookup table entry.  Returns an fd, a negative
+ * errno, or BACKEND_NOT_MINE for an unknown /proc path, which the
+ * caller resolves to FAT.
+ */
+static long proc_open(const char* in_path, const char* local_path,
+                      int flags) {
+    (void)local_path; (void)flags;
     pcb_t* self = process_get_current();
     if (!self) return -(long)EFAULT_;
-
-    /*
-     * DEV backend.  The match is against the UNSTRIPPED resolved
-     * path (in_path), because dev_lookup expects the leading '/'
-     * form and the strip below has not run yet.
-     *
-     * If the path is a known device, return its slot and be done.
-     * If not -- "/dev/tty" before commit 4, "/dev" alone, or
-     * anything else under /dev -- fall through to the FAT path.
-     */
-    if (backend == BACKEND_DEV) {
-        long r = mount_driver(BACKEND_DEV)->open(in_path, NULL, flags);
-        if (r != DEV_NOT_MINE) return r;
-        /* Unknown /dev entry: fall through to FAT. */
-    }
-
-    /*
-     * PROC backend.  Same shape as DEV: match on the unstripped
-     * resolved path, return a FILE_KIND_PROC slot whose obj is the
-     * PROC_ENTRY_* value cast to a pointer, or fall through.
-     */
-    if (backend == BACKEND_PROC) {
+    {
         /*
          * /proc and /proc/self are directories, not table
          * entries.  A FILE_KIND_DIR slot is required so
@@ -3498,6 +3482,159 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                       serial_print_dec((uint64_t)entry); });
             return pfd;
         }
+    }
+    return BACKEND_NOT_MINE;   /* unknown /proc entry: try FAT */
+}
+
+/*
+ * The PROC backend's stat, moved out of stat_resolved: the
+ * /proc, /proc/self, and /proc/<pid> dir cases (each with its
+ * identity ino), the per-pid stat/status/cmdline files, and the
+ * proc_lookup table entries.  Returns 0, a negative errno, or
+ * BACKEND_NOT_MINE for an unknown /proc path, which the caller
+ * resolves to FAT.
+ */
+static long proc_stat(const char* abs_path, void* user_stat) {
+    {
+        int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '\0');
+        int is_proc_self = (abs_path[0] == '/' && abs_path[1] == 'p'
+                            && abs_path[2] == 'r' && abs_path[3] == 'o'
+                            && abs_path[4] == 'c' && abs_path[5] == '/'
+                            && abs_path[6] == 's' && abs_path[7] == 'e'
+                            && abs_path[8] == 'l' && abs_path[9] == 'f'
+                            && abs_path[10] == '\0');
+
+        /*
+         * is_proc_pid_dir: "/proc/<digits>" or "/proc/<digits>/".
+         * Digits only -- "self" is handled above, and a name with
+         * any other character is not a per-pid directory.
+         */
+        int is_proc_pid_dir = 0;
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                int ndig = 0;
+                while (*q >= '0' && *q <= '9') { q++; ndig++; }
+                if (ndig > 0 && *q == '\0') is_proc_pid_dir = 1;
+                else if (ndig > 0 && q[0] == '/' && q[1] == '\0')
+                    is_proc_pid_dir = 1;
+            }
+        }
+
+        if (is_proc_root || is_proc_self || is_proc_pid_dir) {
+            uint64_t dino = is_proc_root ? PROC_INO_ROOT
+                          : is_proc_self ? PROC_INO_SELF
+                          : proc_ino(strtou64_after_proc(abs_path),
+                                     PROC_ENTRY_NONE);
+            kernel_stat_t st;
+            fill_kstat_as_dir(&st, dino);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        /*
+         * /proc/<pid>/stat: same pattern open_resolved accepts.
+         * Report a regular file with a plausible size.  The same
+         * minimal parse; "status" is the next commit.
+         */
+        {
+            const char* q = abs_path;
+            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
+                && q[4]=='c' && q[5]=='/') {
+                q += 6;
+                /* Same component rule as open_resolved: digits or
+                 * the literal "self" (resolved to this process). */
+                uint64_t pid = 0;
+                int ok_component = 0;
+                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
+                    pcb_t* me = process_get_current();
+                    if (me) { pid = me->pid; ok_component = 1; }
+                    q += 4;
+                } else {
+                    int ndig = 0;
+                    while (*q >= '0' && *q <= '9') {
+                        pid = pid * 10 + (uint64_t)(*q - '0');
+                        q++; ndig++;
+                    }
+                    ok_component = (ndig > 0);
+                }
+                int is_stat = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
+                int is_status = (ok_component
+                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
+                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
+                    && q[6]=='s' && q[7]=='\0');
+                int is_cmdline = (ok_component
+                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
+                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
+                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
+                if (is_stat || is_status || is_cmdline) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    uint32_t ptag = is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                                   : is_status ? PROC_ENTRY_PID_STATUS
+                                               : PROC_ENTRY_PID_STAT;
+                    kernel_stat_t st;
+                    fill_kstat_as_proc(&st, ptag, proc_ino(pid, ptag));
+                    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                        return -(long)EFAULT_;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        uint32_t entry = proc_lookup(abs_path);
+        if (entry != PROC_ENTRY_NONE) {
+            kernel_stat_t st;
+            fill_kstat_as_proc(&st, entry, PROC_INO_ENTRY_BASE + (uint64_t)entry);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+    }
+    return BACKEND_NOT_MINE;   /* unknown /proc entry: try FAT */
+}
+
+static long proc_access(const char* abs_path) {
+    return proc_lookup(abs_path) != PROC_ENTRY_NONE
+        ? 0 : BACKEND_NOT_MINE;
+}
+
+static long open_resolved(const char* in_path, int flags, int backend) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+
+    /*
+     * DEV backend.  The match is against the UNSTRIPPED resolved
+     * path (in_path), because dev_lookup expects the leading '/'
+     * form and the strip below has not run yet.
+     *
+     * If the path is a known device, return its slot and be done.
+     * If not -- "/dev/tty" before commit 4, "/dev" alone, or
+     * anything else under /dev -- fall through to the FAT path.
+     */
+    if (backend == BACKEND_DEV) {
+        long r = mount_driver(BACKEND_DEV)->open(in_path, NULL, flags);
+        if (r != BACKEND_NOT_MINE) return r;
+        /* Unknown /dev entry: fall through to FAT. */
+    }
+
+    /*
+     * PROC backend.  Same shape as DEV: match on the unstripped
+     * resolved path, return a FILE_KIND_PROC slot whose obj is the
+     * PROC_ENTRY_* value cast to a pointer, or fall through.
+     */
+    if (backend == BACKEND_PROC) {
+        long r = mount_driver(BACKEND_PROC)->open(in_path, NULL, flags);
+        if (r != BACKEND_NOT_MINE) return r;
+        /* Unknown /proc entry: fall through to FAT. */
     }
 
     char local_path[USER_PATH_MAX];
@@ -4407,136 +4544,14 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      */
     if (backend == BACKEND_DEV) {
         long r = mount_driver(BACKEND_DEV)->stat(abs_path, user_stat);
-        if (r != DEV_NOT_MINE) return r;
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
-    /*
-     * PROC backend.  Same shape as DEV.
-     */
+    /* PROC backend.  Same shape as DEV. */
     if (backend == BACKEND_PROC) {
-        /*
-         * /proc, /proc/self, and /proc/<pid> report as
-         * directories.  The first two are the paths
-         * open_resolved accepts; /proc/<pid> is here because
-         * libbb's procps_scan stats it, not opens it.
-         *
-         * procps_scan (with PSSCAN_UIDGID, which ps's default
-         * flag set and pstree's both have) builds "/proc/<pid>/"
-         * -- with a trailing slash -- and calls stat() on it:
-         *
-         *     if (stat(filename, &sb)) continue;
-         *
-         * If that stat fails, every entry is skipped, which is
-         * exactly the "header but no rows" symptom.  The bare
-         * pid form is accepted too, because a caller may stat
-         * either.
-         *
-         * This commit handles stat only.  open("/proc/<pid>")
-         * is the follow-up; ps does not need it.
-         */
-        int is_proc_root = (abs_path[0] == '/' && abs_path[1] == 'p'
-                            && abs_path[2] == 'r' && abs_path[3] == 'o'
-                            && abs_path[4] == 'c' && abs_path[5] == '\0');
-        int is_proc_self = (abs_path[0] == '/' && abs_path[1] == 'p'
-                            && abs_path[2] == 'r' && abs_path[3] == 'o'
-                            && abs_path[4] == 'c' && abs_path[5] == '/'
-                            && abs_path[6] == 's' && abs_path[7] == 'e'
-                            && abs_path[8] == 'l' && abs_path[9] == 'f'
-                            && abs_path[10] == '\0');
-
-        /*
-         * is_proc_pid_dir: "/proc/<digits>" or "/proc/<digits>/".
-         * Digits only -- "self" is handled above, and a name with
-         * any other character is not a per-pid directory.
-         */
-        int is_proc_pid_dir = 0;
-        {
-            const char* q = abs_path;
-            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
-                && q[4]=='c' && q[5]=='/') {
-                q += 6;
-                int ndig = 0;
-                while (*q >= '0' && *q <= '9') { q++; ndig++; }
-                if (ndig > 0 && *q == '\0') is_proc_pid_dir = 1;
-                else if (ndig > 0 && q[0] == '/' && q[1] == '\0')
-                    is_proc_pid_dir = 1;
-            }
-        }
-
-        if (is_proc_root || is_proc_self || is_proc_pid_dir) {
-            uint64_t dino = is_proc_root ? PROC_INO_ROOT
-                          : is_proc_self ? PROC_INO_SELF
-                          : proc_ino(strtou64_after_proc(abs_path),
-                                     PROC_ENTRY_NONE);
-            kernel_stat_t st;
-            fill_kstat_as_dir(&st, dino);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
-        /*
-         * /proc/<pid>/stat: same pattern open_resolved accepts.
-         * Report a regular file with a plausible size.  The same
-         * minimal parse; "status" is the next commit.
-         */
-        {
-            const char* q = abs_path;
-            if (q[0]=='/' && q[1]=='p' && q[2]=='r' && q[3]=='o'
-                && q[4]=='c' && q[5]=='/') {
-                q += 6;
-                /* Same component rule as open_resolved: digits or
-                 * the literal "self" (resolved to this process). */
-                uint64_t pid = 0;
-                int ok_component = 0;
-                if (q[0]=='s' && q[1]=='e' && q[2]=='l' && q[3]=='f') {
-                    pcb_t* me = process_get_current();
-                    if (me) { pid = me->pid; ok_component = 1; }
-                    q += 4;
-                } else {
-                    int ndig = 0;
-                    while (*q >= '0' && *q <= '9') {
-                        pid = pid * 10 + (uint64_t)(*q - '0');
-                        q++; ndig++;
-                    }
-                    ok_component = (ndig > 0);
-                }
-                int is_stat = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='\0');
-                int is_status = (ok_component
-                    && q[0]=='/' && q[1]=='s' && q[2]=='t'
-                    && q[3]=='a' && q[4]=='t' && q[5]=='u'
-                    && q[6]=='s' && q[7]=='\0');
-                int is_cmdline = (ok_component
-                    && q[0]=='/' && q[1]=='c' && q[2]=='m'
-                    && q[3]=='d' && q[4]=='l' && q[5]=='i'
-                    && q[6]=='n' && q[7]=='e' && q[8]=='\0');
-                if (is_stat || is_status || is_cmdline) {
-                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
-                    uint32_t ptag = is_cmdline ? PROC_ENTRY_PID_CMDLINE
-                                   : is_status ? PROC_ENTRY_PID_STATUS
-                                               : PROC_ENTRY_PID_STAT;
-                    kernel_stat_t st;
-                    fill_kstat_as_proc(&st, ptag, proc_ino(pid, ptag));
-                    if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                        return -(long)EFAULT_;
-                    }
-                    return 0;
-                }
-            }
-        }
-
-        uint32_t entry = proc_lookup(abs_path);
-        if (entry != PROC_ENTRY_NONE) {
-            kernel_stat_t st;
-            fill_kstat_as_proc(&st, entry, PROC_INO_ENTRY_BASE + (uint64_t)entry);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
+        long r = mount_driver(BACKEND_PROC)->stat(abs_path, user_stat);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
@@ -4688,15 +4703,14 @@ static long access_resolved(const char* abs_path, int backend) {
     /* DEV backend: a known device exists. */
     if (backend == BACKEND_DEV) {
         long r = mount_driver(BACKEND_DEV)->access(abs_path);
-        if (r != DEV_NOT_MINE) return r;
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
     /* PROC backend: a known entry exists. */
     if (backend == BACKEND_PROC) {
-        if (proc_lookup(abs_path) != PROC_ENTRY_NONE) {
-            return 0;
-        }
+        long r = mount_driver(BACKEND_PROC)->access(abs_path);
+        if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
