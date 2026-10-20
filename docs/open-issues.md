@@ -1,6 +1,6 @@
 # Open issues
 
-**Last updated: 2026-10-20** (HEAD `v0.6.16`).  This file lists
+**Last updated: 2026-10-20** (HEAD `v0.6.17`).  This file lists
 **only open issues**.  Closed items are removed, not struck
 through; their history is in `git log` and `docs/session-log.md`.
 An item appears here only while it is a defect, a missing
@@ -142,14 +142,25 @@ fallback.
 
 ## Un-numbered open items
 
-**`tar` is disabled in the busybox build.**  Its creation path
-writes an empty archive (1024 zero bytes), skips every member
-with "file is the archive; skipping", and exits 0.  It was
-turned off rather than shipped reporting success on a failed
-operation.  Link restoration through `tar` is unverified and is
-a busybox-source task; the VFS symlink work is verified directly
-by `ln -s`, `readlink`, `readlink -f`, `stat`, `ls -l`, and
-`unlink`.
+**`chmod`/`chown` accept and drop.**  Syscalls 90-93 (path and
+fd forms) return 0 and store nothing: FAT has no mode bits and
+no ownership, everything is uid 0, and `stat` reports the
+synthesized 0644/0755.  This is so `tar -x`, `cp -a`, and
+`install` complete instead of printing "Unknown syscall" for
+every file.  It is not a privilege model -- items 9 and 10 own
+the real answer.
+
+**`tar` is enabled, and link restoration is verified.**  The
+v0.6.16 note that called its creation path a busybox applet
+issue was **wrong**: busybox's self-archive check compares the
+archive's `(st_dev, st_ino)` against each member's, and every
+FAT file reported `Inode: 0`, so every member matched and was
+skipped.  `76d66db` gives FAT a real `st_ino` from `(sclust,
+objsize)`; `tar -cf`/`-tf`/`-xf` now work, and `tar -tvf`
+records a symlink as `lrwxrwxrwx ... -> target`.  One limit
+remains: two empty files with the same name in different
+directories collide in `st_ino`, because `FILINFO` carries no
+parent -- see `fat_ino`.
 
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not

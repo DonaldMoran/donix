@@ -82,8 +82,13 @@
  *  82  rename            sys_rename
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
- *  87  unlink            sys_unlink        (dispatched; applet off)
- *  89  readlink          sys_readlink      (honest -EINVAL: no symlinks)
+ *  87  unlink            sys_unlink
+ *  88  symlink           sys_symlink       (writes a DONIX_LINK marker)
+ *  89  readlink          sys_readlink      (returns the marker's target)
+ *  90  chmod             sys_chmod         (accepts and drops; FAT has no mode)
+ *  91  fchmod            sys_fchmod        (accepts and drops)
+ *  92  chown             sys_chown         (accepts and drops; everything is root)
+ *  93  fchown            sys_fchown        (accepts and drops)
  * 102  getuid            sys_getuid        (returns 0; see note below)
  * 104  getgid            sys_getgid        (returns 0)
  * 107  geteuid           sys_geteuid       (returns 0)
@@ -111,6 +116,10 @@
  * ------------------------------------------------------------
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
+ *
+ *  99  gettimeofday      -- `ps -l` reaches it; a small
+ *                           syscall from g_ticks.  See
+ *                           docs/open-issues.md.
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -174,6 +183,10 @@
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
 #define SYS_GETGROUPS       115
+#define SYS_CHMOD            90
+#define SYS_FCHMOD           91
+#define SYS_CHOWN            92
+#define SYS_FCHOWN           93
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
 #define SYS_GETDENTS64      217

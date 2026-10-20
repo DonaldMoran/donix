@@ -5,8 +5,8 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-20.  **THE VFS IS DONE.  `v0.6.16` is the
-VFS release.**  Every path syscall reaches its filesystem through the
+**Last updated:** 2026-10-20.  **`v0.6.16` is the VFS release;
+`v0.6.17` fixes FAT `st_ino` and re-enables `tar`.**  Every path syscall reaches its filesystem through the
 mount table (`mount_driver(backend)->op(...)`); the resolver is
 `vfs_resolve(path, follow_final)`; symlinks work end to end.  `test.sh`
 is 57/57 and `canary --full` is 28/28, verified from `/` on a freshly
@@ -29,19 +29,21 @@ syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
 file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
 `sys_gettimeofday` (99); signals (contract's async-writer design);
-shebang + `/bin/sh`.  `tar` is **disabled** in busybox: its creation
-path writes an empty archive and exits 0, so it was turned off rather
-than shipped broken.
+shebang + `/bin/sh`.  `tar` is enabled and link restoration is verified (the v0.6.16
+note that called it a busybox issue was wrong -- FAT `st_ino` was 0;
+`76d66db` gives it a real value).  `chmod`/`chown` (90-93) accept and
+drop: FAT has no mode or owner.
 
-**THE SCRATCH TAGS** are development restore points, not release
-artifacts: `20261020-proc-path-fold`, `20261020-proc-entries`,
-`20261020-proc-realpath`, `20261020-vfs-mount-table`,
-`20261020-vfs-dev-dir`, `20261020-vfs-dev-driver`,
-`20261020-vfs-dev-zero-urandom`.  Do not drop them until the `v0.6.16`
-tag and merge summary exist.
+**THE RELEASE TAGS.**  `v0.6.16` (the VFS) and `v0.6.17` (FAT
+`st_ino`, `tar`, `chmod`/`chown`) are the release record; their
+annotations carry the per-release summary.  The scratch
+`2026MMDD-*` tags were development restore points and have been
+dropped, as the release procedure says to do once the tag and the
+summary exist.
 
-**WHERE WE ARE.**  `v0.6.15` is released.  `v0.6.16` (this VFS release)
-is tagged and merging.  The working tree is `dev`.
+**WHERE WE ARE.**  `v0.6.15` (busybox batch 1), `v0.6.16` (the VFS),
+and `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`) are released.
+The working tree is `dev`.
 
 **NEXT.**  Signals (open-issues 12; design against `docs/contract.md`
 first -- they are the first asynchronous state writer), then
@@ -153,11 +155,10 @@ are local objects; once they exist, the scratch tags may be dropped.
 Do not use `git push --tags` -- it would push the scratch tags.  Push
 `vX.Y.Z` by name.
 
-**Current release state.**  **`v0.6.15` is released; `v0.6.16` (the VFS) is tagged and merging.**  Work is now
-pre-**`v0.6.15`**.  The scratch tags `20261019-*` (7b investigation,
-busybox batch 1, the five applets, README) are the source for the
-`v0.6.15` summary; the bump is the maintainer's decision.  Do not
-delete them until the `v0.6.15` tag and merge summary exist.
+**Current release state.**  **`v0.6.17` is released.**  Work is now
+pre-**`v0.6.18`**.  The release tags `v0.6.15`, `v0.6.16`, and
+`v0.6.17` carry their summaries; the scratch tags they were drawn
+from have been dropped.
 
 ---
 
@@ -194,21 +195,17 @@ Do NOT re-walk the refuted paths below.
 
 ### Next -- the highest-value work
 
-1. **The VFS.**  The pathname-dispatch seam exists (`/proc` is a real
-   directory, `/dev` is not); the VFS makes the seam a real layer:
-   a mount table, inode operations, FatFs as one driver, and one
-   `vfs_resolve(path, follow_final)` that every path-taking syscall
-   calls.  It unblocks `/dev` as a directory, symlinks (item 8),
-   file-backed `mmap` (a Wayland prerequisite), and the display
-   stack.  Read `docs/contract.md`'s VFS section first.  Scope it as
-   small, verified commits: mount table, FatFs driver, one syscall
-   through `vfs_resolve`, then `/dev`, then `/proc`, then symlinks.
-2. **Signals (open-issues item 12).**  The first asynchronous state
-   writer; design against `docs/contract.md` before code.
-3. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
+1. **Signals (open-issues item 12).**  The first asynchronous state
+   writer; design against `docs/contract.md`'s Signals section
+   before code.  This is what makes `SIGPIPE`, `SIGSEGV` handlers,
+   and `ash` job control possible.
+2. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
    recursion guard, and an interpreter on the image.
-4. **`sys_gettimeofday` (99)** so `ps -l` works.
-5. The open-issues list (top 6, below).
+3. **`sys_gettimeofday` (99)** so `ps -l` works.
+4. The open-issues list (top 6, below).
+5. **The empty-file `st_ino` collision** -- two empty files with the
+   same name in different directories share an inode, because
+   `FILINFO` carries no parent.  A parent-directory input is needed.
 
 ### Refuted -- do NOT re-walk
 
@@ -247,17 +244,15 @@ open-issues list.
 ## State on disk
 
 Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
-Scratch tags for the `v0.6.15` summary (drop only after the tag and
-merge summary exist): `20261019-7b-investigated`,
-`20261019-busybox-batch1`, `20261019-busybox-applets`,
-`20261019-readme-current`.
+No scratch tags remain: `v0.6.15`, `v0.6.16`, and `v0.6.17` are the
+release record.
 
 ---
 
 ## One-line summary
 
-**The `C` is FIXED, the heap cycle hang is CONTAINED, and busybox
-batch 1 + five applets are in (57/57; a >3.5-hour 100 Hz soak is
-clean).  `docs/contract.md` is the durable concurrency rule.  Next:
-the VFS -- read the contract's VFS section, then scope it as small,
-verified commits.**
+**The VFS is DONE and released (`v0.6.16`); `v0.6.17` fixes FAT
+`st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  `test.sh`
+57/57, `canary --full` 28/28.  `docs/contract.md` is the durable
+concurrency rule.  Next: signals -- read the contract's Signals
+section before any code.**

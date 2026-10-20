@@ -4386,9 +4386,29 @@ long sys_mkdir(const char* path, int mode) {
  * accordingly.  Neither value is read by the A4 test suite; they
  * are set for informational correctness.
  */
-static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
+/*
+ * FAT has no inode number.  A file's identity is its first
+ * cluster plus its size: two distinct files cannot share
+ * (sclust, objsize), and it is stable across calls.  sclust == 0
+ * means an empty file or the root directory, where FAT gives no
+ * cluster; fall back to the name.  Two empty files with the same
+ * name in different directories collide, because FILINFO carries
+ * no parent -- noted rather than hidden.
+ */
+static uint64_t fat_ino(uint32_t sclust, uint32_t objsize,
+                        const char* name) {
+    if (sclust != 0)
+        return ((uint64_t)sclust << 32) | (uint64_t)objsize;
+    uint64_t h = 1469598103934665603ULL;
+    while (name && *name) { h ^= (uint8_t)*name++; h *= 1099511628211ULL; }
+    return h;
+}
+
+static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno,
+                                    uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
 
+    st->st_ino     = ino;
     st->st_nlink   = 1;
     st->st_blksize = 512;
 
@@ -4412,11 +4432,14 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno) {
 static long fat_fstat(file_slot_t* slot, kernel_stat_t* st,
                       void* user_stat) {
     FILINFO fno;
+    uint32_t sclust = 0, objsize = 0;
     for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
     if (slot->kind == FILE_KIND_FILE) {
         FIL* f = (FIL*)slot->obj;
         fno.fsize   = (FSIZE_t)f_size(f);
         fno.fattrib = 0;   /* not AM_DIR */
+        sclust  = (uint32_t)f->obj.sclust;
+        objsize = (uint32_t)f->obj.objsize;
     } else if (slot->kind == FILE_KIND_DIR) {
         fno.fattrib = AM_DIR;
         fno.fsize   = 0;
@@ -4424,7 +4447,8 @@ static long fat_fstat(file_slot_t* slot, kernel_stat_t* st,
         return -(long)EBADF_;
     }
 
-    fill_kstat_from_filinfo(st, &fno);
+    fill_kstat_from_filinfo(st, &fno,
+                            fat_ino(sclust, objsize, NULL));
 
     if (safe_copy_to_user(user_stat, st, sizeof(*st)) != 0) {
         return -(long)EFAULT_;
@@ -4591,8 +4615,26 @@ static long fat_stat_path(const char* path, void* user_stat) {
         return fatfs_errno(r);
     }
 
+    /*
+     * The inode is (sclust, objsize), which FILINFO does not
+     * carry, so open the object once to read FFOBJID and close it
+     * again.  That is a directory lookup and a close -- the same
+     * work f_stat just did -- and it makes stat and fstat report
+     * the same inode for the same file.
+     */
+    uint32_t sclust = 0, objsize = 0;
+    if (!(fno.fattrib & AM_DIR)) {
+        FIL f;
+        if (f_open(&f, path, FA_READ) == FR_OK) {
+            sclust  = (uint32_t)f.obj.sclust;
+            objsize = (uint32_t)f.obj.objsize;
+            f_close(&f);
+        }
+    }
+
     kernel_stat_t st;
-    fill_kstat_from_filinfo(&st, &fno);
+    fill_kstat_from_filinfo(&st, &fno,
+                            fat_ino(sclust, objsize, fno.fname));
 
     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
         return -(long)EFAULT_;
@@ -7176,6 +7218,41 @@ long sys_getppid(void) {
  *
  * PR_SET_NAME = 15.  EINVAL_ = 22.
  */
+/*
+ * chmod/chown, path and fd forms -- syscalls 90-93.
+ *
+ * FAT stores no mode bits and no ownership: everything is uid 0,
+ * gid 0, and the mode is synthesized (0644 for a file, 0755 for
+ * a directory) by fill_kstat_from_filinfo.  These accept and
+ * return 0 so that extraction and copy tools -- tar -x, cp -a,
+ * install -- complete instead of failing on every file.  A caller
+ * that chmods and re-stats sees the synthesized mode, not the
+ * requested one; that is the honest limit of a filesystem with
+ * no mode store, and it is item 9/10's problem, not this one.
+ *
+ * This is the same shape as prctl's PR_SET_NAME: accept the call,
+ * drop the argument, return success.  It is NOT a privilege
+ * model and does not change what stat reports.
+ */
+long sys_chmod(const char* path, int mode) {
+    (void)mode;
+    if (!path) return -(long)EFAULT_;
+    return 0;
+}
+long sys_fchmod(int fd, int mode) {
+    (void)fd; (void)mode;
+    return 0;
+}
+long sys_chown(const char* path, int owner, int group) {
+    (void)owner; (void)group;
+    if (!path) return -(long)EFAULT_;
+    return 0;
+}
+long sys_fchown(int fd, int owner, int group) {
+    (void)fd; (void)owner; (void)group;
+    return 0;
+}
+
 long sys_prctl(int option, unsigned long arg2, unsigned long arg3,
                unsigned long arg4, unsigned long arg5) {
     (void)arg2; (void)arg3; (void)arg4; (void)arg5;
@@ -9348,6 +9425,10 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_SETSID:          return (uint64_t)sys_setsid();
         case SYS_GETGROUPS:       return (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1);
 
+        case SYS_CHMOD:           return (uint64_t)sys_chmod((const char*)arg0, (int)arg1);
+        case SYS_FCHMOD:          return (uint64_t)sys_fchmod((int)arg0, (int)arg1);
+        case SYS_CHOWN:           return (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2);
+        case SYS_FCHOWN:          return (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2);
         case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
