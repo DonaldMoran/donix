@@ -3648,31 +3648,20 @@ long sys_dup(int fd) {
  * the line that turns into a hang, and the fix is a lock or a
  * per-volume flag, not cli.
  */
-static long unlink_body(const char* in_path, int want_dir,
-                        const char* tag) {
-    char local_path[USER_PATH_MAX];
-    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
-        return -(long)ENAMETOOLONG_;
-    }
-    strip_dot_prefix(local_path);
-
-    /* The root is a directory that cannot be removed, whatever the
-     * caller meant.  Synthesize the answer rather than handing "."
-     * or "0:/" to f_stat, which rejects them.  No shared state is
-     * touched, so this runs before the critical section. */
-    if (path_is_root(local_path)) {
-        return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
-    }
-
-    /* --- critical section: stat and unlink must be atomic --- */
+/*
+ * The FatFs unlink operation: stat-then-unlink, one critical
+ * section, moved verbatim out of unlink_body so a mount handler
+ * can reach it.  The pushfq/cli ... pushq/popfq save/restore on
+ * every path is the original and MUST NOT be altered here: that
+ * is contract VFS rule 1 (check and act are one critical section)
+ * and it is why rm and rmdir are race-free against a timer IRQ.
+ * A change to it is a separate commit with its own soak.
+ */
+static long fat_unlink_body(const char* local_path, int want_dir,
+                            const char* tag) {
     uint64_t saved_flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
 
-    /*
-     * Type check.  f_stat_with_retry resolves bare names the same
-     * way stat does, so `rm foo` and `rmdir foo` see the same object
-     * the caller would stat.
-     */
     FILINFO fno;
     FRESULT sr = f_stat_with_retry(local_path, &fno);
     if (sr != FR_OK) {
@@ -3703,6 +3692,25 @@ static long unlink_body(const char* in_path, int want_dir,
         return fatfs_errno(r);
     }
     return 0;
+}
+
+static long unlink_body(const char* in_path, int want_dir,
+                        const char* tag) {
+    char local_path[USER_PATH_MAX];
+    if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    strip_dot_prefix(local_path);
+
+    /* The root is a directory that cannot be removed, whatever the
+     * caller meant.  Synthesize the answer rather than handing "."
+     * or "0:/" to f_stat, which rejects them.  No shared state is
+     * touched, so this runs before the critical section. */
+    if (path_is_root(local_path)) {
+        return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
+    }
+
+    return fat_unlink_body(local_path, want_dir, tag);
 }
 
 /*
@@ -3847,6 +3855,22 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
  * resolved path overflows, otherwise the FatFs errno mapping
  * (FR_NO_FILE -> -ENOENT, FR_EXIST -> -EPERM, etc.).
  */
+/* The FatFs rename operation, moved out of sys_rename.  Takes the
+ * already-stripped FatFs-form paths. */
+static long fat_rename(const char* old_path, const char* new_path) {
+    FRESULT r = f_rename(old_path, new_path);
+    if (r != FR_OK) {
+        serial_print("sys_rename: f_rename FAIL old=");
+        serial_print(old_path);
+        serial_print(" new=");
+        serial_print(new_path);
+        serial_print(" r="); serial_print_dec(r);
+        serial_print("\n");
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 long sys_rename(const char* user_oldpath, const char* user_newpath) {
     pcb_t* self = process_get_current();
     if (!self || !user_oldpath || !user_newpath) return -(long)EFAULT_;
@@ -3900,17 +3924,7 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
     strip_dot_prefix(old_path);
     strip_dot_prefix(new_path);
 
-    FRESULT r = f_rename(old_path, new_path);
-    if (r != FR_OK) {
-        serial_print("sys_rename: f_rename FAIL old=");
-        serial_print(old_path);
-        serial_print(" new=");
-        serial_print(new_path);
-        serial_print(" r="); serial_print_dec(r);
-        serial_print("\n");
-        return fatfs_errno(r);
-    }
-    return 0;
+    return fat_rename(old_path, new_path);
 }
 
 /*
@@ -3949,6 +3963,15 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
  * ever needs -EEXIST, change fatfs_errno's FR_EXIST case to
  * -(long)17 at that time.
  */
+/* The FatFs mkdir operation, moved out of sys_mkdir. */
+static long fat_mkdir(const char* local_path) {
+    FRESULT r = f_mkdir(local_path);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 long sys_mkdir(const char* path, int mode) {
     (void)mode;
 
@@ -3983,11 +4006,7 @@ long sys_mkdir(const char* path, int mode) {
         return -(long)ENOENT_;
     }
 
-    FRESULT r = f_mkdir(local_path);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
-    }
-    return 0;
+    return fat_mkdir(local_path);
 }
 
 /*
