@@ -1560,15 +1560,24 @@ typedef struct fs_driver {
     long (*unlink)(const char* in_path, int want_dir, const char* tag);
     long (*rename)(const char* old_path, const char* new_path);
     long (*mkdir) (const char* local_path);
+    long (*open)  (const char* in_path, const char* local_path,
+                   int flags);
+    long (*stat)  (const char* path, void* user_stat);
+    long (*access)(const char* path);
 } fs_driver_t;
 
 static long fat_unlink_body(const char* local_path, int want_dir,
                             const char* tag);
 static long fat_rename(const char* old_path, const char* new_path);
 static long fat_mkdir(const char* local_path);
+static long fat_open(const char* in_path, const char* local_path,
+                     int flags);
+static long fat_stat_path(const char* path, void* user_stat);
+static long fat_access(const char* path);
 
 static const fs_driver_t fat_driver = {
     fat_unlink_body, fat_rename, fat_mkdir,
+    fat_open, fat_stat_path, fat_access,
 };
 
 /* /dev and /proc are read-only synthesized mounts. */
@@ -1581,7 +1590,18 @@ static long ro_rename(const char* old_path, const char* new_path) {
 static long ro_mkdir(const char* local_path) {
     (void)local_path; return -(long)EROFS_;
 }
-static const fs_driver_t ro_driver = { ro_unlink, ro_rename, ro_mkdir };
+static long ro_open(const char* in_path, const char* local_path, int flags) {
+    (void)in_path; (void)local_path; (void)flags; return -(long)EROFS_;
+}
+static long ro_stat(const char* path, void* user_stat) {
+    (void)path; (void)user_stat; return -(long)EROFS_;
+}
+static long ro_access(const char* path) {
+    (void)path; return -(long)EROFS_;
+}
+static const fs_driver_t ro_driver = {
+    ro_unlink, ro_rename, ro_mkdir, ro_open, ro_stat, ro_access,
+};
 
 static const struct {
     const char* path;      /* absolute mount point, no trailing '/' */
@@ -3449,7 +3469,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
     }
     strip_dot_prefix(local_path);
 
-    return fat_open(in_path, local_path, flags);
+    return mount_driver(BACKEND_FAT)->open(in_path, local_path, flags);
 }
 
 /*
@@ -4491,7 +4511,7 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
-    return fat_stat_path(path, user_stat);
+    return mount_driver(BACKEND_FAT)->stat(path, user_stat);
 }
 
 /*
@@ -4604,6 +4624,20 @@ long sys_lstat(const char* user_path, void* user_stat) {
  * entry "exists" and returns 0 without touching FatFs; an unknown
  * /dev or /proc path falls through, as before.
  */
+/*
+ * The FatFs access operation, moved out of access_resolved.  A
+ * path exists on FAT iff f_stat succeeds; donix tracks no UNIX
+ * permission bits, so the mode is irrelevant.
+ */
+static long fat_access(const char* path) {
+    FILINFO fno;
+    FRESULT r = f_stat_with_retry(path, &fno);
+    if (r != FR_OK) {
+        return fatfs_errno(r);
+    }
+    return 0;
+}
+
 static long access_resolved(const char* abs_path, int backend) {
     char path[USER_PATH_MAX];
     if (path_copy(path, sizeof(path), abs_path) != 0) {
@@ -4638,12 +4672,7 @@ static long access_resolved(const char* abs_path, int backend) {
         /* Unknown /proc entry: fall through to FAT, as before. */
     }
 
-    FILINFO fno;
-    FRESULT r = f_stat_with_retry(path, &fno);
-    if (r != FR_OK) {
-        return fatfs_errno(r);
-    }
-    return 0;
+    return mount_driver(BACKEND_FAT)->access(path);
 }
 
 /*
