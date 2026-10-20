@@ -66,7 +66,8 @@ That's the point. That's the whole point.
   `newfstatat`, `access`, `faccessat`, `chdir`, `getcwd`, `geteuid`,
   `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`,
   `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
-  `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) - the numbers
+  `symlink`, `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) -
+  the numbers
   and semantics match Linux x86_64. musl's `printf`, `malloc`, and
   `opendir` work unmodified.
 - **Has a working per-process working directory.** `chdir` and `getcwd`
@@ -75,7 +76,7 @@ That's the point. That's the whole point.
   `./x`, plain names) resolve against the cwd in every path-taking
   syscall - `sys_open`, `sys_stat`, `sys_access`, `sys_chdir`,
   `sys_unlink`, `sys_mkdir`, and every `*at` syscall through
-  `resolve_at`.
+  `vfs_resolve`.
 - **Runs busybox as the primary shell.** A static musl-linked busybox
   1.36.1 is what you land in: its `ash` is interactive (prompt, echo,
   backspace, line editing, history), and it supports real shell
@@ -139,13 +140,57 @@ That's the point. That's the whole point.
   `ttyname(3)`'s three gates all pass, including the one that
   compares `stat("/dev/console")` against `fstat(0)`.
 
-  **`/proc` is now a real directory**: `readdir("/proc")` lists
-  `self` and the live pids, which is what `ps` and `pstree` read.
-  **`/dev` is not**: `ls /dev` fails, and adding it is the same
-  directory shape `/proc` already has.  `/dev/tty` and
-  `/dev/urandom` do not exist, and `/dev/console` is stat-able but
-  not openable.  See `docs/strategy.md`, "When a feature may force
-  architecture," and `handoff.md`.
+  **`/proc` and `/dev` are both real directories.**  `readdir`
+  on either lists its entries: `/proc` gives `self` and the live
+  pids (what `ps` and `pstree` read); `/dev` gives `console`,
+  `null`, `tty`, `urandom`, and `zero`, and every one of them
+  opens, reads, writes, and stats with its own `(major, minor)`
+  device number.  See "The VFS", below.
+
+---
+
+## The VFS
+
+The pathname-dispatch layer is now a real VFS, and it is the part
+of donix that makes the Linux ABI claims above true rather than
+aspirational.
+
+- **A mount table.**  `g_mounts` maps mount points to filesystem
+  drivers by longest prefix on a component boundary: `/` is
+  FatFs, `/dev` is the device table, `/proc` is the process
+  table.  `/dev` does not match `/devices`, and adding a
+  filesystem is a row, not a clause in every syscall.
+- **One operation vtable per mount.**  `fs_driver_t` has
+  `open`, `stat`, `access`, `unlink`, `rename`, and `mkdir`.
+  Every path-taking syscall resolves the path, looks up the
+  mount, and calls the mount's operation.  No syscall tests the
+  backend to decide what to do.
+- **One resolver.**  `vfs_resolve(path, follow_final)` is the
+  single place a path is resolved: it canonicalizes `.` and
+  `..`, picks the mount, and -- when `follow_final` is set --
+  follows symbolic links.
+- **Symlinks.**  FAT has no symlink bit, so a link is an
+  ordinary file whose first line is `DONIX_LINK:<target>`.
+  `ln -s` writes one; `readlink` reads it; `vfs_resolve`
+  follows it (capped at 8 hops, `ELOOP` beyond); `lstat`
+  reports `S_IFLNK`; and `unlink`, `rmdir`, `unlinkat`, and
+  `rename` operate on the link itself, not its target -- as on
+  Unix.
+- **Devices are drivers, not kinds.**  Each row in
+  `g_dev_table` carries `(major, minor, ino, read, write)`.
+  `/dev/null` is 1,3; `console` 5,1; `tty` 5,0; `zero` 1,5;
+  `urandom` 1,9.  `st_rdev` reports the device number;
+  `st_dev`/`st_ino` report identity.
+
+What this buys: `realpath` works on interior `..`; `readlink -f`
+follows; `ls -l` prints `l ... -> target`; `ps` reads `/proc`;
+`ls /dev` lists the devices; and a write to `/dev/null` or a
+synthesized mount gets the right answer (`0`, or `EROFS`).  What
+it does not do: real `mount(2)` (the table is `static const`),
+file-backed `mmap`, `link(2)`/`mknod(2)` (FAT cannot store
+them), or a cryptographic `/dev/urandom`.  See `handoff.md`.
+
+---
 
 donix is a fork of [dons-os](https://github.com/DonaldMoran/dons-os-x86_64).
 The kernel infrastructure - boot chain, PMM, VMM, heap, scheduler, ATA
@@ -194,10 +239,12 @@ tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
 `CONFIG_FEATURE_EDITING_FANCY_PROMPT=y`,
 `CONFIG_FEATURE_SH_STANDALONE=y`, `CONFIG_FEATURE_HUMAN_READABLE=y`,
 `CONFIG_READLINK=y`, `CONFIG_LONG_OPTS=y`, `CONFIG_PS=y` (with
-`CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, and
+`CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, `CONFIG_SHOW_USAGE=y`, and
 `CONFIG_FEATURE_VI_WIN_RESIZE=y` (so `vi` fills the framebuffer
 console). It also enables the `bc`, `dc`, `diff`, `du`, and `awk`
-applets.
+applets.  `tar` is deliberately **off**: its creation path writes
+an empty archive and exits 0, so it is not shipped until that is
+fixed in the busybox source.
 
 ---
 
