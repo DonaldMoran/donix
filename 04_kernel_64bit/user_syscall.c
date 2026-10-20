@@ -81,6 +81,15 @@ static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
 static long access_resolved(const char* abs_path, int backend);
+/* Defined below, in the path-resolution section.  vfs_resolve
+ * (which is above it) calls it; the symlink follow needs both it
+ * and donix_link_target / DONIX_LINK_MAX declared here. */
+static int vfs_resolve_once(int dirfd, const char* path,
+                            char* out, size_t cap,
+                            int* backend_out);
+#define DONIX_LINK_MAX    256
+static int donix_link_target(const char* fat_path,
+                             char* out, size_t cap);
 /* Defined below, in the sys_chdir section.  Used earlier by
  * sys_readlink to answer existence for synthesized /proc paths,
  * and by sys_chdir for the same shapes.  One enum, one definition. */
@@ -149,6 +158,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ECHILD   10
 #define EINVAL_  22
 #define EROFS_   30   /* read-only filesystem (Linux EROFS) */
+#define ELOOP_   40   /* too many symbolic links (Linux ELOOP) */
 #define EPIPE_   32
 #define ERANGE_  34
 #define ENAMETOOLONG_ 36
@@ -556,6 +566,7 @@ typedef struct {
 #define KSTAT_IFREG  0100000
 #define KSTAT_IFDIR  0040000
 #define KSTAT_IFCHR  0020000   /* character device; /dev/null */
+#define KSTAT_IFLNK  0120000   /* symbolic link; DONIX_LINK marker */
 
 /*
  * True if `p` names the FAT root directory.
@@ -1823,10 +1834,59 @@ static int vfs_canonicalize_abs(char* p, size_t cap) {
  * makes it load-bearing, and it will be a change to this
  * function's body, not to its callers.
  */
+/*
+ * vfs_resolve: the one path resolver every path-taking syscall
+ * calls (docs/contract.md VFS rule 4).
+ *
+ * Resolves the path once with vfs_resolve_once, then, when
+ * follow_final is 1, follows symbolic links: a FAT file whose
+ * first line is "DONIX_LINK:<target>" is a link.  An absolute
+ * target replaces the whole path; a relative target replaces the
+ * link's own last component, which is Unix.  The loop is capped
+ * at 8 hops so a link cycle is -ELOOP, not a hang.
+ *
+ * follow_final 0 means "do not follow the last component":
+ * that is what readlink and lstat pass, and it returns the link
+ * itself.
+ */
 static int vfs_resolve(int dirfd, const char* path,
                        char* out, size_t cap,
                        int* backend_out, int follow_final) {
-    (void)follow_final;   /* no symlinks yet; see the header */
+    int r = vfs_resolve_once(dirfd, path, out, cap, backend_out);
+    if (r != 0 || !follow_final) return r;
+
+    for (int depth = 0; depth < 8; depth++) {
+        if (backend_out && *backend_out != BACKEND_FAT) return 0;
+        char fat[USER_PATH_MAX];
+        if (path_copy(fat, sizeof(fat), out) != 0) return -(long)ENAMETOOLONG_;
+        strip_dot_prefix(fat);
+        char tgt[DONIX_LINK_MAX];
+        if (!donix_link_target(fat, tgt, sizeof(tgt))) return 0;
+
+        if (tgt[0] == '/') {
+            if (path_copy(out, cap, tgt) != 0) return -(long)ENAMETOOLONG_;
+        } else {
+            size_t slash = 0, i = 0;
+            while (out[i]) { if (out[i] == '/') slash = i; i++; }
+            size_t o = slash + 1;
+            if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
+            for (size_t k = 0; tgt[k]; k++) {
+                if (o + 1 >= cap) return -(long)ENAMETOOLONG_;
+                out[o++] = tgt[k];
+            }
+            out[o] = '\0';
+        }
+        if (vfs_canonicalize_abs(out, cap) != 0) return -(long)ENAMETOOLONG_;
+        if (backend_out) *backend_out = path_backend(out);
+    }
+    return -(long)ELOOP_;
+}
+
+/* One resolution pass: no link following.  vfs_resolve below
+ * wraps this with the follow loop. */
+static int vfs_resolve_once(int dirfd, const char* path,
+                            char* out, size_t cap,
+                            int* backend_out) {
     /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
     if (path_is_absolute(path)) {
         if (path_copy(out, cap, path) != 0) return -(long)ENAMETOOLONG_;
@@ -1907,8 +1967,9 @@ static int vfs_resolve(int dirfd, const char* path,
         out[o++] = path[i];
     }
     out[o] = '\0';
-    if (vfs_canonicalize_abs(out, cap) != 0)
+    if (vfs_canonicalize_abs(out, cap) != 0) {
         return -(long)ENAMETOOLONG_;
+    }
     if (backend_out) *backend_out = path_backend(out);
     return 0;
 }
@@ -2028,6 +2089,19 @@ static void fill_kstat_as_chardev(kernel_stat_t* st,
  * This is what /proc/self/status reports: a regular file, mode
  * 0444 (read-only), with a size that is the entry's maximum text
  * length.  See proc_entry_size. */
+/* Fill a kernel_stat_t describing a symbolic link: mode
+ * S_IFLNK | 0777, size = the target's length (which is what
+ * Linux reports for a link, not the file size), one link.  The
+ * target bytes are not in the kstat; readlink returns them. */
+static void fill_kstat_as_link(kernel_stat_t* st, uint64_t target_len) {
+    for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_nlink   = 1;
+    st->st_blksize = 512;
+    st->st_mode    = KSTAT_IFLNK | 0777;
+    st->st_size    = (int64_t)target_len;
+    st->st_blocks  = 0;
+}
+
 static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry,
                                uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
@@ -4025,7 +4099,7 @@ long sys_unlink(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
 
     return unlink_body(resolved, 0, "sys_unlink", backend);
@@ -4055,7 +4129,7 @@ long sys_rmdir(const char* path) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
 
     return unlink_body(resolved, 1, "sys_rmdir", backend);
@@ -4098,7 +4172,7 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
 
     int want_dir = (flags & AT_REMOVEDIR_) != 0;
@@ -4179,12 +4253,13 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
      * resolver as every other path syscall; the tag is unused
      * here and discarded. */
     int backend;
+    /* rename operates on both entries, not their targets: 0. */
     int rr = vfs_resolve(AT_FDCWD_, old_path, old_resolved,
-                        sizeof(old_resolved), &backend, 1);
+                        sizeof(old_resolved), &backend, 0);
     if (rr != 0) return rr;
     (void)backend;
     rr = vfs_resolve(AT_FDCWD_, new_path, new_resolved,
-                    sizeof(new_resolved), &backend, 1);
+                    sizeof(new_resolved), &backend, 0);
     if (rr != 0) return rr;
     (void)backend;
 
@@ -4526,7 +4601,7 @@ static long fat_stat_path(const char* path, void* user_stat) {
 }
 
 static long stat_resolved(const char* abs_path, void* user_stat,
-                          int backend) {
+                          int backend, int follow_final) {
     if (!user_stat) return -(long)EFAULT_;
 
     char path[USER_PATH_MAX];
@@ -4570,6 +4645,26 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         long r = mount_driver(BACKEND_PROC)->stat(abs_path, user_stat);
         if (r != BACKEND_NOT_MINE) return r;
         /* Unknown /proc entry: fall through to FAT, as before. */
+    }
+
+    /*
+     * A DONIX_LINK marker with follow_final == 0 (lstat): report
+     * S_IFLNK with st_size = target length.  follow_final == 1
+     * already followed in vfs_resolve, so the path is the target
+     * and this does not apply.
+     */
+    if (!follow_final && backend == BACKEND_FAT) {
+        char tgt[DONIX_LINK_MAX];
+        if (donix_link_target(path, tgt, sizeof(tgt))) {
+            size_t tlen = 0;
+            while (tgt[tlen]) tlen++;
+            kernel_stat_t st;
+            fill_kstat_as_link(&st, tlen);
+            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
     }
 
     return mount_driver(BACKEND_FAT)->stat(path, user_stat);
@@ -4635,10 +4730,12 @@ long sys_newfstatat(int dirfd, const char* pathname, void* user_stat,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved),
+                         &backend, follow_final);
     if (rr != 0) return rr;
 
-    return stat_resolved(resolved, user_stat, backend);
+    return stat_resolved(resolved, user_stat, backend, follow_final);
 }
 
 /*
@@ -4807,6 +4904,7 @@ long sys_access(const char* user_path, int mode) {
  * AT_EACCESS set, saw the wrong resolution.
  */
 long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
     (void)mode;
     (void)flags;
 
@@ -4819,7 +4917,7 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4858,6 +4956,7 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
  */
 long sys_utimensat(int dirfd, const char* path, const void* times,
                    int flags) {
+    int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
     (void)times;
 
     if (!path) return -(long)EFAULT_;
@@ -4884,7 +4983,7 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
     return access_resolved(resolved, backend);
@@ -4954,7 +5053,6 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
  * resolves against the link's own directory at follow time.
  */
 #define DONIX_LINK_PREFIX "DONIX_LINK:"
-#define DONIX_LINK_MAX    256
 static int donix_link_target(const char* fat_path,
                              char* out, size_t cap) {
     FIL f;
