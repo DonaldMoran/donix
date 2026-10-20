@@ -81,6 +81,17 @@ static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
 static long access_resolved(const char* abs_path, int backend);
+/* Defined below, in the sys_chdir section.  Used earlier by
+ * sys_readlink to answer existence for synthesized /proc paths,
+ * and by sys_chdir for the same shapes.  One enum, one definition. */
+enum proc_shape {
+    PROC_SHAPE_NONE = 0,
+    PROC_SHAPE_DIR_LIVE,
+    PROC_SHAPE_DIR_DEAD,
+    PROC_SHAPE_FILE_LIVE,
+    PROC_SHAPE_FILE_DEAD,
+};
+static enum proc_shape proc_entry_shape(const char* r);
 /* Defined below, in the path-resolution section.  resolve_at
  * calls it before path_backend so the backend is chosen from
  * the canonical path, not the raw one (contract VFS rule 4). */
@@ -4612,6 +4623,27 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     if (backend == BACKEND_PROC) {
         long rl = proc_readlink(resolved, buf, bufsiz);
         if (rl != PROC_READLINK_NOT_MINE) return rl;
+        /*
+         * Not a self/fd symlink.  Answer existence exactly from
+         * the same shape helper sys_chdir uses: a live synthesized
+         * entry exists and is not a link (-EINVAL, which is what
+         * musl's realpath keys on to mean "descend"); a
+         * well-formed but dead /proc/<pid> does not exist
+         * (-ENOENT).  The previous fallthrough went through
+         * access_resolved, which does not know the synthesized
+         * shapes and returned -ENOENT for live entries too, so
+         * realpath aborted at the first /proc component.
+         */
+        switch (proc_entry_shape(resolved)) {
+        case PROC_SHAPE_DIR_LIVE:
+        case PROC_SHAPE_FILE_LIVE:
+            return -(long)EINVAL_;
+        case PROC_SHAPE_DIR_DEAD:
+        case PROC_SHAPE_FILE_DEAD:
+            return -(long)ENOENT_;
+        default:
+            break;   /* not a synthesized shape: fall through */
+        }
     }
 
     /* Validate the path exists, so a missing path is -ENOENT and a
@@ -7044,6 +7076,66 @@ long sys_getcwd(char* buf, unsigned long size) {
 #define ENOTDIR_ 20
 #endif
 
+/*
+ * What shape a resolved /proc path is.  One definition, three
+ * callers (sys_chdir, sys_readlink, and any future one), so the
+ * "is this /proc/<pid>" test cannot drift between syscalls.
+ *
+ * NONE       not a synthesized /proc path (FAT, DEV, etc.)
+ * DIR_LIVE   /proc, /proc/self, /proc/<live pid>  -- a directory
+ * DIR_DEAD   /proc/<dead pid>                     -- well-formed
+ * FILE_LIVE  /proc/<live pid>/{stat,status,cmdline}
+ * FILE_DEAD  /proc/<dead pid>/{stat,status,cmdline}
+ *
+ * A path of the shape /proc/x/y that is neither a known file nor
+ * a pid is NONE; the caller falls through to FatFs, which is
+ * what produced ENOENT for unknown /proc paths before the seam.
+ */
+
+static enum proc_shape proc_entry_shape(const char* r) {
+    if (!r) return PROC_SHAPE_NONE;
+    if (!(r[0]=='/' && r[1]=='p' && r[2]=='r' && r[3]=='o'
+          && r[4]=='c')) return PROC_SHAPE_NONE;
+    if (r[5] == '\0') return PROC_SHAPE_DIR_LIVE;   /* /proc */
+    if (r[5] != '/') return PROC_SHAPE_NONE;
+
+    const char* c = r + 6;
+    uint64_t pid = 0;
+    int is_self = (c[0]=='s' && c[1]=='e' && c[2]=='l'
+                   && c[3]=='f');
+    if (is_self) {
+        pcb_t* me = process_get_current();
+        if (!me) return PROC_SHAPE_NONE;
+        pid = me->pid;
+        c += 4;
+    } else {
+        int ndig = 0;
+        while (*c >= '0' && *c <= '9') {
+            pid = pid * 10 + (uint64_t)(*c - '0');
+            c++; ndig++;
+        }
+        if (ndig == 0) return PROC_SHAPE_NONE;
+    }
+
+    int live = process_find_by_pid(pid) != NULL;
+
+    if (c[0] == '\0') {
+        return live ? PROC_SHAPE_DIR_LIVE : PROC_SHAPE_DIR_DEAD;
+    }
+    if (c[0] != '/') return PROC_SHAPE_NONE;
+    c++;
+    int is_stat = (c[0]=='s' && c[1]=='t' && c[2]=='a'
+                   && c[3]=='t' && c[4]=='\0');
+    int is_status = (c[0]=='s' && c[1]=='t' && c[2]=='a'
+                     && c[3]=='t' && c[4]=='u' && c[5]=='s'
+                     && c[6]=='\0');
+    int is_cmdline = (c[0]=='c' && c[1]=='m' && c[2]=='d'
+                      && c[3]=='l' && c[4]=='i' && c[5]=='n'
+                      && c[6]=='e' && c[7]=='\0');
+    if (!(is_stat || is_status || is_cmdline)) return PROC_SHAPE_NONE;
+    return live ? PROC_SHAPE_FILE_LIVE : PROC_SHAPE_FILE_DEAD;
+}
+
 long sys_chdir(const char* user_path) {
     pcb_t* self = process_get_current();
     if (!self || !user_path) return -(long)EFAULT_;
@@ -7104,25 +7196,8 @@ long sys_chdir(const char* user_path) {
      * requires the path to END at the pid.
      */
     if (backend == BACKEND_PROC) {
-        int is_proc_dir = 0;
-        const char* r = resolved;
-        if (r[0]=='/' && r[1]=='p' && r[2]=='r' && r[3]=='o'
-            && r[4]=='c') {
-            if (r[5] == '\0') {
-                is_proc_dir = 1;                 /* /proc */
-            } else if (r[5] == '/') {
-                const char* c = r + 6;
-                if (c[0]=='s' && c[1]=='e' && c[2]=='l'
-                    && c[3]=='f' && c[4]=='\0') {
-                    is_proc_dir = 1;             /* /proc/self */
-                } else {
-                    int ndig = 0;
-                    while (*c >= '0' && *c <= '9') { c++; ndig++; }
-                    if (ndig > 0 && *c == '\0') is_proc_dir = 1;
-                }
-            }
-        }
-        if (is_proc_dir) {
+        enum proc_shape sh = proc_entry_shape(resolved);
+        if (sh == PROC_SHAPE_DIR_LIVE) {
             size_t o = 0;
             for (size_t i = 0; resolved[i] && o < sizeof(self->cwd) - 1; i++) {
                 self->cwd[o++] = resolved[i];
