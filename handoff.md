@@ -5,12 +5,13 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-18.  **The `C` is FIXED and the heap cycle
-hang is CONTAINED.**  pipe7e passes at 100 kHz (250000 iterations,
-zero events) and at 100 Hz (applet suite green, pipe7e clean); the
-heap ran 10000 iterations clean with no `HEAP:` lines.  Read "What was
-fixed" first, then "Releases" for the version-bump procedure, then
-"Next" for what remains.
+**Last updated:** 2026-10-20.  **The `C` is FIXED, the heap cycle hang
+is CONTAINED, and busybox batch 1 + five applets are in.**  pipe7e
+passed at 100 kHz (250000 iterations, zero events) and a >3.5-hour
+100 Hz soak passed clean; the heap ran 10000 iterations clean with no
+`HEAP:` lines.  `test.sh` is 57/57 and the busybox applets `bc`, `dc`,
+`diff`, `du`, `awk` are enabled and verified by running them.  Read
+"The concurrency contract" first, then "Where we are", then "Next".
 
 **THE `C`, in one paragraph.**  `context_switch_resume` loads
 `next->rsp` and reads 20 slots as a resume frame.  The `C` fired when
@@ -39,6 +40,18 @@ across `coalesce_blocks()` + `heap_validate()` in `kfree`.  **There is
 no evidence of a caller overflow** -- the heap had a race, not an
 overflow.  The bounded walk and split guard remain as real protection
 against a future corruption.
+
+**THE CONCURRENCY CONTRACT.**  `docs/contract.md` is the durable
+statement; this file summarizes it.  A shared-state mutation and the
+check that authorizes it are one critical section; a refused dispatch
+restores `current_process`.  `state`, `block_kind`, and ready-queue
+membership are changed only under `cli`.  Heap list mutation and
+validation are one critical section; file-slot refcounts and the
+`put_file_slot`/`sys_close` pipe-wake coupling are the VFS's version
+of the same rule.  **Signals are the first ASYNCHRONOUS state writer**
+-- the exact shape of the races just fixed -- and must be designed
+against `docs/contract.md` before code lands.  Read that file before
+touching signals or the VFS.
 
 **What was fixed.**
 
@@ -78,6 +91,20 @@ against a future corruption.
     the corrupt print names the block's fields; `HEAP_TRACE_MERGE`
     (default 0) traces the coalesce arithmetic.
 
+  Busybox (tags `20261019-busybox-batch1`,
+  `20261019-busybox-applets`, `20261019-readme-current`):
+  - Batch 1: fancy prompt (`\w` in `PS1`), `readlink` (+follow),
+    `ls` filetypes/timestamps/sort/recursive, human-readable sizes,
+    long options.  Verified 57/57.
+  - Five applets enabled and verified by running them on the booted
+    image: `bc`, `dc`, `diff`, `du`, `awk`.  `test.sh` 57/57.
+  - `docs/contract.md` added (`963f4b8`); handoff points at it
+    (`a93991c`).
+  - Process lesson: enable busybox applets ONE AT A TIME from a clean
+    baseline and rebuild; stacking several config changes in one build
+    tree leaves stale `built-in.o` / `applet_tables.h` and produces a
+    binary missing the new applets.
+
 **THE VERIFICATION.**
   - `C`: pipe7e at `pit_init(100000)` -- **PIPE7E-ALL-PASS**,
     250000 iterations, zero `SWITCH-DEAD`, zero `C`.  At
@@ -87,6 +114,9 @@ against a future corruption.
     no `C`), canary `--full` 28/28, `test.sh` 57/57.  The run is
     faster than the corrupt runs -- the allocator was spending time
     on the broken list.
+  - Soak: pipe7e `pit_init(100)`, 250000 iterations, >3.5 hours,
+    **PIPE7E-ALL-PASS**, zero `C`/`SWITCH-DEAD`/`YIELD-REFUSE`/`HEAP:`.
+    Recorded in `docs/open-issues.md` 7b.
   - Selftest: 18/18, `[exception_de]`/`[exception_pf]`/
     `[exception_gp]` PASS, the kernel shell returns; the
     `TIMER-REFUSE ... fail_slot` line is gone; the `create_fail`
@@ -95,18 +125,8 @@ against a future corruption.
     interleavings; 100 Hz covers the user-mode-preemption paths.
 
 **NOT PROVEN.**  "Clean at both rates" is strong evidence, not proof.
-The runs are not a soak; a race that fires 1-in-500000 did not fire in
-these runs, which does not mean it cannot.  A multi-hour soak at
-100 Hz is the validation the fast run cannot give.
-
-**THE INVARIANT -- signals must honor it.**  `state`, `block_kind`,
-and ready-queue membership are changed only under `cli`; a dispatch's
-check and act are one critical section; a refused dispatch restores
-`current_process`.  Heap list mutation and validation are also one
-critical section.  Signals (open-issues item 12) are the first feature
-that adds an ASYNCHRONOUS state writer -- exactly the shape of the
-races just fixed.  Any signal delivery that changes a process's state
-from outside its own execution must follow this discipline.  The durable statement is in `docs/contract.md`; this paragraph is the summary.
+The runs are not proof a 1-in-N race cannot fire; the soak is strong
+evidence, not closure.  Do not call a race closed on one clean run.
 
 **Repo state -- run these; do not write it here.**
 
@@ -137,8 +157,7 @@ closes the terminal.  Write to `/tmp/<name>.sh` with
 style.**  **`set -e` at the top.**  **Idempotent edit scripts.**
 **Do the count check IN PYTHON (`str.count`), not with `grep`.**
 `grep -Fc` does not do multi-line matches; `grep -Fxc` requires a
-whole-line match.  Both produced false abort counts this session.
-`str.count` is the only honest multi-line count.
+whole-line match.  `str.count` is the only honest multi-line count.
 
 **BEFORE ASSERTING A COUNT, count the occurrences in the file and
 write the expected number from that count, not from memory.**
@@ -186,38 +205,46 @@ committed value is 100.  Do not call a race closed on one clean run.**
 ## Releases
 
 **Before a release:** the scratch `2026MMDD-*` tags are annotated and
-are the source for the version summary.  Do not delete them until the
-`vX.Y.Z` tag is made and the summary is in the merge commit.
+are the source for the version summary.  **Write the summary from
+them BEFORE dropping them.**  The release tag and the merge commit
+are local objects; once they exist, the scratch tags may be dropped.
 
-**The release procedure** (from `vX.Y.Z` on `dev`):
+**The release procedure** (on `dev`, pre-release):
 
-    git tag vX.Y.Z
-    git push origin dev
-    git push origin vX.Y.Z
-    git checkout main
-    git merge --no-ff dev -m "<version summary>"
-    git push origin main
-    git checkout dev
+1. **Patch the docs first.**  Update this file's release paragraph and
+   (optionally) `docs/version-history.md`.  Commit.
+2. **Bump the version string in `kmain.c` manually** (the banner).
+   Commit.
+3. **Tag** `vX.Y.Z` annotated, on `dev`, summary from the scratch
+   tags' annotations and `vPREV..HEAD`:
 
-`--no-ff` keeps the merge point in `main`'s history.  The summary is
-written from the scratch tags' annotations and the
-`vPREV..HEAD` commit log, in the project's voice.
+       git tag -a vX.Y.Z -m "<version summary>"
 
-**Then drop the scratch tags:**
+4. **Drop the scratch tags locally** (the tag and summary now exist):
 
-    git tag --list '2026*' > /tmp/scratch-tags.txt
-    for t in $(git tag --list '2026*'); do git tag -d "$t"; done
+       for t in $(git tag --list '2026*'); do git tag -d "$t"; done
 
-(Local tags only; if any were pushed, `git push origin :refs/tags/<t>`
-for each.)
+5. **Push `dev`, then the tag:**
 
-**v0.6.13 is closed.**  The banner is bumped (`f1b4a21`,
-tag `20261018-v0614-bump`) and this is the first change under
-**v0.6.14**.  The release tag will be `v0.6.14`, covering
-sessions 60-68: the migration, the pipe/scheduler lost-wakeup and
-queue-mutator family, the `C`, the heap cycle, the selftest fixes,
-and the `run` rewrite.  The long-form narrative is the `v0.6.13`
-entry in `docs/version-history.md` (commit `033bd53`).
+       git push origin dev
+       git push origin vX.Y.Z
+
+6. **Merge to `main` with `--no-ff`** (keeps the merge point in
+   `main`'s history), push, return to `dev`:
+
+       git checkout main
+       git merge --no-ff dev -m "<version summary>"
+       git push origin main
+       git checkout dev
+
+Do not use `git push --tags` -- it would push the scratch tags.  Push
+`vX.Y.Z` by name.
+
+**Current release state.**  **`v0.6.14` is released.**  Work is now
+pre-**`v0.6.15`**.  The scratch tags `20261019-*` (7b investigation,
+busybox batch 1, the five applets, README) are the source for the
+`v0.6.15` summary; the bump is the maintainer's decision.  Do not
+delete them until the `v0.6.15` tag and merge summary exist.
 
 ---
 
@@ -226,9 +253,12 @@ entry in `docs/version-history.md` (commit `033bd53`).
 A fork of dons-os.  Goal: a Unix-like OS that runs static musl-linked
 binaries on the Linux x86_64 ABI, natively.  Newlib is gone.
 Userland is a tracked source tree at `userland/musl/`.  Phase B
-(busybox) is well underway.
+(busybox) is well underway: the shell is interactive, pipelines and
+redirection work, and the applet set now includes `bc`, `dc`, `diff`,
+`du`, `awk` in addition to the file/text applets.
 
 Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
+Concurrency rules: `docs/contract.md`.
 
 ---
 
@@ -239,20 +269,33 @@ Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
 Both fixed.  See "What was fixed" and "THE VERIFICATION" at the top.
 Do NOT re-walk the refuted paths below.
 
+### Current baseline
+
+- `test.sh` 57/57; canary `--full` 28/28; pipe7e clean at 100 kHz and
+  on a >3.5-hour 100 Hz soak.
+- Busybox batch 1 (prompt, readlink, `ls` features, human-readable,
+  long options) and five applets (`bc`, `dc`, `diff`, `du`, `awk`)
+  enabled and verified by running them.
+- `docs/contract.md` is the durable concurrency rule; read it before
+  any shared-state change.
+
 ### Next -- the highest-value work
 
-1. **A 100 Hz soak.**  The runs above are not a soak.  Let pipe7e or
-   the applet suite run for hours at `pit_init(100)` and confirm no
-   `C`, no `SWITCH-DEAD`, no `YIELD-REFUSE`, no `HEAP:`.  This is the
-   validation the fast run cannot give.
+1. **The VFS.**  The pathname-dispatch seam exists (`/proc` is a real
+   directory, `/dev` is not); the VFS makes the seam a real layer:
+   a mount table, inode operations, FatFs as one driver, and one
+   `vfs_resolve(path, follow_final)` that every path-taking syscall
+   calls.  It unblocks `/dev` as a directory, symlinks (item 8),
+   file-backed `mmap` (a Wayland prerequisite), and the display
+   stack.  Read `docs/contract.md`'s VFS section first.  Scope it as
+   small, verified commits: mount table, FatFs driver, one syscall
+   through `vfs_resolve`, then `/dev`, then `/proc`, then symlinks.
 2. **Signals (open-issues item 12).**  The first asynchronous state
-   writer.  Honor the invariant above.
-3. **Shebang + `/bin/sh`.**  `./script.sh` works via ash's `ENOEXEC`
-   fallback, but `/bin/sh` does not exist and `sys_execve` has no
-   `#!` handling.  Two parts: put `/bin/sh` on the image (copy of
-   busybox or a kernel alias -- a decision), and add `#!` parsing to
-   `sys_execve` with a recursion guard.  Not a bug -- a feature gap.
-4. The open-issues list (top 6, below).
+   writer; design against `docs/contract.md` before code.
+3. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
+   recursion guard, and an interpreter on the image.
+4. **`sys_gettimeofday` (99)** so `ps -l` works.
+5. The open-issues list (top 6, below).
 
 ### Refuted -- do NOT re-walk
 
@@ -283,27 +326,25 @@ Do NOT re-walk the refuted paths below.
    process bug.
 6. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
 
-Plus: **shebang + `/bin/sh`** (see Next), and **a 100 Hz soak**.
+Plus: **the VFS** (see Next), **shebang + `/bin/sh`**, and the
+open-issues list.
 
 ---
 
 ## State on disk
 
 Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
-Scratch tags from the `C`/heap work (drop before release):
-`20261016-c-contained`, `20261016-destroy-both-current`,
-`20261016-tail-state-check`, `20261017-pipe7e-all-pass`,
-`20261018-heap-cycle-contained`.
-Earlier: `20261014-queue-race-closed`, `20261014-pipe7e-100k-clean`,
-`20261013-session-start`.
+Scratch tags for the `v0.6.15` summary (drop only after the tag and
+merge summary exist): `20261019-7b-investigated`,
+`20261019-busybox-batch1`, `20261019-busybox-applets`,
+`20261019-readme-current`.
 
 ---
 
 ## One-line summary
 
-**The `C` is FIXED (pop-to-dispatch `cli`, atomic tail check) and the
-heap cycle hang is CONTAINED (bounded walk, split guard,
-`cli`-across-coalesce-and-validate).  pipe7e passes at 100 kHz
-(250000, zero events) and at 100 Hz; the heap ran 10000 iterations
-clean.  Next: a 100 Hz soak, then signals -- honoring the invariant
-that state changes happen under `cli`.**
+**The `C` is FIXED, the heap cycle hang is CONTAINED, and busybox
+batch 1 + five applets are in (57/57; a >3.5-hour 100 Hz soak is
+clean).  `docs/contract.md` is the durable concurrency rule.  Next:
+the VFS -- read the contract's VFS section, then scope it as small,
+verified commits.**
