@@ -81,6 +81,10 @@ static file_slot_t* get_file_slot_any(int fd);
 /* Defined below, in the file-access section.  sys_access and
  * sys_faccessat both call it. */
 static long access_resolved(const char* abs_path, int backend);
+/* Defined below, in the path-resolution section.  resolve_at
+ * calls it before path_backend so the backend is chosen from
+ * the canonical path, not the raw one (contract VFS rule 4). */
+static int vfs_canonicalize_abs(char* p, size_t cap);
 /* Defined below, in the safe-copy section.  proc_readlink (above
  * that definition) calls it. */
 static int safe_copy_to_user(void* user_dest, const void* kernel_src,
@@ -1436,6 +1440,99 @@ static int path_backend(const char* abs_path) {
 }
 
 /*
+ * Canonicalize an absolute Unix-form path in place: fold '.' and
+ * '..' components and collapse repeated '/'.  This is the VFS
+ * rule-4 canonicalizer -- the one place '..' is handled, so
+ * realpath, cd -P, find, and future symlink targets all see the
+ * same folded path (docs/open-issues.md, realpath item).
+ *
+ * Lexical only.  Symlinks do not exist yet (open-issues item 8),
+ * so there is nothing to follow; when they land, following happens
+ * here or just above, not in individual syscalls.
+ *
+ * A path whose first byte is not '/' is left untouched and
+ * reported success.  The FatFs drive form ("0:/FOO") reaches
+ * resolve_at's AT_FDCWD branch via resolve_against_cwd's
+ * pass-through, and path_backend already classifies it as FAT;
+ * folding it would corrupt the drive prefix.  So the fold is a
+ * no-op for anything not starting with '/'.
+ *
+ * A trailing '/' is preserved (one, and not at root) when the
+ * input had one.  resolve_at's dirfd branches preserve a
+ * dir_path's trailing slash, and the fold must not introduce a
+ * distinction between "sub/" and "sub" that the resolver did
+ * not previously make.
+ *
+ * Returns 0 on success, -1 if the folded result would not fit in
+ * cap (the caller maps that to -ENAMETOOLONG, the resolver's
+ * existing overflow mapping).
+ */
+static int vfs_canonicalize_abs(char* p, size_t cap) {
+    if (!p || cap < 2) return -1;
+    if (p[0] != '/') return 0;   /* not Unix-absolute: leave it */
+
+    /* Build the folded result in a scratch buffer, then copy
+     * back.  USER_PATH_MAX is the caller's cap; a path already
+     * fits in out, so a same-sized scratch is enough. */
+    char tmp[USER_PATH_MAX];
+    size_t in = 0;
+    size_t out = 0;
+    int trailing_slash = 0;
+
+    /* Detect a trailing slash on the input (not at root). */
+    {
+        size_t len = 0;
+        while (p[len]) len++;
+        if (len > 1 && p[len - 1] == '/') trailing_slash = 1;
+    }
+
+    tmp[out++] = '/';
+
+    while (p[in]) {
+        /* Skip separators. */
+        while (p[in] == '/') in++;
+        if (!p[in]) break;
+
+        /* Find component bounds. */
+        size_t start = in;
+        while (p[in] && p[in] != '/') in++;
+        size_t clen = in - start;
+
+        /* '.' -> skip. */
+        if (clen == 1 && p[start] == '.') continue;
+
+        /* '..' -> pop the last component (never above root). */
+        if (clen == 2 && p[start] == '.' && p[start + 1] == '.') {
+            if (out > 1) {
+                out--;                       /* drop trailing '/' */
+                while (out > 1 && tmp[out - 1] != '/') out--;
+            }
+            continue;
+        }
+
+        /* Ordinary component: '/' + component. */
+        if (out > 1 && tmp[out - 1] != '/') {
+            if (out + 1 >= cap) return -1;
+            tmp[out++] = '/';
+        }
+        for (size_t k = 0; k < clen; k++) {
+            if (out + 1 >= cap) return -1;
+            tmp[out++] = p[start + k];
+        }
+    }
+
+    if (trailing_slash && out > 1) {
+        if (out + 1 >= cap) return -1;
+        tmp[out++] = '/';
+    }
+
+    tmp[out] = '\0';
+    if (out + 1 > cap) return -1;
+    for (size_t k = 0; k <= out; k++) p[k] = tmp[k];
+    return 0;
+}
+
+/*
  * Resolve `path` against `dirfd` the way Unix does.
  *
  *   out, cap        the destination; cap must be >= USER_PATH_MAX
@@ -1477,7 +1574,9 @@ static int resolve_at(int dirfd, const char* path,
     /* 1. Absolute path: dirfd is irrelevant, exactly as on Unix. */
     if (path_is_absolute(path)) {
         if (path_copy(out, cap, path) != 0) return -(long)ENAMETOOLONG_;
-        if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0)
+        return -(long)ENAMETOOLONG_;
+    if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -1501,7 +1600,9 @@ static int resolve_at(int dirfd, const char* path,
              */
             return -(long)ENAMETOOLONG_;
         }
-        if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0)
+        return -(long)ENAMETOOLONG_;
+    if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -1522,7 +1623,9 @@ static int resolve_at(int dirfd, const char* path,
         if (path_copy(out, cap, slot->dir_path) != 0) {
             return -(long)ENAMETOOLONG_;
         }
-        if (backend_out) *backend_out = path_backend(out);
+        if (vfs_canonicalize_abs(out, cap) != 0)
+        return -(long)ENAMETOOLONG_;
+    if (backend_out) *backend_out = path_backend(out);
         return 0;
     }
 
@@ -1545,6 +1648,8 @@ static int resolve_at(int dirfd, const char* path,
         out[o++] = path[i];
     }
     out[o] = '\0';
+    if (vfs_canonicalize_abs(out, cap) != 0)
+        return -(long)ENAMETOOLONG_;
     if (backend_out) *backend_out = path_backend(out);
     return 0;
 }
