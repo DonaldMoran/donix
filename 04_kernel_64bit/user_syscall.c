@@ -148,6 +148,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENOEXEC  8
 #define ECHILD   10
 #define EINVAL_  22
+#define EROFS_   30   /* read-only filesystem (Linux EROFS) */
 #define EPIPE_   32
 #define ERANGE_  34
 #define ENAMETOOLONG_ 36
@@ -1538,15 +1539,72 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * Order is irrelevant: longest match wins, so the entries may be
  * listed in any order.  Do not register duplicate paths.
  */
+/*
+ * The mount's operations.  A filesystem is reached by its
+ * driver, not by a backend test at the call site.  This is the
+ * Unix dispatch: the syscall looks up the mount and calls the
+ * operation.
+ *
+ * fat_driver points at the extracted FatFs operations.  ro_driver
+ * is what /dev and /proc use: they are synthesized, read-only
+ * mounts, so unlink/rename/mkdir there are -EROFS rather than a
+ * fall-through to FatFs.  (Today such a call fell through and
+ * got a misleading answer; -EROFS is the truthful one, and it is
+ * what Linux returns for a write on a read-only mount.)
+ *
+ * Only unlink/rename/mkdir are here so far.  open/stat/access
+ * join when their FatFs bodies are extracted (vfsM2b) and the
+ * syscalls are moved behind the same pointer (vfsM4).
+ */
+typedef struct fs_driver {
+    long (*unlink)(const char* in_path, int want_dir, const char* tag);
+    long (*rename)(const char* old_path, const char* new_path);
+    long (*mkdir) (const char* local_path);
+} fs_driver_t;
+
+static long fat_unlink_body(const char* local_path, int want_dir,
+                            const char* tag);
+static long fat_rename(const char* old_path, const char* new_path);
+static long fat_mkdir(const char* local_path);
+
+static const fs_driver_t fat_driver = {
+    fat_unlink_body, fat_rename, fat_mkdir,
+};
+
+/* /dev and /proc are read-only synthesized mounts. */
+static long ro_unlink(const char* in_path, int want_dir, const char* tag) {
+    (void)in_path; (void)want_dir; (void)tag; return -(long)EROFS_;
+}
+static long ro_rename(const char* old_path, const char* new_path) {
+    (void)old_path; (void)new_path; return -(long)EROFS_;
+}
+static long ro_mkdir(const char* local_path) {
+    (void)local_path; return -(long)EROFS_;
+}
+static const fs_driver_t ro_driver = { ro_unlink, ro_rename, ro_mkdir };
+
 static const struct {
     const char* path;      /* absolute mount point, no trailing '/' */
     int         backend;   /* BACKEND_* */
+    const fs_driver_t* driver;  /* the operation vtable */
 } g_mounts[] = {
-    { "/",     BACKEND_FAT  },
-    { "/dev",  BACKEND_DEV  },
-    { "/proc", BACKEND_PROC },
+    { "/",     BACKEND_FAT,  &fat_driver },
+    { "/dev",  BACKEND_DEV,  &ro_driver  },
+    { "/proc", BACKEND_PROC, &ro_driver  },
 };
 #define G_MOUNTS_LEN (sizeof(g_mounts) / sizeof(g_mounts[0]))
+
+/* The operation vtable for a mount, by backend tag.  Every
+ * syscall that dispatches through a driver uses this; the
+ * backend tag from resolve_at names the mount, and the mount
+ * names its driver.  FAT is the fallback because "/" always
+ * matches and it is FAT. */
+static const fs_driver_t* mount_driver(int backend) {
+    for (size_t i = 0; i < G_MOUNTS_LEN; i++) {
+        if (g_mounts[i].backend == backend) return g_mounts[i].driver;
+    }
+    return &fat_driver;
+}
 
 /*
  * The seam's decision.  Given an absolute Unix-form path, return
@@ -3715,7 +3773,7 @@ static long fat_unlink_body(const char* local_path, int want_dir,
 }
 
 static long unlink_body(const char* in_path, int want_dir,
-                        const char* tag) {
+                        const char* tag, int backend) {
     char local_path[USER_PATH_MAX];
     if (path_copy(local_path, sizeof(local_path), in_path) != 0) {
         return -(long)ENAMETOOLONG_;
@@ -3730,7 +3788,7 @@ static long unlink_body(const char* in_path, int want_dir,
         return want_dir ? -(long)EBUSY_ : -(long)EISDIR_;
     }
 
-    return fat_unlink_body(local_path, want_dir, tag);
+    return mount_driver(backend)->unlink(in_path, want_dir, tag);
 }
 
 /*
@@ -3758,9 +3816,8 @@ long sys_unlink(const char* path) {
     int backend;
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return unlink_body(resolved, 0, "sys_unlink");
+    return unlink_body(resolved, 0, "sys_unlink", backend);
 }
 
 /*
@@ -3789,9 +3846,8 @@ long sys_rmdir(const char* path) {
     int backend;
     int rr = resolve_at(AT_FDCWD_, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
-    return unlink_body(resolved, 1, "sys_rmdir");
+    return unlink_body(resolved, 1, "sys_rmdir", backend);
 }
 
 /*
@@ -3833,10 +3889,9 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
     int backend;
     int rr = resolve_at(dirfd, local, resolved, sizeof(resolved), &backend);
     if (rr != 0) return rr;
-    (void)backend;
 
     int want_dir = (flags & AT_REMOVEDIR_) != 0;
-    return unlink_body(resolved, want_dir, "sys_unlinkat");
+    return unlink_body(resolved, want_dir, "sys_unlinkat", backend);
 }
 
 /*
@@ -3944,7 +3999,7 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
     strip_dot_prefix(old_path);
     strip_dot_prefix(new_path);
 
-    return fat_rename(old_path, new_path);
+    return mount_driver(backend)->rename(old_path, new_path);
 }
 
 /*
@@ -4026,7 +4081,7 @@ long sys_mkdir(const char* path, int mode) {
         return -(long)ENOENT_;
     }
 
-    return fat_mkdir(local_path);
+    return mount_driver(backend)->mkdir(local_path);
 }
 
 /*
