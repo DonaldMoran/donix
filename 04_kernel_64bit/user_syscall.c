@@ -1572,6 +1572,10 @@ static long fat_rename(const char* old_path, const char* new_path);
 static long fat_mkdir(const char* local_path);
 static long fat_open(const char* in_path, const char* local_path,
                      int flags);
+static long dev_open(const char* in_path, const char* local_path,
+                     int flags);
+static long dev_stat(const char* abs_path, void* user_stat);
+static long dev_access(const char* abs_path);
 static long fat_stat_path(const char* path, void* user_stat);
 static long fat_access(const char* path);
 
@@ -1602,6 +1606,10 @@ static long ro_access(const char* path) {
 static const fs_driver_t ro_driver = {
     ro_unlink, ro_rename, ro_mkdir, ro_open, ro_stat, ro_access,
 };
+static const fs_driver_t dev_driver = {
+    ro_unlink, ro_rename, ro_mkdir,
+    dev_open, dev_stat, dev_access,
+};
 
 static const struct {
     const char* path;      /* absolute mount point, no trailing '/' */
@@ -1609,7 +1617,7 @@ static const struct {
     const fs_driver_t* driver;  /* the operation vtable */
 } g_mounts[] = {
     { "/",     BACKEND_FAT,  &fat_driver },
-    { "/dev",  BACKEND_DEV,  &ro_driver  },
+    { "/dev",  BACKEND_DEV,  &dev_driver },
     { "/proc", BACKEND_PROC, &ro_driver  },
 };
 #define G_MOUNTS_LEN (sizeof(g_mounts) / sizeof(g_mounts[0]))
@@ -3237,6 +3245,73 @@ static long fat_open(const char* in_path, const char* local_path,
     return fatfs_errno(r);
 }
 
+/*
+ * A DEV operation returns DEV_NOT_MINE when the path is not a
+ * known /dev entry, so the caller falls through to the next
+ * backend (FAT).  That is the same fall-through the inline DEV
+ * branch has always had; it is made explicit here so the
+ * handler can live in the mount table.  Any other value is a
+ * real result (an fd, an errno, or 0).
+ */
+#define DEV_NOT_MINE  ((long)-123456789L)
+
+static long dev_open(const char* in_path, const char* local_path,
+                     int flags) {
+    (void)local_path; (void)flags;
+    /* /dev itself: a synthesized directory. */
+    int is_dev_root = (in_path[0]=='/' && in_path[1]=='d'
+                       && in_path[2]=='e' && in_path[3]=='v'
+                       && (in_path[4]=='\0'
+                           || (in_path[4]=='/' && in_path[5]=='\0')));
+    if (is_dev_root) {
+        file_slot_t* dslot = NULL;
+        int dfd = alloc_file_slot(&dslot);
+        if (dfd == -1) return -(long)EIO_;
+        dslot->kind = FILE_KIND_DIR;
+        dslot->obj  = SYNTH_DIR_SENTINEL;
+        dslot->end  = 0;
+        dslot->dir_path = (char*)kmalloc(5);
+        if (dslot->dir_path) {
+            dslot->dir_path[0]='/'; dslot->dir_path[1]='d';
+            dslot->dir_path[2]='e'; dslot->dir_path[3]='v';
+            dslot->dir_path[4]='\0';
+        }
+        return dfd;
+    }
+    const dev_driver_t* d = dev_lookup(in_path);
+    if (d) {
+        file_slot_t* dslot = NULL;
+        int dfd = alloc_file_slot(&dslot);
+        if (dfd == -1) return -(long)EIO_;
+        dslot->kind = FILE_KIND_DEV;
+        dslot->obj  = (void*)d;
+        FDTRACE({ serial_print("open  dev -> fd=");
+                  serial_print_dec((uint64_t)dfd);
+                  serial_print(" dev=");
+                  serial_print(d->name); });
+        return dfd;
+    }
+    return DEV_NOT_MINE;   /* unknown /dev entry: try FAT */
+}
+
+static long dev_stat(const char* abs_path, void* user_stat) {
+    const dev_driver_t* d = dev_lookup(abs_path);
+    if (d) {
+        kernel_stat_t st;
+        fill_kstat_as_chardev(&st, 1, d->ino);
+        st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
+    return DEV_NOT_MINE;
+}
+
+static long dev_access(const char* abs_path) {
+    return dev_lookup(abs_path) != NULL ? 0 : DEV_NOT_MINE;
+}
+
 static long open_resolved(const char* in_path, int flags, int backend) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EFAULT_;
@@ -3251,46 +3326,8 @@ static long open_resolved(const char* in_path, int flags, int backend) {
      * anything else under /dev -- fall through to the FAT path.
      */
     if (backend == BACKEND_DEV) {
-        /*
-         * /dev itself: a synthesized directory.  dev_lookup
-         * matches only /dev/<name>, so /dev falls through to
-         * FatFs today and readdir reads the empty image
-         * directory.  Give it a DIR slot with the sentinel obj
-         * and dir_path "/dev"; sys_getdents64 lists the
-         * g_dev_table names for it.  Same shape as /proc.
-         */
-        int is_dev_root = (in_path[0]=='/' && in_path[1]=='d'
-                           && in_path[2]=='e' && in_path[3]=='v'
-                           && (in_path[4]=='\0'
-                               || (in_path[4]=='/' && in_path[5]=='\0')));
-        if (is_dev_root) {
-            file_slot_t* dslot = NULL;
-            int dfd = alloc_file_slot(&dslot);
-            if (dfd == -1) return -(long)EIO_;
-            dslot->kind = FILE_KIND_DIR;
-            dslot->obj  = SYNTH_DIR_SENTINEL;
-            dslot->end  = 0;
-            dslot->dir_path = (char*)kmalloc(5);
-            if (dslot->dir_path) {
-                dslot->dir_path[0]='/'; dslot->dir_path[1]='d';
-                dslot->dir_path[2]='e'; dslot->dir_path[3]='v';
-                dslot->dir_path[4]='\0';
-            }
-            return dfd;
-        }
-        const dev_driver_t* d = dev_lookup(in_path);
-        if (d) {
-            file_slot_t* dslot = NULL;
-            int dfd = alloc_file_slot(&dslot);
-            if (dfd == -1) return -(long)EIO_;
-            dslot->kind = FILE_KIND_DEV;
-            dslot->obj  = (void*)d;
-            FDTRACE({ serial_print("open  dev -> fd=");
-                      serial_print_dec((uint64_t)dfd);
-                      serial_print(" dev=");
-                      serial_print(d->name); });
-            return dfd;
-        }
+        long r = mount_driver(BACKEND_DEV)->open(in_path, NULL, flags);
+        if (r != DEV_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT. */
     }
 
@@ -4369,16 +4406,8 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      * -ENOENT for unknown /dev paths before commit 2 as well.
      */
     if (backend == BACKEND_DEV) {
-        const dev_driver_t* d = dev_lookup(abs_path);
-        if (d) {
-            kernel_stat_t st;
-            fill_kstat_as_chardev(&st, 1, d->ino);
-            st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
+        long r = mount_driver(BACKEND_DEV)->stat(abs_path, user_stat);
+        if (r != DEV_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
@@ -4658,9 +4687,8 @@ static long access_resolved(const char* abs_path, int backend) {
 
     /* DEV backend: a known device exists. */
     if (backend == BACKEND_DEV) {
-        if (dev_lookup(abs_path) != NULL) {
-            return 0;
-        }
+        long r = mount_driver(BACKEND_DEV)->access(abs_path);
+        if (r != DEV_NOT_MINE) return r;
         /* Unknown /dev entry: fall through to FAT, as before. */
     }
 
