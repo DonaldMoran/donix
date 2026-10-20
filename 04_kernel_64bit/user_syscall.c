@@ -2907,6 +2907,40 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                               serial_print_dec(pid); });
                     return sfd;
                 }
+                /* /proc/<pid> itself: the per-pid directory.
+                 * realpath opens each component, so this must
+                 * succeed or realpath /proc/<pid>/<file> fails
+                 * at the intermediate.  obj is the sentinel
+                 * (a synthesized dir has no FatFs DIR*); the
+                 * pid is carried in dir_path, as for /proc and
+                 * /proc/self.  put_file_slot already skips
+                 * f_closedir for the sentinel and frees
+                 * dir_path, so no new case is needed there. */
+                int is_pid_dir = (ok_component && q[0] == '\0');
+                if (is_pid_dir) {
+                    if (!process_find_by_pid(pid)) return -(long)ENOENT_;
+                    /* /proc/ + up to 20 digits + NUL. */
+                    char nbuf[24]; int t = 0; uint64_t v = pid;
+                    if (v == 0) nbuf[t++] = '0';
+                    else { while (v) { nbuf[t++] = (char)('0'+(v%10)); v/=10; } }
+                    size_t plen = 6 + (size_t)t;   /* "/proc/" + digits */
+                    char* dpath = (char*)kmalloc(plen + 1);
+                    if (!dpath) return -(long)ENOMEM_;
+                    dpath[0]='/'; dpath[1]='p'; dpath[2]='r';
+                    dpath[3]='o'; dpath[4]='c'; dpath[5]='/';
+                    for (int k = 0; k < t; k++) dpath[6 + k] = nbuf[t - 1 - k];
+                    dpath[plen] = '\0';
+                    file_slot_t* dslot = NULL;
+                    int dfd = alloc_file_slot(&dslot);
+                    if (dfd == -1) { kfree(dpath); return -(long)EIO_; }
+                    dslot->kind = FILE_KIND_DIR;
+                    dslot->obj  = PROC_DIR_SENTINEL;
+                    dslot->end  = 0;
+                    dslot->dir_path = dpath;
+                    FDTRACE({ serial_print("open  proc piddir -> fd=");
+                              serial_print_dec((uint64_t)dfd); });
+                    return dfd;
+                }
             }
         }
 
@@ -7998,6 +8032,39 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
      * /proc/self is a leaf (ps reads its stat/status, never its
      * directory); its readdir returns 0 immediately.
      */
+    if (slot->obj == PROC_DIR_SENTINEL && slot->dir_path) {
+        /* A /proc/<digits> dir_path is a per-pid directory;
+         * /proc and /proc/self fall through to the block
+         * below, which is unchanged. */
+        const char* dp = slot->dir_path;
+        int is_pid_dir = (dp[0]=='/' && dp[1]=='p' && dp[2]=='r'
+                          && dp[3]=='o' && dp[4]=='c' && dp[5]=='/'
+                          && dp[6] >= '0' && dp[6] <= '9');
+        if (is_pid_dir) {
+            static const char* const pid_entries[3] = {
+                "stat", "status", "cmdline" };
+            if (slot->end >= 3) return 0;
+            const char* nm = pid_entries[slot->end];
+            slot->end++;
+            size_t nlen = 0; while (nm[nlen]) nlen++;
+            size_t reclen = GETDENTS64_HDR + nlen + 1;
+            reclen = (reclen + 7) & ~(size_t)7;
+            if (reclen > count) return -(long)EINVAL_;
+            uint8_t entbuf[GETDENTS64_MAXREC];
+            uint8_t* p = entbuf;
+            *(uint64_t*)(p + 0)  = 0;
+            *(int64_t*)(p + 8)   = 0;
+            *(uint16_t*)(p + 16) = (uint16_t)reclen;
+            p[18] = DT_REG;
+            for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = nm[i];
+            p[GETDENTS64_HDR + nlen] = '\0';
+            for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+            if (safe_copy_to_user(dirp, entbuf, reclen) != 0)
+                return -(long)EFAULT_;
+            return (long)reclen;
+        }
+    }
+
     if (slot->obj == PROC_DIR_SENTINEL) {
         /*
          * Synthesized /proc directory entries.
