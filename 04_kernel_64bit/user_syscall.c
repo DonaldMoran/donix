@@ -627,14 +627,56 @@ static long dev_null_write(const void* buf, size_t n) {
     (void)buf; return (long)n;      /* always accepted */
 }
 
+/* /dev/zero: reads fill zeros; writes are accepted and discarded. */
+static long dev_zero_read(void* buf, size_t n) {
+    for (size_t i = 0; i < n; i++) ((uint8_t*)buf)[i] = 0;
+    return (long)n;
+}
+static long dev_zero_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;
+}
+
+/*
+ * /dev/urandom.  xorshift64*, seeded from rdtsc at first use.
+ * NON-CRYPTOGRAPHIC: adequate for /dev/urandom on a single-user
+ * system (shuffles, temporary names, jitter), NOT for keys,
+ * tokens, or anything an attacker's guess would compromise.
+ * A real CSPRNG is a separate, larger change; the name /dev/urandom
+ * promises non-blocking, and that is what this delivers.
+ */
+static uint64_t g_urandom_state;
+static long dev_urandom_read(void* buf, size_t n) {
+    if (g_urandom_state == 0) {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        g_urandom_state = ((uint64_t)hi << 32) | lo;
+        if (g_urandom_state == 0) g_urandom_state = 0x9E3779B97F4A7C15ULL;
+    }
+    uint8_t* p = (uint8_t*)buf;
+    size_t i = 0;
+    while (i < n) {
+        uint64_t x = g_urandom_state;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        g_urandom_state = x;
+        uint64_t v = x * 0x2545F4914F6CDD1DULL;
+        for (int k = 0; k < 8 && i < n; k++, i++) p[i] = (uint8_t)(v >> (k * 8));
+    }
+    return (long)n;
+}
+static long dev_urandom_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;   /* Linux accepts and discards */
+}
+
 /* tty/console forward to the console path implemented below. */
 static long console_read(void* buf, size_t n);
 static long console_write(const void* buf, size_t n);
 
 static const dev_driver_t g_dev_table[] = {
-    { "null",    1, 3, 2, dev_null_read,  dev_null_write  },
-    { "console", 5, 1, 1, console_read,   console_write   },
-    { "tty",     5, 0, 1, console_read,   console_write   },
+    { "null",    1, 3, 2, dev_null_read,    dev_null_write    },
+    { "zero",    1, 5, 3, dev_zero_read,    dev_zero_write    },
+    { "urandom", 1, 9, 4, dev_urandom_read, dev_urandom_write },
+    { "console", 5, 1, 1, console_read,     console_write     },
+    { "tty",     5, 0, 1, console_read,     console_write     },
 };
 #define G_DEV_TABLE_LEN (sizeof(g_dev_table) / sizeof(g_dev_table[0]))
 
