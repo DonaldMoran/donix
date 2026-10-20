@@ -296,7 +296,7 @@ static char g_write_bounce[WRITE_CHUNK];
  * slot whose tag is one of the PID_* values; for a fixed entry it
  * returns the entry, which is what the read path wants anyway.
  *
- * PROC_DIR_SENTINEL (below) is a DIR slot, not a PROC file slot,
+ * SYNTH_DIR_SENTINEL (below) is a DIR slot, not a PROC file slot,
  * and never goes through these.
  */
 #define PROC_OBJ_TAG(obj)  ((uint32_t)((uintptr_t)(obj) & 0xFF))
@@ -315,7 +315,7 @@ static char g_write_bounce[WRITE_CHUNK];
  *
  * It is a non-NULL sentinel that no real DIR* can be.
  */
-#define PROC_DIR_SENTINEL ((void*)(uintptr_t)0xFFFFFFFFFFFFFF01ULL)
+#define SYNTH_DIR_SENTINEL ((void*)(uintptr_t)0xFFFFFFFFFFFFFF01ULL)
 
 /*
  * Which backend owns a resolved path.  THE SEAM.
@@ -2157,11 +2157,11 @@ static void put_file_slot(file_slot_t* slot) {
     } else if (slot->kind == FILE_KIND_DIR) {
         /*
          * A synthesized PROC directory (open_resolved) has no
-         * DIR* behind it -- obj is PROC_DIR_SENTINEL.  Do not
+         * DIR* behind it -- obj is SYNTH_DIR_SENTINEL.  Do not
          * f_closedir or kfree it.  dir_path is still a real
          * kmalloc'd string and is freed either way.
          */
-        if (slot->obj != PROC_DIR_SENTINEL) {
+        if (slot->obj != SYNTH_DIR_SENTINEL) {
             f_closedir((DIR*)slot->obj);
             kfree(slot->obj);
         }
@@ -2911,7 +2911,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
          * /proc and /proc/self are directories, not table
          * entries.  A FILE_KIND_DIR slot is required so
          * sys_getdents64's get_file_slot(fd, FILE_KIND_DIR)
-         * accepts the fd; the obj is PROC_DIR_SENTINEL rather
+         * accepts the fd; the obj is SYNTH_DIR_SENTINEL rather
          * than a DIR*, because there is no FatFs directory
          * behind it.  put_file_slot knows not to f_closedir it.
          *
@@ -2933,7 +2933,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
             int dfd = alloc_file_slot(&dslot);
             if (dfd == -1) return -(long)EIO_;
             dslot->kind = FILE_KIND_DIR;
-            dslot->obj  = PROC_DIR_SENTINEL;
+            dslot->obj  = SYNTH_DIR_SENTINEL;
             dslot->end  = 0;   /* readdir cursor: not yet drained */
             size_t plen = 0;
             while (in_path[plen]) plen++;
@@ -3043,7 +3043,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
                     int dfd = alloc_file_slot(&dslot);
                     if (dfd == -1) { kfree(dpath); return -(long)EIO_; }
                     dslot->kind = FILE_KIND_DIR;
-                    dslot->obj  = PROC_DIR_SENTINEL;
+                    dslot->obj  = SYNTH_DIR_SENTINEL;
                     dslot->end  = 0;
                     dslot->dir_path = dpath;
                     FDTRACE({ serial_print("open  proc piddir -> fd=");
@@ -3994,7 +3994,7 @@ static long sys_fstat_body(int fd, void* user_stat) {
      * calls fill_kstat_from_filinfo, which reports (0,0) --
      * correct for a FAT dir, wrong for a synthesized one.
      */
-    if (slot->kind == FILE_KIND_DIR && slot->obj == PROC_DIR_SENTINEL) {
+    if (slot->kind == FILE_KIND_DIR && slot->obj == SYNTH_DIR_SENTINEL) {
         const char* dp = slot->dir_path ? slot->dir_path : "/proc";
         uint64_t dino = PROC_INO_ROOT;
         if (dp[0]=='/' && dp[1]=='p' && dp[2]=='r' && dp[3]=='o'
@@ -8287,7 +8287,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
      * /proc/self is a leaf (ps reads its stat/status, never its
      * directory); its readdir returns 0 immediately.
      */
-    if (slot->obj == PROC_DIR_SENTINEL && slot->dir_path) {
+    if (slot->obj == SYNTH_DIR_SENTINEL && slot->dir_path) {
         /* A /proc/<digits> dir_path is a per-pid directory;
          * /proc and /proc/self fall through to the block
          * below, which is unchanged. */
@@ -8320,7 +8320,7 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
         }
     }
 
-    if (slot->obj == PROC_DIR_SENTINEL) {
+    if (slot->obj == SYNTH_DIR_SENTINEL) {
         /*
          * Synthesized /proc directory entries.
          *
