@@ -4945,6 +4945,84 @@ long sys_futimesat(int dirfd, const char* path, const void* times) {
  * dirfd: readlink(2) has none (readlinkat(2), 267, is the dirfd
  * form, and donix does not implement it).
  */
+/*
+ * A symbolic link on donix is an ordinary FAT file whose first
+ * line is "DONIX_LINK:<target>\n".  FAT has no symlink bit, so
+ * the marker lives in the file content; this helper reads it.
+ * Returns 1 and copies the target into out, or 0 if the file is
+ * not a marker.  The target is stored verbatim: a relative one
+ * resolves against the link's own directory at follow time.
+ */
+#define DONIX_LINK_PREFIX "DONIX_LINK:"
+#define DONIX_LINK_MAX    256
+static int donix_link_target(const char* fat_path,
+                             char* out, size_t cap) {
+    FIL f;
+    if (f_open(&f, fat_path, FA_READ) != FR_OK) return 0;
+    char buf[DONIX_LINK_MAX + 1];
+    UINT got = 0;
+    FRESULT fr = f_read(&f, buf, DONIX_LINK_MAX, &got);
+    f_close(&f);
+    if (fr != FR_OK || got < 11) return 0;
+    const char* pfx = DONIX_LINK_PREFIX;
+    for (int i = 0; i < 11; i++) if (buf[i] != pfx[i]) return 0;
+    size_t n = 0;
+    for (UINT i = 11; i < got && buf[i] != '\n'; i++) {
+        if (n + 1 >= cap) return 0;
+        out[n++] = buf[i];
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+/*
+ * Linux x86_64 symlink(2) -- syscall 88.
+ *
+ * Creates a symbolic link by writing a DONIX_LINK marker file.
+ * The target is stored verbatim; a relative target resolves
+ * against the link's directory when followed.  The link path
+ * must not already exist (FA_CREATE_NEW -> -EEXIST), as Unix.
+ */
+long sys_symlink(const char* user_target, const char* user_linkpath) {
+    pcb_t* self = process_get_current();
+    if (!self || !user_target || !user_linkpath) return -(long)EFAULT_;
+
+    char target[DONIX_LINK_MAX];
+    char linkpath[USER_PATH_MAX];
+    if (copy_user_string(target, sizeof(target), user_target) != 0)
+        return -(long)EFAULT_;
+    if (copy_user_string(linkpath, sizeof(linkpath), user_linkpath) != 0)
+        return -(long)EFAULT_;
+
+    char resolved[USER_PATH_MAX];
+    int backend;
+    int rr = vfs_resolve(AT_FDCWD_, linkpath, resolved,
+                         sizeof(resolved), &backend, 0);
+    if (rr != 0) return rr;
+
+    char fat_path[USER_PATH_MAX];
+    if (path_copy(fat_path, sizeof(fat_path), resolved) != 0)
+        return -(long)ENAMETOOLONG_;
+    strip_dot_prefix(fat_path);
+
+    FIL f;
+    FRESULT fr = f_open(&f, fat_path, FA_WRITE | FA_CREATE_NEW);
+    if (fr != FR_OK) return fatfs_errno(fr);
+
+    char line[DONIX_LINK_MAX + 16];
+    size_t n = 0;
+    const char* pfx = DONIX_LINK_PREFIX;
+    while (*pfx) line[n++] = *pfx++;
+    for (size_t i = 0; target[i]; i++) line[n++] = target[i];
+    line[n++] = '\n';
+
+    UINT wrote = 0;
+    fr = f_write(&f, line, (UINT)n, &wrote);
+    f_close(&f);
+    if (fr != FR_OK || wrote != (UINT)n) return -(long)EIO_;
+    return 0;
+}
+
 long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     if (!user_path || !buf) return -(long)EFAULT_;
 
@@ -4955,7 +5033,7 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
 
     char resolved[USER_PATH_MAX];
     int backend;
-    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 1);
+    int rr = vfs_resolve(AT_FDCWD_, local, resolved, sizeof(resolved), &backend, 0);
     if (rr != 0) return rr;
 
     /*
@@ -4991,10 +5069,26 @@ long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
         }
     }
 
+    /* A DONIX_LINK marker: readlink returns its target. */
+    if (backend == BACKEND_FAT) {
+        char fat_path[USER_PATH_MAX];
+        if (path_copy(fat_path, sizeof(fat_path), resolved) == 0) {
+            strip_dot_prefix(fat_path);
+            char tgt[DONIX_LINK_MAX];
+            if (donix_link_target(fat_path, tgt, sizeof(tgt))) {
+                size_t tlen = 0;
+                while (tgt[tlen]) tlen++;
+                if (tlen > bufsiz) return -(long)EINVAL_;
+                if (safe_copy_to_user(buf, tgt, tlen) != 0) {
+                    return -(long)EFAULT_;
+                }
+                return (long)tlen;
+            }
+        }
+    }
+
     /* Validate the path exists, so a missing path is -ENOENT and a
-     * present one is -EINVAL (not a symlink).  access_resolved does
-     * exactly this check and returns 0 / -ENOENT; reuse its shape
-     * rather than duplicating the root-alias and stat logic. */
+     * present one is -EINVAL (not a symlink). */
     long exists = access_resolved(resolved, backend);
     if (exists != 0) return exists;   /* -ENOENT, or -ENAMETOOLONG */
 
@@ -9146,6 +9240,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
         case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
 
+        case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
         case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
         case SYS_GETUID:          return (uint64_t)sys_getuid();
         case SYS_GETGID:          return (uint64_t)sys_getgid();
