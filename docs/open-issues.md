@@ -33,25 +33,6 @@ Fixing this means implementing signal delivery (item 12).  Same
 subsystem a Wayland `wl_shm` client needs for `SIGBUS` on buffer
 overrun.  Doing it once serves both.
 
-**8.  Symlinks: recorded design, not scheduled — and buildable.**
-FAT16 has no native symlink storage, and donix is committed to
-FAT.  The correct frame is Unix semantics, not FAT storage: if
-`ln -s`, `readlink`, `realpath`, and archive restoration all
-behave correctly, the kernel is semantically correct.
-
-The encoding is a magic marker in an ordinary file — e.g.
-`DONIX_LINK:/usr/bin/busybox` — hidden entirely inside the
-pathname dispatch seam.  Do not implement standalone symlink
-handling in individual syscalls (`open`, `stat`, `lstat`,
-`execve`, `chdir`, `access`); that is the technical debt the
-seam exists to prevent.  The seam exists (session 44), so this
-is buildable as the seam's next consumer.
-
-Payoff when it lands: `ln`, `link`, `readlink` with real
-targets, `realpath` correctness, `tar`/`unzip` link restoration,
-and the quiet assumptions (`/bin/sh -> busybox`) that many
-configure scripts make.
-
 **9.  No privilege model: uid/gid are 0 for every process.**
 No per-process uid/euid split, no setuid bit (FAT has no mode
 bits to hold one), no `chown`, no way to become root.  In that
@@ -160,6 +141,15 @@ fallback.
 ---
 
 ## Un-numbered open items
+
+**`tar` is disabled in the busybox build.**  Its creation path
+writes an empty archive (1024 zero bytes), skips every member
+with "file is the archive; skipping", and exits 0.  It was
+turned off rather than shipped reporting success on a failed
+operation.  Link restoration through `tar` is unverified and is
+a busybox-source task; the VFS symlink work is verified directly
+by `ln -s`, `readlink`, `readlink -f`, `stat`, `ls -l`, and
+`unlink`.
 
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
