@@ -2870,6 +2870,33 @@ static long open_resolved(const char* in_path, int flags, int backend) {
      * anything else under /dev -- fall through to the FAT path.
      */
     if (backend == BACKEND_DEV) {
+        /*
+         * /dev itself: a synthesized directory.  dev_lookup
+         * matches only /dev/<name>, so /dev falls through to
+         * FatFs today and readdir reads the empty image
+         * directory.  Give it a DIR slot with the sentinel obj
+         * and dir_path "/dev"; sys_getdents64 lists the
+         * g_dev_table names for it.  Same shape as /proc.
+         */
+        int is_dev_root = (in_path[0]=='/' && in_path[1]=='d'
+                           && in_path[2]=='e' && in_path[3]=='v'
+                           && (in_path[4]=='\0'
+                               || (in_path[4]=='/' && in_path[5]=='\0')));
+        if (is_dev_root) {
+            file_slot_t* dslot = NULL;
+            int dfd = alloc_file_slot(&dslot);
+            if (dfd == -1) return -(long)EIO_;
+            dslot->kind = FILE_KIND_DIR;
+            dslot->obj  = SYNTH_DIR_SENTINEL;
+            dslot->end  = 0;
+            dslot->dir_path = (char*)kmalloc(5);
+            if (dslot->dir_path) {
+                dslot->dir_path[0]='/'; dslot->dir_path[1]='d';
+                dslot->dir_path[2]='e'; dslot->dir_path[3]='v';
+                dslot->dir_path[4]='\0';
+            }
+            return dfd;
+        }
         uint32_t kind = dev_lookup(in_path);
         if (kind == FILE_KIND_DEV_NULL) {
             file_slot_t* dslot = NULL;
@@ -8263,6 +8290,7 @@ long sys_rseq(void* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
 #define DT_UNKNOWN 0
 #define DT_REG     8
 #define DT_DIR     4
+#define DT_CHR     2
 
 #define GETDENTS64_HDR 19
 #define GETDENTS64_MAXREC (GETDENTS64_HDR + 256)
@@ -8318,6 +8346,38 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
                 return -(long)EFAULT_;
             return (long)reclen;
         }
+    }
+
+    /*
+     * Synthesized /dev directory: list g_dev_table, one entry
+     * per call.  slot->end is the cursor (index into the
+     * table); a value >= G_DEV_TABLE_LEN ends the directory.
+     * Keyed on dir_path == "/dev" so the /proc blocks below
+     * are untouched.
+     */
+    if (slot->obj == SYNTH_DIR_SENTINEL && slot->dir_path
+        && slot->dir_path[0]=='/' && slot->dir_path[1]=='d'
+        && slot->dir_path[2]=='e' && slot->dir_path[3]=='v'
+        && slot->dir_path[4]=='\0') {
+        if (slot->end >= G_DEV_TABLE_LEN) return 0;
+        const char* nm = g_dev_table[slot->end].name;
+        slot->end++;
+        size_t nlen = 0; while (nm[nlen]) nlen++;
+        size_t reclen = GETDENTS64_HDR + nlen + 1;
+        reclen = (reclen + 7) & ~(size_t)7;
+        if (reclen > count) return -(long)EINVAL_;
+        uint8_t entbuf[GETDENTS64_MAXREC];
+        uint8_t* p = entbuf;
+        *(uint64_t*)(p + 0)  = 0;
+        *(int64_t*)(p + 8)   = 0;
+        *(uint16_t*)(p + 16) = (uint16_t)reclen;
+        p[18] = DT_CHR;
+        for (size_t i = 0; i < nlen; i++) p[GETDENTS64_HDR + i] = nm[i];
+        p[GETDENTS64_HDR + nlen] = '\0';
+        for (size_t i = GETDENTS64_HDR + nlen + 1; i < reclen; i++) p[i] = 0;
+        if (safe_copy_to_user(dirp, entbuf, reclen) != 0)
+            return -(long)EFAULT_;
+        return (long)reclen;
     }
 
     if (slot->obj == SYNTH_DIR_SENTINEL) {
