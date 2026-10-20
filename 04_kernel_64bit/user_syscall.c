@@ -1697,6 +1697,33 @@ static long fatfs_errno(FRESULT r) {
 }
 
 /* Fill a kernel_stat_t describing the FAT root as a directory. */
+/* PROC st_ino allocation.  Every synthesized /proc path must
+ * report a distinct, stable (st_dev, st_ino): realpath uses the
+ * pair to tell entries apart and to detect loops, and with every
+ * entry at (0,0) it rejects /proc/<pid> as a duplicate of /proc.
+ * st_dev stays 0 for PROC (DEV uses 1). */
+#define PROC_INO_ROOT       ((uint64_t)1)
+#define PROC_INO_SELF       ((uint64_t)2)
+#define PROC_INO_PID_BASE   ((uint64_t)0x100000)
+#define PROC_INO_ENTRY_BASE ((uint64_t)0x200000)
+
+static uint64_t proc_ino(uint64_t pid, uint32_t tag) {
+    return PROC_INO_PID_BASE + (pid << 2) + (uint64_t)tag;
+}
+
+/* Parse the pid out of an absolute "/proc/<digits>" form.
+ * Returns 0 for any other shape; 0 is not a live pid. */
+static uint64_t strtou64_after_proc(const char* p) {
+    if (!(p[0]=='/' && p[1]=='p' && p[2]=='r' && p[3]=='o'
+          && p[4]=='c' && p[5]=='/')) return 0;
+    p += 6;
+    uint64_t v = 0; int n = 0;
+    while (*p >= '0' && *p <= '9') { v = v*10 + (uint64_t)(*p-'0'); p++; n++; }
+    if (n == 0) return 0;
+    if (*p != '\0' && !(*p == '/' && p[1] == '\0')) return 0;
+    return v;
+}
+
 static void fill_kstat_as_root(kernel_stat_t* st) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
     st->st_nlink   = 1;
@@ -1742,8 +1769,10 @@ static void fill_kstat_as_chardev(kernel_stat_t* st,
  * This is what /proc/self/status reports: a regular file, mode
  * 0444 (read-only), with a size that is the entry's maximum text
  * length.  See proc_entry_size. */
-static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
+static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry,
+                               uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_ino     = ino;
     st->st_nlink   = 1;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFREG | 0444;
@@ -1757,8 +1786,9 @@ static void fill_kstat_as_proc(kernel_stat_t* st, uint32_t entry) {
  * fill_kstat_from_filinfo uses for a real FAT directory; this
  * helper exists separately because a PROC directory has no
  * FILINFO. */
-static void fill_kstat_as_dir(kernel_stat_t* st) {
+static void fill_kstat_as_dir(kernel_stat_t* st, uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
+    st->st_ino     = ino;
     st->st_nlink   = 2;
     st->st_blksize = 512;
     st->st_mode    = KSTAT_IFDIR | 0555;
@@ -3864,8 +3894,39 @@ static long sys_fstat_body(int fd, void* user_stat) {
     if (slot->kind == FILE_KIND_PROC) {
         /* Synthesized file: report S_IFREG | 0444, st_size is the
          * entry's maximum text length (see proc_entry_size). */
-        uint32_t entry = (uint32_t)(uintptr_t)slot->obj;
-        fill_kstat_as_proc(&st, entry);
+        uint32_t entry = PROC_OBJ_TAG(slot->obj);
+        uint64_t pino = PROC_OBJ_PID(slot->obj)
+            ? proc_ino(PROC_OBJ_PID(slot->obj), entry)
+            : PROC_INO_ENTRY_BASE + (uint64_t)entry;
+        fill_kstat_as_proc(&st, entry, pino);
+        if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
+            return -(long)EFAULT_;
+        }
+        return 0;
+    }
+
+    /*
+     * A synthesized /proc directory (/proc, /proc/self,
+     * /proc/<pid>): report the SAME (st_dev, st_ino) and mode
+     * that stat_resolved reports for the same path.  realpath
+     * fstats the fd it opened and compares the identity against
+     * the stat it did on the path; if they disagree it rejects
+     * the component.  The generic FILE_KIND_DIR branch below
+     * calls fill_kstat_from_filinfo, which reports (0,0) --
+     * correct for a FAT dir, wrong for a synthesized one.
+     */
+    if (slot->kind == FILE_KIND_DIR && slot->obj == PROC_DIR_SENTINEL) {
+        const char* dp = slot->dir_path ? slot->dir_path : "/proc";
+        uint64_t dino = PROC_INO_ROOT;
+        if (dp[0]=='/' && dp[1]=='p' && dp[2]=='r' && dp[3]=='o'
+            && dp[4]=='c' && dp[5]=='/' && dp[6]=='s' && dp[7]=='e'
+            && dp[8]=='l' && dp[9]=='f' && dp[10]=='\0') {
+            dino = PROC_INO_SELF;
+        } else {
+            uint64_t dpid = strtou64_after_proc(dp);
+            if (dpid) dino = proc_ino(dpid, PROC_ENTRY_NONE);
+        }
+        fill_kstat_as_dir(&st, dino);
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
@@ -4075,8 +4136,12 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         }
 
         if (is_proc_root || is_proc_self || is_proc_pid_dir) {
+            uint64_t dino = is_proc_root ? PROC_INO_ROOT
+                          : is_proc_self ? PROC_INO_SELF
+                          : proc_ino(strtou64_after_proc(abs_path),
+                                     PROC_ENTRY_NONE);
             kernel_stat_t st;
-            fill_kstat_as_dir(&st);
+            fill_kstat_as_dir(&st, dino);
             if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                 return -(long)EFAULT_;
             }
@@ -4121,11 +4186,11 @@ static long stat_resolved(const char* abs_path, void* user_stat,
                     && q[6]=='n' && q[7]=='e' && q[8]=='\0');
                 if (is_stat || is_status || is_cmdline) {
                     if (!process_find_by_pid(pid)) return -(long)ENOENT_;
-                    kernel_stat_t st;
-                    fill_kstat_as_proc(&st,
-                        is_cmdline ? PROC_ENTRY_PID_CMDLINE
+                    uint32_t ptag = is_cmdline ? PROC_ENTRY_PID_CMDLINE
                                    : is_status ? PROC_ENTRY_PID_STATUS
-                                               : PROC_ENTRY_PID_STAT);
+                                               : PROC_ENTRY_PID_STAT;
+                    kernel_stat_t st;
+                    fill_kstat_as_proc(&st, ptag, proc_ino(pid, ptag));
                     if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                         return -(long)EFAULT_;
                     }
@@ -4137,7 +4202,7 @@ static long stat_resolved(const char* abs_path, void* user_stat,
         uint32_t entry = proc_lookup(abs_path);
         if (entry != PROC_ENTRY_NONE) {
             kernel_stat_t st;
-            fill_kstat_as_proc(&st, entry);
+            fill_kstat_as_proc(&st, entry, PROC_INO_ENTRY_BASE + (uint64_t)entry);
             if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                 return -(long)EFAULT_;
             }
@@ -7024,6 +7089,53 @@ long sys_chdir(const char* user_path) {
                         sizeof(resolved), &backend);
     if (rr != 0) return rr;
     (void)backend;
+
+    /*
+     * chdir: synthesized PROC directory.
+     *
+     * A /proc, /proc/self, or /proc/<pid> path is a directory
+     * by stat_resolved's PROC branch, but it has no FatFs DIR*
+     * and no FAT directory entry, so the f_stat_with_retry
+     * validation below would call f_stat("proc") and get
+     * FR_NO_PATH -> ENOENT.  Trust the same three shapes
+     * stat_resolved trusts, store the resolved absolute path
+     * as cwd, and skip FatFs.  /proc/<pid>/<file> is a FILE
+     * and must not be accepted here; the shape test below
+     * requires the path to END at the pid.
+     */
+    if (backend == BACKEND_PROC) {
+        int is_proc_dir = 0;
+        const char* r = resolved;
+        if (r[0]=='/' && r[1]=='p' && r[2]=='r' && r[3]=='o'
+            && r[4]=='c') {
+            if (r[5] == '\0') {
+                is_proc_dir = 1;                 /* /proc */
+            } else if (r[5] == '/') {
+                const char* c = r + 6;
+                if (c[0]=='s' && c[1]=='e' && c[2]=='l'
+                    && c[3]=='f' && c[4]=='\0') {
+                    is_proc_dir = 1;             /* /proc/self */
+                } else {
+                    int ndig = 0;
+                    while (*c >= '0' && *c <= '9') { c++; ndig++; }
+                    if (ndig > 0 && *c == '\0') is_proc_dir = 1;
+                }
+            }
+        }
+        if (is_proc_dir) {
+            size_t o = 0;
+            for (size_t i = 0; resolved[i] && o < sizeof(self->cwd) - 1; i++) {
+                self->cwd[o++] = resolved[i];
+            }
+            self->cwd[o] = '\0';
+#if DEBUG_CHDIR
+            serial_print("sys_chdir: synthesized PROC dir, cwd='");
+            serial_print(self->cwd);
+            serial_print("'\n");
+#endif
+            return 0;
+        }
+    }
 
     /*
      * FAT form: strip the leading '/' and "./" components that
