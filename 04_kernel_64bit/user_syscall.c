@@ -2932,6 +2932,233 @@ long sys_pipe(int* user_pipefd) {
  * -ENOENT for unknown /dev and /proc paths before the seam as
  * well.
  */
+/*
+ * The FatFs open operation, moved verbatim out of
+ * open_resolved.  Takes the resolved absolute path, the stripped
+ * FatFs-form path, and the raw Linux flags; allocates the slot,
+ * decides DIR vs FILE, and owns its own cleanup on every error
+ * path (kfree(slot) + clear file_table[fd] before returning a
+ * negative errno).  The caller has no cleanup.
+ *
+ * The f_open -> f_opendir fallback (a directory opened without
+ * O_DIRECTORY) is FatFs-specific and lives here, inside the open
+ * operation, not at the call site.
+ */
+static long fat_open(const char* in_path, const char* local_path,
+                     int flags) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+
+    file_slot_t* slot = NULL;
+    int fd = alloc_file_slot(&slot);
+    if (fd == -1) return -(long)EIO_;
+
+    BYTE mode = 0;
+    switch (flags & 0x3) {
+        case 0:  mode |= FA_READ;             break;   /* O_RDONLY */
+        case 1:  mode |= FA_WRITE;            break;   /* O_WRONLY */
+        case 2:  mode |= FA_READ | FA_WRITE;  break;   /* O_RDWR   */
+        default: /* O_ACCMODE == 3 is invalid */
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -(long)EINVAL_;
+    }
+
+    /*
+     * Translate Linux open(2) flags to FatFs open mode.
+     *
+     * Linux x86_64 flag bits (include/uapi/asm-generic/fcntl.h):
+     *
+     *   0x0001   O_WRONLY
+     *   0x0002   O_RDWR
+     *   0x0040   O_CREAT
+     *   0x0080   O_EXCL
+     *   0x0200   O_TRUNC
+     *   0x0400   O_APPEND
+     *   0x8000   O_LARGEFILE   (ignored here; we are already 64-bit)
+     *   0x10000  O_DIRECTORY   (handled further below)
+     *
+     * FatFs mode bits (ff.h):
+     *
+     *   0x01  FA_READ
+     *   0x02  FA_WRITE
+     *   0x04  FA_CREATE_NEW
+     *   0x08  FA_CREATE_ALWAYS
+     *   0x10  FA_OPEN_ALWAYS
+     *   0x30  FA_OPEN_APPEND
+     *
+     * FatFs expresses the creation choice as a single mode value,
+     * not as independent bits, so the order of precedence matters.
+     */
+    int o_creat  = (flags & 0x0040) != 0;   /* O_CREAT  */
+    int o_excl   = (flags & 0x0080) != 0;   /* O_EXCL   */
+    int o_trunc  = (flags & 0x0200) != 0;   /* O_TRUNC  */
+    int o_append = (flags & 0x0400) != 0;   /* O_APPEND */
+
+    if (o_creat && o_excl) {
+        mode |= FA_CREATE_NEW;
+    } else if (o_creat && o_trunc) {
+        mode |= FA_CREATE_ALWAYS;
+    } else if (o_creat) {
+        mode |= FA_OPEN_ALWAYS;
+    } else if (o_trunc) {
+        mode |= FA_CREATE_ALWAYS;
+    } else {
+        mode |= FA_OPEN_EXISTING;
+    }
+
+    if (o_append) {
+        mode |= FA_OPEN_APPEND;
+    }
+
+    /*
+     * Linux open(2) is also used to open directories -- musl's
+     * opendir() calls open(path, O_RDONLY|O_DIRECTORY) and then
+     * readdir(), which uses getdents64(2).
+     *
+     * O_DIRECTORY is 0x10000 on Linux x86_64.
+     */
+    #define O_DIRECTORY 0x10000
+    int wants_dir = (flags & O_DIRECTORY) != 0;
+    int is_root   = path_is_root(local_path);
+
+    if (wants_dir || is_root) {
+        /*
+         * O_DIRECTORY on a file: Linux returns -ENOTDIR.
+         */
+        if (wants_dir && !is_root) {
+            FILINFO fno;
+            FRESULT sr = f_stat_with_retry(local_path, &fno);
+            if (sr != FR_OK) {
+                kfree(slot);
+                self->file_table[fd] = NULL;
+                return fatfs_errno(sr);
+            }
+            if (!(fno.fattrib & AM_DIR)) {
+                kfree(slot);
+                self->file_table[fd] = NULL;
+                return -(long)ENOTDIR_;
+            }
+        }
+
+        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
+        if (!dir_obj) {
+            kfree(slot);
+            self->file_table[fd] = NULL;
+            return -(long)EIO_;
+        }
+        const char* dir_path = is_root ? "0:/" : local_path;
+        FRESULT dr = f_opendir(dir_obj, dir_path);
+        if (dr == FR_OK) {
+            slot->kind = FILE_KIND_DIR;
+            slot->obj  = dir_obj;
+            /*
+             * Remember the absolute Unix-form path so an *at()
+             * syscall with this fd as dirfd can resolve against
+             * it.  is_root stores "/"; otherwise store the
+             * resolved absolute path the caller passed in
+             * (in_path), NOT the strip_dot_prefix'd FatFs form.
+             */
+            {
+                const char* store = is_root ? "/" : in_path;
+                size_t plen = 0;
+                while (store[plen]) plen++;
+                slot->dir_path = (char*)kmalloc(plen + 1);
+                if (slot->dir_path) {
+                    for (size_t i = 0; i <= plen; i++)
+                        slot->dir_path[i] = store[i];
+                }
+            }
+            FDTRACE({ serial_print("open  "); serial_print(dir_path);
+                      serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                      serial_print(" kind=DIR"); });
+            return fd;
+        }
+        kfree(dir_obj);
+        #if TRACE_OPEN
+        serial_print("sys_open: f_opendir FAIL path=");
+        serial_print(dir_path);
+        serial_print(" dr=");
+        serial_print_dec(dr);
+        serial_print("\n");
+        #endif
+        kfree(slot);
+        self->file_table[fd] = NULL;
+        return fatfs_errno(dr);
+    }
+
+    FIL* file_obj = (FIL*)kmalloc(sizeof(FIL));
+    if (!file_obj) {
+        kfree(slot);
+        self->file_table[fd] = NULL;
+        return -(long)EIO_;
+    }
+
+    FRESULT r = f_open(file_obj, local_path, mode);
+    if (r == FR_OK) {
+        slot->kind = FILE_KIND_FILE;
+        slot->obj  = file_obj;
+        FDTRACE({ serial_print("open  "); serial_print(local_path);
+                  serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                  serial_print(" kind=FILE"); });
+        return fd;
+    }
+
+    /*
+     * f_open failed and the caller did not ask for a directory.
+     * Last-resort fallback: the path might be a directory the
+     * caller opened without O_DIRECTORY.  FR_INVALID_NAME (6) and
+     * FR_NO_FILE (4) are what FatFs returns when f_open is asked
+     * to open a directory with file semantics.
+     */
+    if (r == FR_INVALID_NAME || r == FR_NO_FILE) {
+        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
+        if (dir_obj) {
+            FRESULT dr = f_opendir(dir_obj, local_path);
+            if (dr == FR_OK) {
+                kfree(file_obj);
+                slot->kind = FILE_KIND_DIR;
+                slot->obj  = dir_obj;
+                /* Same dir_path recording as the O_DIRECTORY
+                 * branch above. */
+                {
+                    size_t plen = 0;
+                    while (in_path[plen]) plen++;
+                    slot->dir_path = (char*)kmalloc(plen + 1);
+                    if (slot->dir_path) {
+                        for (size_t i = 0; i <= plen; i++)
+                            slot->dir_path[i] = in_path[i];
+                    }
+                }
+                FDTRACE({ serial_print("open  "); serial_print(local_path);
+                          serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
+                          serial_print(" kind=DIR (fallback)"); });
+                return fd;
+            }
+            kfree(dir_obj);
+        }
+    }
+
+    #if TRACE_OPEN
+    serial_print("sys_open: f_open FAIL path=");
+    serial_print(local_path);
+    serial_print(" flags=0x");
+    serial_print_hex((uint64_t)flags);
+    serial_print(" mode=0x");
+    serial_print_hex((uint64_t)mode);
+    serial_print(" r=");
+    serial_print_dec(r);
+    serial_print("\n");
+    #endif
+
+    kfree(file_obj);
+    kfree(slot);
+    self->file_table[fd] = NULL;
+    FDTRACE({ serial_print("open  FAIL "); serial_print(local_path);
+              serial_print(" r="); serial_print_dec(r); });
+    return fatfs_errno(r);
+}
+
 static long open_resolved(const char* in_path, int flags, int backend) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)EFAULT_;
@@ -3164,214 +3391,7 @@ static long open_resolved(const char* in_path, int flags, int backend) {
     }
     strip_dot_prefix(local_path);
 
-    file_slot_t* slot = NULL;
-    int fd = alloc_file_slot(&slot);
-    if (fd == -1) return -(long)EIO_;
-
-    BYTE mode = 0;
-    switch (flags & 0x3) {
-        case 0:  mode |= FA_READ;             break;   /* O_RDONLY */
-        case 1:  mode |= FA_WRITE;            break;   /* O_WRONLY */
-        case 2:  mode |= FA_READ | FA_WRITE;  break;   /* O_RDWR   */
-        default: /* O_ACCMODE == 3 is invalid */
-            kfree(slot);
-            self->file_table[fd] = NULL;
-            return -(long)EINVAL_;
-    }
-
-    /*
-     * Translate Linux open(2) flags to FatFs open mode.
-     *
-     * Linux x86_64 flag bits (include/uapi/asm-generic/fcntl.h):
-     *
-     *   0x0001   O_WRONLY
-     *   0x0002   O_RDWR
-     *   0x0040   O_CREAT
-     *   0x0080   O_EXCL
-     *   0x0200   O_TRUNC
-     *   0x0400   O_APPEND
-     *   0x8000   O_LARGEFILE   (ignored here; we are already 64-bit)
-     *   0x10000  O_DIRECTORY   (handled further below)
-     *
-     * FatFs mode bits (ff.h):
-     *
-     *   0x01  FA_READ
-     *   0x02  FA_WRITE
-     *   0x04  FA_CREATE_NEW
-     *   0x08  FA_CREATE_ALWAYS
-     *   0x10  FA_OPEN_ALWAYS
-     *   0x30  FA_OPEN_APPEND
-     *
-     * FatFs expresses the creation choice as a single mode value,
-     * not as independent bits, so the order of precedence matters.
-     */
-    int o_creat  = (flags & 0x0040) != 0;   /* O_CREAT  */
-    int o_excl   = (flags & 0x0080) != 0;   /* O_EXCL   */
-    int o_trunc  = (flags & 0x0200) != 0;   /* O_TRUNC  */
-    int o_append = (flags & 0x0400) != 0;   /* O_APPEND */
-
-    if (o_creat && o_excl) {
-        mode |= FA_CREATE_NEW;
-    } else if (o_creat && o_trunc) {
-        mode |= FA_CREATE_ALWAYS;
-    } else if (o_creat) {
-        mode |= FA_OPEN_ALWAYS;
-    } else if (o_trunc) {
-        mode |= FA_CREATE_ALWAYS;
-    } else {
-        mode |= FA_OPEN_EXISTING;
-    }
-
-    if (o_append) {
-        mode |= FA_OPEN_APPEND;
-    }
-
-    /*
-     * Linux open(2) is also used to open directories -- musl's
-     * opendir() calls open(path, O_RDONLY|O_DIRECTORY) and then
-     * readdir(), which uses getdents64(2).
-     *
-     * O_DIRECTORY is 0x10000 on Linux x86_64.
-     */
-    #define O_DIRECTORY 0x10000
-    int wants_dir = (flags & O_DIRECTORY) != 0;
-    int is_root   = path_is_root(local_path);
-
-    if (wants_dir || is_root) {
-        /*
-         * O_DIRECTORY on a file: Linux returns -ENOTDIR.
-         */
-        if (wants_dir && !is_root) {
-            FILINFO fno;
-            FRESULT sr = f_stat_with_retry(local_path, &fno);
-            if (sr != FR_OK) {
-                kfree(slot);
-                self->file_table[fd] = NULL;
-                return fatfs_errno(sr);
-            }
-            if (!(fno.fattrib & AM_DIR)) {
-                kfree(slot);
-                self->file_table[fd] = NULL;
-                return -(long)ENOTDIR_;
-            }
-        }
-
-        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
-        if (!dir_obj) {
-            kfree(slot);
-            self->file_table[fd] = NULL;
-            return -(long)EIO_;
-        }
-        const char* dir_path = is_root ? "0:/" : local_path;
-        FRESULT dr = f_opendir(dir_obj, dir_path);
-        if (dr == FR_OK) {
-            slot->kind = FILE_KIND_DIR;
-            slot->obj  = dir_obj;
-            /*
-             * Remember the absolute Unix-form path so an *at()
-             * syscall with this fd as dirfd can resolve against
-             * it.  is_root stores "/"; otherwise store the
-             * resolved absolute path the caller passed in
-             * (in_path), NOT the strip_dot_prefix'd FatFs form.
-             */
-            {
-                const char* store = is_root ? "/" : in_path;
-                size_t plen = 0;
-                while (store[plen]) plen++;
-                slot->dir_path = (char*)kmalloc(plen + 1);
-                if (slot->dir_path) {
-                    for (size_t i = 0; i <= plen; i++)
-                        slot->dir_path[i] = store[i];
-                }
-            }
-            FDTRACE({ serial_print("open  "); serial_print(dir_path);
-                      serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
-                      serial_print(" kind=DIR"); });
-            return fd;
-        }
-        kfree(dir_obj);
-        #if TRACE_OPEN
-        serial_print("sys_open: f_opendir FAIL path=");
-        serial_print(dir_path);
-        serial_print(" dr=");
-        serial_print_dec(dr);
-        serial_print("\n");
-        #endif
-        kfree(slot);
-        self->file_table[fd] = NULL;
-        return fatfs_errno(dr);
-    }
-
-    FIL* file_obj = (FIL*)kmalloc(sizeof(FIL));
-    if (!file_obj) {
-        kfree(slot);
-        self->file_table[fd] = NULL;
-        return -(long)EIO_;
-    }
-
-    FRESULT r = f_open(file_obj, local_path, mode);
-    if (r == FR_OK) {
-        slot->kind = FILE_KIND_FILE;
-        slot->obj  = file_obj;
-        FDTRACE({ serial_print("open  "); serial_print(local_path);
-                  serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
-                  serial_print(" kind=FILE"); });
-        return fd;
-    }
-
-    /*
-     * f_open failed and the caller did not ask for a directory.
-     * Last-resort fallback: the path might be a directory the
-     * caller opened without O_DIRECTORY.  FR_INVALID_NAME (6) and
-     * FR_NO_FILE (4) are what FatFs returns when f_open is asked
-     * to open a directory with file semantics.
-     */
-    if (r == FR_INVALID_NAME || r == FR_NO_FILE) {
-        DIR* dir_obj = (DIR*)kmalloc(sizeof(DIR));
-        if (dir_obj) {
-            FRESULT dr = f_opendir(dir_obj, local_path);
-            if (dr == FR_OK) {
-                kfree(file_obj);
-                slot->kind = FILE_KIND_DIR;
-                slot->obj  = dir_obj;
-                /* Same dir_path recording as the O_DIRECTORY
-                 * branch above. */
-                {
-                    size_t plen = 0;
-                    while (in_path[plen]) plen++;
-                    slot->dir_path = (char*)kmalloc(plen + 1);
-                    if (slot->dir_path) {
-                        for (size_t i = 0; i <= plen; i++)
-                            slot->dir_path[i] = in_path[i];
-                    }
-                }
-                FDTRACE({ serial_print("open  "); serial_print(local_path);
-                          serial_print(" -> fd="); serial_print_dec((uint64_t)fd);
-                          serial_print(" kind=DIR (fallback)"); });
-                return fd;
-            }
-            kfree(dir_obj);
-        }
-    }
-
-    #if TRACE_OPEN
-    serial_print("sys_open: f_open FAIL path=");
-    serial_print(local_path);
-    serial_print(" flags=0x");
-    serial_print_hex((uint64_t)flags);
-    serial_print(" mode=0x");
-    serial_print_hex((uint64_t)mode);
-    serial_print(" r=");
-    serial_print_dec(r);
-    serial_print("\n");
-    #endif
-
-    kfree(file_obj);
-    kfree(slot);
-    self->file_table[fd] = NULL;
-    FDTRACE({ serial_print("open  FAIL "); serial_print(local_path);
-              serial_print(" r="); serial_print_dec(r); });
-    return fatfs_errno(r);
+    return fat_open(in_path, local_path, flags);
 }
 
 /*
