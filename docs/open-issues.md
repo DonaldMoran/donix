@@ -181,6 +181,8 @@ instrument — a first-party reproduction of the `find` sequence,
 or a kernel-side `#GP` handler trace — before it is guessed at.
 It is not the same fault as 7a and must not be folded into 7a.
 
+**Disassembly of the current build (2026-10-18).**  `third_party/busybox/busybox` is non-PIE (`Type: EXEC`, load base `0x400000`); `0x42F1A7` is inside the executable PT_LOAD but is **not an instruction boundary** -- it falls inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.  Starting a disassembly at `0x42F1A7` yields a spurious `movabs`, which is the tell.  The nearest real instructions that can raise a user `#GP(0)` are `0x42F1A3` (`mov 0xa0(%r12),%rdi`, a non-canonical `%r12`) and `0x42F1AB` (`cmpb $0x0,0x1(%rbp)`, a non-canonical `%rbp` set by `xchg %rax,%rbp` at `0x42F197` from a returned pointer).  No SSE/XMM instruction appears in the window, so 7b is **not** a face of item 10.  The recorded address is therefore either a fault/operand address, a transcription slip, or from an older build.  Suspected (not proven) to be a downstream symptom of a pre-v0.6.13 corruption race (heap cycle / pipe wake / `C`); unobserved since those closed.  The standing test is a 100 Hz soak (PIPE7E-ALL-PASS, 250000 iterations @ 100 Hz over >3.5 hours, 2026-10-18); if it recurs, inspect `%r12`/`%rbp` at `0x42F1A3`/`0x42F1AB` and trace the corruption upstream of `find`.
+
 **Item 7e — ash's stale `jmp_buf`.**  The kernel-side faces of
 7e are closed (the pipe-wake face by `c3e5c97`; the
 heap-corruption face by `2fc7fde`; the pipe-reader lost-wakeup
@@ -195,6 +197,9 @@ liveness check.  First-party reproduction: `pipe7e_sjlj_stale`
 (`/usr/bin/PIPE7E_SJLJ_STALE`).  **The mechanism is
 `third_party/`'s and is not editable.**
 
+**`realpath` and path canonicalization do not resolve `..`.**  `realpath /root` prints `/root` and `realpath /root/scripts` prints `/root/scripts`, but any path with a `..` component fails: `realpath /root/scripts/../scripts` prints
+`realpath: /root/scripts/../scripts: No such file or directory`.  The resolver appears to stat the literal `..` entry rather than canonicalizing it, and FatFs's `..` lookup does not satisfy that.  Confirmed pre-existing: `CONFIG_REALPATH=y` was already set, and `test.sh` is 57/57 before and after the 2026-10-19 busybox batch.  This is a shared-resolve-path defect -- the same path the VFS (the item-8 seam) will own -- so the VFS work should fix it, and any `..`-dependent caller (`find`, `cd -P`, build scripts, future symlink targets) is exposed until then.  It is not a busybox bug; do not enable `CONFIG_LN`/symlinks expecting this to work.
+
 **`readdir("/dev")` fails; `readdir("/proc")` works.**  `/proc`
 is a listable directory; `/dev` is not.  `ls /dev`, `ls /dev/`,
 and `ls dev` all fail with `ENOENT`.  Adding it is the same
@@ -204,6 +209,8 @@ for the prefix.  The mechanism is proven and the pattern is
 established.  This is what would let `tty` and `null` appear in
 `ls /dev`, and it is the prerequisite for `/dev/tty` and
 `/dev/urandom`.
+
+**`ls` long options are unavailable in the pinned BusyBox 1.36.1.**  `CONFIG_LONG_OPTS=y` is set, but `ls --color=auto`, `ls --help`, `ls --full-time`, and `ls --group-directories-first` all fail with `ls: unrecognized option: -`.  The `ls` applet registers no long-option table in this source snapshot: the applet's long-option registration is gated behind `FEATURE_LS_COLOR` rather than `LONG_OPTS` (the bug upstream fixed in 2017 by changing `IF_FEATURE_LS_COLOR(applet_long_options = ls_longopts;)` to `IF_LONG_OPTS(applet_long_options = ls_longopts;)`).  `third_party/` is read-only, so this cannot be fixed in-tree.  Workaround: use short options (`-l`, `-F`, `-R`, `-h`), which work and are verified by `test.sh` and the batch-1 smoke run.  If long `ls` options are ever wanted, the pinned source needs the 2017 fix.  Not a kernel bug and not a batch-1 regression.
 
 **`st_rdev` is 0 on device nodes.**  `ls -l /dev/console` prints
 `0, 0` for the major/minor column; a real Unix prints `4, 0`.
