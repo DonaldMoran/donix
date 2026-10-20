@@ -1432,22 +1432,90 @@ static int path_copy(char* out, size_t cap, const char* src) {
  * No libc string functions, matching this file's convention (see
  * the comment on dev_lookup).  Manual compare.
  */
+/*
+ * The mount table.  THE SEAM's data.
+ *
+ * Each entry maps a mount point to a backend.  path_backend does
+ * a LONGEST-PREFIX match on a component boundary: a mount M
+ * matches abs_path when abs_path starts with M.path and the next
+ * character is '/' or end-of-string.  So "/dev" matches "/dev"
+ * and "/dev/null" but NOT "/devices", and the deepest matching
+ * mount wins.  "/" is the root mount and is the fallback, so a
+ * path that matches nothing else still resolves to a backend.
+ *
+ * Adding a backend is a row here, not a clause in path_backend.
+ * That is contract VFS rule 1: one mount table, one place the
+ * mapping lives.
+ *
+ * This table is static and const.  Nothing mutates it at runtime,
+ * so no lock is needed: contract VFS rule 1's critical section is
+ * for DYNAMIC mount-table mutation (a real mount(2)), which does
+ * not exist yet.  When it does, that commit makes this array
+ * mutable, adds an init, and holds cli across the mutation -- and
+ * it will be a different, larger change.
+ *
+ * Order is irrelevant: longest match wins, so the entries may be
+ * listed in any order.  Do not register duplicate paths.
+ */
+static const struct {
+    const char* path;      /* absolute mount point, no trailing '/' */
+    int         backend;   /* BACKEND_* */
+} g_mounts[] = {
+    { "/",     BACKEND_FAT  },
+    { "/dev",  BACKEND_DEV  },
+    { "/proc", BACKEND_PROC },
+};
+#define G_MOUNTS_LEN (sizeof(g_mounts) / sizeof(g_mounts[0]))
+
+/*
+ * The seam's decision.  Given an absolute Unix-form path, return
+ * which backend owns it, by longest matching mount point.
+ *
+ * This is the ONLY place the mapping lives.  A second copy of
+ * "does this path start with /dev or /proc" is the failure mode
+ * docs/strategy.md names -- do not add one.  When a later session
+ * wants a new backend, it adds a row to g_mounts and a handler; it
+ * does not touch the syscalls.
+ *
+ * The comparison is by COMPONENT, not by bare prefix: "/dev" and
+ * "/dev/null" match, "/devices/x" does not, because after "dev"
+ * comes 'i', not '/' or end-of-string.  A plain prefix compare of
+ * "/dev" would wrongly match "/devices".
+ *
+ * Called only on paths that came from resolve_at, which are
+ * absolute, so abs_path[0] == '/' is guaranteed by the caller.
+ * The guard below is defensive, not load-bearing: a non-absolute
+ * path is treated as FAT, which is the pre-seam behavior.
+ *
+ * No libc string functions, matching this file's convention (see
+ * the comment on dev_lookup).  Manual compare.
+ */
 static int path_backend(const char* abs_path) {
     if (abs_path[0] != '/') return BACKEND_FAT;
 
-    const char* p = abs_path + 1;
+    int best = -1;          /* index of the longest matching mount */
+    size_t best_len = 0;
 
-    /* "dev" followed by '/' or end-of-string. */
-    if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' &&
-        (p[3] == '/' || p[3] == '\0')) {
-        return BACKEND_DEV;
+    for (size_t i = 0; i < G_MOUNTS_LEN; i++) {
+        const char* m = g_mounts[i].path;
+        size_t mlen = 0;
+        while (m[mlen]) mlen++;
+
+        size_t k = 0;
+        while (k < mlen && abs_path[k] == m[k]) k++;
+        if (k != mlen) continue;
+
+        char next = abs_path[mlen];
+        if (next != '/' && next != '\0') continue;
+
+        if (mlen >= best_len) {
+            best = (int)i;
+            best_len = mlen;
+        }
     }
-    /* "proc" followed by '/' or end-of-string. */
-    if (p[0] == 'p' && p[1] == 'r' && p[2] == 'o' && p[3] == 'c' &&
-        (p[4] == '/' || p[4] == '\0')) {
-        return BACKEND_PROC;
-    }
-    return BACKEND_FAT;
+
+    if (best < 0) return BACKEND_FAT;   /* unreachable: "/" always matches */
+    return g_mounts[best].backend;
 }
 
 /*
