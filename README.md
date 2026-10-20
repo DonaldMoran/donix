@@ -66,7 +66,8 @@ That's the point. That's the whole point.
   `newfstatat`, `access`, `faccessat`, `chdir`, `getcwd`, `geteuid`,
   `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`,
   `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
-  `symlink`, `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) -
+  `symlink`, `chmod`, `fchmod`, `chown`, `fchown`,
+  `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) -
   the numbers
   and semantics match Linux x86_64. musl's `printf`, `malloc`, and
   `opendir` work unmodified.
@@ -242,9 +243,12 @@ tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
 `CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, `CONFIG_SHOW_USAGE=y`, and
 `CONFIG_FEATURE_VI_WIN_RESIZE=y` (so `vi` fills the framebuffer
 console). It also enables the `bc`, `dc`, `diff`, `du`, and `awk`
-applets.  `tar` is deliberately **off**: its creation path writes
-an empty archive and exits 0, so it is not shipped until that is
-fixed in the busybox source.
+applets, and `tar`.  (`tar` was briefly off at `v0.6.16` because
+its creation path wrote an empty archive: every FAT file reported
+`Inode: 0`, so busybox's self-archive check treated every member
+as the archive.  `v0.6.17` gives FAT a real `st_ino`, and `tar -cf`
+through `tar -tvf` now work -- including recording a symlink as
+`lrwxrwxrwx ... -> target`.)
 
 ---
 
