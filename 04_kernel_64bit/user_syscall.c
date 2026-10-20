@@ -232,6 +232,10 @@ static char g_write_bounce[WRITE_CHUNK];
  * warranted, gets designed against two devices instead of one.
  */
 #define FILE_KIND_DEV_NULL 5
+/* One kind for every character device; the slot's obj is a row in
+ * g_dev_table (a dev_driver_t), so read/write/stat dispatch through
+ * (major, minor) and the row's function pointers. */
+#define FILE_KIND_DEV 8
 
 /*
  * A character device that is stat-able but not openable.
@@ -590,12 +594,47 @@ static int path_is_root(const char* p) {
  * "console".  The match is by full component, so "/dev/nullx" does
  * not match "null"; see dev_lookup.
  */
-static const struct {
+/*
+ * A character device driver.  A device is not a kind: it is a
+ * (major, minor) pair and a pair of operations, exactly as Unix
+ * models it.  open() returns one FILE_KIND_DEV slot carrying a
+ * pointer to the row; read/write dispatch through it; stat
+ * reports (major, minor) as st_rdev.  Adding a device is a row
+ * with two functions, not a clause at eight call sites.
+ *
+ * Linux's char-device majors for these: /dev/null 1:3,
+ * /dev/zero 1:5, /dev/urandom 1:9, /dev/tty 5:0,
+ * /dev/console 5:1.  The console sentinel on fds 0/1/2 is not
+ * a /dev path and keeps its own (1,1) pair -- musl's ttyname
+ * gate depends on it.
+ */
+typedef struct dev_driver {
     const char* name;
-    uint32_t    kind;
-} g_dev_table[] = {
-    { "null",    FILE_KIND_DEV_NULL },
-    { "console", FILE_KIND_DEV_CHAR },
+    uint8_t     major;   /* st_rdev major */
+    uint8_t     minor;   /* st_rdev minor */
+    uint16_t    ino;     /* st_ino identity; st_dev is 1 for DEV.
+                          * console and tty share 1 -- the console
+                          * sentinel on fds 0/1/2 uses (1,1), and
+                          * musl's ttyname compares that pair. */
+    long      (*read)(void* buf, size_t n);
+    long      (*write)(const void* buf, size_t n);
+} dev_driver_t;
+
+static long dev_null_read(void* buf, size_t n) {
+    (void)buf; (void)n; return 0;   /* always EOF */
+}
+static long dev_null_write(const void* buf, size_t n) {
+    (void)buf; return (long)n;      /* always accepted */
+}
+
+/* tty/console forward to the console path implemented below. */
+static long console_read(void* buf, size_t n);
+static long console_write(const void* buf, size_t n);
+
+static const dev_driver_t g_dev_table[] = {
+    { "null",    1, 3, 2, dev_null_read,  dev_null_write  },
+    { "console", 5, 1, 1, console_read,   console_write   },
+    { "tty",     5, 0, 1, console_read,   console_write   },
 };
 #define G_DEV_TABLE_LEN (sizeof(g_dev_table) / sizeof(g_dev_table[0]))
 
@@ -620,18 +659,18 @@ static const struct {
  * device is not the device).  No libc string functions, matching
  * this file's convention.
  */
-static uint32_t dev_lookup(const char* abs_path) {
-    if (abs_path[0] != '/') return 0;
+static const dev_driver_t* dev_lookup(const char* abs_path) {
+    if (abs_path[0] != '/') return NULL;
 
     /* Skip "/dev/". */
     const char* p = abs_path + 1;
     if (!(p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == '/')) {
-        return 0;
+        return NULL;
     }
     const char* name = p + 4;   /* after "dev/" */
 
     /* Empty component: "/dev/" alone is not a device. */
-    if (name[0] == '\0') return 0;
+    if (name[0] == '\0') return NULL;
 
     for (size_t i = 0; i < G_DEV_TABLE_LEN; i++) {
         const char* entry = g_dev_table[i].name;
@@ -641,10 +680,10 @@ static uint32_t dev_lookup(const char* abs_path) {
          * (either at the string end or at a '/' -- but a '/' means
          * there is more path, so only '\0' counts). */
         if (entry[j] == '\0' && name[j] == '\0') {
-            return g_dev_table[i].kind;
+            return &g_dev_table[i];
         }
     }
-    return 0;
+    return NULL;
 }
 
 /*
@@ -2168,13 +2207,8 @@ static void put_file_slot(file_slot_t* slot) {
         if (slot->dir_path) kfree(slot->dir_path);
     } else if (slot->kind == FILE_KIND_CONSOLE) {
         /* obj is NULL; nothing to close or free. */
-    } else if (slot->kind == FILE_KIND_DEV_NULL) {
-        /* obj is NULL; nothing to close or free. */
-    } else if (slot->kind == FILE_KIND_DEV_CHAR) {
-        /* obj is NULL; nothing to close or free.  Unreachable
-         * today -- open_resolved refuses this kind -- but the
-         * case is here so the switch is total.  A future commit
-         * that opens /dev/console reaches it. */
+    } else if (slot->kind == FILE_KIND_DEV) {
+        /* obj points at a g_dev_table row; nothing to free. */
     } else if (slot->kind == FILE_KIND_PROC) {
         /*
          * obj is the PROC_ENTRY_* value cast to a pointer, not an
@@ -2897,33 +2931,18 @@ static long open_resolved(const char* in_path, int flags, int backend) {
             }
             return dfd;
         }
-        uint32_t kind = dev_lookup(in_path);
-        if (kind == FILE_KIND_DEV_NULL) {
+        const dev_driver_t* d = dev_lookup(in_path);
+        if (d) {
             file_slot_t* dslot = NULL;
             int dfd = alloc_file_slot(&dslot);
             if (dfd == -1) return -(long)EIO_;
-            dslot->kind = kind;
-            /* obj stays NULL; refcount is 1 from alloc_file_slot. */
+            dslot->kind = FILE_KIND_DEV;
+            dslot->obj  = (void*)d;
             FDTRACE({ serial_print("open  dev -> fd=");
                       serial_print_dec((uint64_t)dfd);
-                      serial_print(" kind=");
-                      serial_print_dec((uint64_t)kind); });
+                      serial_print(" dev=");
+                      serial_print(d->name); });
             return dfd;
-        }
-        /*
-         * A DEV table entry that is stat-able but not openable --
-         * /dev/console in commit 4.  Refuse it rather than
-         * producing a slot with no read/write behavior.  Linux
-         * allows open("/dev/console"); donix does not yet, and
-         * the honest answer is ENOENT rather than a slot that
-         * misbehaves the first time someone reads from it.
-         *
-         * When a future commit makes it openable, this is the
-         * branch that changes, and that commit adds the
-         * read/write cases at the same time.
-         */
-        if (kind == FILE_KIND_DEV_CHAR) {
-            return -(long)ENOENT_;
         }
         /* Unknown /dev entry: fall through to FAT. */
     }
@@ -3986,11 +4005,11 @@ static long sys_fstat_body(int fd, void* user_stat) {
         return 0;
     }
 
-    if (slot->kind == FILE_KIND_DEV_NULL) {
-        /* Character device, like Linux's /dev/null.  Nothing calls
-         * fstat on an open devnull fd yet; this keeps the answer
-         * correct if something does. */
-        fill_kstat_as_chardev(&st, 1, 2);
+    if (slot->kind == FILE_KIND_DEV) {
+        const dev_driver_t* d = (const dev_driver_t*)slot->obj;
+        if (!d) return -(long)EBADF_;
+        fill_kstat_as_chardev(&st, 1, d->ino);
+        st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
         if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
             return -(long)EFAULT_;
         }
@@ -4166,20 +4185,11 @@ static long stat_resolved(const char* abs_path, void* user_stat,
      * -ENOENT for unknown /dev paths before commit 2 as well.
      */
     if (backend == BACKEND_DEV) {
-        uint32_t kind = dev_lookup(abs_path);
-        if (kind == FILE_KIND_DEV_NULL) {
+        const dev_driver_t* d = dev_lookup(abs_path);
+        if (d) {
             kernel_stat_t st;
-            fill_kstat_as_chardev(&st, 1, 2);
-            if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
-                return -(long)EFAULT_;
-            }
-            return 0;
-        }
-        if (kind == FILE_KIND_DEV_CHAR) {
-            /* /dev/console: S_IFCHR, (st_dev, st_ino) = (1, 1),
-             * matching the console sentinel's fstat. */
-            kernel_stat_t st;
-            fill_kstat_as_chardev(&st, 1, 1);
+            fill_kstat_as_chardev(&st, 1, d->ino);
+            st.st_rdev = ((uint64_t)d->major << 8) | (uint64_t)d->minor;
             if (safe_copy_to_user(user_stat, &st, sizeof(st)) != 0) {
                 return -(long)EFAULT_;
             }
@@ -4462,7 +4472,7 @@ static long access_resolved(const char* abs_path, int backend) {
 
     /* DEV backend: a known device exists. */
     if (backend == BACKEND_DEV) {
-        if (dev_lookup(abs_path) != 0) {
+        if (dev_lookup(abs_path) != NULL) {
             return 0;
         }
         /* Unknown /dev entry: fall through to FAT, as before. */
@@ -5727,6 +5737,65 @@ long sys_wait4(long pid, int* user_status, int options) {
 // ============================================================
 // IO
 // ============================================================
+/*
+ * The console write/read implementation, shared by fds 0/1/2 (a
+ * FILE_KIND_CONSOLE slot) and /dev/tty and /dev/console (a
+ * FILE_KIND_DEV slot whose row points here).  One implementation,
+ * three callers.
+ *
+ * The bodies are moved verbatim from sys_write's fd-1/2 branch and
+ * sys_read's fd-0 branch.  The cli/sti/hlt sequence, the pid-1
+ * branch, and the nine-register save in console_read are the
+ * original and MUST NOT be altered here: that is the blocking
+ * discipline this project has paid for races in (the C, the pipe
+ * lost-wakeup).  A change to those lines is a different commit
+ * with its own soak, not a side effect of sharing the code.
+ */
+static long console_write(const void* buf, size_t count) {
+    size_t remaining = count;
+    const uint8_t* user_ptr = (const uint8_t*)buf;
+    while (remaining > 0) {
+        size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
+        if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
+            return -(long)EFAULT_;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            char c = g_write_bounce[i];
+            serial_putc(c); vga_putc(c);
+        }
+        user_ptr += chunk; remaining -= chunk;
+    }
+    return (long)count;
+}
+
+static long console_read(void* buf, size_t count) {
+    pcb_t* self = process_get_current();
+    char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
+    while (bytes_read < count) {
+        __asm__ volatile("cli");
+        if (kbd_buffer_get_mux(&c)) {
+            __asm__ volatile("sti");
+            if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
+            else return -(long)EFAULT_;
+            break;
+        }
+        if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
+        self->state = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_NONE;
+        __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
+        __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
+        __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
+        __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
+        __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
+        __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
+        __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
+        __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
+        __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
+        __asm__ volatile("sti"); __asm__ volatile("hlt");
+    }
+    return (long)bytes_read;
+}
+
 long sys_write(int fd, const void* buf, size_t count) {
     if (!buf || count == 0) return 0;
     pcb_t* self = process_get_current();
@@ -5751,31 +5820,21 @@ long sys_write(int fd, const void* buf, size_t count) {
      */
     file_slot_t* std_slot = get_file_slot_any(fd);
 
-    /* /dev/null: accept and discard.  Returns count, as Linux does
-     * for a successful write to /dev/null. */
+    /* Character device: dispatch through the row's write.  For
+     * /dev/null this accepts and discards, returning count, as
+     * Linux does. */
     {
         file_slot_t* dn = get_file_slot_any(fd);
-        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
-            return (long)count;
+        if (dn && dn->kind == FILE_KIND_DEV) {
+            const dev_driver_t* d = (const dev_driver_t*)dn->obj;
+            if (!d || !d->write) return -(long)EBADF_;
+            return d->write(buf, count);
         }
     }
 
     if ((fd == 1 || fd == 2) &&
         (!std_slot || std_slot->kind == FILE_KIND_CONSOLE)) {
-        size_t remaining = count;
-        const uint8_t* user_ptr = (const uint8_t*)buf;
-        while (remaining > 0) {
-            size_t chunk = remaining > WRITE_CHUNK ? WRITE_CHUNK : remaining;
-            if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
-                return -(long)EFAULT_;
-            }
-            for (size_t i = 0; i < chunk; i++) {
-                char c = g_write_bounce[i];
-                serial_putc(c); vga_putc(c);
-            }
-            user_ptr += chunk; remaining -= chunk;
-        }
-        return (long)count;
+        return console_write(buf, count);
     }
 
     /*
@@ -6182,8 +6241,10 @@ long sys_read(int fd, void* buf, size_t count) {
      * paths so a devnull slot is never mistaken for either. */
     {
         file_slot_t* dn = get_file_slot_any(fd);
-        if (dn && dn->kind == FILE_KIND_DEV_NULL) {
-            return 0;
+        if (dn && dn->kind == FILE_KIND_DEV) {
+            const dev_driver_t* d = (const dev_driver_t*)dn->obj;
+            if (!d || !d->read) return -(long)EBADF_;
+            return d->read(buf, count);
         }
     }
 
@@ -6286,58 +6347,7 @@ long sys_read(int fd, void* buf, size_t count) {
 
     if (fd == 0 &&
         (!fd0_slot || fd0_slot->kind == FILE_KIND_CONSOLE)) {
-        char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
-        while (bytes_read < count) {
-            __asm__ volatile("cli");
-            if (kbd_buffer_get_mux(&c)) {
-                __asm__ volatile("sti");
-                if (safe_copy_to_user(dest_ptr + bytes_read, &c, 1) == 0) bytes_read++;
-                else return -(long)EFAULT_;
-                /*
-                 * Return as soon as at least one byte has been copied.
-                 *
-                 * POSIX read(2) on a terminal returns when at least
-                 * one byte is available; it does not block until
-                 * count bytes have been accumulated.  The previous
-                 * behavior (loop until bytes_read == count) made
-                 * musl's read(0, line, 255) wait for 255 keystrokes
-                 * before returning, which is not how any Unix
-                 * program expects stdin to behave.  The newlib
-                 * shell never noticed because it reads 1 byte at a
-                 * time (count == 1), so the loop exited on the
-                 * first byte anyway.
-                 *
-                 * The byte is NOT echoed here.  Users of this path
-                 * that want their input echoed (musl_sh, the kernel
-                 * shell) do the echoing themselves.  busybox ash
-                 * with FEATURE_EDITING=y also echoes itself via
-                 * lineedit.c.  Echoing here as well would
-                 * double-echo every keystroke for whichever of
-                 * those programs was currently reading.
-                 */
-                break;
-            }
-            if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
-            self->state = PROC_STATE_BLOCKED;
-            self->block_kind = BLOCK_KIND_NONE;
-            /* PROBE (session 61): save the live caller-saved
-             * registers before halting, so the ring-0 resume
-             * restores them instead of the stale pcb slots.
-             * See context-switch-block-design.md. */
-            __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
-            __asm__ volatile("movq %%rcx, %0" : "=m"(self->rcx) :: "memory");
-            __asm__ volatile("movq %%rdx, %0" : "=m"(self->rdx) :: "memory");
-            __asm__ volatile("movq %%rsi, %0" : "=m"(self->rsi) :: "memory");
-            __asm__ volatile("movq %%rdi, %0" : "=m"(self->rdi) :: "memory");
-            __asm__ volatile("movq %%r8,  %0" : "=m"(self->r8)  :: "memory");
-            __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
-            __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
-            __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
-
-
-            __asm__ volatile("sti"); __asm__ volatile("hlt");
-        }
-        return (long)bytes_read;
+        return console_read(buf, count);
     }
 
     /*
