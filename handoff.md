@@ -5,8 +5,8 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-20.  **THE VFS IS DONE.  `v0.6.16` is the
-VFS release.**  Every path syscall reaches its filesystem through the
+**Last updated:** 2026-10-20.  **`v0.6.16` is the VFS release;
+`v0.6.17` fixes FAT `st_ino` and re-enables `tar`.**  Every path syscall reaches its filesystem through the
 mount table (`mount_driver(backend)->op(...)`); the resolver is
 `vfs_resolve(path, follow_final)`; symlinks work end to end.  `test.sh`
 is 57/57 and `canary --full` is 28/28, verified from `/` on a freshly
@@ -29,9 +29,10 @@ syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
 file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
 `sys_gettimeofday` (99); signals (contract's async-writer design);
-shebang + `/bin/sh`.  `tar` is **disabled** in busybox: its creation
-path writes an empty archive and exits 0, so it was turned off rather
-than shipped broken.
+shebang + `/bin/sh`.  `tar` is enabled and link restoration is verified (the v0.6.16
+note that called it a busybox issue was wrong -- FAT `st_ino` was 0;
+`76d66db` gives it a real value).  `chmod`/`chown` (90-93) accept and
+drop: FAT has no mode or owner.
 
 **THE SCRATCH TAGS** are development restore points, not release
 artifacts: `20261020-proc-path-fold`, `20261020-proc-entries`,
