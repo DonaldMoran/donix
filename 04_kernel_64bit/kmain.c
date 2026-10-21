@@ -88,6 +88,39 @@ void test_process_entry(void) {
     process_exit();
 }
 
+/*
+ * Kernel-mode entry point for the sigdump acceptance test.
+ *
+ * Calls sys_kill on itself with SIGUSR1 and exits.  It is the
+ * kernel-side twin of userland/musl/tests/kill_self.c: same
+ * sys_kill, same pending-bit set, same g_sig_raise_count
+ * increment.  The only difference is that this runs in kernel
+ * mode, which is what lets the kernel shell -- the only shell
+ * with a process-dump command -- do the raise and the dump in
+ * one boot.
+ *
+ * The kernel shell and the user shell are mutually exclusive per
+ * boot (kmain's 'k' branch switches to the kernel shell and does
+ * not fall through to musl_sh), so kill_self cannot be followed
+ * by proclist in one boot.  This entry point closes that gap
+ * without adding a syscall.
+ *
+ * SIGUSR1 is 10 (Linux x86_64).  sys_kill is the same function
+ * the syscall dispatcher reaches, not a parallel path.
+ */
+void test_kill_entry(void) {
+    long pid = (long)process_get_current()->pid;
+    long r = sys_kill(pid, 10);   /* SIGUSR1 */
+    if (r != 0) {
+        serial_print("KILLTEST: sys_kill failed: ");
+        serial_print_dec((uint64_t)r);
+        serial_print("\n");
+    } else {
+        serial_print("KILLTEST: sys_kill returned 0 (raise ok)\n");
+    }
+    process_exit();
+}
+
 extern void user_syscall_entry(void);
 
 static int cpu_has_syscall(void) {
@@ -1113,7 +1146,7 @@ static void handle_command(const char *cmd) {
     }
 
     if (strcmp(cmd, "help") == 0) {
-        vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
+        vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  sigdump, killtest,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
         vga_clear(); vga_print("donix v0.6.17\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
@@ -1210,6 +1243,39 @@ static void handle_command(const char *cmd) {
         vga_print("> ");
     } else if (strcmp(cmd, "proclist") == 0) {
         vga_print("\nTrace streamed to serial logs.\n"); process_dump_all(); vga_print("> ");
+    } else if (strcmp(cmd, "sigdump") == 0) {
+        /*
+         * Slice 1 of docs/signal-design.md, question 6: the
+         * two signal counters, without the rest of the process
+         * dump.  g_sig_deliver_count is 0 in slice 1 -- the
+         * code that would increment it is slice 2's -- so a
+         * healthy dump reads "sig_raise=N sig_deliver=0".
+         */
+        extern volatile uint64_t g_sig_raise_count;
+        extern volatile uint64_t g_sig_deliver_count;
+        PRINT_BOTH("\nsig_raise=");
+        PRINT_BOTH_DEC(g_sig_raise_count);
+        PRINT_BOTH(" sig_deliver=");
+        PRINT_BOTH_DEC(g_sig_deliver_count);
+        PRINT_BOTH("\n> ");
+    } else if (strcmp(cmd, "killtest") == 0) {
+        /*
+         * Spawn a kernel-mode child that calls sys_kill on
+         * itself, the same way the sigsegv selftest spawns a
+         * kernel-mode child that faults.  suspend_self_for_
+         * diagnostic keeps the shell off the ready queue
+         * while the child runs; scheduler_switch_to runs it.
+         * When it exits, process_exit resumes the shell.
+         */
+        extern void test_kill_entry(void);
+        pcb_t* proc = process_create("killtest", (uint64_t)test_kill_entry, 0);
+        if (proc) {
+            suspend_self_for_diagnostic();
+            scheduler_switch_to(proc);
+        } else {
+            PRINT_BOTH("killtest: process_create failed\n");
+        }
+        vga_print("> ");
     } else if (strcmp(cmd, "vmmclone") == 0) {
         process_test_clone(); vga_print("> ");
     } else if (strcmp(cmd, "proccreate") == 0) {

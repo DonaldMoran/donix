@@ -288,6 +288,26 @@ long sys_stat(const char* user_path, void* user_stat);
 long sys_newfstatat(int dirfd, const char* pathname, void* user_stat, int flags);
 long sys_wait4(long pid, int* user_status, int options);
 /*
+ * kill(62) and tgkill(234) -- slice 1 of docs/signal-design.md.
+ *
+ * Declared here, not in include/user_syscall.h, because they are
+ * reached from two translation units: the syscall dispatcher and
+ * kmain.c's killtest child (the kernel-side twin of kill_self,
+ * which makes the sigdump acceptance line observable in the one
+ * shell that has a process dump).
+ *
+ * sys_kill sets the target's sig_pending bit and wakes it if it
+ * is BLOCKED and the signal is unblocked.  It does not deliver:
+ * that is slice 2's frame work.  pid <= 0 is -EINVAL (donix has
+ * no process groups); sig == 0 is the existence check; -ESRCH
+ * for a pid that names no live process.
+ *
+ * sys_tgkill requires tgid == tid (donix has one thread per
+ * process) and is otherwise kill(tid, sig).
+ */
+long sys_kill(long pid, int sig);
+long sys_tgkill(long tgid, long tid, int sig);
+/*
  * sys_pipe -- Linux x86_64 pipe(2), syscall 22.
  *
  * arg0 is a user pointer to int[2]; on success pipefd[0] is the
