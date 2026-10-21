@@ -120,9 +120,11 @@ small.
 works only because busybox ash falls back on `ENOEXEC` and runs
 `sh script.sh`.  The kernel's `sys_execve` opens the file, checks
 for ELF magic, finds `#!`, prints `sys_execve: not an ELF file`,
-and returns `-ENOEXEC`; there is no shebang handling.  And
-`/bin/sh` does not exist on the image — `/bin` contains only
-`busybox`.
+and returns `-ENOEXEC`; there is no shebang handling.
+**The image half is now done**: `/bin/sh` exists as a soft
+link to busybox (after the one-time
+`/bin/busybox --install -s /bin`; see handoff).  What remains
+is the kernel half -- `#!` parsing in `sys_execve`.
 
 Both must land together: `#!` parsing in `sys_execve` (read the
 first line, build argv `[interp, optional_arg, script, ...]`,
