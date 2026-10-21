@@ -45,9 +45,12 @@ summary exist.
 and `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`) are released.
 The working tree is `dev`.
 
-**NEXT.**  Signals (open-issues 12; design against `docs/contract.md`
-first -- they are the first asynchronous state writer), then
-shebang + `/bin/sh`, then file-backed `mmap`, then `mount(2)`.
+**NEXT.**  Signals (open-issues 12).  **The design is written:
+`docs/signal-design.md`** -- read it and `docs/contract.md`'s
+Signals section before any code.  It answers the contract's six
+questions and splits the work into five verifiable slices; slice 1
+is the pending mask with no delivery.  Then shebang + `/bin/sh`,
+then file-backed `mmap`, then `mount(2)`.
 
 **DONE SINCE `v0.6.17`** (scratch tag `20261020-psl-sysinfo`, on
 `dev`, no version bump): `ps -l` works -- busybox gained
@@ -206,9 +209,13 @@ Do NOT re-walk the refuted paths below.
 ### Next -- the highest-value work
 
 1. **Signals (open-issues item 12).**  The first asynchronous state
-   writer; design against `docs/contract.md`'s Signals section
-   before code.  This is what makes `SIGPIPE`, `SIGSEGV` handlers,
-   and `ash` job control possible.
+   writer.  **Design: `docs/signal-design.md`** (written, five
+   slices).  Start with slice 1 -- the pending mask, no delivery --
+   which does not touch the syscall-return frame.  Delivery (slice
+   2) is the frame work; it needs `user_syscall_entry.asm` and
+   `context_switch.asm` open, and its own session.  This is what
+   makes `SIGPIPE`, `SIGSEGV` handlers, and `ash` job control
+   possible.
 2. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
    recursion guard, and an interpreter on the image.
 3. The open-issues list (top 6, below).
@@ -237,7 +244,9 @@ Do NOT re-walk the refuted paths below.
 
 ## Open issues (top 6)
 
-1. **`open-issues.md` item 12: signal delivery is a stub.**
+1. **`open-issues.md` item 12: signal delivery is a stub.**  Design
+   written: `docs/signal-design.md`; slice 1 (pending mask, no
+   delivery) is the next code.
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
