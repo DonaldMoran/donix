@@ -1,6 +1,8 @@
 # Signal delivery: design
 
-Status: **design, slice 1 is committed (`588ae53`, `3f60a19`, `ce69a7b`); slice 2 is next.**  This answers the six
+Status: **slices 1-3 are committed** (slice 1: `588ae53`, `3f60a19`,
+`ce69a7b`; slice 2: `866588f`, `d2126d8`; slice 3: `17ffeb9`,
+`a1c90ff`, `c4b3ba7`); **slice 4 is next.**  This answers the six
 questions in `docs/contract.md`'s Signals section, which says no
 signal code lands until they are answered here.  Read the contract
 first; read this second; then the slice list at the bottom.
@@ -230,12 +232,35 @@ widening `sigsegv_probe.c`'s test struct to match are a
 follow-up commit; slice 2 only widens the read path, so a caller
 that reads `oldact` today gets the same 16 bytes it always did.
 
-**Slice 3 -- delivery on `iretq`.**
-The interrupt-return path observes the same mask and builds the
-same frame.  Verified by: a busy-loop process gets `SIGUSR1` from
-another process and its handler runs while it is in user mode.
-Failure signature: the frame is built but `iretq` resumes at the
-wrong RIP.
+**Slice 3 -- delivery on `iretq`.  (DONE: `17ffeb9`, `a1c90ff`,
+`c4b3ba7`.)**
+The tick path observes the mask in `timer_preempt_handler` and
+builds the same user-stack frame as slice 2, rewriting the
+20-slot iretq frame in place.  Three deliver sites, each targeting
+the frame it resumes from: the identity self-pick (`next ==
+current`, target `stack_pointer`), the by-value self-pick
+(`next->rsp == stack_pointer`, target `stack_pointer`), and the
+dispatch branch (`return next->rsp`, target `next->rsp`).  The
+refuse paths do not deliver: `current` resumes its own frame
+unchanged, and its pending signal is observed on its next
+dispatch.
+
+The fix that mattered: `signal_deliver_frame_iretq` takes the
+target PCB as a parameter, not `process_get_current()`.  The tick
+path runs outside any syscall, and the scheduler's and process.c's
+`current_process` are two copies kept in step by convention
+(contract rule 5); passing the target makes the helper correct
+regardless.  `process_get_current()` stays correct for slice 2,
+which runs inside the syscall.
+
+Verified by `sigspin`: a child in a no-syscall loop gets `SIGUSR1`
+from another process, the handler runs on the tick,
+`sys_rt_sigreturn` resumes the loop, the child exits 0, the parent
+reaps.  Failure signature: handler runs but the loop does not
+resume (the frame's saved RIP/RSP is wrong), or the tick never
+delivers (no `got SIGUSR1`).  Known limit surfaced by the test:
+`kill(pid, SIGKILL)` does not terminate (default actions are slice
+5), so `sigspin`'s child exits itself.
 
 **Slice 4 -- fault raises.**
 `SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` set the pending bit at fault

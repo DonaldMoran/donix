@@ -56,9 +56,23 @@ kernel shell still reads `sig_raise=1 sig_deliver=0` -- expected,
 because `killtest` has no handler and does not return to user mode.
 `sys_rt_sigreturn` (15) is new: `SYS_RT_SIGRETURN` in `syscall.h`,
 `sys_rt_sigreturn` in `user_syscall.c`, `ucontext_t` frame at
-`restorer (8) + 816 bytes`.  **Slice 3 is delivery on `iretq`**
-(the interrupt-return path), which is the work in
-`context_switch.asm`; it needs that file open and its own session.
+`restorer (8) + 816 bytes`.  **Slice 3 is DONE** (`17ffeb9` code, `a1c90ff` parameterization,
+`c4b3ba7` test), verified by running `sigspin`: a child in a
+no-syscall loop gets `SIGUSR1` from another process, the handler
+runs on the tick, `sys_rt_sigreturn` resumes the loop, the child
+exits 0, the parent reaps (`status=0`).  Delivery is on the
+interrupt-return path: the tick's deliver check runs at the
+identity self-pick (`next == current`), the by-value self-pick
+(`next->rsp == stack_pointer`), and the dispatch branch (`return
+next->rsp`), each targeting that frame.  **The fix that mattered:**
+`signal_deliver_frame_iretq` takes the target PCB as a parameter
+instead of calling `process_get_current()`; the tick path runs
+outside any syscall, and the scheduler's and process.c's
+`current_process` are two copies (contract rule 5).
+`process_get_current()` stays correct for slice 2, which runs
+inside the syscall.  **Known limit surfaced by the test:**
+`kill(pid, SIGKILL)` sets a pending bit and does not terminate;
+default actions are slice 5, so `sigspin`'s child exits itself.
 
 **What slice 2 taught the slice-3 author, so it is not re-walked:**
 
@@ -292,12 +306,14 @@ Do NOT re-walk the refuted paths below.
 
 ## Open issues (top 6)
 
-1. **`open-issues.md` item 12: signals, slices 3-5 remain.**  Slices
-   1 and 2 are done (`d2126d8`).  Slice 3 is `iretq` delivery; slice
+1. **`open-issues.md` item 12: signals, slices 4-5 remain.**  Slices
+   1-3 are done (`d2126d8`, `17ffeb9`, `a1c90ff`, `c4b3ba7`).  Slice
    4 is fault raises (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` set the
    pending bit at fault entry instead of killing); slice 5 is
-   `SIGPIPE`/`SIGCHLD`/default actions.  Known limit from slice 2:
-   `signal_deliver_frame` requires a nonzero `restorer`.
+   `SIGPIPE`/`SIGCHLD`/default actions.  Known limits: from slice 2,
+   `signal_deliver_frame` requires a nonzero `restorer`; surfaced by
+   slice 3's test, `kill(pid, SIGKILL)` does not terminate (default
+   actions are slice 5).
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
@@ -335,8 +351,11 @@ next release procedure.
 **The VFS is DONE and released (`v0.6.16`); `v0.6.17` fixes FAT
 `st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  Since
 `v0.6.17`: `ps -l` works via `sys_sysinfo` (99) and a real
-`creation_time` for `STIME`; **signals slices 1 and 2 are DONE**
-(`d2126d8`), verified by running `kill_self` end to end (install,
-raise, handler, `sys_rt_sigreturn`, caller resumes).  Next: slice 3,
-`iretq` delivery.  Read `docs/contract.md`'s Signals section and
-"NEXT" in this file before any code.**
+`creation_time` for `STIME`; **signals slices 1-3 are DONE**
+(`d2126d8`, `17ffeb9`, `a1c90ff`, `c4b3ba7`).  Slice 2 verified by
+`kill_self` (install, raise, handler, `sys_rt_sigreturn`, caller
+resumes).  Slice 3 verified by `sigspin`: a no-syscall-loop child
+gets `SIGUSR1` on the tick, the handler runs, the loop resumes,
+the child exits 0 and the parent reaps.  Next: slice 4, fault
+raises.  Read `docs/contract.md`'s Signals section and "NEXT" in
+this file before any code.**
