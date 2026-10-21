@@ -10,6 +10,7 @@
 #include "include/user_syscall.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/interrupts.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -138,6 +139,7 @@ static void process_initialize_pcb(pcb_t* pcb) {
     pcb->parent_pid = 0;
     pcb->exit_status = 0;
     pcb->wait_pid = 0;
+    pcb->creation_time = g_ticks;   /* 100 Hz; /proc/<pid>/stat field 22 */
     process_count++;
 }
 
