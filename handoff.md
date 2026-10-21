@@ -154,9 +154,11 @@ echo and command output go to the serial terminal.
 **The scratch tags since `v0.6.17` (`20261020-psl-sysinfo`,
 `20261021-signal-slice1-base`, `-slice1-pre-docs`, `-slice1-docs-post`,
 `-slice2-done`, `-slice3-done`, `-shell-echo-pre-fix`,
-`-shell-echo-post-fix`) have been dropped** once
-`20261021-slice4-done` and this summary existed, per the release
-procedure.
+`-shell-echo-post-fix`) are still the restore points.**  No new tag
+has been created and nothing has been pushed: the policy is not to
+push until the signal implementation (slices 1-5) is complete and
+verified.  When slice 5 ships, the release procedure writes a new
+scratch tag's summary from these, then drops them.
 
 **Working style -- how this project gets changed**
 
@@ -372,11 +374,11 @@ busybox reads `/proc/self/exe` to find itself, donix has no
 `/proc/self/exe`, and it falls back to `argv[0]` -- which must
 start with `/`.  This is a manual step, not part of the build;
 automating it is a Makefile/boot change and is not done.
-`v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  One
-scratch tag exists: `20261021-slice4-done`, the restore point for
-`ps -l`/sysinfo, the kernel-shell echo fix, and signals slices 1-4
-after `v0.6.17`.  It is dropped by the next release procedure, which
-will draw the release summary from it.
+`v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  The
+scratch tags listed above are the current restore points; there is
+no single `20261021-slice4-done` tag yet, and nothing is pushed
+until slice 5 is complete and verified.  The next release procedure
+draws the release summary from these tags before dropping them.
 
 ---
 
