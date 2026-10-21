@@ -45,12 +45,15 @@ summary exist.
 and `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`) are released.
 The working tree is `dev`.
 
-**NEXT.**  Signals (open-issues 12).  **The design is written:
-`docs/signal-design.md`** -- read it and `docs/contract.md`'s
-Signals section before any code.  It answers the contract's six
-questions and splits the work into five verifiable slices; slice 1
-is the pending mask with no delivery.  Then shebang + `/bin/sh`,
-then file-backed `mmap`, then `mount(2)`.
+**NEXT.**  Signals (open-issues 12).  **Slice 1 is DONE** --
+three commits (`588ae53`, `3f60a19`, `ce69a7b`), verified by
+running.  The pending/blocked masks exist on `pcb_t`; `kill` and
+`tgkill` set the pending bit, count the raise, and wake a blocked
+target; `sigdump` and `killtest` in the kernel shell make the
+acceptance line observable (`sig_raise=1 sig_deliver=0`).
+**Slice 2 is delivery**, which is the frame work in
+`user_syscall_entry.asm` and `context_switch.asm`; it needs those
+files open and its own session.
 
 **DONE SINCE `v0.6.17`** (scratch tag `20261020-psl-sysinfo`, on
 `dev`, no version bump): `ps -l` works -- busybox gained

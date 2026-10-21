@@ -1,6 +1,6 @@
 # Signal delivery: design
 
-Status: **design, slice 1 not yet written.**  This answers the six
+Status: **design, slice 1 is committed (`588ae53`, `3f60a19`, `ce69a7b`); slice 2 is next.**  This answers the six
 questions in `docs/contract.md`'s Signals section, which says no
 signal code lands until they are answered here.  Read the contract
 first; read this second; then the slice list at the bottom.
@@ -137,19 +137,19 @@ divergence visible in one `ps`-adjacent dump, which is what the
 Each is one commit, verified by running, per the working style.
 Later slices may be revised when an earlier one lands.
 
-**Slice 1 -- the pending mask, no delivery.**
-`sys_rt_sigaction` stores a real per-process handler table (it
-currently stores one `uint64_t` in a debug hook; `pcb_t` already
-has `signal_handler[64]`, so this is making the existing field
-authoritative).  `sys_rt_sigprocmask` stores `sig_blocked`.
+**Slice 1 -- the pending mask, no delivery.  (DONE)**
+`sys_rt_sigaction` stores a real per-process handler table.
+`sys_rt_sigprocmask` stores `sig_blocked`.
 `kill(2)` (62) and `tgkill(2)` (234) set `sig_pending` and, if the
 target is BLOCKED and the signal is unblocked, wake it per
 question 3.  **No delivery.**  Verified by: `sigsegv_probe` still
-passes (handler installed, fault redirects, process exits);
-a new `kill_self` test installs a handler, calls `kill(getpid(),
-SIGUSR1)`, and the kernel-shell counter dump shows
-`sig_raise_count == 1, sig_deliver_count == 0`.  Failure
-signature: the counters stay 0, or the wake does not happen.
+passes; `kill_self` (user shell) and `killtest` (kernel shell,
+added because the two shells are mutually exclusive per boot) both
+raise the signal.  The counter dump (`sigdump`) shows
+`sig_raise_count > 0, sig_deliver_count == 0`.
+Note: the counters are global and accumulate across raises; the
+clear in `process_reclaim`/`process_destroy` zeroes the per-process
+mask but not the global counter.
 
 **Slice 2 -- delivery on syscall return only.**
 `user_syscall_entry.asm` observes `sig_pending & ~sig_blocked`
