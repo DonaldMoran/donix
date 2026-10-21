@@ -9038,6 +9038,8 @@ long sys_rt_sigreturn(void) {
      * user_syscall_entry.asm for the exact layout; the numbers
      * below are its post-add offsets, relative to that frame.
      */
+    self->in_signal_handler = 0;
+
     extern uint64_t g_syscall_stack_top;
     /*
      * g_syscall_stack_top is the pre-push top.  The stub pushes:
@@ -9217,6 +9219,7 @@ static uint64_t signal_build_user_frame(const struct sig_frame_regs* regs,
 long signal_deliver_frame(void) {
     pcb_t* self = process_get_current();
     if (!self) return 0;
+    if (self->in_signal_handler) return 0;
 
     uint64_t pend = self->sig_pending & ~self->sig_blocked;
     if (pend == 0) return 0;
@@ -9269,6 +9272,7 @@ long signal_deliver_frame(void) {
     kf[1] = frame + 8;    /* rdx = ucontext_t* */
 
     self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
     g_sig_deliver_count++;
     return 1;
 }
@@ -9299,6 +9303,7 @@ long signal_deliver_frame(void) {
  */
 long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
     if (!self) return 0;
+    if (self->in_signal_handler) return 0;
 
     uint64_t pend = self->sig_pending & ~self->sig_blocked;
     if (pend == 0) return 0;
@@ -9350,6 +9355,104 @@ long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
     f[0x58 / 8] = frame + 8;    /* rdx = ucontext_t* */
 
     self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
+    g_sig_deliver_count++;
+    return 1;
+}
+
+/*
+ * signal_deliver_frame_exc -- slice 4's deliver helper, fault path.
+ *
+ * Called from the user-mode exit of isr0_handler / isr6_handler /
+ * isr13_handler / isr14_handler, after the raise (sig_pending bit
+ * set, fault_signal recorded) and after the diagnostic prints.
+ *
+ * The exception frame is NOT the irq0_stub 20-slot frame.  Its
+ * layout, as every handler in interrupts.c already reads it via
+ * `uint64_t *raw = (uint64_t *)frame`:
+ *
+ *   raw[0x00/8]=r15  raw[0x08/8]=r14  raw[0x10/8]=r13
+ *   raw[0x18/8]=r12  raw[0x20/8]=r11  raw[0x28/8]=r10
+ *   raw[0x30/8]=r9   raw[0x38/8]=r8   raw[0x40/8]=rbp
+ *   raw[0x48/8]=rdi  raw[0x50/8]=rsi  raw[0x58/8]=rdx
+ *   raw[0x60/8]=rcx  raw[0x68/8]=rbx  raw[0x70/8]=rax
+ *   raw[EXC_OFF_RIP]=16  raw[EXC_OFF_CS]=17
+ *   raw[EXC_OFF_RFLAGS]=18  raw[EXC_OFF_RSP]=19
+ *   raw[EXC_OFF_SS]=20
+ *
+ * The user-stack frame is identical to slice 2/3's: signal_build_user_frame
+ * does all the work.  The writeback differs only in offsets.  The faulting
+ * instruction's context becomes the ucontext, so a handler that returns
+ * without editing gregs[16] re-executes the faulting instruction -- which
+ * is Unix: a SIGSEGV that the handler does not fix is fatal on the second
+ * fault, and the re-entry guard (in_signal_handler) makes the second fault
+ * take the fault_kill_current path, not the deliver path.
+ *
+ * CS and SS are not rewritten: the handler runs in user mode with the
+ * same segments the fault came from, and iretq reads them from the
+ * frame unchanged.
+ */
+#define EXC_OFF_ERROR_CODE_ 15
+#define EXC_OFF_RIP_        16
+#define EXC_OFF_CS_         17
+#define EXC_OFF_RFLAGS_     18
+#define EXC_OFF_RSP_        19
+#define EXC_OFF_SS_         20
+
+long signal_deliver_frame_exc(pcb_t* self, uint64_t* raw, int sig) {
+    if (!self || !raw) return 0;
+    if (self->in_signal_handler) return 0;
+
+    if ((raw[EXC_OFF_CS_] & 3) != 3) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = sig;
+    if (n <= 0 || n >= 64) return 0;
+    if (!(pend & (1ULL << n))) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0 || restorer == 0) return 0;
+
+    struct sig_frame_regs r;
+    r.gpr[0]  = raw[0x00 / 8];   /* r15 */
+    r.gpr[1]  = raw[0x08 / 8];   /* r14 */
+    r.gpr[2]  = raw[0x10 / 8];   /* r13 */
+    r.gpr[3]  = raw[0x18 / 8];   /* r12 */
+    r.gpr[4]  = raw[0x20 / 8];   /* r11 */
+    r.gpr[5]  = raw[0x28 / 8];   /* r10 */
+    r.gpr[6]  = raw[0x30 / 8];   /* r9  */
+    r.gpr[7]  = raw[0x38 / 8];   /* r8  */
+    r.gpr[8]  = raw[0x40 / 8];   /* rbp */
+    r.gpr[9]  = raw[0x48 / 8];   /* rdi */
+    r.gpr[10] = raw[0x50 / 8];   /* rsi */
+    r.gpr[11] = raw[0x58 / 8];   /* rdx */
+    r.gpr[12] = raw[0x60 / 8];   /* rcx */
+    r.gpr[13] = raw[0x68 / 8];   /* rbx */
+    r.gpr[14] = raw[0x70 / 8];   /* rax */
+    r.rsp    = raw[EXC_OFF_RSP_];
+    r.rflags = raw[EXC_OFF_RFLAGS_];
+    r.rip    = raw[EXC_OFF_RIP_];
+
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
+
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
+    }
+
+    raw[EXC_OFF_RIP_]    = handler;
+    raw[EXC_OFF_RSP_]    = frame;
+    raw[EXC_OFF_RFLAGS_] = r.rflags;
+    raw[0x48 / 8]        = (uint64_t)n;   /* rdi = signum */
+    raw[0x50 / 8]        = 0;             /* rsi = siginfo* (NULL) */
+    raw[0x58 / 8]        = frame + 8;     /* rdx = ucontext_t* */
+
+    self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
     g_sig_deliver_count++;
     return 1;
 }

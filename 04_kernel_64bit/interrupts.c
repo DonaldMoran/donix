@@ -141,6 +141,88 @@ volatile int g_expect_fault   = -1;
 volatile int g_fault_observed = -1;
 
 /*
+ * Slice 4: fault raises.  docs/signal-design.md.
+ *
+ * A user-mode fault is now a RAISE point, not a kill point.  On
+ * entry to a user-mode fault the handler:
+ *
+ *   1. records the Linux signal number in self->fault_signal (the
+ *      sys_wait4 view -- unchanged from before this slice);
+ *   2. sets the pending bit in self->sig_pending and bumps the
+ *      raise counter (the raise itself);
+ *   3. if the process has a handler AND a restorer AND is not
+ *      already inside a handler, calls signal_deliver_frame_exc
+ *      to rewrite the exception frame at the handler -- the same
+ *      mechanism slice 2/3 use for syscall and iretq delivery;
+ *   4. otherwise calls fault_kill_current, as before.
+ *
+ * Step 4 is the Unix default-action shape: a fault with no handler
+ * is fatal, and so is a fault inside a handler (the re-entry guard
+ * is signal_deliver_frame_exc's `in_signal_handler` refusal).  A
+ * handler that returns without editing ucontext.gregs[RIP] will
+ * re-execute the faulting instruction and take step 4 on the second
+ * fault, which is what Linux does for SIGSEGV with SA_NODEFER off.
+ *
+ * signal_deliver_frame_exc and g_sig_raise_count live in
+ * user_syscall.c next to the other two deliver helpers.
+ */
+extern long signal_deliver_frame_exc(pcb_t* self, uint64_t* raw, int sig);
+extern volatile uint64_t g_sig_raise_count;
+
+/*
+ * Map a CPU exception vector to the Linux signal it raises.
+ * Centralised so isr0/6/13/14 agree with fault_kill_current's own
+ * mapping (which is kept for the expected-fault self-test path,
+ * untouched by slice 4).
+ */
+static int exc_vector_to_signal(int vec) {
+    switch (vec) {
+        case 0x00: return 8;    /* #DE  -> SIGFPE  */
+        case 0x01: return 5;    /* #DB  -> SIGTRAP */
+        case 0x06: return 4;    /* #UD  -> SIGILL  */
+        case 0x0D: return 11;   /* #GP  -> SIGSEGV */
+        case 0x0E: return 11;   /* #PF  -> SIGSEGV */
+        default:   return 11;
+    }
+}
+
+/*
+ * Raise the signal for a user-mode fault and deliver it if the
+ * process handles it.  Returns 1 if delivery rewrote the frame
+ * (the stub's iretq will resume at the handler, so the caller must
+ * `return;`), 0 if the caller should take the kill path.
+ *
+ * Runs with interrupts off (the exception stub issued cli).  The
+ * pending-bit write, the raise-counter bump, and the frame rewrite
+ * are one critical section relative to any other writer, which is
+ * what signal-design.md question 2 asks for.
+ */
+static int exc_raise_or_kill(exception_frame_t* frame, int vec) {
+    uint64_t* raw = (uint64_t*)frame;
+    if ((raw[EXC_OFF_CS] & 3) != 3) return 0;   /* kernel-mode fault */
+
+    pcb_t* self = process_get_current();
+    if (!self) return 0;
+
+    int sig = exc_vector_to_signal(vec);
+    /* Do NOT set self->fault_signal here.  fault_signal is the
+     * sys_wait4 signal-kill status, and a raise is not a kill: a
+     * handler that recovers and exit(0)s must reap as status 0.
+     * fault_kill_current sets fault_signal on the paths that
+     * actually terminate the process (no handler, in-handler, or
+     * delivery failure).  Setting it on the raise made a
+     * recovered sigsegv_probe reap as "Segmentation fault" even
+     * though it exited 0. */
+    self->sig_pending |= (1ULL << (uint64_t)sig);
+    g_sig_raise_count++;
+
+    if (self->signal_handler[sig] && self->signal_restorer[sig]) {
+        if (signal_deliver_frame_exc(self, raw, sig)) return 1;
+    }
+    return 0;
+}
+
+/*
  * Terminate the current process from an expected fault.
  *
  * process_exit() is declared noreturn in process.h.  It disables
@@ -841,8 +923,8 @@ void irq1_handler(void) {
  * sets rdi = rsp before the call).
  */
 void isr0_handler(exception_frame_t *frame) {
-    (void)frame;
     if (g_expect_fault == 0x00) fault_kill_current(0x00);
+    if (exc_raise_or_kill(frame, 0x00)) return;
     vga_print("\n*** DIVIDE BY ZERO EXCEPTION (#DE) ***\n");
     while (1) __asm__ volatile("hlt");
 }
@@ -909,6 +991,7 @@ void isr6_handler(exception_frame_t *frame) {
         serial_lock();
         dump_user_stack_window(fault_rsp, fault_cs);
         serial_unlock();
+        if (exc_raise_or_kill(frame, 0x06)) return;
         fault_kill_current(0x06);
     }
     while (1) __asm__ volatile("hlt");
@@ -977,82 +1060,6 @@ void isr8_handler(exception_frame_t *frame) {
     while (1) __asm__ volatile("hlt");
 }
 
-/*
- * signal_maybe_redirect — debug instrument for item 7e.
- *
- * If the faulting process has a handler installed for `sig`, point
- * the interrupt frame at it and return 1.  The caller returns
- * without killing; the stub's POP_ALL_GPRS / iretq resumes at the
- * handler.
- *
- * Returns 0 if no handler is installed; the caller kills the
- * process the normal way.
- *
- * The handler does NOT return.  It is expected to print and then
- * exit_group.  There is no rt_sigreturn and no saved frame: the
- * redirect runs the handler once, on the fault path, and the
- * process dies from inside it.
- *
- * NOT the signal subsystem.  No masks, no queueing, no
- * cross-process delivery, and a fault inside the handler is not
- * caught — it faults again and is killed the normal way.
- */
-static int signal_maybe_redirect(exception_frame_t *frame, int sig) {
-    /*
-     * The frame the exception stub passes is the base of the GPR
-     * block, NOT the CPU frame.  exception_frame_t's named fields
-     * (error_code, rip, cs, ...) describe the CPU-pushed part,
-     * which sits EXC_OFF_ERROR_CODE slots ABOVE this pointer.
-     * Reading frame->cs here reads a GPR slot, not the CS.  Use
-     * raw[EXC_OFF_*] exactly as isr13_handler / isr14_handler do.
-     */
-    uint64_t *raw = (uint64_t *)frame;
-
-    if ((raw[EXC_OFF_CS] & 3) != 3) return 0;
-
-    extern pcb_t* process_get_current(void);
-    pcb_t *self = process_get_current();
-    if (!self) return 0;
-
-    uint64_t handler = self->signal_handler[sig];
-    if (!handler) return 0;
-
-    /*
-     * Re-entry guard.  A handler that itself faults must be
-     * killed, not re-entered.  Without this, the redirect fired
-     * again on the handler's own fault -- the handler stayed
-     * installed -- and the process looped on the faulting
-     * instruction.  pipe7e_sjlj_stale demonstrated it: a
-     * corrupt %rsp of 0x30 made the handler's first push fault
-     * at 0x28, and the redirect re-entered the handler forever.
-     */
-    if (self->in_signal_handler) return 0;
-    self->in_signal_handler = 1;
-
-    /*
-     * Give the handler a stack below the faulting RSP, 16-aligned.
-     * It is the same user stack, already mapped.  One page of
-     * headroom; if the faulting RSP is near the stack bottom this
-     * walks into an unmapped page and the handler faults again --
-     * which kills the process the normal way, not a hang.
-     */
-    /* Leave the handler on the SAME stack as the fault, so its
-     * own rsp/rbp reads are the faulting frame's rsp/rbp and
-     * the window it prints is the frame that faulted.  A
-     * one-shot reporter can clobber the live frame: nothing
-     * after it needs those values. */
-    uint64_t new_rsp = raw[EXC_OFF_RSP] & ~0xFULL;
-
-    /* Point the interrupt frame at the handler.  raw[EXC_OFF_RIP]
-     * and raw[EXC_OFF_RSP] are what POP_ALL_GPRS / iretq resume
-     * from.  The handler does not need the signal number, so no
-     * GPR slot is set. */
-    (void)sig;
-    raw[EXC_OFF_RIP] = handler;
-    raw[EXC_OFF_RSP] = new_rsp;
-
-    return 1;
-}
 
 void isr13_handler(exception_frame_t *frame) {
     if (g_expect_fault == 0x0D) fault_kill_current(0x0D);
@@ -1195,7 +1202,7 @@ void isr13_handler(exception_frame_t *frame) {
 
     if ((fault_cs & 3) == 3) {
         race_p1_tick_dump();
-        if (signal_maybe_redirect(frame, 4)) return;    /* SIGILL */
+        if (exc_raise_or_kill(frame, 0x0D)) return;
         fault_kill_current(0x0D);
     }
     while (1) __asm__ volatile("hlt");
@@ -1444,7 +1451,7 @@ void isr14_handler(exception_frame_t *frame) {
      */
     if (error_code & 4) {
         race_p1_tick_dump();
-        if (signal_maybe_redirect(frame, 11)) return;   /* SIGSEGV */
+        if (exc_raise_or_kill(frame, 0x0E)) return;
         fault_kill_current(0x0E);
     }
 
