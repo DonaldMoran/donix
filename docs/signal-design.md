@@ -163,6 +163,73 @@ resume (frame wrong), or the process faults at a user address
 history warns about; it needs the entry stub in front of the
 author.
 
+**`rt_sigreturn` (15) is ADDED in this slice.**  It does not
+exist today; syscall.h skips 15, the dispatcher has no case for
+it, and there is no body.  Slice 2 adds `SYS_RT_SIGRETURN 15`,
+`sys_rt_sigreturn`, and a dispatcher case, alongside the frame
+builder.  musl's `__restore_rt` is three instructions
+(`mov $15, %rax; syscall`) and reads no arguments, so the frame
+is located from the user `%rsp` saved by the syscall stub --
+`sys_rt_sigreturn` reads `ucontext_t` directly from that saved
+RSP, with no offset arithmetic and no `%rdi` dependency.
+
+**The user-stack frame is NOT the kernel-side 20-slot frame.**
+It is `restorer` (8 bytes) followed by a musl `ucontext_t`
+(816 bytes).  The handler returns by `ret`-ing to `restorer`,
+which advances the user RSP by 8 before `syscall`, so at
+`rt_sigreturn` entry the user RSP points at the `ucontext_t`'s
+first byte.  The kernel-side 20-slot frame is what the stub
+rewrites from that `ucontext_t` -- two distinct frames, one on
+each side of the syscall boundary.
+
+`ucontext_t` layout (musl x86_64, `_GNU_SOURCE` form, which is
+what musl is compiled with internally):
+
+    offset  size  field
+       0      8    uc_flags
+       8      8    uc_link
+      16     24    uc_stack (ss_sp 16, ss_flags 24, ss_size 32)
+      40    256    uc_mcontext -- gregs[23] at 40..223,
+                                fpregs at 224, __reserved1 at 232
+     296      8    uc_sigmask
+     304    512    __fpregs_mem
+     816          total
+
+`gregs[]` indices, each 8 bytes, base at ucontext+40:
+R8=0 R9=1 R10=2 R11=3 R12=4 R13=5 R14=6 R15=7
+RDI=8 RSI=9 RBP=10 RBX=11 RDX=12 RAX=13 RCX=14
+RSP=15 RIP=16 EFL=17 CSGSFS=18 ERR=19 TRAPNO=20
+OLDMASK=21 CR2=22.
+
+**The restorer is read from `sa_restorer`.**  musl's
+`k_sigaction` on x86_64 is 32 bytes: handler (0), flags (8),
+restorer (16), mask[2] (24).  `sys_rt_sigaction` reads all 32
+and stores `handler` and `restorer` per signal; a new
+`signal_restorer[64]` array on `pcb_t`, appended after
+`sig_blocked`, holds the restorer.  The kernel does not supply a
+fixed `__restore_rt` address: that would silently depend on
+every signal-using binary being static non-PIE, which is not a
+pinned build invariant.  Reading `sa_restorer` is the shape
+musl was compiled against and is what keeps slice 2 working if
+a PIE binary ever lands.
+
+**Deliver point.**  In `user_syscall_entry.asm`, between the
+exit-check `cli` (after `cmp rbx, 231 / je .handle_exit`) and
+the first `pop`, with the frame at post-`add rsp, 8` offsets:
+`[rsp+48]` user RSP, `[rsp+56]` user RFLAGS, `[rsp+64]` user
+RIP, `[rsp+104]` rdi, `[rsp+112]` rbx.  Reading these before
+the first `pop` is what makes the frame valid; reading them
+after the exit-check `cli` keeps the deliver block inside the
+stub's interrupt-off tail, as §1 requires.
+
+`sa_mask` is read into a scratch field and ignored: slice 2
+delivers one signal at a time, with no `siginfo`, no deferral,
+and no `SA_RESTART`.  Deferral and `sa_mask` are a later slice.
+Widening `sys_rt_sigaction`'s `oldact` write to 32 bytes and
+widening `sigsegv_probe.c`'s test struct to match are a
+follow-up commit; slice 2 only widens the read path, so a caller
+that reads `oldact` today gets the same 16 bytes it always did.
+
 **Slice 3 -- delivery on `iretq`.**
 The interrupt-return path observes the same mask and builds the
 same frame.  Verified by: a busy-loop process gets `SIGUSR1` from
