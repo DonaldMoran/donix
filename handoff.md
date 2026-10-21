@@ -28,7 +28,7 @@ syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
 
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
 file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
-`sys_sysinfo` (99); signals (contract's async-writer design);
+signals (contract's async-writer design);
 shebang + `/bin/sh`.  `tar` is enabled and link restoration is verified (the v0.6.16
 note that called it a busybox issue was wrong -- FAT `st_ino` was 0;
 `76d66db` gives it a real value).  `chmod`/`chown` (90-93) accept and
@@ -47,8 +47,18 @@ The working tree is `dev`.
 
 **NEXT.**  Signals (open-issues 12; design against `docs/contract.md`
 first -- they are the first asynchronous state writer), then
-`sys_sysinfo` (99, so `ps -l` works), then shebang + `/bin/sh`,
-then file-backed `mmap`, then `mount(2)`.
+shebang + `/bin/sh`, then file-backed `mmap`, then `mount(2)`.
+
+**DONE SINCE `v0.6.17`** (scratch tag `20261020-psl-sysinfo`, on
+`dev`, no version bump): `ps -l` works -- busybox gained
+`FEATURE_PS_LONG`/`PS_TIME`, and the kernel gained `sys_sysinfo`
+(99).  **99 is `sysinfo`, not `gettimeofday`** (96; `time` is 201),
+and neither 96 nor 201 is reached by anything on the image.
+`ps -l`'s `STIME` was a separate defect: `proc_build_stat` emits
+`p->creation_time`, which was never assigned; `process_initialize_pcb`
+now records `g_ticks`.  Also in this batch: `tar` added to the
+README applet list; `syscall.h` defines 90-93 moved into numeric
+order; `user_syscall.c`'s 90-93 `case` lines moved to match.
 
 **Working style -- how this project gets changed**
 
@@ -201,9 +211,8 @@ Do NOT re-walk the refuted paths below.
    and `ash` job control possible.
 2. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
    recursion guard, and an interpreter on the image.
-3. **`sys_sysinfo` (99)** so `ps -l` works.
-4. The open-issues list (top 6, below).
-5. **The empty-file `st_ino` collision** -- two empty files with the
+3. The open-issues list (top 6, below).
+4. **The empty-file `st_ino` collision** -- two empty files with the
    same name in different directories share an inode, because
    `FILINFO` carries no parent.  A parent-directory input is needed.
 
@@ -231,10 +240,11 @@ Do NOT re-walk the refuted paths below.
 1. **`open-issues.md` item 12: signal delivery is a stub.**
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-4. **`sys_sysinfo` (99)** so `ps -l` works.
-5. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
+4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
    process bug.
-6. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
+5. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
+6. **`gettimeofday` (96) / `time` (201) not implemented** -- no
+   caller on the image today; `date`/`time` need them if enabled.
 
 Plus: **the VFS** (see Next), **shebang + `/bin/sh`**, and the
 open-issues list.
@@ -244,15 +254,18 @@ open-issues list.
 ## State on disk
 
 Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
-No scratch tags remain: `v0.6.15`, `v0.6.16`, and `v0.6.17` are the
-release record.
+`v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  One
+scratch tag exists: `20261020-psl-sysinfo`, the restore point for
+the `ps -l` / sysinfo work after `v0.6.17`.  It is dropped by the
+next release procedure.
 
 ---
 
 ## One-line summary
 
 **The VFS is DONE and released (`v0.6.16`); `v0.6.17` fixes FAT
-`st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  `test.sh`
-57/57, `canary --full` 28/28.  `docs/contract.md` is the durable
-concurrency rule.  Next: signals -- read the contract's Signals
-section before any code.**
+`st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  Since
+`v0.6.17` (scratch tag `20261020-psl-sysinfo`): `ps -l` works via
+`sys_sysinfo` (99) and a real `creation_time` for `STIME`.  Next:
+signals -- read `docs/contract.md`'s Signals section before any
+code.**

@@ -142,13 +142,21 @@ fallback.
 
 ## Un-numbered open items
 
-**`chmod`/`chown` accept and drop.**  Syscalls 90-93 (path and
-fd forms) return 0 and store nothing: FAT has no mode bits and
-no ownership, everything is uid 0, and `stat` reports the
-synthesized 0644/0755.  This is so `tar -x`, `cp -a`, and
-`install` complete instead of printing "Unknown syscall" for
-every file.  It is not a privilege model -- items 9 and 10 own
-the real answer.
+**`chmod`/`chown` accept and drop, and their applets are not
+compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and
+store nothing: FAT has no mode bits and no ownership, everything
+is uid 0, and `stat` reports the synthesized 0644/0755.  This is
+so `tar -x`, `cp -a`, and `install` complete instead of printing
+"Unknown syscall" for every file.  It is not a privilege model --
+items 9 and 10 own the real answer.
+
+`CONFIG_CHMOD` and `CONFIG_CHOWN` are **unset** in
+`configs/busybox.config`, so no command on the image calls 90-93
+and `chmod`/`chown` say "not found".  Enabling them would make
+the commands run and report success while changing nothing (FAT
+has no mode store).  Honoring FAT's read-only attribute via
+FatFs's `f_chmod` would be a real but two-state mode change, and
+a separate, larger decision.
 
 **`tar` is enabled, and link restoration is verified.**  The
 v0.6.16 note that called its creation path a busybox applet
@@ -206,15 +214,14 @@ the path shape, not on `process_find_by_pid`.  `ps` only stats
 pids `readdir` gave it, so it does not affect the consumer.
 Worth one line when `/proc` is next touched.
 
-**`sysinfo` (99) was unimplemented; `ps -l` hit it.**  With
-`CONFIG_FEATURE_PS_LONG`/`PS_TIME` enabled, `ps -l` logs
-`Unknown syscall: 99`.  99 is `sysinfo` on Linux x86_64;
-`gettimeofday` is **96** and `time()` is **201**, neither of
-which `ps` reaches.  `sys_sysinfo` now fills `struct sysinfo`
-from `g_ticks` and the PMM (uptime, procs, totalram, freeram;
-the rest zero).  `gettimeofday` (96) and `time` (201) remain
-unimplemented and are not reached by anything on the image --
-implement them when a caller appears.
+**`gettimeofday` (96) and `time` (201) are unimplemented.**
+Neither is reached by anything on the image today.  `ps -l`
+reaches **99**, which is `sysinfo`, not `gettimeofday` -- that
+number was recorded wrong in earlier notes.  `sys_sysinfo` now
+fills `struct sysinfo` from `g_ticks` and the PMM (uptime,
+procs, totalram, freeram; the rest zero).  Implement 96 and 201
+when a caller appears -- e.g. `date` (needs 201) or a
+`CONFIG_FEATURE_PS_TIME` path that actually uses `time()`.
 
 **A live pipe slot's `end` field is 0; no writer is in the
 source.**  Latent, not active.  A `file_slot_t` of kind
