@@ -74,6 +74,7 @@
  *  59  execve            sys_execve
  *  60  exit              sys_exit
  *  61  wait4             sys_wait4
+ *  62  kill              sys_kill           (slice 1: pending bit, no delivery)
  *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
  *  77  ftruncate         sys_ftruncate     (session 31)
@@ -102,6 +103,7 @@
  * 218  set_tid_address   sys_set_tid_address
  * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
  * 231  exit_group        sys_exit_group -> sys_exit
+ * 234  tgkill            sys_tgkill         (slice 1: pending bit, no delivery)
  * 235  utimes            sys_utimes        (session 31; no-op stub)
  * 257  openat            sys_openat        (resolve_at; find needs it)
  * 261  futimesat         sys_futimesat     (session 31; no-op stub)
@@ -163,6 +165,7 @@
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
+#define SYS_KILL            62
 #define SYS_UNAME           63
 #define SYS_FCNTL           72
 #define SYS_FTRUNCATE       77
@@ -192,6 +195,7 @@
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
+#define SYS_TGKILL          234
 #define SYS_UTIMES          235
 #define SYS_OPENAT          257
 #define SYS_FUTIMESAT       261

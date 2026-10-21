@@ -832,6 +832,17 @@ void process_dump_all(void) {
     serial_print("\n=== PROCESS LIST ===\n");
     serial_print("PID  Name                State    Entry     Kernel Stack\n");
     serial_print("---  -------------------  -------  ----------  ----------\n");
+    /*
+     * Signal counters -- slice 1 of docs/signal-design.md,
+     * question 6.  g_sig_deliver_count is 0 in slice 1; slice 2
+     * is the commit that increments it.  Defined in
+     * user_syscall.c.
+     */
+    extern volatile uint64_t g_sig_raise_count;
+    extern volatile uint64_t g_sig_deliver_count;
+    serial_print("sig_raise=");   serial_print_dec(g_sig_raise_count);
+    serial_print(" sig_deliver="); serial_print_dec(g_sig_deliver_count);
+    serial_print("\n");
     serial_unlock();
 
 #if RACE_PROBE_DUMP_VGA

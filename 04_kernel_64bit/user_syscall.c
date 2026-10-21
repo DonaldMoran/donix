@@ -37,6 +37,24 @@ uint64_t g_sys14_slots[8];
 int      g_sys14_valid;
 
 volatile uint64_t g_pipe_stamp_counter = 0;
+
+/*
+ * Signal raise/deliver counters -- slice 1 of docs/signal-design.md,
+ * question 6 ("what does unobserved mean").
+ *
+ * g_sig_raise_count is incremented each time kill/tgkill sets a
+ * pending bit.  g_sig_deliver_count is incremented each time a
+ * pending bit is OBSERVED on the way out to user mode.  Slice 1
+ * has no observation point, so g_sig_deliver_count is defined and
+ * printed but never incremented -- a zero that is zero because the
+ * code that would raise it is slice 2's, not a zero hiding a bug.
+ *
+ * Read by process_dump_all (process.c) so a recurrence of an
+ * "observed but never raised" or "raised but never observed"
+ * divergence is visible in one ps-adjacent dump.
+ */
+volatile uint64_t g_sig_raise_count = 0;
+volatile uint64_t g_sig_deliver_count = 0;
 volatile uint64_t g_last_fs_base = 0;
 volatile uint64_t g_arch_prctl_addr[32];
 
@@ -8276,6 +8294,88 @@ long sys_set_tid_address(int* tidptr) {
 }
 
 /*
+ * Linux x86_64 kill(2) -- syscall 62.
+ *
+ * Slice 1 of docs/signal-design.md: set the target's pending bit
+ * and, if the target is BLOCKED and the signal is not blocked,
+ * wake it (question 3).  No delivery -- nothing observes the bit
+ * on the way out to user mode; that is slice 2's frame work.
+ *
+ * sig == 0 is the existence check: return 0 if the target exists
+ * and would be permitted to receive a signal, without setting a
+ * bit.  On donix every signal is permitted (no privilege model),
+ * so this reduces to "does the pid name a live process".
+ *
+ * SCOPE.  pid > 0 only.  donix has no process groups: setsid is a
+ * no-op that returns the caller's pid (see sys_setsid), and
+ * nothing tracks a pgid.  So kill(0, sig) and kill(-pgid, sig)
+ * -- "signal every process in my group" -- cannot be implemented
+ * honestly, and returning -EINVAL is the honest answer rather
+ * than silently doing nothing.  If process groups ever land,
+ * this is the function that grows the pid <= 0 branches.
+ *
+ * The pending-bit set and the wake are one critical section
+ * (question 2): the check-and-act is the same shape as
+ * pipe_wake_waiter, and cli keeps the waker from running between
+ * the bit set and the state change.  No signal path calls
+ * context_switch -- the wake does state = READY,
+ * block_kind = NONE, scheduler_ready_queue_add, and the timer's
+ * next dispatch picks the process up.
+ *
+ * RETURN.  0 on success (or an existence check that found the
+ * process), -EINVAL for a bad signal number or an unsupported
+ * pid, -ESRCH for a pid that names no live process.
+ */
+#define ESRCH_ 3
+long sys_kill(long pid, int sig) {
+    if (sig < 0 || sig > 63) return -(long)EINVAL_;
+    if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
+
+    pcb_t* target = process_find_by_pid((uint64_t)pid);
+    if (!target) return -(long)ESRCH_;
+
+    if (sig == 0) return 0;   /* existence check: no bit set */
+
+    uint64_t bit = 1ULL << (uint64_t)sig;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    target->sig_pending |= bit;
+    g_sig_raise_count++;
+
+    /*
+     * Wake per question 3: only if the target is BLOCKED and the
+     * signal is not blocked.  A signal the target is blocking
+     * stays pending and does not disturb the block -- that is
+     * what sig_blocked means.
+     */
+    if (target->state == PROC_STATE_BLOCKED &&
+        (target->sig_pending & ~target->sig_blocked & bit) != 0) {
+        target->state      = PROC_STATE_READY;
+        target->block_kind = BLOCK_KIND_NONE;
+        scheduler_ready_queue_add(target);
+    }
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return 0;
+}
+
+/*
+ * Linux x86_64 tgkill(2) -- syscall 234.
+ *
+ * tgkill(tgid, tid, sig): signal one thread of a thread group.
+ * donix has one thread per process, so the only well-formed call
+ * is tgid == tid, and it is exactly kill(tid, sig).  Anything
+ * else names a thread that does not exist, and -EINVAL is the
+ * honest answer -- the same honesty as kill's pid <= 0 case.
+ */
+long sys_tgkill(long tgid, long tid, int sig) {
+    if (tgid != tid) return -(long)EINVAL_;   /* no threads */
+    return sys_kill(tid, sig);
+}
+
+/*
  * Linux x86_64 ioctl(2) — syscall 16.
  *
  * Previously returned -ENOTTY for every request.  That is fine for
@@ -9560,6 +9660,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
         case SYS_EXIT:            sys_exit((int)arg0); return 0;
         case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
+        case SYS_KILL:            return (uint64_t)sys_kill((long)arg0, (int)arg1);
         case SYS_UNAME:           return (uint64_t)sys_uname((void*)arg0);
         case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
         case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
@@ -9591,6 +9692,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
         case SYS_CLOCK_GETTIME:   return (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1);
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
+        case SYS_TGKILL:          return (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2);
         case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
         case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
         case SYS_NEWFSTATAT:      return (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3);
