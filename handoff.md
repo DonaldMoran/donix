@@ -263,6 +263,15 @@ open-issues list.
 ## State on disk
 
 Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
+
+**After a fresh image, one manual step:** the image stages
+`/bin/busybox` alone.  To get the applet symlinks (including
+`/bin/sh`, which shebang will need), boot and run
+`/bin/busybox --install -s /bin`.  The absolute path is required:
+busybox reads `/proc/self/exe` to find itself, donix has no
+`/proc/self/exe`, and it falls back to `argv[0]` -- which must
+start with `/`.  This is a manual step, not part of the build;
+automating it is a Makefile/boot change and is not done.
 `v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  One
 scratch tag exists: `20261020-psl-sysinfo`, the restore point for
 the `ps -l` / sysinfo work after `v0.6.17`.  It is dropped by the
