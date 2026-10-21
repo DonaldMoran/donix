@@ -5,13 +5,14 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-21.  **`v0.6.16` is the VFS release;
-`v0.6.17` fixes FAT `st_ino` and re-enables `tar`.**  Every path syscall reaches its filesystem through the
-mount table (`mount_driver(backend)->op(...)`); the resolver is
-`vfs_resolve(path, follow_final)`; symlinks work end to end.  `test.sh`
-is 57/57 and `canary --full` is 28/28, verified from `/` on a freshly
-built image.  Read "The concurrency contract" in `docs/contract.md`
-before touching shared state, then "Where we are".
+**Last updated:** 2026-10-21.  **`v0.6.17` is the last release.
+Signals slices 1-4 are done on `dev`.**  The restore point is
+`20261021-slice4-done`.  Every path syscall reaches its filesystem
+through the mount table (`mount_driver(backend)->op(...)`); the
+resolver is `vfs_resolve(path, follow_final)`; symlinks work end to
+end.  `test.sh` is 57/57 and `canary --full` is 28/28, verified from
+`/` on a freshly built image.  Read "The concurrency contract" in
+`docs/contract.md` before touching shared state, then "Where we are".
 
 **WHAT THE VFS IS NOW, in one paragraph.**  `g_mounts` maps `/`
 (FAT), `/dev`, and `/proc` to `fs_driver_t` vtables: `unlink`,
@@ -45,34 +46,34 @@ summary exist.
 and `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`) are released.
 The working tree is `dev`.
 
-**NEXT.**  Signals (open-issues 12).  **Slice 1 is DONE** --
-three commits (`588ae53`, `3f60a19`, `ce69a7b`), verified by
-running.  **Slice 2 is DONE** (`866588f` docs, `d2126d8` code),
-verified by running: `kill_self` in the user shell installs a
-handler, raises SIGUSR1, the handler runs (`sig=0xa`), returns via
-a restorer trampoline (`mov $15,%rax; syscall`), and the caller
-resumes ("caller resumed after handler").  `killtest` in the
-kernel shell still reads `sig_raise=1 sig_deliver=0` -- expected,
-because `killtest` has no handler and does not return to user mode.
-`sys_rt_sigreturn` (15) is new: `SYS_RT_SIGRETURN` in `syscall.h`,
-`sys_rt_sigreturn` in `user_syscall.c`, `ucontext_t` frame at
-`restorer (8) + 816 bytes`.  **Slice 3 is DONE** (`17ffeb9` code, `a1c90ff` parameterization,
-`c4b3ba7` test), verified by running `sigspin`: a child in a
-no-syscall loop gets `SIGUSR1` from another process, the handler
-runs on the tick, `sys_rt_sigreturn` resumes the loop, the child
-exits 0, the parent reaps (`status=0`).  Delivery is on the
-interrupt-return path: the tick's deliver check runs at the
-identity self-pick (`next == current`), the by-value self-pick
-(`next->rsp == stack_pointer`), and the dispatch branch (`return
-next->rsp`), each targeting that frame.  **The fix that mattered:**
-`signal_deliver_frame_iretq` takes the target PCB as a parameter
-instead of calling `process_get_current()`; the tick path runs
-outside any syscall, and the scheduler's and process.c's
-`current_process` are two copies (contract rule 5).
-`process_get_current()` stays correct for slice 2, which runs
-inside the syscall.  **Known limit surfaced by the test:**
-`kill(pid, SIGKILL)` sets a pending bit and does not terminate;
-default actions are slice 5, so `sigspin`'s child exits itself.
+**NEXT.**  Signals slice 5: `SIGPIPE` on the `-EPIPE` write
+(open-issues item 5), `SIGCHLD` on child exit, and the
+default-action table (terminate, ignore, stop, core).  Slices 1-4
+are done and verified by running; see "DONE SINCE `v0.6.17`"
+below for the commit list and the per-slice acceptance.
+
+Slice 5's shape, from `docs/signal-design.md`: `SIGPIPE` is raised
+in `sys_write`'s pipe branch where it currently returns `-EPIPE_`
+without setting a bit; `SIGCHLD` is raised in `process_exit` next
+to `process_wake_parent_if_waiting`; the default-action table is a
+per-signal enum consulted by the deliver helpers when
+`signal_handler[n] == 0`, and "terminate" is `fault_kill_current`'s
+existing body factored out.  `kill(pid, SIGKILL)` terminating is
+part of this slice, and it is the first default action that is not
+a fault.
+
+**Known limits carried into slice 5:**
+- No `SIGBUS` generator.  x86 has no `#BUS` vector and donix's
+  `mmap` is anonymous-only, so nothing can raise 7.  Do not add
+  the number to `exc_vector_to_signal`; there is no vector to map.
+- `sys_rt_sigaction` stores `signal_restorer[signum]`
+  unconditionally and does not require `SA_RESTORER`.  Musl always
+  sets it, so this does not bite; a strict check is a separate
+  change.  `sigsegv_probe` sets `flags = 0` and still gets a
+  working restorer because of this leniency.
+- `signal_deliver_frame*` requires a nonzero restorer (slice 2's
+  known limit).  A caller that installs a handler with
+  `restorer == 0` gets no delivery and the pending bit stays set.
 
 **What slice 2 taught the slice-3 author, so it is not re-walked:**
 
@@ -105,25 +106,57 @@ default actions are slice 5, so `sigspin`'s child exits itself.
   pending bit stays set.  Musl always sets `SA_RESTORER`; this does
   not bite today.  Tracked as a follow-up.
 
-**DONE SINCE `v0.6.17`** (scratch tag `20261020-psl-sysinfo`, on
-`dev`, no version bump): `ps -l` works -- busybox gained
-`FEATURE_PS_LONG`/`PS_TIME`, and the kernel gained `sys_sysinfo`
-(99).  **99 is `sysinfo`, not `gettimeofday`** (96; `time` is 201),
-and neither 96 nor 201 is reached by anything on the image.
-`ps -l`'s `STIME` was a separate defect: `proc_build_stat` emits
-`p->creation_time`, which was never assigned; `process_initialize_pcb`
-now records `g_ticks`.  Also in this batch: `tar` added to the
-README applet list; `syscall.h` defines 90-93 moved into numeric
-order; `user_syscall.c`'s 90-93 `case` lines moved to match.
+**DONE SINCE `v0.6.17`** (restore point `20261021-slice4-done`,
+on `dev`, no version bump):
 
-**Signals slice 1 and 2** are also on `dev` since `v0.6.17`:
-`588ae53`, `3f60a19`, `ce69a7b` (slice 1: pending/blocked masks,
-`kill`/`tgkill` raise, `sigdump`/`killtest`), `866588f` (slice-2
-design amendment, `rt_sigreturn` and the `ucontext_t` frame), and
-`d2126d8` (slice 2: delivery at the top of `syscall_dispatch`,
-`sys_rt_sigreturn`, the widened `rt_sigaction` read).  No scratch
-tag yet; the next release procedure draws the summary from the
-commit log, not from a tag.
+*Batch 1 -- `ps -l` / sysinfo* (`20261020-psl-sysinfo`): `ps -l`
+works -- busybox gained `FEATURE_PS_LONG`/`PS_TIME`, and the kernel
+gained `sys_sysinfo` (99).  **99 is `sysinfo`, not
+`gettimeofday`** (96; `time` is 201), and neither 96 nor 201 is
+reached by anything on the image.  `ps -l`'s `STIME` was a separate
+defect: `proc_build_stat` emits `p->creation_time`, which was never
+assigned; `process_initialize_pcb` now records `g_ticks`.  Also in
+this batch: `tar` added to the README applet list; `syscall.h`
+defines 90-93 moved into numeric order; `user_syscall.c`'s 90-93
+`case` lines moved to match.
+
+*Batch 2 -- kernel shell echo* (`b06787d`): the kernel shell's
+echo and command output go to the serial terminal.
+
+*Batch 3 -- signals slices 1-4:*
+- Slice 1 (`588ae53`, `3f60a19`, `ce69a7b`): pending and blocked
+  masks, `kill`/`tgkill` raise, `sigdump`/`killtest`.  No delivery.
+- Slice 2 (`866588f` design, `d2126d8` code): delivery at the top
+  of `syscall_dispatch`, `sys_rt_sigreturn` (15), the
+  `ucontext_t` frame at `restorer (8) + 816 bytes`.  Verified by
+  `kill_self`: install, raise SIGUSR1, handler runs (`sig=0xa`),
+  return via the restorer trampoline, caller resumes.
+- Slice 3 (`17ffeb9`, `a1c90ff`, `c4b3ba7`): delivery on `iretq`,
+  `signal_deliver_frame_iretq` taking the target PCB as a
+  parameter.  Verified by `sigspin`: a no-syscall-loop child gets
+  `SIGUSR1` on the tick, the handler runs, the loop resumes, the
+  child exits 0, the parent reaps `status=0`.
+- Slice 4 (`1d256ed`, `f90d517`): fault raises.  A user-mode
+  `#DE`/`#UD`/`#GP`/`#PF` sets the pending bit and -- if the
+  process has a handler with a restorer and is not already inside
+  a handler -- the exception frame is rewritten so the stub's
+  `iretq` resumes at the handler.  `fault_signal` is set only by
+  `fault_kill_current`, so a handler that recovers and `exit(0)`s
+  reaps as status 0.  `signal_maybe_redirect` is deleted;
+  `in_signal_handler` gains its real semantics (set by all three
+  deliver helpers, cleared by `sys_rt_sigreturn`).  Verified by
+  `sigsegv_probe`: handler runs with `sig=0xb`, `ucontext.gregs[16]`
+  rewritten to a post-fault function, `rt_sigreturn` resumes it,
+  and the process exits 0 with no "Segmentation fault".
+  `kill_self` and `sigspin` unchanged; `test.sh` 57/57;
+  `canary --full` 28/28.
+
+**The scratch tags since `v0.6.17` (`20261020-psl-sysinfo`,
+`20261021-signal-slice1-base`, `-slice1-pre-docs`, `-slice1-docs-post`,
+`-slice2-done`, `-slice3-done`, `-shell-echo-pre-fix`,
+`-shell-echo-post-fix`) have been dropped** once
+`20261021-slice4-done` and this summary existed, per the release
+procedure.
 
 **Working style -- how this project gets changed**
 
@@ -340,22 +373,24 @@ busybox reads `/proc/self/exe` to find itself, donix has no
 start with `/`.  This is a manual step, not part of the build;
 automating it is a Makefile/boot change and is not done.
 `v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  One
-scratch tag exists: `20261020-psl-sysinfo`, the restore point for
-the `ps -l` / sysinfo work after `v0.6.17`.  It is dropped by the
-next release procedure.
+scratch tag exists: `20261021-slice4-done`, the restore point for
+`ps -l`/sysinfo, the kernel-shell echo fix, and signals slices 1-4
+after `v0.6.17`.  It is dropped by the next release procedure, which
+will draw the release summary from it.
 
 ---
 
 ## One-line summary
 
-**The VFS is DONE and released (`v0.6.16`); `v0.6.17` fixes FAT
-`st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  Since
-`v0.6.17`: `ps -l` works via `sys_sysinfo` (99) and a real
-`creation_time` for `STIME`; **signals slices 1-3 are DONE**
-(`d2126d8`, `17ffeb9`, `a1c90ff`, `c4b3ba7`).  Slice 2 verified by
-`kill_self` (install, raise, handler, `sys_rt_sigreturn`, caller
-resumes).  Slice 3 verified by `sigspin`: a no-syscall-loop child
-gets `SIGUSR1` on the tick, the handler runs, the loop resumes,
-the child exits 0 and the parent reaps.  Next: slice 4, fault
-raises.  Read `docs/contract.md`'s Signals section and "NEXT" in
-this file before any code.**
+**`v0.6.17` is the last release (VFS, FAT `st_ino`, `tar`,
+`chmod`/`chown`).  Since then, on `dev`: `ps -l` via `sys_sysinfo`
+(99) and a real `creation_time`; the kernel shell's echo goes to
+serial (`b06787d`); and **signals slices 1-4 are DONE** (slice 1
+`588ae53`/`3f60a19`/`ce69a7b`; slice 2 `866588f`/`d2126d8`; slice 3
+`17ffeb9`/`a1c90ff`/`c4b3ba7`; slice 4 `1d256ed`/`f90d517`).  Slice
+4 verified by `sigsegv_probe`: a NULL deref raises SIGSEGV, the
+handler edits `ucontext.gregs[16]`, `rt_sigreturn` resumes past the
+fault, and the process exits 0.  `test.sh` 57/57, `canary --full`
+28/28.  Restore point: `20261021-slice4-done`.  Next: slice 5
+(`SIGPIPE`/`SIGCHLD`/default actions).  Read `docs/contract.md`'s
+Signals section and "NEXT" in this file before any code.**
