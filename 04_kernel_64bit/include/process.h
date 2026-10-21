@@ -195,27 +195,28 @@ typedef struct pcb {
     uint64_t signal_handler[64];
 
     /*
-     * Re-entry guard for the minimal signal redirect (item 7e
-     * instrument).
+     * Re-entry guard for signal delivery, slices 2-4.
      *
-     * signal_maybe_redirect points the interrupt frame at a
-     * process's installed handler and returns 1 so the caller
-     * resumes into it.  Without this field, a handler that
-     * itself faulted re-entered itself forever: the handler
-     * stayed installed, so signal_maybe_redirect returned 1 on
-     * every subsequent fault, and the process looped on a
-     * faulting handler instruction instead of being killed.
+     * Set by each of the three deliver helpers
+     * (signal_deliver_frame, signal_deliver_frame_iretq,
+     * signal_deliver_frame_exc) when a handler frame is built;
+     * cleared by sys_rt_sigreturn when the handler returns.  All
+     * three helpers refuse to deliver when it is already set, so
+     * a fault taken inside a handler is killed by
+     * fault_kill_current rather than re-delivered into the same
+     * handler forever.  That is the Unix behavior for a SIGSEGV
+     * with SA_NODEFER off: the handler runs once, and a fault in
+     * it is fatal.
      *
-     * Set when the redirect fires; if it is already set, the
-     * redirect returns 0 and the caller kills the process the
-     * normal way -- which is what the comment above
-     * signal_maybe_redirect has always claimed happens.
+     * It previously guarded only the deleted 7e signal_maybe_
+     * redirect instrument; slice 4 moved the semantics to the
+     * deliver helpers and the rt_sigreturn clear.
      *
      * APPENDED AT THE END so no offset that context_switch.asm
      * reads (which stops at block_kind, offset 0x158) moves.
      * Same rule as the cwd, fault_signal, and signal_handler
-     * fields above.  Cleared by process_reclaim so a reused PCB
-     * slot starts clean.
+     * fields above.  Cleared by process_reclaim and
+     * process_destroy so a reused PCB slot starts clean.
      */
     int in_signal_handler;
 
