@@ -5,7 +5,7 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-20.  **`v0.6.16` is the VFS release;
+**Last updated:** 2026-10-21.  **`v0.6.16` is the VFS release;
 `v0.6.17` fixes FAT `st_ino` and re-enables `tar`.**  Every path syscall reaches its filesystem through the
 mount table (`mount_driver(backend)->op(...)`); the resolver is
 `vfs_resolve(path, follow_final)`; symlinks work end to end.  `test.sh`
@@ -28,7 +28,7 @@ syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
 
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
 file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
-signals (contract's async-writer design);
+signals beyond slice 2 (see "NEXT": slices 3-5 are open);
 shebang + `/bin/sh`.  `tar` is enabled and link restoration is verified (the v0.6.16
 note that called it a busybox issue was wrong -- FAT `st_ino` was 0;
 `76d66db` gives it a real value).  `chmod`/`chown` (90-93) accept and
@@ -47,13 +47,49 @@ The working tree is `dev`.
 
 **NEXT.**  Signals (open-issues 12).  **Slice 1 is DONE** --
 three commits (`588ae53`, `3f60a19`, `ce69a7b`), verified by
-running.  The pending/blocked masks exist on `pcb_t`; `kill` and
-`tgkill` set the pending bit, count the raise, and wake a blocked
-target; `sigdump` and `killtest` in the kernel shell make the
-acceptance line observable (`sig_raise=1 sig_deliver=0`).
-**Slice 2 is delivery**, which is the frame work in
-`user_syscall_entry.asm` and `context_switch.asm`; it needs those
-files open and its own session.
+running.  **Slice 2 is DONE** (`866588f` docs, `d2126d8` code),
+verified by running: `kill_self` in the user shell installs a
+handler, raises SIGUSR1, the handler runs (`sig=0xa`), returns via
+a restorer trampoline (`mov $15,%rax; syscall`), and the caller
+resumes ("caller resumed after handler").  `killtest` in the
+kernel shell still reads `sig_raise=1 sig_deliver=0` -- expected,
+because `killtest` has no handler and does not return to user mode.
+`sys_rt_sigreturn` (15) is new: `SYS_RT_SIGRETURN` in `syscall.h`,
+`sys_rt_sigreturn` in `user_syscall.c`, `ucontext_t` frame at
+`restorer (8) + 816 bytes`.  **Slice 3 is delivery on `iretq`**
+(the interrupt-return path), which is the work in
+`context_switch.asm`; it needs that file open and its own session.
+
+**What slice 2 taught the slice-3 author, so it is not re-walked:**
+
+- **Do NOT call `signal_deliver_frame` from the asm stub.**  The
+  first attempt did (after the exit-check `cli`); the extra call +
+  return address + callee frame pushed the 16 KB kernel stack over
+  on the deepest syscalls (`musl_sh`'s `read(0)` at its prompt),
+  and the stub's `pop`s read user-stack data as the resume frame.
+  Boot-time `#PF` at RIP `0x40B845`, CR2 `0x1000`.  The deliver
+  check runs at the top of `syscall_dispatch`, inside the C frame
+  every syscall already returns through.  Slice 3's `iretq` path
+  has no such C frame; it will need its own shape, and the
+  alignment/depth problem is the same one.
+- **The handler entry `RSP` is `frame`, not `frame + 8`.**  The
+  frame is `[restorer][ucontext_t]`; the handler is a normal C
+  function whose epilogue `pop rbp; ret` pops `frame[0]`.  If entry
+  RSP is `frame + 8`, the `ret` pops `frame[16]` (`uc_link = 0`)
+  and jumps to address 0.  `sys_rt_sigreturn` reads the
+  `ucontext_t` from the user RSP saved at syscall entry, which is
+  `frame + 8` because the restorer was popped; it does not subtract
+  8.
+- **`killtest` cannot close a slice's delivery acceptance.**  It
+  has no handler and does not return to user mode.  Use
+  `kill_self` (user shell) for delivery-and-restore, and add a
+  slice-3-specific test in the user shell for the tick-delivered
+  path.  `sigdump`/`killtest` stay as slice-1 instruments.
+- **Known limit (not fixed):** `signal_deliver_frame` requires a
+  nonzero `restorer` (matching `SA_RESTORER`).  A caller that
+  installs a handler with `restorer == 0` gets no delivery and the
+  pending bit stays set.  Musl always sets `SA_RESTORER`; this does
+  not bite today.  Tracked as a follow-up.
 
 **DONE SINCE `v0.6.17`** (scratch tag `20261020-psl-sysinfo`, on
 `dev`, no version bump): `ps -l` works -- busybox gained
@@ -65,6 +101,15 @@ and neither 96 nor 201 is reached by anything on the image.
 now records `g_ticks`.  Also in this batch: `tar` added to the
 README applet list; `syscall.h` defines 90-93 moved into numeric
 order; `user_syscall.c`'s 90-93 `case` lines moved to match.
+
+**Signals slice 1 and 2** are also on `dev` since `v0.6.17`:
+`588ae53`, `3f60a19`, `ce69a7b` (slice 1: pending/blocked masks,
+`kill`/`tgkill` raise, `sigdump`/`killtest`), `866588f` (slice-2
+design amendment, `rt_sigreturn` and the `ucontext_t` frame), and
+`d2126d8` (slice 2: delivery at the top of `syscall_dispatch`,
+`sys_rt_sigreturn`, the widened `rt_sigaction` read).  No scratch
+tag yet; the next release procedure draws the summary from the
+commit log, not from a tag.
 
 **Working style -- how this project gets changed**
 
@@ -247,9 +292,12 @@ Do NOT re-walk the refuted paths below.
 
 ## Open issues (top 6)
 
-1. **`open-issues.md` item 12: signal delivery is a stub.**  Design
-   written: `docs/signal-design.md`; slice 1 (pending mask, no
-   delivery) is the next code.
+1. **`open-issues.md` item 12: signals, slices 3-5 remain.**  Slices
+   1 and 2 are done (`d2126d8`).  Slice 3 is `iretq` delivery; slice
+   4 is fault raises (`SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE` set the
+   pending bit at fault entry instead of killing); slice 5 is
+   `SIGPIPE`/`SIGCHLD`/default actions.  Known limit from slice 2:
+   `signal_deliver_frame` requires a nonzero `restorer`.
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
@@ -286,7 +334,9 @@ next release procedure.
 
 **The VFS is DONE and released (`v0.6.16`); `v0.6.17` fixes FAT
 `st_ino`, re-enables `tar`, and accepts `chmod`/`chown`.  Since
-`v0.6.17` (scratch tag `20261020-psl-sysinfo`): `ps -l` works via
-`sys_sysinfo` (99) and a real `creation_time` for `STIME`.  Next:
-signals -- read `docs/contract.md`'s Signals section before any
-code.**
+`v0.6.17`: `ps -l` works via `sys_sysinfo` (99) and a real
+`creation_time` for `STIME`; **signals slices 1 and 2 are DONE**
+(`d2126d8`), verified by running `kill_self` end to end (install,
+raise, handler, `sys_rt_sigreturn`, caller resumes).  Next: slice 3,
+`iretq` delivery.  Read `docs/contract.md`'s Signals section and
+"NEXT" in this file before any code.**
