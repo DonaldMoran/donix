@@ -1,3 +1,189 @@
+## Session 69 -- `ps -l` works: sysinfo (99), creation_time (STIME), and two ordering cleanups
+
+Nine commits on `dev`, one scratch tag (`20261020-psl-sysinfo`),
+unpushed.  **Not a milestone** -- a session that started as two
+small doc cleanups, turned into a real `ps -l` fix when the handoff's
+own claim about it turned out to be wrong twice, and ended with the
+signal-delivery design written.  No `v*` bump; the tree is
+pre-`v0.6.18`.
+
+| Tag | What |
+|---|---|
+| `20261020-psl-sysinfo` | marks the seven-commit code state before the two docs commits: README `tar`, `syscall.h` 90-93 order, busybox `PS_LONG`/`PS_TIME`, `sys_sysinfo` (99), the docs correction, `creation_time`, the dispatcher case order |
+
+### The two cleanups the session opened with
+
+**`7124954` -- README names `tar`.**  `tar` was enabled (`83aeb69`)
+and verified (`tar -cf`/`-tf`/`-xf`, and `tar -tvf` recording a
+symlink as `-> target`), but the applet enumeration in "Runs busybox
+as the primary shell" did not name it.  The config paragraph at the
+end of that section already mentioned `tar`; the list is where a
+reader looks to see what commands exist.  One line.
+
+**`91d71a7` -- `syscall.h` defines 90-93 in numeric order.**
+`SYS_CHMOD`/`FCHMOD`/`CHOWN`/`FCHOWN` had been appended after
+`SYS_GETGROUPS` (115) and `SYS_SETSID` (112), so the block ran
+`...112, 115, 90, 91, 92, 93, 157...`.  The values were right and
+the syscalls worked, but the file's own header calls it the source
+of truth for numbering, and an out-of-order table invites the
+silent-shadowing bug the header warns about.  Moved between
+`SYS_READLINK` (89) and `SYS_GETUID` (102).
+
+Both are docs-only.  Neither bump.
+
+### The `ps -l` work, and the two wrong claims it corrected
+
+The handoff's Next list said **"`sys_gettimeofday` (99) so `ps -l`
+works."**  Both halves were wrong, and the session found each the
+hard way.
+
+**First: `ps -l` was rejected by busybox.**  Running it printed
+`ps: unrecognized option: l` -- the applet was built without
+`CONFIG_FEATURE_PS_LONG`.  `configs/busybox.config` had `CONFIG_PS`
+and `FEATURE_PS_WIDE` only.  `19c47ce` enables `PS_LONG` and
+`PS_TIME`.  That is the **cause** of the `ps -l` gap; no syscall was
+reached until it was fixed.
+
+**Second: the number 99 was right, the syscall name was wrong.**
+With `-l` working, `ps -l` printed a table and then
+`Unknown syscall: 99`.  The canonical table
+(`arch/x86/entry/syscalls/syscall_64.tbl`) says **99 is `sysinfo`**;
+`gettimeofday` is **96**, `time` is **201**, and neither is reached
+by this path.  The handoff, `syscall.h`'s header comment, and
+`docs/open-issues.md` all named `sys_gettimeofday` for 99.  The
+session's first plan was a handler at 96 -- wrong, and the tree said
+so; the number in the docs was right and the name was wrong.
+
+`734876a` adds `sys_sysinfo` (99): `uptime` from `g_ticks / 100`
+(the same source as `clock_gettime`), `procs` from a live-PCB walk,
+`totalram`/`freeram` from `pmm_get_total_pages`/`pmm_get_free_pages`
+with `mem_unit = 4096`.  The `struct sysinfo` layout is transcribed
+from musl's `sys/sysinfo.h` (364 bytes, `uptime` at 0 in both).
+`loads`, `sharedram`, `bufferram`, and the swap/high fields are
+zero -- donix does not track them, and a zero is the truth.
+`810dc7f` corrects the three docs.
+
+### `STIME` was a separate defect, and not the one we were chasing
+
+`ps -l` worked after the syscall, with no `Unknown syscall` line --
+but **`STIME` showed `00:00` for every process**, including one
+started after a `sleep 70`.  The obvious reading (`sysinfo.uptime`
+is 0) was wrong.
+
+Reading `third_party/busybox/procps/ps.c` settled it: `STIME` is
+`start_time / get_kernel_HZ()`, and `start_time` is field 22 of
+`/proc/<pid>/stat`, which `proc_build_stat` emits as
+`p->creation_time`.  The field was **declared** in `process.h:92`
+and **never assigned** anywhere in `process.c` -- 0 for every
+process since it existed.  `sys_sysinfo`'s `uptime` feeds
+`get_uptime()`, which is the `-f`/desktop `elapsed` path, not
+`STIME`.  Two fields, one clock, and the wrong one was being blamed.
+
+`7467c7e` sets `pcb->creation_time = g_ticks` in
+`process_initialize_pcb`, and `process.c` gains the `interrupts.h`
+include for `g_ticks`.  Verified by running: after `sleep 70`, the
+`ps` row shows `STIME 00:01`; the boot-time rows still `00:00`,
+which is correct for processes started in the first second.
+
+### The dispatcher case order, and the chmod finding
+
+`4072f17` moves the `case SYS_CHMOD:`...`case SYS_FCHOWN:` lines
+between `SYS_READLINK` and `SYS_SYSINFO`.  Cosmetic -- the switch
+matches by value -- but the same reason as `91d71a7`: the
+dispatcher's own comment says "strictly ascending," and it was not.
+
+`CONFIG_CHMOD` is **unset** in the busybox config, so the `chmod`
+applet does not exist and syscall 90 has no caller on the image.
+That does not make the case dead (it dispatches if anything calls
+90), and it does not make the reorder pointless; it does mean the
+"verify by running `chmod`" check is not available.  The regression
+run was `ps -l`/`ls`/`echo >`/`cat`/`mv`, which exercises the
+dispatcher broadly.  Recorded in `open-issues.md`'s chmod/chown
+entry: the applets are unset; enabling them would make the commands
+run and report success while changing nothing, because FAT has no
+mode store.
+
+### The signal design
+
+The handoff's top item is signals (open-issues 12), and
+`docs/contract.md`'s Signals section says **"No signal code lands
+until these [six questions] are answered here or in a linked design
+note."**  `65c4e95` answers them in `docs/signal-design.md`:
+
+- **Safe point:** syscall return (`user_syscall_entry.asm`'s frame)
+  and `iretq` (`context_switch.asm`).  Faults **raise** but deliver
+  through the same return paths -- one delivery mechanism, not
+  three.
+- **Under `cli`:** the pending-bit write, any wake it implies
+  (through `scheduler_ready_queue_add`), and the delivery frame
+  write (already inside the stub's `cli` tail).
+- **Dispatch:** only to wake a blocked target; the dispatch goes
+  through the existing `scheduler_switch_to` tail check and
+  `current_process` restore.  No signal path bypasses it.
+- **`rt_sigreturn`:** a normal syscall; the frame write is not
+  tick-visible.
+- **Representation:** a `uint64_t sig_pending` bitmask on `pcb_t`,
+  appended after `user_rsp` so no asserted offset moves.  No queue
+  in slice 1.
+- **Observation:** `sig_raise_count`/`sig_deliver_count` plus a
+  `race_record` pair, so a recurrence has a signature.
+
+Five slices, each with a verification and a failure signature.
+**Slice 1 is frame-free** -- handler table, blocked mask,
+`kill`/`tgkill` set a bit and wake a blocked target -- and is the
+next session's work.  Slice 2 is the entry-stub frame, and it needs
+`user_syscall_entry.asm` and `context_switch.asm` open.
+
+### What went wrong, in the order it went wrong
+
+Three retyped literals, all the same shape: **the anchor was written
+from memory instead of copied from the bytes.**
+
+1. The first `SYS_SYSINFO` insert used `#define SYS_READLINK 89` as
+   the anchor, which put 99 *before* 90-93.  The monotonic
+   parse-and-assert caught it -- after the write, so `syscall.h` was
+   briefly non-monotonic until the next script fixed it forward.  No
+   `git reset`; the fix was another edit.
+2. `SYS_FCHOWN`'s alignment: I wrote 11 spaces where the file has
+   10, so `right_ctx` counted 0.  That one aborted **before**
+   writing, which is the assert doing its job.
+3. The `sys_nanosleep` boundary: I anchored on a comment block that
+   is not adjacent to the function.  Aborted before writing; fixed
+   by anchoring on the single unique `long sys_nanosleep(...)` line.
+
+**The lesson, which is the handoff's own rule restated:** a
+post-write check string must be copied from the `new` literal, and
+an anchor must be copied from the file -- and the structural
+assertion (monotonic defines, the 89...102 subsequence) is what
+turns a silent mis-ordering into an abort.  Two of the three
+failures were caught by a count, one by the monotonic assert.
+
+### Verification
+
+| Test | Result |
+|---|---|
+| `syscall.h` defines | 68, monotonic; 89/90/91/92/93/99/102 |
+| `ps -l` | table printed, **no** `Unknown syscall: 99` |
+| `grep 'Unknown syscall' capture.txt` | empty |
+| `STIME` after `sleep 70` | `00:01` for the post-sleep row; `00:00` for boot rows |
+| dispatcher order | 89...102 contiguous; `ps`/`ls`/`cat`/`echo >`/`mv` dispatch |
+| README | line 93 names `awk`, `tar` |
+| docs | `gettimeofday` only at 96/201 in `open-issues.md`; nowhere else |
+
+The `gettimeofday` (96) / `time` (201) gap is now recorded as
+"unimplemented, not reached" -- `date` (needs 201) and a
+`PS_TIME` path that actually uses `time()` are named as the callers
+to implement it for.
+
+### Scratch tag
+
+`20261020-psl-sysinfo` on `4072f17`, local, not pushed.  It marks
+the code state; the two docs commits (`feb7518`, `65c4e95`) ride on
+top.  The next release procedure drops it once `v0.6.18`'s summary
+is written from the annotation.
+
+---
+
 ## Session 68 — the heap cycle is a race, not an overflow; two selftest fixes; `run`
 
 Six commits on `dev`, scratch-tagged, unpushed.  **Not a milestone
