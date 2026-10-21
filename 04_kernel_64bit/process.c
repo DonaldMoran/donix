@@ -1028,6 +1028,7 @@ void process_reclaim(pcb_t* pcb) {
      */
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
+    for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
     process_count--;
 }
 
@@ -1049,6 +1050,7 @@ void process_destroy(pcb_t* pcb) {
      * per-process and must not survive slot reuse. */
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
+    for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) scheduler_set_current(NULL);

@@ -65,6 +65,8 @@ static void handler(long sig) {
 struct ksigaction {
     uint64_t handler;
     uint64_t flags;
+    uint64_t restorer;   /* slice 2: k_sigaction is 32 bytes on x86_64 */
+    uint64_t mask[1];    /* mask[2] is 2 x unsigned int = 8 bytes */
 };
 
 int main(void) {
@@ -73,6 +75,8 @@ int main(void) {
     struct ksigaction sa;
     sa.handler = (uint64_t)handler;
     sa.flags   = 0;
+    sa.restorer = 0;   /* slice 2: no restorer -> no delivery */
+    sa.mask[0]  = 0;
 
     if (sc3(13, 11, (long)&sa, 0) != 0) {
         puts_raw("SIGSEGV-PROBE: rt_sigaction failed\n");

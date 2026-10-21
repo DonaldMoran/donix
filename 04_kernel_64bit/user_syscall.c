@@ -8923,25 +8923,304 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
      * user pointer, but a bad one must EFAULT, not fault the
      * kernel -- every other user-pointer read in this file goes
      * through safe_copy_from_user for that reason.
+     *
+     * SLICE 2 WIDENS THE READ TO 32 BYTES.  musl's k_sigaction on
+     * x86_64 is 32 bytes: handler (0), flags (8), restorer (16),
+     * mask[2] (24..32).  Slice 1 read 16 bytes (handler, flags),
+     * which is the first half of the same struct and is why the
+     * 7e probe's two-uint64_t struct matched.  Slice 2 needs the
+     * restorer, so the read widens; the 7e probe's struct will
+     * be widened to 32 bytes in a follow-up commit.
+     *
+     * oldact is written back as 32 bytes for the same reason: a
+     * caller that reads oldact must see the same shape it wrote.
+     * The write is a no-op for a caller that does not read it.
      */
-    uint64_t a[2];
+    uint64_t a[4];
     if (safe_copy_from_user(a, act, sizeof(a)) != 0) {
         return -(long)EFAULT_;
     }
-    uint64_t handler = a[0];
+    uint64_t handler  = a[0];
+    uint64_t restorer = a[2];
     if (handler == 1) handler = 0;   /* SIG_IGN -> no handler */
+    if (handler == 0) restorer = 0;  /* SIG_DFL -> no restorer  */
 
-    uint64_t prev = self->signal_handler[signum];
-    self->signal_handler[signum] = handler;
+    uint64_t prev_h = self->signal_handler[signum];
+    uint64_t prev_r = self->signal_restorer[signum];
+    self->signal_handler[signum]  = handler;
+    self->signal_restorer[signum] = restorer;
     if (oldact) {
-        uint64_t old[2];
-        old[0] = prev;
+        uint64_t old[4];
+        old[0] = prev_h;
         old[1] = 0;
+        old[2] = prev_r;
+        old[3] = 0;
         if (safe_copy_to_user(oldact, old, sizeof(old)) != 0) {
             return -(long)EFAULT_;
         }
     }
     return 0;
+}
+
+/*
+ * sys_rt_sigreturn -- syscall 15, slice 2 of docs/signal-design.md.
+ *
+ * musl's __restore_rt is 'mov $15, %rax; syscall' and reads no
+ * arguments.  At entry, the user %rsp saved by the syscall stub
+ * (g_user_rsp_save, then [kernel_rsp+48] after the stub's add
+ * rsp,8) points at the ucontext_t's first byte: the handler's
+ * ret popped the restorer pointer off the frame top and advanced
+ * RSP by 8.
+ *
+ * This function reads the ucontext_t from that saved user RSP,
+ * and writes its gregs[] back into the kernel-side 20-slot frame
+ * the stub is about to pop.  The gregs[] offsets are musl's
+ * _GNU_SOURCE layout (third_party/musl-install/include/bits/
+ * signal.h): gregs base is ucontext+40, each 8 bytes, and
+ * RSP=15, RIP=16, EFL=17.  See signal-design.md slice 2 for the
+ * full table.
+ *
+ * Returns 0 so the stub's epilogue runs; the frame it pops is
+ * now the interrupted context, and sysret resumes there.
+ */
+static uint64_t uctx_read_u64(pcb_t* self, uint64_t uva) {
+    (void)self;   /* cr3 comes from the current process */
+    uint64_t v = 0;
+    if (safe_copy_from_user(&v, (const void*)uva, 8) != 0) return 0;
+    return v;
+}
+
+long sys_rt_sigreturn(void) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+
+    /*
+     * The user RSP at syscall entry.  The stub stored it in
+     * g_user_rsp_save and pushed it at [kernel_rsp+48] after the
+     * add rsp,8; but this function runs INSIDE syscall_dispatch,
+     * which was called before the stub's add.  So the saved user
+     * RSP is g_user_rsp_save, which the stub wrote at entry and
+     * which no one has overwritten (it is written only at entry).
+     */
+    extern volatile uint64_t g_user_rsp_save;
+    uint64_t frame = g_user_rsp_save;   /* ucontext_t base */
+
+    /* gregs base at ucontext+40; each greg is 8 bytes. */
+    enum { G_R8=0, G_R9=1, G_R10=2, G_R11=3, G_R12=4, G_R13=5,
+           G_R14=6, G_R15=7, G_RDI=8, G_RSI=9, G_RBP=10, G_RBX=11,
+           G_RDX=12, G_RAX=13, G_RCX=14, G_RSP=15, G_RIP=16, G_EFL=17 };
+
+    uint64_t v[18];
+    for (int i = 0; i < 18; i++) {
+        v[i] = uctx_read_u64(self, frame + 40 + (uint64_t)i * 8);
+    }
+
+    /*
+     * The kernel-side 20-slot frame, as user_syscall_entry.asm
+     * has it after 'add rsp,8' (post-add offsets):
+     *   [rsp+0]   r10      [rsp+8]   rdx
+     *   [rsp+16]  rsi      [rsp+24]  rdi
+     *   [rsp+32]  r9       [rsp+40]  r8
+     *   [rsp+48]  user RSP [rsp+56]  user RFLAGS
+     *   [rsp+64]  user RIP [rsp+72]  r15
+     *   [rsp+80]  r14      [rsp+88]  r13
+     *   [rsp+96]  r12      [rsp+104] rbp
+     *   [rsp+112] rbx
+     *
+     * The kernel stack pointer at this moment is the one the
+     * stub had after 'add rsp,8'.  We do not have it in a
+     * register here; the stub pushed g_user_rsp_save at
+     * [rsp+48], and we can recover the kernel RSP from
+     * g_syscall_stack_top minus the fixed offset the stub has
+     * advanced to.  Simpler: the stub's frame is at a fixed
+     * offset from g_syscall_stack_top, and the offset is known
+     * from the push sequence.  See the deliver block in
+     * user_syscall_entry.asm for the exact layout; the numbers
+     * below are its post-add offsets, relative to that frame.
+     */
+    extern uint64_t g_syscall_stack_top;
+    /*
+     * g_syscall_stack_top is the pre-push top.  The stub pushes:
+     *   6 callee-saved (rbx rbp r12 r13 r14 r15)      48 bytes
+     *   rcx (user RIP), r11 (user RFLAGS)            16
+     *   g_user_rsp_save (user RSP)                    8
+     *   r8, r9                                       16
+     *   rdi, rsi, rdx, r10                           32
+     *   arg5                                          8
+     *   call syscall_dispatch (return address)        8
+     *   add rsp,8 (discard arg5)                      -
+     * Total from top: 48+16+8+16+32 = 120 before call,
+     * +8 return = 128, -8 discard = 120 at return.
+     * At the deliver point (after exit-check cli, before pop):
+     * kernel RSP = top - 120.
+     */
+    uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
+
+    /* Write the 16 GPRs the slot layout holds + RIP/RFLAGS/RSP. */
+    kf[0]  = v[G_R10];
+    kf[1]  = v[G_RDX];
+    kf[2]  = v[G_RSI];
+    kf[3]  = v[G_RDI];
+    kf[4]  = v[G_R9];
+    kf[5]  = v[G_R8];
+    kf[6]  = v[G_RSP];    /* user RSP   */
+    kf[7]  = v[G_EFL];    /* user RFLAGS */
+    kf[8]  = v[G_RIP];    /* user RIP   */
+    kf[9]  = v[G_R15];
+    kf[10] = v[G_R14];
+    kf[11] = v[G_R13];
+    kf[12] = v[G_R12];
+    kf[13] = v[G_RBP];
+    kf[14] = v[G_RBX];
+    /* rcx and r11 are syscall-clobbered; the stub reloads them
+     * from the frame at [rsp+?] -- but the stub does not keep
+     * rcx/r11 separate: it loads RFLAGS from [rsp+8] and RIP
+     * from [rsp+16] in its own post-add layout, which is
+     * [kf+7] and [kf+8] here.  So rcx/r11 need no restore. */
+
+    return 0;
+}
+
+/*
+ * signal_deliver_frame -- slice 2's deliver helper.
+ *
+ * Called from user_syscall_entry.asm after the exit-check cli and
+ * before the first pop.  Reads sig_pending & ~sig_blocked; if
+ * nonzero, builds the user-stack frame and rewrites the
+ * kernel-side 20-slot frame, then returns 1.  Returns 0 if
+ * nothing to deliver.
+ *
+ * The user-stack frame, from the frame base upward:
+ *   [0]  restorer  (signal_restorer[n])
+ *   [8]  ucontext_t (816 bytes), with gregs[] at +48 (i.e.
+ *        frame+8+40 = frame+48) holding the interrupted context,
+ *        and ucontext[296] = frame+8+296 = frame+304 holding
+ *        the current sig_blocked mask.
+ *
+ * The handler is entered with RSP = frame + 8 (so its ret pops
+ * restorer from [frame]), RIP = signal_handler[n], RDI = n.
+ */
+long signal_deliver_frame(void) {
+    pcb_t* self = process_get_current();
+    if (!self) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = 0;
+    while (n < 64 && !(pend & (1ULL << n))) n++;
+    if (n >= 64) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0 || restorer == 0) {
+        /* No handler installed (SIG_DFL) -- slice 2 does not
+         * apply default actions; leave pending. */
+        return 0;
+    }
+
+    extern uint64_t g_syscall_stack_top;
+    uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
+    uint64_t user_rsp    = kf[6];
+    uint64_t user_rflags = kf[7];
+    uint64_t user_rip    = kf[8];
+
+    /*
+     * Frame base: below the current user RSP, 16-byte aligned
+     * (musl's ucontext_t has 8-byte alignment internally; 16 is
+     * safe and matches what Linux does for rt_sigframe).
+     */
+    uint64_t frame = (user_rsp - (8 + 816 + 128)) & ~0xFULL;
+
+    /* [frame] = restorer */
+    if (safe_copy_to_user((void*)frame, &restorer, 8) != 0) {
+        return 0;
+    }
+
+    /* ucontext_t at frame+8.  Zero it first, then write fields. */
+    {
+        uint8_t zero[816];
+        for (int i = 0; i < 816; i++) zero[i] = 0;
+        if (safe_copy_to_user((void*)(frame + 8), zero, 816) != 0) {
+            return 0;
+        }
+    }
+    /* gregs base = frame + 8 + 40 = frame + 48. */
+    #define UCTX_G(uc_off, val) do {         if (safe_copy_to_user((void*)(frame + 48 + (uc_off)),                               &(val), 8) != 0) return 0;     } while (0)
+    UCTX_G(0*8, kf[5]);   /* R8  <- kf[5]  */
+    UCTX_G(1*8, kf[4]);   /* R9  <- kf[4]  */
+    UCTX_G(2*8, kf[0]);   /* R10 <- kf[0]  */
+    /* R11 (idx 3): syscall-clobbered; restore as 0. */
+    { uint64_t z = 0; UCTX_G(3*8, z); }
+    UCTX_G(4*8, kf[12]);  /* R12 <- kf[12] */
+    UCTX_G(5*8, kf[11]);  /* R13 <- kf[11] */
+    UCTX_G(6*8, kf[10]);  /* R14 <- kf[10] */
+    UCTX_G(7*8, kf[9]);   /* R15 <- kf[9]  */
+    UCTX_G(8*8, kf[3]);   /* RDI <- kf[3]  */
+    UCTX_G(9*8, kf[2]);   /* RSI <- kf[2]  */
+    UCTX_G(10*8, kf[13]); /* RBP <- kf[13] */
+    UCTX_G(11*8, kf[14]); /* RBX <- kf[14] */
+    UCTX_G(12*8, kf[1]);  /* RDX <- kf[1]  */
+    /* RAX (idx 13): clobbered; restore as 0. */
+    { uint64_t z = 0; UCTX_G(13*8, z); }
+    /* RCX (idx 14): clobbered; restore as 0. */
+    { uint64_t z = 0; UCTX_G(14*8, z); }
+    UCTX_G(15*8, user_rsp);     /* RSP */
+    UCTX_G(16*8, user_rip);     /* RIP */
+    UCTX_G(17*8, user_rflags);  /* EFL */
+    #undef UCTX_G
+
+    /* uc_sigmask at ucontext+296 = frame + 8 + 296 = frame + 304. */
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) {
+            return 0;
+        }
+    }
+
+    /*
+     * Rewrite the kernel-side frame.  The handler is entered with:
+     *   RIP = handler, RSP = frame + 8, RFLAGS = user_rflags,
+     *   RDI = n (signum), RSI = 0 (siginfo, NULL in slice 2),
+     *   RDX = frame + 8 (ucontext pointer).
+     */
+    kf[8]  = handler;
+    /*
+     * Handler entry RSP = frame, NOT frame + 8.
+     *
+     * The kernel's frame is:
+     *     [frame + 0]  restorer
+     *     [frame + 8]  ucontext_t (816 bytes)
+     *
+     * The handler is a normal C function.  Its prologue pushes
+     * rbp; its epilogue does `pop rbp; ret`.  If entry RSP is
+     * `frame`, the `pop rbp` eats frame[-8] (user red zone, fine
+     * for the handler's duration) and the `ret` pops frame[0],
+     * which is the restorer.  That is the shape that makes the
+     * restorer the return target.
+     *
+     * If entry RSP were `frame + 8` (the earlier, wrong shape),
+     * `pop rbp` eats frame[8] (uc_flags = 0) and `ret` pops
+     * frame[16] (uc_link = 0), jumping to address 0 -- exactly
+     * the fault the capture showed (RIP 0, CR2 0, error 0x15,
+     * user stack holding puthex's ASCII output below the fault
+     * RSP).
+     */
+    kf[6]  = frame;
+    kf[7]  = user_rflags;
+    kf[3]  = (uint64_t)n;
+    kf[2]  = 0;
+    /*
+     * RDX is the handler's `ucontext_t *` argument.  It points
+     * at the ucontext_t, which starts at frame + 8 (one slot
+     * past the restorer).  Unchanged from before.
+     */
+    kf[1]  = frame + 8;
+
+    /* Clear the pending bit and count the delivery. */
+    self->sig_pending &= ~(1ULL << n);
+    g_sig_deliver_count++;
+    return 1;
 }
 
 long sys_rt_sigprocmask(int how, const void* set, void* oldset,
@@ -9427,6 +9706,8 @@ long sys_fork(void) {
      */
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
+    for (int _i = 0; _i < 64; _i++)
+        child->signal_restorer[_i] = parent->signal_restorer[_i];
 
 
     /*
@@ -9603,6 +9884,37 @@ uint64_t syscall_dispatch(uint64_t num,
     }
     (void)arg3; (void)arg4; (void)arg5;
 
+    /* --- signal delivery, slice 2 --- */
+    /*
+     * Run the deliver check on the way OUT to user mode, at the
+     * top of this function (which is where syscall_dispatch has
+     * always returned through on every syscall), not as a
+     * separate `call` from the asm stub.  The asm form was the
+     * version that produced the boot-time #PF at musl_sh's
+     * prompt (RIP 0x40B845, CR2 0x1000) -- the extra call on
+     * the stub's frame at that depth pushed the kernel stack
+     * past what the deeper syscalls (musl_sh's read(0)) could
+     * absorb, and the stub's pops read user-stack data as the
+     * resume frame.  The rewrite target is unchanged:
+     * signal_deliver_frame() writes into the asm frame at
+     * g_syscall_stack_top - 120, which is the same frame the
+     * stub is about to pop.
+     *
+     * Runs with interrupts off (the stub has issued cli before
+     * the exit checks and has not issued sti).  A signal
+     * delivered here rewrites the asm frame, and the stub's
+     * epilogue returns the process to its handler instead of
+     * to the syscall's continuation -- exactly slice 2's
+     * design (signal-design.md, slice 2).
+     */
+    {
+        pcb_t* _sd_self = process_get_current();
+        if (_sd_self &&
+            (_sd_self->sig_pending & ~_sd_self->sig_blocked) != 0) {
+            signal_deliver_frame();
+        }
+    }
+
     switch (num) {
 
         /* --- Linux x86_64 numbers, strictly ascending --- */
@@ -9622,7 +9934,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
         case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
         // case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-                case SYS_RT_SIGPROCMASK: {
+                case SYS_RT_SIGRETURN:    return (uint64_t)sys_rt_sigreturn();
+        case SYS_RT_SIGPROCMASK: {
             /* Snapshot the user stack around g_user_rsp_save before
              * the handler runs.  Diagnostic for item 7e only. */
             uint64_t rs = g_user_rsp_save;

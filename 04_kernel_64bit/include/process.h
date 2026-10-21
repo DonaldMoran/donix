@@ -264,6 +264,28 @@ typedef struct pcb {
      */
     uint64_t sig_pending;
     uint64_t sig_blocked;
+
+    /*
+     * Restorer per signal -- slice 2 of docs/signal-design.md.
+     *
+     * musl's k_sigaction is 32 bytes on x86_64: handler (0),
+     * flags (8), restorer (16), mask[2] (24).  sys_rt_sigaction
+     * reads all 32 and stores handler in signal_handler[] and
+     * restorer here.  The deliver path writes signal_restorer[n]
+     * into the user-stack frame's first slot; the handler rets
+     * to it, and it is __restore_rt ('mov \$15, %rax; syscall').
+     *
+     * APPENDED AT THE END, after sig_blocked, so no asserted
+     * offset moves.  sizeof(pcb_t) grows from 0x628 to 0x828.
+     * context_switch.asm reads nothing past block_kind (0x158)
+     * or user_rsp (0x610); both are untouched.
+     *
+     * Cleared in process_reclaim and process_destroy alongside
+     * the other signal fields.  Copied in sys_fork: Linux
+     * inherits handlers across fork, and the restorer is part of
+     * the handler.
+     */
+    uint64_t signal_restorer[64];
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

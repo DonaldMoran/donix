@@ -61,6 +61,7 @@
  *  12  brk               sys_brk
  *  13  rt_sigaction      sys_rt_sigaction  (stub)
  *  14  rt_sigprocmask    sys_rt_sigprocmask(stub)
+ *  15  rt_sigreturn      sys_rt_sigreturn  (slice 2: restores from user-stack frame)
  *  16  ioctl             sys_ioctl
  *  19  readv             sys_readv
  *  20  writev            sys_writev
@@ -152,6 +153,7 @@
 #define SYS_BRK             12
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
+#define SYS_RT_SIGRETURN    15
 #define SYS_IOCTL           16
 #define SYS_READV           19
 #define SYS_WRITEV          20
