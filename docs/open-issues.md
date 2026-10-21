@@ -206,11 +206,15 @@ the path shape, not on `process_find_by_pid`.  `ps` only stats
 pids `readdir` gave it, so it does not affect the consumer.
 Worth one line when `/proc` is next touched.
 
-**`sys_gettimeofday` (99) is not implemented.**  `clock_gettime`
-(228) is, and is what musl reaches for in most cases, but
-`PS_LONG`/`PS_TIME` in `ps` call `time()`/`localtime()`, which
-reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
-small syscall from `g_ticks`, like `clock_gettime`.
+**`sysinfo` (99) was unimplemented; `ps -l` hit it.**  With
+`CONFIG_FEATURE_PS_LONG`/`PS_TIME` enabled, `ps -l` logs
+`Unknown syscall: 99`.  99 is `sysinfo` on Linux x86_64;
+`gettimeofday` is **96** and `time()` is **201**, neither of
+which `ps` reaches.  `sys_sysinfo` now fills `struct sysinfo`
+from `g_ticks` and the PMM (uptime, procs, totalram, freeram;
+the rest zero).  `gettimeofday` (96) and `time` (201) remain
+unimplemented and are not reached by anything on the image --
+implement them when a caller appears.
 
 **A live pipe slot's `end` field is 0; no writer is in the
 source.**  Latent, not active.  A `file_slot_t` of kind

@@ -28,7 +28,7 @@ syscall tests `BACKEND_*` to choose an operation.  Devices are rows in
 
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static const`);
 file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store them);
-`sys_gettimeofday` (99); signals (contract's async-writer design);
+`sys_sysinfo` (99); signals (contract's async-writer design);
 shebang + `/bin/sh`.  `tar` is enabled and link restoration is verified (the v0.6.16
 note that called it a busybox issue was wrong -- FAT `st_ino` was 0;
 `76d66db` gives it a real value).  `chmod`/`chown` (90-93) accept and
@@ -47,7 +47,7 @@ The working tree is `dev`.
 
 **NEXT.**  Signals (open-issues 12; design against `docs/contract.md`
 first -- they are the first asynchronous state writer), then
-`sys_gettimeofday` (99, so `ps -l` works), then shebang + `/bin/sh`,
+`sys_sysinfo` (99, so `ps -l` works), then shebang + `/bin/sh`,
 then file-backed `mmap`, then `mount(2)`.
 
 **Working style -- how this project gets changed**
@@ -201,7 +201,7 @@ Do NOT re-walk the refuted paths below.
    and `ash` job control possible.
 2. **Shebang + `/bin/sh`.**  `sys_execve` `#!` parsing with a
    recursion guard, and an interpreter on the image.
-3. **`sys_gettimeofday` (99)** so `ps -l` works.
+3. **`sys_sysinfo` (99)** so `ps -l` works.
 4. The open-issues list (top 6, below).
 5. **The empty-file `st_ino` collision** -- two empty files with the
    same name in different directories share an inode, because
@@ -231,7 +231,7 @@ Do NOT re-walk the refuted paths below.
 1. **`open-issues.md` item 12: signal delivery is a stub.**
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-4. **`sys_gettimeofday` (99)** so `ps -l` works.
+4. **`sys_sysinfo` (99)** so `ps -l` works.
 5. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
    process bug.
 6. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
