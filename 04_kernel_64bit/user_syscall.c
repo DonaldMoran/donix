@@ -9500,6 +9500,10 @@ uint64_t syscall_dispatch(uint64_t num,
 
         case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
         case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
+        case SYS_CHMOD:           return (uint64_t)sys_chmod((const char*)arg0, (int)arg1);
+        case SYS_FCHMOD:          return (uint64_t)sys_fchmod((int)arg0, (int)arg1);
+        case SYS_CHOWN:           return (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2);
+        case SYS_FCHOWN:          return (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2);
         case SYS_SYSINFO:         return (uint64_t)sys_sysinfo((void*)arg0);
         case SYS_GETUID:          return (uint64_t)sys_getuid();
         case SYS_GETGID:          return (uint64_t)sys_getgid();
@@ -9509,10 +9513,6 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_SETSID:          return (uint64_t)sys_setsid();
         case SYS_GETGROUPS:       return (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1);
 
-        case SYS_CHMOD:           return (uint64_t)sys_chmod((const char*)arg0, (int)arg1);
-        case SYS_FCHMOD:          return (uint64_t)sys_fchmod((int)arg0, (int)arg1);
-        case SYS_CHOWN:           return (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2);
-        case SYS_FCHOWN:          return (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2);
         case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
         case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
         case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
