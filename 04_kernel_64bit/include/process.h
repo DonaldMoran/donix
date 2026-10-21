@@ -232,6 +232,38 @@ typedef struct pcb {
      * _Static_assert in process.c pins that offset.
      */
     uint64_t user_rsp;
+
+    /*
+     * Signal state -- slice 1 of docs/signal-design.md.
+     *
+     * Pending mask and blocked mask, one bit per signal, matching
+     * signal_handler[]'s indexing: bit N for signal N, with
+     * signal_handler[N] the handler for signal N.  Signals 1..63
+     * are the usable range; bit 0 is unused (signal 0 is not a
+     * deliverable signal) and bit 64 is unused (signal_handler[]
+     * has 64 entries, indexed 0..63).
+     *
+     * SLICE 1 HAS NO DELIVERY.  These fields are written by
+     * sys_rt_sigprocmask (sig_blocked) and by kill/tgkill
+     * (sig_pending), and read only by the counters and the
+     * wake-on-raise path.  Nothing consults them on the way out
+     * to user mode; that is slice 2's frame work.
+     *
+     * APPENDED AT THE END, after user_rsp, so no asserted offset
+     * moves.  Nothing asserts sizeof(pcb_t); the _Static_assert
+     * block in process.c pins named offsets through user_rsp at
+     * 0x610, all of which are before these fields.
+     *
+     * CLEARED in process_reclaim and process_destroy, like
+     * signal_handler[] and in_signal_handler: a reused PCB slot
+     * must not carry the previous process's pending bits or
+     * blocked mask.  COPIED in sys_fork: the child inherits the
+     * parent's blocked mask (as on Linux) and starts with no
+     * pending signals (process_create's memset already zeroed
+     * it, and sys_fork sets it explicitly as well).
+     */
+    uint64_t sig_pending;
+    uint64_t sig_blocked;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

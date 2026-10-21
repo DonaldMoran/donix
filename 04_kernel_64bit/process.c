@@ -1009,6 +1009,14 @@ void process_reclaim(pcb_t* pcb) {
      */
     for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
     pcb->in_signal_handler = 0;
+    /*
+     * Clear the signal masks too.  sig_pending and sig_blocked
+     * are per-process (see pcb_t); a reused PCB slot must not
+     * carry the previous process's pending bits or blocked
+     * mask, for the same reason signal_handler[] is cleared.
+     */
+    pcb->sig_pending = 0;
+    pcb->sig_blocked = 0;
     process_count--;
 }
 
@@ -1026,6 +1034,10 @@ void process_destroy(pcb_t* pcb) {
     pcb->fault_signal = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
     pcb->in_signal_handler = 0;
+    /* See the comment in process_reclaim: the signal masks are
+     * per-process and must not survive slot reuse. */
+    pcb->sig_pending = 0;
+    pcb->sig_blocked = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) scheduler_set_current(NULL);

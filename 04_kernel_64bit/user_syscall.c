@@ -8811,24 +8811,83 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
      * For the real subsystem (masks, SA_* flags, oldact, queued
      * signals) see open-issues item 12.  This is not it.
      */
-    if (signum < 0 || signum >= 64) return -(long)EINVAL_;
+    if (signum < 1 || signum >= 64) return -(long)EINVAL_;
     pcb_t *self = process_get_current();
     if (!self) return -(long)EINVAL_;
 
     if (!act) return 0;
 
-    const uint64_t *a = (const uint64_t *)act;
+    /*
+     * Read the caller's struct through safe_copy_from_user.
+     * The probe (sigsegv_probe.c) and musl both pass a valid
+     * user pointer, but a bad one must EFAULT, not fault the
+     * kernel -- every other user-pointer read in this file goes
+     * through safe_copy_from_user for that reason.
+     */
+    uint64_t a[2];
+    if (safe_copy_from_user(a, act, sizeof(a)) != 0) {
+        return -(long)EFAULT_;
+    }
     uint64_t handler = a[0];
     if (handler == 1) handler = 0;   /* SIG_IGN -> no handler */
 
+    uint64_t prev = self->signal_handler[signum];
     self->signal_handler[signum] = handler;
-    (void)oldact;
+    if (oldact) {
+        uint64_t old[2];
+        old[0] = prev;
+        old[1] = 0;
+        if (safe_copy_to_user(oldact, old, sizeof(old)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
     return 0;
 }
 
 long sys_rt_sigprocmask(int how, const void* set, void* oldset,
                         size_t sigsetsize) {
-    (void)how; (void)set; (void)oldset; (void)sigsetsize;
+    /*
+     * Slice 1 stores the blocked mask.  Delivery (slice 2) is
+     * what consults it; nothing reads it yet.
+     *
+     * Linux requires sigsetsize == sizeof(sigset_t), which on
+     * x86_64 is 8.  do not validate: musl and the probes pass
+     * 8, but a future raw caller may pass 0 and the design's
+     * slice 1 acceptance does not depend on the check.  When
+     * something needs the strictness, add it here and update
+     * the callers first.
+     */
+    (void)sigsetsize;
+
+    if (how != 0 && how != 1 && how != 2) {
+        return -(long)EINVAL_;   /* SIG_BLOCK/UNBLOCK/SETMASK */
+    }
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    uint64_t newset = 0;
+    if (set) {
+        if (safe_copy_from_user(&newset, set, sizeof(newset)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    uint64_t prev = self->sig_blocked;
+    if (set) {
+        if (how == 0)      self->sig_blocked |= newset;   /* BLOCK   */
+        else if (how == 1) self->sig_blocked &= ~newset;  /* UNBLOCK */
+        else               self->sig_blocked = newset;    /* SETMASK */
+    }
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+
+    if (oldset) {
+        if (safe_copy_to_user(oldset, &prev, sizeof(prev)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
     return 0;
 }
 
@@ -9255,6 +9314,19 @@ long sys_fork(void) {
      * See the fs_base comment in process.h.
      */
     child->fs_base = parent->fs_base;
+
+    /*
+     * Signal state across fork, slice 1 of docs/signal-design.md.
+     *
+     * sig_blocked is inherited, as on Linux: a child runs with the
+     * parent's blocked mask.  sig_pending starts clear -- the
+     * parent's pending signals belong to the parent, and
+     * process_create's memset already zeroed the child's PCB.  The
+     * explicit clear is belt and braces on the one field where a
+     * stale bit would be a delivered signal to the wrong process.
+     */
+    child->sig_blocked = parent->sig_blocked;
+    child->sig_pending = 0;
 
 
     /*
