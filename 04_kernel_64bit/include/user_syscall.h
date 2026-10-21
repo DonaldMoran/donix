@@ -38,7 +38,7 @@ void user_syscall_clear_file_table(struct pcb* pcb);
  * RIP +0x78, CS +0x80, RFLAGS +0x88, RSP +0x90, SS +0x98).  Both
  * return 1 if a signal was delivered, 0 otherwise. */
 long signal_deliver_frame(void);
-long signal_deliver_frame_iretq(uint64_t frame_base);
+long signal_deliver_frame_iretq(struct pcb* self, uint64_t frame_base);
 // void syscall_init(void);
 
 #endif

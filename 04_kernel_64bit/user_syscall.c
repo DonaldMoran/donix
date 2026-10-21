@@ -9276,6 +9276,13 @@ long signal_deliver_frame(void) {
 /*
  * signal_deliver_frame_iretq -- slice 3's deliver helper, tick path.
  *
+ * `self` is the process whose frame is being rewritten.  It is a
+ * PARAMETER, not process_get_current(): the tick path runs outside
+ * any syscall, and the scheduler's current_process and process.c's
+ * current_process are two copies (contract rule 5).  Passing the
+ * target explicitly makes the helper correct regardless of whether
+ * the two copies have agreed.
+ *
  * frame_base is a 20-slot iretq frame built by irq0_stub's
  * PUSH_ALL_GPRS (POP_ALL_GPRS layout):
  *   [+0x00] r15  [+0x08] r14  [+0x10] r13  [+0x18] r12
@@ -9290,8 +9297,7 @@ long signal_deliver_frame(void) {
  * signum at RDI, 0 at RSI, ucontext at RDX.  CS and SS are left
  * alone (the handler runs in user mode with the same segments).
  */
-long signal_deliver_frame_iretq(uint64_t frame_base) {
-    pcb_t* self = process_get_current();
+long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
     if (!self) return 0;
 
     uint64_t pend = self->sig_pending & ~self->sig_blocked;

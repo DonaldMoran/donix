@@ -609,6 +609,19 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * exactly as the current->pid == 1 early return above does.
          */
         if (next == current) {
+            /*
+             * Slice 3, self-pick branch.  This IS a dispatch:
+             * current resumes from stack_pointer, its own frame.
+             * With no other runnable process the ready queue
+             * keeps returning current, so this branch is taken on
+             * every tick -- a pending signal must be observed here
+             * or it is never observed at all.  Deliver to
+             * current, targeting stack_pointer, before the
+             * no-op return.
+             */
+            if (current->sig_pending & ~current->sig_blocked) {
+                signal_deliver_frame_iretq(current, stack_pointer);
+            }
             current->timeslice_ticks = 0;
             return stack_pointer;
         }
@@ -638,6 +651,18 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * like the identity self-pick.
          */
         if (next->rsp == stack_pointer) {
+            /*
+             * Slice 3, self-pick-by-value branch.  Same shape
+             * as the identity self-pick above: a process other
+             * than current was popped, but its frame IS the one
+             * this tick built, so resuming it would pop this
+             * frame.  current resumes from stack_pointer
+             * unchanged; a pending signal on current must be
+             * delivered here, targeting stack_pointer.
+             */
+            if (current->sig_pending & ~current->sig_blocked) {
+                signal_deliver_frame_iretq(current, stack_pointer);
+            }
             current->timeslice_ticks = 0;
             return stack_pointer;
         }
@@ -761,7 +786,7 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * pending signal will be observed on its next dispatch.
          */
         if (next->sig_pending & ~next->sig_blocked) {
-            signal_deliver_frame_iretq(next->rsp);
+            signal_deliver_frame_iretq(next, next->rsp);
         }
 
         return next->rsp;
