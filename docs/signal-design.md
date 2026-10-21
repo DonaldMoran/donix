@@ -269,11 +269,27 @@ Replaces the 7e `signal_maybe_redirect` instrument.  Verified by:
 `sigsegv_probe` now returns from its handler instead of exiting.
 This is where `in_signal_handler` gets its real semantics.
 
-**Slice 5 -- `SIGPIPE`, `SIGCHLD`, default actions.**
-`SIGPIPE` on the `-EPIPE` write (open-issues item 5); `SIGCHLD`
-on child exit; the default-action table (terminate, ignore, stop,
-core).  Verified by: `yes | head -n 1` still works; a program that
-does not handle `SIGPIPE` dies.
+**Slice 5 -- `SIGPIPE`, default actions.  (`SIGCHLD` moved out.)**
+`SIGPIPE` on the `-EPIPE` write (open-issues item 5); the
+default-action table (terminate, ignore, stop, core); `SIGKILL`
+acting at the raise; `signal_terminate_current` as the one
+terminate path.  Verified by: `yes | head -n 1` still works; a
+program that does not handle `SIGPIPE` dies; `test.sh` 57/57 and
+`canary --full` 28/28.
+
+**`SIGCHLD` is NOT in slice 5.**  It was implemented three ways
+and each hung `echo hi | wc` under KVM (and not under slow TCG):
+inside `process_wake_parent_if_waiting` before its `BLOCKED`
+check; inside it after; and in `process_exit` after the wake, in
+the wake's existing `cli` section.  The raise is authorized by
+`parent->sig_blocked`, and that check was never in the section the
+raise ran in -- contract rule 1.  It needs its own slice, on top
+of a passing slice 5, as a factored `signal_raise(target, sig)`
+(check-and-act, one section, the shape `sys_kill` already has),
+with a `sigchld_probe` that installs a handler, forks, and does
+not wait, so the handler running is the acceptance.  Until then,
+`wait4`'s wake (`process_wake_parent_if_waiting`) is the only
+child-exit notification, and it is `dev`'s code, unchanged.
 
 Not in any slice yet: `siginfo`, `SA_SIGINFO`, `sigqueue`,
 `SA_RESTART` semantics for interrupted syscalls, `SIGSTOP`/`SIGCONT`

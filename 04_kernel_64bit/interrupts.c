@@ -256,34 +256,14 @@ void fault_kill_current(int vec) {
      * NULL, skip the write and let process_exit do its default
      * teardown.
      */
-    pcb_t* self = process_get_current();
-    if (self) {
-        /*
-         * Map the CPU exception vector to a Linux signal number.
-         * The two are different namespaces: 0x0E (#PF) is vector
-         * 14 but SIGSEGV (11), and 0x0D (#GP) is vector 13 but
-         * SIGSEGV (11) as well.  Storing the vector directly makes
-         * busybox ash print "Alarm clock" (SIGALRM = 14) for a
-         * page fault, which is a lie the user would believe.
-         *
-         * Only the exceptions this kernel actually delivers are
-         * mapped.  Anything else falls through to SIGSEGV, which
-         * is the honest answer for "an architectural exception
-         * killed this process" when we do not know better.
-         */
-        int sig;
-        switch (vec) {
-            case 0x00: sig = 8;  break;   /* #DE  -> SIGFPE  */
-            case 0x01: sig = 5;  break;   /* #DB  -> SIGTRAP */
-            case 0x06: sig = 4;  break;   /* #UD  -> SIGILL  */
-            case 0x0D: sig = 11; break;   /* #GP  -> SIGSEGV */
-            case 0x0E: sig = 11; break;   /* #PF  -> SIGSEGV */
-            default:   sig = 11; break;   /* fallback: SIGSEGV */
-        }
-        self->fault_signal = sig;
-    }
-
-    process_exit();
+    /*
+     * Slice 5: one terminate path.  exc_vector_to_signal (defined
+     * above) is the only vector-to-signal mapping;
+     * signal_terminate_current sets fault_signal and calls
+     * process_exit.  fault_kill_current keeps only its self-test
+     * bookkeeping.
+     */
+    signal_terminate_current(exc_vector_to_signal(vec));
     __builtin_unreachable();
 }
 

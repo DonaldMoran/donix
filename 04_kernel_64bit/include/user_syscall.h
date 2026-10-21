@@ -39,6 +39,21 @@ void user_syscall_clear_file_table(struct pcb* pcb);
  * return 1 if a signal was delivered, 0 otherwise. */
 long signal_deliver_frame(void);
 long signal_deliver_frame_iretq(struct pcb* self, uint64_t frame_base);
+
+/*
+ * Terminate the current process as if killed by signal `sig`.
+ * Sets fault_signal (the sys_wait4 signal-kill view) and calls
+ * process_exit.  noreturn.
+ *
+ * The one terminate path for a signal: fault_kill_current (via
+ * exc_vector_to_signal) and signal_default_action (via its
+ * TERMINATE entry) both call this, so there is one writer of
+ * fault_signal and one way a process dies from a signal.
+ *
+ * Implemented in user_syscall.c.
+ */
+void signal_terminate_current(int sig) __attribute__((noreturn));
+
 // void syscall_init(void);
 
 #endif

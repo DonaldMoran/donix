@@ -109,6 +109,44 @@ void scheduler_ready_queue_add(pcb_t* process) {
     if (process->pid == 1) { __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags)); return; }
 
     /*
+     * Dead-process guard.  A ZOMBIE or TERMINATED process must
+     * never be on the ready queue.
+     *
+     * This is the _add-side counterpart to scheduler_ready_
+     * queue_next's RUNNING skip and scheduler_switch_to's
+     * SWITCH-DEAD refuse.  Without it, a caller that _adds a
+     * process after it has exited puts a zombie on the queue; if
+     * that zombie is the only node, _next pops it, switch_to
+     * refuses it with SWITCH-DEAD, and the queue is left holding
+     * nothing while a live process (and a BLOCKED shell) wait
+     * forever.  Observed on the slice-5 build: `echo hi | wc`
+     * hung with ready_queue_head == ready_queue_tail == a
+     * PROC_STATE_ZOMBIE PCB, and the pipeline never completed.
+     *
+     * The print is failure-path signal, not success-path noise:
+     * it fires only when a caller is doing something that
+     * deadlocks the scheduler, and __builtin_return_address(0)
+     * names the caller so the next occurrence is diagnosed from
+     * the serial log rather than from gdb.
+     */
+    if (process->state == PROC_STATE_ZOMBIE ||
+        process->state == PROC_STATE_TERMINATED) {
+        serial_lock();
+        serial_print("Q-ADD-DEAD: pid=");
+        serial_print_dec(process->pid);
+        serial_print(" state=");
+        serial_print_dec((uint64_t)process->state);
+        serial_print(" name=");
+        serial_print(process->name);
+        serial_print(" caller=0x");
+        serial_print_hex((uint64_t)__builtin_return_address(0));
+        serial_print("\n");
+        serial_unlock();
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return;
+    }
+
+    /*
      * Idempotency guard.  See scheduler_ready_queue_contains for
      * the failure mode.  A process that is already on the queue
      * must not be linked in again: the second link overwrites its

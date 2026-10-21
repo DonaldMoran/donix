@@ -6386,6 +6386,23 @@ long sys_write(int fd, const void* buf, size_t count) {
              * this code.  Track it in open-issues.
              */
             if (pipe->readers_open == 0) {
+                /*
+                 * Slice 5: raise SIGPIPE.  The write still returns
+                 * -EPIPE -- a caller must see it whether or not it
+                 * handles the signal -- and the signal is delivered
+                 * on the way out to user mode (signal_deliver_frame,
+                 * at the top of syscall_dispatch).  With no handler,
+                 * signal_default_action terminates; the parent's
+                 * wait4 then reports SIGPIPE (13), which is what
+                 * makes `yes | head` behave.
+                 *
+                 * The raise is under the cli already held by the
+                 * enclosing loop, same critical section as the
+                 * readers_open check, so a close racing this write
+                 * cannot slip between the check and the bit set.
+                 */
+                self->sig_pending |= (1ULL << 13);   /* SIGPIPE */
+                g_sig_raise_count++;
                 __asm__ volatile("sti");
                 return -(long)EPIPE_;
             }
@@ -8327,14 +8344,67 @@ long sys_set_tid_address(int* tidptr) {
  * pid, -ESRCH for a pid that names no live process.
  */
 #define ESRCH_ 3
+
+/*
+ * signal_kill_other -- terminate a process other than the caller.
+ * Called from sys_kill for SIGKILL on a target that is not the
+ * current process.  Cannot use signal_terminate_current: that is
+ * noreturn and the caller is still running.
+ *
+ * ORDER: close_all_files(target); fault_signal = sig;
+ * state = TERMINATED; remove from ready queue; wake parent.
+ * Does NOT free the PCB -- process_reclaim does, when the parent
+ * reaps.
+ */
+static void signal_kill_other(pcb_t* target, int sig) {
+    if (!target) return;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    if (target->state == PROC_STATE_TERMINATED ||
+        target->state == PROC_STATE_UNUSED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return;
+    }
+
+    close_all_files(target);
+
+    target->fault_signal = sig;
+    target->state        = PROC_STATE_TERMINATED;
+    scheduler_ready_queue_remove(target);
+
+    process_wake_parent_if_waiting(target);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+}
+
 long sys_kill(long pid, int sig) {
     if (sig < 0 || sig > 63) return -(long)EINVAL_;
     if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
+    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
 
     pcb_t* target = process_find_by_pid((uint64_t)pid);
     if (!target) return -(long)ESRCH_;
 
     if (sig == 0) return 0;   /* existence check: no bit set */
+
+    /*
+     * Slice 5: SIGKILL acts at the raise, not at a deliver point.
+     * It cannot be caught, blocked, or ignored, so a target in a
+     * hlt loop must die without waiting for a safe point.  It does
+     * not set sig_pending -- there is no point at which a
+     * SIGKILL would be observed as pending; it is acted on here.
+     */
+    if (sig == 9) {   /* SIGKILL */
+        g_sig_raise_count++;
+        if (target == process_get_current()) {
+            signal_terminate_current(9);
+            __builtin_unreachable();
+        }
+        signal_kill_other(target, 9);
+        return 0;
+    }
 
     uint64_t bit = 1ULL << (uint64_t)sig;
 
@@ -8344,12 +8414,6 @@ long sys_kill(long pid, int sig) {
     target->sig_pending |= bit;
     g_sig_raise_count++;
 
-    /*
-     * Wake per question 3: only if the target is BLOCKED and the
-     * signal is not blocked.  A signal the target is blocking
-     * stays pending and does not disturb the block -- that is
-     * what sig_blocked means.
-     */
     if (target->state == PROC_STATE_BLOCKED &&
         (target->sig_pending & ~target->sig_blocked & bit) != 0) {
         target->state      = PROC_STATE_READY;
@@ -9205,6 +9269,58 @@ static uint64_t signal_build_user_frame(const struct sig_frame_regs* regs,
 }
 
 /*
+ * signal_terminate_current -- the one signal-terminate path.
+ *
+ * Sets fault_signal (the sys_wait4 signal-kill view) and calls
+ * process_exit.  fault_kill_current and signal_default_action both
+ * call this, so fault_signal has exactly one writer and a process
+ * dies from a signal exactly one way.
+ */
+void signal_terminate_current(int sig) {
+    pcb_t* self = process_get_current();
+    if (self) self->fault_signal = sig;
+    process_exit();
+    __builtin_unreachable();
+}
+
+/*
+ * signal_default_action -- slice 5's default-action table.
+ *
+ * Called by the three deliver helpers when a pending signal has no
+ * handler installed.  The bit has already been cleared by the
+ * caller.
+ *
+ *   IGNORE     SIGCHLD (17), SIGURG (23), SIGWINCH (28),
+ *              SIGCONT (18).  The bit is cleared and the process
+ *              resumes normally; returns 0.
+ *   TERMINATE  everything else, including SIGKILL (9), SIGTERM
+ *              (15), SIGPIPE (13), and -- with the caveat below --
+ *              SIGSTOP (19), SIGTSTP (20), SIGQUIT (3).
+ *
+ * STOP AND CORE ARE NOT IMPLEMENTED.  A default "stop" needs
+ * PROC_STATE_STOPPED and a SIGCONT that resumes the saved frame;
+ * a default "core" needs a core dump.  Neither exists.  Mapping
+ * them to TERMINATE kills loudly instead of hanging forever, which
+ * is the honest placeholder until job control (open-issues item 13)
+ * lands.  See docs/signal-design.md, slice 5.
+ *
+ * Never returns for TERMINATE (signal_terminate_current is
+ * noreturn).  Returns 0 for IGNORE.
+ */
+static long signal_default_action(pcb_t* self, int sig) {
+    switch (sig) {
+        case 17:   /* SIGCHLD  */
+        case 23:   /* SIGURG   */
+        case 28:   /* SIGWINCH */
+        case 18:   /* SIGCONT  */
+            return 0;
+        default:
+            (void)self;
+            signal_terminate_current(sig);
+    }
+}
+
+/*
  * signal_deliver_frame -- slice 2's deliver helper, unchanged in
  * net effect.  Reads the syscall-entry stub's frame at
  * g_syscall_stack_top - 120, builds the user-stack frame via
@@ -9230,7 +9346,22 @@ long signal_deliver_frame(void) {
 
     uint64_t handler  = self->signal_handler[n];
     uint64_t restorer = self->signal_restorer[n];
-    if (handler == 0 || restorer == 0) return 0;
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (restorer == 0) return 0;
 
     extern uint64_t g_syscall_stack_top;
     uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
@@ -9314,7 +9445,22 @@ long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
 
     uint64_t handler  = self->signal_handler[n];
     uint64_t restorer = self->signal_restorer[n];
-    if (handler == 0 || restorer == 0) return 0;
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (restorer == 0) return 0;
 
     uint64_t* f = (uint64_t*)frame_base;
     if (!f) return 0;
@@ -9414,7 +9560,22 @@ long signal_deliver_frame_exc(pcb_t* self, uint64_t* raw, int sig) {
 
     uint64_t handler  = self->signal_handler[n];
     uint64_t restorer = self->signal_restorer[n];
-    if (handler == 0 || restorer == 0) return 0;
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (restorer == 0) return 0;
 
     struct sig_frame_regs r;
     r.gpr[0]  = raw[0x00 / 8];   /* r15 */
