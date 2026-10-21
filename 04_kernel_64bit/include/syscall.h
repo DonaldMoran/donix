@@ -117,9 +117,7 @@
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
  *
- *  99  gettimeofday      -- `ps -l` reaches it; a small
- *                           syscall from g_ticks.  See
- *                           docs/open-issues.md.
+ *  99  sysinfo           sys_sysinfo        (from g_ticks + PMM)
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -180,6 +178,7 @@
 #define SYS_FCHMOD          91
 #define SYS_CHOWN           92
 #define SYS_FCHOWN          93
+#define SYS_SYSINFO          99
 #define SYS_GETUID          102
 #define SYS_GETGID          104
 #define SYS_GETEUID         107

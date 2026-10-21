@@ -7563,6 +7563,89 @@ long sys_clock_gettime(int clk_id, void* user_ts) {
  * Validation, matching Linux: tv_sec < 0 is -EINVAL; tv_nsec
  * must be in [0, 999999999] or -EINVAL.  NULL req is -EFAULT.
  */
+/*
+ * Linux x86_64 sysinfo(2) -- syscall 99.
+ *
+ * struct sysinfo, exactly as musl's <sys/sysinfo.h> defines it for
+ * x86_64 (third_party/musl-install/include/sys/sysinfo.h):
+ *
+ *   offset  size  field
+ *     0      8    uptime          (seconds since boot)
+ *     8     24    loads[3]        (fixed-point, SI_LOAD_SHIFT 16)
+ *    32      8    totalram        (in units of mem_unit)
+ *    40      8    freeram
+ *    48      8    sharedram
+ *    56      8    bufferram
+ *    64      8    totalswap
+ *    72      8    freeswap
+ *    80      2    procs           (unsigned short)
+ *    82      2    pad
+ *    88      8    totalhigh
+ *    96      8    freehigh
+ *   104      4    mem_unit        (unsigned int; scales the ram fields)
+ *   108    256    __reserved
+ *   364          total
+ *
+ * Filled honestly:
+ *   uptime   g_ticks / 100           (100 Hz PIT, same source as
+ *                                     sys_clock_gettime)
+ *   procs    live PCB count          (walk MAX_PROCESSES, skip UNUSED)
+ *   totalram pmm_get_total_pages()   (bytes, via mem_unit = 4096)
+ *   freeram  pmm_get_free_pages()
+ *   mem_unit 4096                    (PAGE_SIZE; scales ram fields)
+ *
+ * Zeroed, because donix does not track them: loads, sharedram,
+ * bufferram, totalswap, freeswap, totalhigh, freehigh.  busybox's
+ * ps reads uptime/procs/totalram/freeram; a zero elsewhere is the
+ * truth, not a placeholder that hides something.
+ *
+ * One read of g_ticks into a local, as sys_clock_gettime does.
+ * A read that races the timer IRQ is one tick off, which is fine
+ * for an uptime field.
+ */
+struct donix_sysinfo {
+    unsigned long  uptime;
+    unsigned long  loads[3];
+    unsigned long  totalram;
+    unsigned long  freeram;
+    unsigned long  sharedram;
+    unsigned long  bufferram;
+    unsigned long  totalswap;
+    unsigned long  freeswap;
+    unsigned short procs;
+    unsigned short pad;
+    unsigned long  totalhigh;
+    unsigned long  freehigh;
+    unsigned int   mem_unit;
+    char           __reserved[256];
+};
+
+long sys_sysinfo(void* user_info) {
+    if (!user_info) return -(long)EFAULT_;
+
+    struct donix_sysinfo si;
+    for (size_t i = 0; i < sizeof(si); i++) ((uint8_t*)&si)[i] = 0;
+
+    uint64_t ticks = g_ticks;            /* one read */
+
+    si.uptime    = (unsigned long)(ticks / 100);
+    si.totalram  = (unsigned long)pmm_get_total_pages();
+    si.freeram   = (unsigned long)pmm_get_free_pages();
+    si.mem_unit  = 4096;                 /* PAGE_SIZE */
+
+    unsigned short nprocs = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcb_t* p = process_get_pcb(i);
+        if (p && p->state != PROC_STATE_UNUSED) nprocs++;
+    }
+    si.procs = nprocs;
+
+    if (safe_copy_to_user(user_info, &si, sizeof(si)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 long sys_nanosleep(const void* user_req, void* user_rem) {
     (void)user_rem;   /* never written; see the header comment */
 
@@ -9417,6 +9500,7 @@ uint64_t syscall_dispatch(uint64_t num,
 
         case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
         case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
+        case SYS_SYSINFO:         return (uint64_t)sys_sysinfo((void*)arg0);
         case SYS_GETUID:          return (uint64_t)sys_getuid();
         case SYS_GETGID:          return (uint64_t)sys_getgid();
         case SYS_GETEUID:         return (uint64_t)sys_geteuid();
