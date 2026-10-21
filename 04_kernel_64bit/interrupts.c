@@ -9,6 +9,7 @@
 #include "include/user_msr.h"
 #include "include/pmm.h"
 #include "include/vmm.h"
+#include "include/user_syscall.h"
 
 /* Written by user_syscall_entry.asm immediately before sysret.  Read
  * here when a fault lands at RIP < 0x1000 in user mode, which is the
@@ -744,6 +745,25 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * it, a process resumed by the timer kept a non-zero rsp, and
          * the later stale-frame dispatch passed every check.
          */
+
+        /*
+         * Slice 3: deliver a pending signal to `next` before it
+         * resumes in user mode.  This is the tick path's delivery
+         * point -- the process was preempted from user mode, so its
+         * iretq frame is at next->rsp and irq0_stub will pop it.
+         * signal_deliver_frame_iretq rewrites that frame in place;
+         * if it delivers, the stub resumes at the handler instead
+         * of the interrupted RIP.  Interrupts are off here (the
+         * whole dispatch is under the IRQ gate), so the pending
+         * mask read and the frame rewrite are one critical section.
+         * Refuse paths above (return stack_pointer) do NOT deliver:
+         * current resumes from its own frame unchanged, and its
+         * pending signal will be observed on its next dispatch.
+         */
+        if (next->sig_pending & ~next->sig_blocked) {
+            signal_deliver_frame_iretq(next->rsp);
+        }
+
         return next->rsp;
     }
 

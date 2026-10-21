@@ -30,6 +30,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t arg0, uint64_t arg1,
  */
 void user_syscall_init_console_fds(struct pcb* pcb);
 void user_syscall_clear_file_table(struct pcb* pcb);
+
+/* Slice 2/3 signal delivery.  signal_deliver_frame() reads the
+ * syscall-entry stub's frame at g_syscall_stack_top - 120;
+ * signal_deliver_frame_iretq(frame_base) reads a 20-slot iretq frame
+ * at frame_base (POP_ALL_GPRS layout: r15..rax at +0x00..+0x70,
+ * RIP +0x78, CS +0x80, RFLAGS +0x88, RSP +0x90, SS +0x98).  Both
+ * return 1 if a signal was delivered, 0 otherwise. */
+long signal_deliver_frame(void);
+long signal_deliver_frame_iretq(uint64_t frame_base);
 // void syscall_init(void);
 
 #endif

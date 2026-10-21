@@ -9100,6 +9100,120 @@ long sys_rt_sigreturn(void) {
  * The handler is entered with RSP = frame + 8 (so its ret pops
  * restorer from [frame]), RIP = signal_handler[n], RDI = n.
  */
+/*
+ * The saved user context, in one shape, so the user-stack frame
+ * builder can serve both delivery wrappers.  This is NOT a ucontext_t
+ * and NOT a kernel frame: it is the 15 GPRs plus user RSP/RFLAGS/RIP
+ * that a wrapper reads out of its own kernel-side frame and hands to
+ * signal_build_user_frame().
+ *
+ * gpr[0..14] in POP_ALL_GPRS order: r15 r14 r13 r12 r11 r10 r9 r8
+ * rbp rdi rsi rdx rcx rbx rax.  That is the iretq frame's stack order
+ * and the reverse of the push order, so a wrapper reads
+ * frame[+0x00] .. frame[+0x70] straight into gpr[0] .. gpr[14].
+ */
+struct sig_frame_regs {
+    uint64_t gpr[15];   /* r15..rax, POP_ALL_GPRS stack order */
+    uint64_t rsp;       /* user RSP */
+    uint64_t rflags;    /* user RFLAGS */
+    uint64_t rip;       /* user RIP */
+};
+
+/*
+ * Build the user-stack signal frame from `regs`.  Returns the
+ * handler-entry RSP (the frame base) on success, or 0 if nothing
+ * can be delivered or a user copy faulted.
+ *
+ * On success:
+ *   [frame + 0]   = restorer
+ *   [frame + 8]   = ucontext_t (816 bytes), zeroed then filled
+ *   gregs at frame + 48  (ucontext + 40), 18 entries
+ *   uc_sigmask at frame + 304  (ucontext + 296)
+ *
+ * The gregs are ordered as musl's _GNU_SOURCE ucontext_t expects:
+ * R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI RBP RBX RDX RAX RCX
+ * RSP RIP EFL.  `regs->gpr[]` is in POP_ALL_GPRS order; the mapping
+ * below is the one place the two orders are reconciled.
+ *
+ * No kmalloc: this runs at interrupt and syscall-return depth.
+ * Everything goes through safe_copy_to_user.
+ */
+static uint64_t signal_build_user_frame(const struct sig_frame_regs* regs,
+                                        uint64_t handler, uint64_t restorer) {
+    uint64_t frame = (regs->rsp - (8 + 816 + 128)) & ~0xFULL;
+
+    if (safe_copy_to_user((void*)frame, &restorer, 8) != 0) return 0;
+
+    {
+        uint8_t zero[816];
+        for (int i = 0; i < 816; i++) zero[i] = 0;
+        if (safe_copy_to_user((void*)(frame + 8), zero, 816) != 0) return 0;
+    }
+
+    /*
+     * POP_ALL_GPRS stack order (low -> high):
+     *   gpr[0]=r15 gpr[1]=r14 gpr[2]=r13 gpr[3]=r12
+     *   gpr[4]=r11 gpr[5]=r10 gpr[6]=r9  gpr[7]=r8
+     *   gpr[8]=rbp gpr[9]=rdi gpr[10]=rsi gpr[11]=rdx
+     *   gpr[12]=rcx gpr[13]=rbx gpr[14]=rax
+     *
+     * musl gregs order (index -> value):
+     *   0 R8   1 R9   2 R10  3 R11  4 R12  5 R13  6 R14  7 R15
+     *   8 RDI  9 RSI 10 RBP 11 RBX 12 RDX 13 RAX 14 RCX
+     *  15 RSP 16 RIP 17 EFL
+     */
+    #define UCTX_G(uc_idx, val) do { \
+        uint64_t _v = (val); \
+        if (safe_copy_to_user((void*)(frame + 48 + ((uc_idx) * 8)), \
+                              &_v, 8) != 0) return 0; \
+    } while (0)
+
+    UCTX_G(0,  regs->gpr[7]);    /* R8  */
+    UCTX_G(1,  regs->gpr[6]);    /* R9  */
+    UCTX_G(2,  regs->gpr[5]);    /* R10 */
+    UCTX_G(3,  regs->gpr[4]);    /* R11 */
+    UCTX_G(4,  regs->gpr[3]);    /* R12 */
+    UCTX_G(5,  regs->gpr[2]);    /* R13 */
+    UCTX_G(6,  regs->gpr[1]);    /* R14 */
+    UCTX_G(7,  regs->gpr[0]);    /* R15 */
+    UCTX_G(8,  regs->gpr[9]);    /* RDI */
+    UCTX_G(9,  regs->gpr[10]);   /* RSI */
+    UCTX_G(10, regs->gpr[8]);    /* RBP */
+    UCTX_G(11, regs->gpr[13]);   /* RBX */
+    UCTX_G(12, regs->gpr[11]);   /* RDX */
+    UCTX_G(13, regs->gpr[14]);   /* RAX */
+    UCTX_G(14, regs->gpr[12]);   /* RCX */
+    UCTX_G(15, regs->rsp);       /* RSP */
+    UCTX_G(16, regs->rip);       /* RIP */
+    UCTX_G(17, regs->rflags);    /* EFL */
+
+    #undef UCTX_G
+
+    /* uc_sigmask at ucontext+296 = frame + 8 + 296 = frame + 304.
+     * Filled by the caller (it needs `self`); zero here, the wrapper
+     * overwrites it. */
+    {
+        uint64_t zero_sm = 0;
+        if (safe_copy_to_user((void*)(frame + 304), &zero_sm, 8) != 0)
+            return 0;
+    }
+
+    (void)handler;
+    return frame;
+}
+
+/*
+ * signal_deliver_frame -- slice 2's deliver helper, unchanged in
+ * net effect.  Reads the syscall-entry stub's frame at
+ * g_syscall_stack_top - 120, builds the user-stack frame via
+ * signal_build_user_frame, and rewrites the syscall-stub slots:
+ *   kf[8]=handler kf[6]=frame kf[7]=rflags kf[3]=n kf[2]=0
+ *   kf[1]=frame+8
+ * The ucontext gregs are read from the kf[] slots (kf[5]=r8,
+ * kf[4]=r9, kf[0]=r10, kf[12]=r12, kf[11]=r13, kf[10]=r14,
+ * kf[9]=r15, kf[3]=rdi, kf[2]=rsi, kf[13]=rbp, kf[14]=rbx,
+ * kf[1]=rdx), the same mapping the original used.
+ */
 long signal_deliver_frame(void) {
     pcb_t* self = process_get_current();
     if (!self) return 0;
@@ -9113,111 +9227,122 @@ long signal_deliver_frame(void) {
 
     uint64_t handler  = self->signal_handler[n];
     uint64_t restorer = self->signal_restorer[n];
-    if (handler == 0 || restorer == 0) {
-        /* No handler installed (SIG_DFL) -- slice 2 does not
-         * apply default actions; leave pending. */
-        return 0;
-    }
+    if (handler == 0 || restorer == 0) return 0;
 
     extern uint64_t g_syscall_stack_top;
     uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
-    uint64_t user_rsp    = kf[6];
-    uint64_t user_rflags = kf[7];
-    uint64_t user_rip    = kf[8];
 
-    /*
-     * Frame base: below the current user RSP, 16-byte aligned
-     * (musl's ucontext_t has 8-byte alignment internally; 16 is
-     * safe and matches what Linux does for rt_sigframe).
-     */
-    uint64_t frame = (user_rsp - (8 + 816 + 128)) & ~0xFULL;
+    struct sig_frame_regs r;
+    r.gpr[0]  = kf[9];   /* r15 */
+    r.gpr[1]  = kf[10];  /* r14 */
+    r.gpr[2]  = kf[11];  /* r13 */
+    r.gpr[3]  = kf[12];  /* r12 */
+    r.gpr[4]  = 0;       /* r11: syscall-clobbered */
+    r.gpr[5]  = kf[0];   /* r10 */
+    r.gpr[6]  = kf[4];   /* r9  */
+    r.gpr[7]  = kf[5];   /* r8  */
+    r.gpr[8]  = kf[13];  /* rbp */
+    r.gpr[9]  = kf[3];   /* rdi */
+    r.gpr[10] = kf[2];   /* rsi */
+    r.gpr[11] = kf[1];   /* rdx */
+    r.gpr[12] = 0;       /* rcx: syscall-clobbered */
+    r.gpr[13] = kf[14];  /* rbx */
+    r.gpr[14] = 0;       /* rax: syscall-clobbered */
+    r.rsp    = kf[6];
+    r.rflags = kf[7];
+    r.rip    = kf[8];
 
-    /* [frame] = restorer */
-    if (safe_copy_to_user((void*)frame, &restorer, 8) != 0) {
-        return 0;
-    }
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
 
-    /* ucontext_t at frame+8.  Zero it first, then write fields. */
-    {
-        uint8_t zero[816];
-        for (int i = 0; i < 816; i++) zero[i] = 0;
-        if (safe_copy_to_user((void*)(frame + 8), zero, 816) != 0) {
-            return 0;
-        }
-    }
-    /* gregs base = frame + 8 + 40 = frame + 48. */
-    #define UCTX_G(uc_off, val) do {         if (safe_copy_to_user((void*)(frame + 48 + (uc_off)),                               &(val), 8) != 0) return 0;     } while (0)
-    UCTX_G(0*8, kf[5]);   /* R8  <- kf[5]  */
-    UCTX_G(1*8, kf[4]);   /* R9  <- kf[4]  */
-    UCTX_G(2*8, kf[0]);   /* R10 <- kf[0]  */
-    /* R11 (idx 3): syscall-clobbered; restore as 0. */
-    { uint64_t z = 0; UCTX_G(3*8, z); }
-    UCTX_G(4*8, kf[12]);  /* R12 <- kf[12] */
-    UCTX_G(5*8, kf[11]);  /* R13 <- kf[11] */
-    UCTX_G(6*8, kf[10]);  /* R14 <- kf[10] */
-    UCTX_G(7*8, kf[9]);   /* R15 <- kf[9]  */
-    UCTX_G(8*8, kf[3]);   /* RDI <- kf[3]  */
-    UCTX_G(9*8, kf[2]);   /* RSI <- kf[2]  */
-    UCTX_G(10*8, kf[13]); /* RBP <- kf[13] */
-    UCTX_G(11*8, kf[14]); /* RBX <- kf[14] */
-    UCTX_G(12*8, kf[1]);  /* RDX <- kf[1]  */
-    /* RAX (idx 13): clobbered; restore as 0. */
-    { uint64_t z = 0; UCTX_G(13*8, z); }
-    /* RCX (idx 14): clobbered; restore as 0. */
-    { uint64_t z = 0; UCTX_G(14*8, z); }
-    UCTX_G(15*8, user_rsp);     /* RSP */
-    UCTX_G(16*8, user_rip);     /* RIP */
-    UCTX_G(17*8, user_rflags);  /* EFL */
-    #undef UCTX_G
-
-    /* uc_sigmask at ucontext+296 = frame + 8 + 296 = frame + 304. */
+    /* uc_sigmask: the current blocked mask. */
     {
         uint64_t sm = self->sig_blocked;
-        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) {
-            return 0;
-        }
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
     }
 
-    /*
-     * Rewrite the kernel-side frame.  The handler is entered with:
-     *   RIP = handler, RSP = frame + 8, RFLAGS = user_rflags,
-     *   RDI = n (signum), RSI = 0 (siginfo, NULL in slice 2),
-     *   RDX = frame + 8 (ucontext pointer).
-     */
-    kf[8]  = handler;
-    /*
-     * Handler entry RSP = frame, NOT frame + 8.
-     *
-     * The kernel's frame is:
-     *     [frame + 0]  restorer
-     *     [frame + 8]  ucontext_t (816 bytes)
-     *
-     * The handler is a normal C function.  Its prologue pushes
-     * rbp; its epilogue does `pop rbp; ret`.  If entry RSP is
-     * `frame`, the `pop rbp` eats frame[-8] (user red zone, fine
-     * for the handler's duration) and the `ret` pops frame[0],
-     * which is the restorer.  That is the shape that makes the
-     * restorer the return target.
-     *
-     * If entry RSP were `frame + 8` (the earlier, wrong shape),
-     * `pop rbp` eats frame[8] (uc_flags = 0) and `ret` pops
-     * frame[16] (uc_link = 0), jumping to address 0 -- exactly
-     * the fault the capture showed (RIP 0, CR2 0, error 0x15,
-     * user stack holding puthex's ASCII output below the fault
-     * RSP).
-     */
-    kf[6]  = frame;
-    kf[7]  = user_rflags;
-    kf[3]  = (uint64_t)n;
-    kf[2]  = 0;
-    /*
-     * RDX is the handler's `ucontext_t *` argument.  It points
-     * at the ucontext_t, which starts at frame + 8 (one slot
-     * past the restorer).  Unchanged from before.
-     */
-    kf[1]  = frame + 8;
+    kf[8] = handler;
+    kf[6] = frame;        /* handler-entry RSP: frame, not frame+8 */
+    kf[7] = r.rflags;
+    kf[3] = (uint64_t)n;  /* rdi = signum */
+    kf[2] = 0;            /* rsi = siginfo* (NULL) */
+    kf[1] = frame + 8;    /* rdx = ucontext_t* */
 
-    /* Clear the pending bit and count the delivery. */
+    self->sig_pending &= ~(1ULL << n);
+    g_sig_deliver_count++;
+    return 1;
+}
+
+/*
+ * signal_deliver_frame_iretq -- slice 3's deliver helper, tick path.
+ *
+ * frame_base is a 20-slot iretq frame built by irq0_stub's
+ * PUSH_ALL_GPRS (POP_ALL_GPRS layout):
+ *   [+0x00] r15  [+0x08] r14  [+0x10] r13  [+0x18] r12
+ *   [+0x20] r11  [+0x28] r10  [+0x30] r9   [+0x38] r8
+ *   [+0x40] rbp  [+0x48] rdi  [+0x50] rsi  [+0x58] rdx
+ *   [+0x60] rcx  [+0x68] rbx  [+0x70] rax
+ *   [+0x78] RIP  [+0x80] CS   [+0x88] RFLAGS
+ *   [+0x90] RSP  [+0x98] SS
+ *
+ * The user-stack frame is identical to slice 2's.  The kernel-side
+ * rewrite differs only in offsets: handler at RIP, frame at RSP,
+ * signum at RDI, 0 at RSI, ucontext at RDX.  CS and SS are left
+ * alone (the handler runs in user mode with the same segments).
+ */
+long signal_deliver_frame_iretq(uint64_t frame_base) {
+    pcb_t* self = process_get_current();
+    if (!self) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = 0;
+    while (n < 64 && !(pend & (1ULL << n))) n++;
+    if (n >= 64) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0 || restorer == 0) return 0;
+
+    uint64_t* f = (uint64_t*)frame_base;
+    if (!f) return 0;
+
+    struct sig_frame_regs r;
+    r.gpr[0]  = f[0x00 / 8];   /* r15 */
+    r.gpr[1]  = f[0x08 / 8];   /* r14 */
+    r.gpr[2]  = f[0x10 / 8];   /* r13 */
+    r.gpr[3]  = f[0x18 / 8];   /* r12 */
+    r.gpr[4]  = f[0x20 / 8];   /* r11 */
+    r.gpr[5]  = f[0x28 / 8];   /* r10 */
+    r.gpr[6]  = f[0x30 / 8];   /* r9  */
+    r.gpr[7]  = f[0x38 / 8];   /* r8  */
+    r.gpr[8]  = f[0x40 / 8];   /* rbp */
+    r.gpr[9]  = f[0x48 / 8];   /* rdi */
+    r.gpr[10] = f[0x50 / 8];   /* rsi */
+    r.gpr[11] = f[0x58 / 8];   /* rdx */
+    r.gpr[12] = f[0x60 / 8];   /* rcx */
+    r.gpr[13] = f[0x68 / 8];   /* rbx */
+    r.gpr[14] = f[0x70 / 8];   /* rax */
+    r.rsp    = f[0x90 / 8];
+    r.rflags = f[0x88 / 8];
+    r.rip    = f[0x78 / 8];
+
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
+
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
+    }
+
+    f[0x78 / 8] = handler;
+    f[0x90 / 8] = frame;        /* handler-entry RSP */
+    f[0x88 / 8] = r.rflags;
+    f[0x48 / 8] = (uint64_t)n;  /* rdi = signum */
+    f[0x50 / 8] = 0;            /* rsi = siginfo* (NULL) */
+    f[0x58 / 8] = frame + 8;    /* rdx = ucontext_t* */
+
     self->sig_pending &= ~(1ULL << n);
     g_sig_deliver_count++;
     return 1;
