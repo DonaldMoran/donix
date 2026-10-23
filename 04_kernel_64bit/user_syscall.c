@@ -9042,7 +9042,15 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
     }
     uint64_t handler  = a[0];
     uint64_t restorer = a[2];
-    if (handler == 1) handler = 0;   /* SIG_IGN -> no handler */
+    /* SIG_IGN (1) is kept as 1: it is a disposition, not a
+     * handler address and not SIG_DFL.  Collapsing it to 0 made
+     * it indistinguishable from SIG_DFL, and the deliver helpers
+     * then terminated the process on a signal it had asked to
+     * ignore.  sigterm_ignore found this: SIG_IGN for SIGTERM
+     * followed by kill(SIGTERM) died with status 143.
+     *
+     * SIG_DFL (0) clears the restorer; SIG_IGN does not need one
+     * and does not use one. */
     if (handler == 0) restorer = 0;  /* SIG_DFL -> no restorer  */
 
     uint64_t prev_h = self->signal_handler[signum];
@@ -9413,6 +9421,19 @@ long signal_deliver_frame(uint64_t syscall_result) {
         __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
         return signal_default_action(self, n);
     }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
+    }
     if (restorer == 0) return 0;
 
     extern uint64_t g_syscall_stack_top;
@@ -9511,6 +9532,19 @@ long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
         self->sig_pending &= ~(1ULL << n);
         __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
         return signal_default_action(self, n);
+    }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
     }
     if (restorer == 0) return 0;
 
@@ -9645,6 +9679,19 @@ long signal_deliver_frame_exc(pcb_t* self, uint64_t* raw, int sig) {
         self->sig_pending &= ~(1ULL << n);
         __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
         return signal_default_action(self, n);
+    }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
     }
     if (restorer == 0) return 0;
 
