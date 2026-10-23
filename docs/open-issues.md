@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-10-20** (HEAD `v0.6.17`).  This file lists
-**only open issues**.  Closed items are removed, not struck
+**Last updated: 2026-10-23** (HEAD `20261023-sigign`).  This file
+lists **only open issues**.  Closed items are removed, not struck
 through; their history is in `git log` and `docs/session-log.md`.
 An item appears here only while it is a defect, a missing
 feature, or an unverified claim about the tree.
@@ -14,24 +14,6 @@ not reused.
 ---
 
 ## Open items
-
-**5.  `-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on
-a pipe with no reader returns `-EPIPE` (32), matching Linux's
-errno.  Real Linux also raises `SIGPIPE` first, which by default
-terminates the process before `write` returns.  donix's signal
-path is a stub (item 12), so the signal is not delivered and the
-process sees the errno instead of dying.  A program that checks
-`write`'s return value sees the right answer; a program that
-relies on dying from `SIGPIPE` does not.
-
-The exposure is narrow: busybox apps generally check `write`'s
-return, and `yes | head -n 1` does not hang.  The remaining
-exposure is a program that expects to be *killed* by `SIGPIPE`
-and does not check `write` — none has been found.
-
-Fixing this means implementing signal delivery (item 12).  Same
-subsystem a Wayland `wl_shm` client needs for `SIGBUS` on buffer
-overrun.  Doing it once serves both.
 
 **9.  No privilege model: uid/gid are 0 for every process.**
 No per-process uid/euid split, no setuid bit (FAT has no mode
@@ -77,43 +59,17 @@ No test currently fails because of this; the corruption is
 latent, and the surface is *any* 64-bit computation that gcc
 chooses to vectorize.
 
-**12.  Signal delivery is a stub; a faulted process cannot catch
-its own signal.**  `sys_rt_sigaction` returns 0 and installs
-nothing; `sys_rt_sigprocmask` returns 0 and does nothing.  A
-process that faults is killed; a process that receives `-EPIPE`
-on a write with no reader (item 5) sees the errno and is not
-killed by `SIGPIPE`.
-
-The exit path is honest: a faulted child's wait status is a
-signal-kill encoding, so the parent's shell prints `Segmentation
-fault` and can tell a crash from a clean exit.  But the signal
-is not delivered to the process itself.
-
-A minimal instrument exists — a first-party process can install
-a `SIGSEGV` handler via a minimal `sys_rt_sigaction`, fault, and
-run it (`sigsegv_probe`, staged as `/usr/bin/SIGSEGV_PROBE`).
-The handler does not return; there is no `rt_sigreturn`, no
-masks, no `SA_*` flags, no `oldact`, no queued signals, no
-cross-process delivery.  **That is an instrument, not this
-subsystem.**
-
-Fixing this means implementing signal delivery: a real
-`sys_rt_sigaction`, per-process signal handlers, a raise on the
-fault path that runs the handler if installed, an `rt_sigreturn`
-that restores the frame after the handler returns, and a
-`SIGPIPE` raise on the `-EPIPE` write path.  That is a
-subsystem, not a small change.  Same subsystem a Wayland
-`wl_shm` client needs for `SIGBUS` on buffer overrun.  Doing it
-once serves both.
-
 **13.  `CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's
 job-control code is gated behind `CONFIG_ASH_JOB_CONTROL`, which
 this build does not set.  When a child faults and `sys_wait4`
 returns a signal-kill status, ash's default message is printed,
 but the shell does not do job-control bookkeeping (no `[1]+
-Done` lines, no `fg`/`bg`, no `kill %1`).  It needs the same
-signal delivery as item 12 plus the job-control surface
-(process groups, a controlling terminal, `tcsetpgrp`).  Not
+Done` lines, no `fg`/`bg`, no `kill %1`).  Signal delivery now
+exists (see handoff), so what remains is the job-control surface
+itself: SIGSTOP/SIGTSTP stopping a process instead of
+terminating it (the default-action table maps STOP and CORE to
+TERMINATE until this lands), SIGCONT resuming a stopped process,
+process groups, a controlling terminal, and `tcsetpgrp`.  Not
 small.
 
 **14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
@@ -171,6 +127,38 @@ records a symlink as `lrwxrwxrwx ... -> target`.  One limit
 remains: two empty files with the same name in different
 directories collide in `st_ino`, because `FILINFO` carries no
 parent -- see `fat_ino`.
+
+**`tkill` (200) is implemented as `kill(tid, sig)`.**  Not an
+open issue; noted so it is not re-added.  busybox's `kill`
+applet, signalling itself, issues raw syscall 200; without a
+handler it printed "Unknown syscall: 200" and SIGINT's default
+action could not be exercised.  `tkill(tid, sig)` is
+`kill(tid, sig)` in a single-threaded process, implemented as a
+thin wrapper over `sys_kill` so the raise path stays
+single-sourced (`b976b40`).
+
+**The `-120` frame-base constant is consistent with what is
+tested, not proven.**  `signal_deliver_frame` and
+`sys_rt_sigreturn` both compute the frame base as
+`g_syscall_stack_top - 120`, while `user_syscall_entry.asm`
+pushes 128 bytes (48 callee-saved + 16 RIP/RFLAGS + 8 user RSP
++ 16 r8/r9 + 32 rdi/rsi/rdx/r10, plus a return address and a
+discarded arg5 slot).  The signal gate passing means the
+constant agrees with every tested delivery point; it does not
+prove the derivation.  Any change to the stub's pushes or to a
+delivery point must re-derive it, and a change to one without
+the other is a bug.
+
+**The pipe lost-wakeup equality is a standing question, not a
+live bug.**  `wake_no_waiter == writers_nonzero` was observed on
+a 2026-10-23 capture (`P12`: 8 and 8) and not on the
+`20261023-sigign` boot (`P12`: 0 and 0).  The reader's
+self-clear of `pipe->reader_waiting` was removed at `7aaaafd`,
+which closed the lost-wakeup mechanism; the equality itself was
+never explained.  Do not chase it as a signal bug and do not
+call it closed on one clean run: it is a standing question about
+the pipe wake counts, separate from signals.  If it reproduces
+as a hang, the ring's `P13` events are the place to read.
 
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
@@ -308,8 +296,12 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 - **`mmap_nx`** proves `sys_mmap`'s `PT_NX` gate is enforced.
   Run it when changing `sys_mmap`, the `PROT_*` handling, or the
   leaf-PTE construction.
-- **`sigsegv_probe`** installs a `SIGSEGV` handler via a minimal
-  `sys_rt_sigaction`.  The handler does not return.
+- **`sigsegv_probe`** installs a `SIGSEGV` handler, faults, and
+  edits `ucontext.gregs[16]` so `rt_sigreturn` resumes past the
+  fault.  It is the acceptance check for slice 4.
+- **`sigterm_ignore`** installs `SIG_IGN` for SIGTERM, raises
+  SIGTERM, and prints whether it survived.  It is the acceptance
+  check for the `SIG_IGN` disposition (`20261023-sigign`).
 - **`at_step1` sections**, as of session 41: sections 1–7
   `resolve_at`; 8–9 `faccessat`; 11 `utimensat`.  (There is no
   section 10.)
