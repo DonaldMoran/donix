@@ -515,6 +515,37 @@ timer_preempt_handler(uint64_t stack_pointer) {
         current->timeslice_ticks = 0;
 
         /*
+         * FIX-MIDSYSCALL: a RUNNING kernel-mode current is
+         * mid-syscall.  Its saved frame at current->rsp is the
+         * irq0_stub interrupt frame, not a context_switch switch
+         * frame; dispatching it later via context_switch_resume's
+         * .frame_cs_kernel would iretq into the middle of
+         * syscall_dispatch, abandoning the syscall's return value
+         * on the C stack and re-entering the tick on the next
+         * 10 ms boundary -- the one-character-per-requeue crawl,
+         * and under repeated fork/exec/wait, the shell hang.
+         *
+         * Let the syscall finish: return stack_pointer so
+         * irq0_stub iretqs back into the interrupted instruction.
+         * The next USER-mode tick, after sysret, sets
+         * timeslice_ticks and preempts normally.
+         *
+         * Idle (pid 1) is exempt: it is RUNNING by construction,
+         * and switching from it to a READY user task is what the
+         * kernel-mode branch exists to do.  A BLOCKED kernel-mode
+         * current (a shell in console_read's sti; hlt) is exempt:
+         * its saved frame is a genuine ring-0 switch frame, and
+         * .frame_cs_kernel resumes it correctly.
+         *
+         * This is the same shape as the four refusals below: a
+         * return stack_pointer with no side effects.
+         */
+        if ((frame->cs & 3) == 0 && current->pid != 1 &&
+            current->state == PROC_STATE_RUNNING) {
+            return stack_pointer;
+        }
+
+        /*
          * Refuse the switch when the tick interrupted a queue mutator.
          *
          * scheduler_ready_queue_add / _remove / _next save the

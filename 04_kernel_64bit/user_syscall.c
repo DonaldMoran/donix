@@ -9144,7 +9144,16 @@ long sys_rt_sigreturn(void) {
      * from [rsp+16] in its own post-add layout, which is
      * [kf+7] and [kf+8] here.  So rcx/r11 need no restore. */
 
-    return 0;
+    /*
+     * FIX-SIGRETURN rax: return the interrupted syscall's return
+     * value, not 0.  v[G_RAX] is ucontext.gregs[13], which
+     * signal_deliver_frame stored when it delivered.  Returning 0
+     * made every syscall that a signal was delivered on appear to
+     * return 0 -- wait4 returned 0 instead of the child's pid, and
+     * the shell treated that as "no child reaped".  That was the
+     * sigchld_probe failure and the test.sh cascade.
+     */
+    return (long)v[G_RAX];
 }
 
 /*
@@ -9471,6 +9480,25 @@ long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
 
     uint64_t* f = (uint64_t*)frame_base;
     if (!f) return 0;
+
+    /*
+     * FIX-GUARD kernel frame: only deliver to a USER-mode iretq
+     * frame.  A process blocked in a syscall (wait4, read, ...)
+     * has an iretq frame whose CS slot (f[0x80/8]) is 0x18 --
+     * kernel -- and whose RSP slot is a KERNEL stack pointer.
+     * signal_build_user_frame would build a handler frame on that
+     * kernel stack, and rt_sigreturn would then restore a kernel
+     * context as if it were user.  That was the hang: a process
+     * blocked in wait4 got a SIGCHLD handler frame on its kernel
+     * stack, and never returned to wait4.
+     *
+     * Refuse here.  The bit stays pending, and the syscall-return
+     * delivery (Step A) handles it when the process returns from
+     * the syscall -- for wait4, after the reap, which is the
+     * correct Unix point.  This is the same check
+     * signal_deliver_frame_exc uses for the fault path.
+     */
+    if ((f[0x80 / 8] & 3) != 3) return 0;
 
     struct sig_frame_regs r;
     r.gpr[0]  = f[0x00 / 8];   /* r15 */

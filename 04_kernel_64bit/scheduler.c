@@ -588,6 +588,24 @@ void __attribute__((noreturn)) process_exit(void) {
     if (exiting->parent_pid != 0) {
         exiting->state = PROC_STATE_ZOMBIE;
         process_wake_parent_if_waiting(exiting);
+        /*
+         * FIX-RAISE: SIGCHLD bit-set on the parent, after the wake
+         * and after ZOMBIE.  No wake: SIGCHLD is not an interrupting
+         * signal, and wait4 is unblocked by the correct wake above,
+         * not by this.  The bit is delivered at the next syscall
+         * return (Step A) -- for a process that was blocked in
+         * wait4, that is the wait4 return, after the reap.  Unix.
+         *
+         * The bit-set is in the cli section process_exit already
+         * holds, one critical section with every other writer of
+         * sig_pending.
+         */
+        {
+            pcb_t* _p = process_find_by_pid(exiting->parent_pid);
+            if (_p) {
+                _p->sig_pending |= (1ULL << 17);   /* SIGCHLD */
+            }
+        }
     } else {
         process_reclaim(exiting);
     }
