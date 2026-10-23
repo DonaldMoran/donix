@@ -8440,6 +8440,42 @@ long sys_tgkill(long tgid, long tid, int sig) {
 }
 
 /*
+ * Linux x86_64 tkill(2) -- syscall 200.
+ *
+ * tkill(tid, sig) is the obsolete predecessor of tgkill.  It
+ * signals one thread; in donix every process is its own thread
+ * group, so tid == pid and tkill(tid, sig) is exactly
+ * kill(tid, sig).
+ *
+ * WHY IT EXISTS AT ALL.  busybox's `kill` applet, when signalling
+ * itself, issues raw syscall 200 rather than going through the
+ * libc kill() wrapper.  Without a handler here, `kill -2 $$` hit
+ * the default case and printed "Unknown syscall: 200", so SIGINT's
+ * default action could not be exercised from the shell.
+ *
+ * WHY IT DELEGATES.  The signal-raise path -- the SIGKILL
+ * special case, the pending-bit set, the cli critical section,
+ * the wake-if-blocked -- lives in sys_kill and must not be
+ * duplicated.  A second copy would drift from the first, and the
+ * two would disagree about exactly the things that matter
+ * (SIGKILL, pid 1, the blocked-and-unblocked wake).  Delegating
+ * means tkill and kill cannot give different answers for the
+ * same pid, which is the property a caller relies on.
+ *
+ * The only thing tkill does that tgkill(tid, tid, sig) would not
+ * is nothing -- tgkill(tid, tid, sig) is already defined as
+ * kill(tid, sig) when tgid == tid.  So this is a two-argument
+ * spelling of the same call, and that is the whole of it.
+ *
+ * RETURN.  Same as kill: 0 on success, -EINVAL for a bad signal
+ * or an unsupported pid, -ESRCH for a pid that names no live
+ * process, -EPERM for pid 1.
+ */
+long sys_tkill(long tid, int sig) {
+    return sys_kill(tid, sig);
+}
+
+/*
  * Linux x86_64 ioctl(2) — syscall 16.
  *
  * Previously returned -ENOTTY for every request.  That is fine for
@@ -10406,6 +10442,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_CLOCK_GETTIME:   result = (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1); break;
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); result = 0; break;
         case SYS_TGKILL:          result = (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2); break;
+        case SYS_TKILL:           result = (uint64_t)sys_tkill((long)arg0, (int)arg1); break;
         case SYS_UTIMES:          result = (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1); break;
         case SYS_FUTIMESAT:       result = (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2); break;
         case SYS_NEWFSTATAT:      result = (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3); break;

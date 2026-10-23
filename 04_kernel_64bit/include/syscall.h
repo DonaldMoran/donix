@@ -100,6 +100,7 @@
  * 115  getgroups         sys_getgroups     (returns 0 groups)
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
+ * 200  tkill            sys_tkill         (slice 5: alias of kill; busybox `kill`)
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
  * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
@@ -193,6 +194,7 @@
 #define SYS_GETGROUPS       115
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
+#define SYS_TKILL           200
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_CLOCK_GETTIME   228
@@ -309,6 +311,23 @@ long sys_wait4(long pid, int* user_status, int options);
  */
 long sys_kill(long pid, int sig);
 long sys_tgkill(long tgid, long tid, int sig);
+/*
+ * sys_tkill -- Linux x86_64 tkill(2), syscall 200.
+ *
+ * The obsolete predecessor of tgkill.  tkill(tid, sig) signals
+ * one thread; donix is single-threaded per process, so tid == pid
+ * and this is exactly kill(tid, sig).  It delegates to sys_kill
+ * rather than duplicating the raise path -- one place the
+ * SIGKILL special case, the pending-bit critical section, and
+ * the wake-if-blocked live.
+ *
+ * Added because busybox's `kill` applet issues raw syscall 200
+ * when signalling itself; without it, `kill -2 $$` returned
+ * "Unknown syscall: 200" and SIGINT's default action could not
+ * be exercised.
+ */
+long sys_tkill(long tid, int sig);
+
 /*
  * sys_pipe -- Linux x86_64 pipe(2), syscall 22.
  *
