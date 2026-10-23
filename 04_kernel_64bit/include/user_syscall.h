@@ -37,7 +37,7 @@ void user_syscall_clear_file_table(struct pcb* pcb);
  * at frame_base (POP_ALL_GPRS layout: r15..rax at +0x00..+0x70,
  * RIP +0x78, CS +0x80, RFLAGS +0x88, RSP +0x90, SS +0x98).  Both
  * return 1 if a signal was delivered, 0 otherwise. */
-long signal_deliver_frame(void);
+long signal_deliver_frame(uint64_t syscall_result);  /* STEP-A2 deliver-result */
 long signal_deliver_frame_iretq(struct pcb* self, uint64_t frame_base);
 
 /*

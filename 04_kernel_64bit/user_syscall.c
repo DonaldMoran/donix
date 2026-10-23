@@ -9332,7 +9332,14 @@ static long signal_default_action(pcb_t* self, int sig) {
  * kf[9]=r15, kf[3]=rdi, kf[2]=rsi, kf[13]=rbp, kf[14]=rbx,
  * kf[1]=rdx), the same mapping the original used.
  */
-long signal_deliver_frame(void) {
+long signal_deliver_frame(uint64_t syscall_result) {
+    /* STEP-A2 deliver-result:
+     * syscall_result is the interrupted syscall's return value.
+     * It goes into ucontext.gregs[13] (RAX) so the handler can
+     * read it and rt_sigreturn restores it -- Unix: the caller
+     * sees its own return value after the handler runs.  At
+     * 7245390 the value was hardcoded 0 because delivery ran
+     * before the syscall. */
     pcb_t* self = process_get_current();
     if (!self) return 0;
     if (self->in_signal_handler) return 0;
@@ -9381,7 +9388,7 @@ long signal_deliver_frame(void) {
     r.gpr[11] = kf[1];   /* rdx */
     r.gpr[12] = 0;       /* rcx: syscall-clobbered */
     r.gpr[13] = kf[14];  /* rbx */
-    r.gpr[14] = 0;       /* rax: syscall-clobbered */
+    r.gpr[14] = syscall_result;  /* rax: interrupted syscall's result */
     r.rsp    = kf[6];
     r.rflags = kf[7];
     r.rip    = kf[8];
@@ -10279,57 +10286,27 @@ uint64_t syscall_dispatch(uint64_t num,
     }
     (void)arg3; (void)arg4; (void)arg5;
 
-    /* --- signal delivery, slice 2 --- */
-    /*
-     * Run the deliver check on the way OUT to user mode, at the
-     * top of this function (which is where syscall_dispatch has
-     * always returned through on every syscall), not as a
-     * separate `call` from the asm stub.  The asm form was the
-     * version that produced the boot-time #PF at musl_sh's
-     * prompt (RIP 0x40B845, CR2 0x1000) -- the extra call on
-     * the stub's frame at that depth pushed the kernel stack
-     * past what the deeper syscalls (musl_sh's read(0)) could
-     * absorb, and the stub's pops read user-stack data as the
-     * resume frame.  The rewrite target is unchanged:
-     * signal_deliver_frame() writes into the asm frame at
-     * g_syscall_stack_top - 120, which is the same frame the
-     * stub is about to pop.
-     *
-     * Runs with interrupts off (the stub has issued cli before
-     * the exit checks and has not issued sti).  A signal
-     * delivered here rewrites the asm frame, and the stub's
-     * epilogue returns the process to its handler instead of
-     * to the syscall's continuation -- exactly slice 2's
-     * design (signal-design.md, slice 2).
-     */
-    {
-        pcb_t* _sd_self = process_get_current();
-        if (_sd_self &&
-            (_sd_self->sig_pending & ~_sd_self->sig_blocked) != 0) {
-            signal_deliver_frame();
-        }
-    }
-
+    uint64_t result = 0;
     switch (num) {
 
         /* --- Linux x86_64 numbers, strictly ascending --- */
-        case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
-        case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
-        case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
-        case SYS_OPENAT:          return (uint64_t)sys_openat((int)arg0, (const char*)arg1, (int)arg2);
-        case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
-        case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
-        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
-        case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
-        case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
-        case SYS_LSEEK:           return (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2);
-        case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
-        case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
-        case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
-        case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
-        case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-        // case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-                case SYS_RT_SIGRETURN:    return (uint64_t)sys_rt_sigreturn();
+        case SYS_READ:            result = (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2); break;
+        case SYS_WRITE:           result = (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2); break;
+        case SYS_OPEN:            result = (uint64_t)sys_open((const char*)arg0, (int)arg1); break;
+        case SYS_OPENAT:          result = (uint64_t)sys_openat((int)arg0, (const char*)arg1, (int)arg2); break;
+        case SYS_CLOSE:           result = (uint64_t)sys_close((int)arg0); break;
+        case SYS_STAT:            result = (uint64_t)sys_stat((const char*)arg0, (void*)arg1); break;
+        case SYS_FSTAT:           result = (uint64_t)sys_fstat((int)arg0, (void*)arg1); break;
+        case SYS_LSTAT:           result = (uint64_t)sys_lstat((const char*)arg0, (void*)arg1); break;
+        case SYS_POLL:            result = (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2); break;
+        case SYS_LSEEK:           result = (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2); break;
+        case SYS_MMAP:            result = (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5); break;
+        case SYS_MPROTECT:        result = (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2); break;
+        case SYS_MUNMAP:          result = (uint64_t)sys_munmap((void*)arg0, (size_t)arg1); break;
+        case SYS_BRK:             result = (uint64_t)sys_brk((void*)arg0); break;
+        case SYS_RT_SIGACTION:    result = (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3); break;
+        // case SYS_RT_SIGPROCMASK:  result = (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3); break;
+                case SYS_RT_SIGRETURN:    result = (uint64_t)sys_rt_sigreturn(); break;
         case SYS_RT_SIGPROCMASK: {
             /* Snapshot the user stack around g_user_rsp_save before
              * the handler runs.  Diagnostic for item 7e only. */
@@ -10349,74 +10326,108 @@ uint64_t syscall_dispatch(uint64_t num,
                     g_sys14_valid = 1;
                 }
             }
-            return (uint64_t)sys_rt_sigprocmask((int)arg0,
+            result = (uint64_t)sys_rt_sigprocmask((int)arg0,
                                                 (const void*)arg1,
                                                 (void*)arg2,
-                                                (size_t)arg3);
+                                                (size_t)arg3); break;
         }
         
-        case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
-        case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
-        case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
-        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
-        case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
-        case SYS_DUP:             return (uint64_t)sys_dup((int)arg0);
-        case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
-        case SYS_NANOSLEEP:       return (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1);
-        case SYS_GETPID:          return (uint64_t)sys_getpid();
-        case SYS_FORK:            return (uint64_t)sys_fork();
-        case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
-        case SYS_EXIT:            sys_exit((int)arg0); return 0;
-        case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
-        case SYS_KILL:            return (uint64_t)sys_kill((long)arg0, (int)arg1);
-        case SYS_UNAME:           return (uint64_t)sys_uname((void*)arg0);
-        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
-        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
-        case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
-        case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
-        case SYS_RENAME:          return (uint64_t)sys_rename((const char*)arg0, (const char*)arg1);
-        case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
-        case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
-        case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_IOCTL:           result = (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2); break;
+        case SYS_READV:           result = (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2); break;
+        case SYS_WRITEV:          result = (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2); break;
+        case SYS_ACCESS:          result = (uint64_t)sys_access((const char*)arg0, (int)arg1); break;
+        case SYS_PIPE:            result = (uint64_t)sys_pipe((int*)arg0); break;
+        case SYS_DUP:             result = (uint64_t)sys_dup((int)arg0); break;
+        case SYS_DUP2:            result = (uint64_t)sys_dup2((int)arg0, (int)arg1); break;
+        case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
+        case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
+        case SYS_FORK:            result = (uint64_t)sys_fork(); break;
+        case SYS_EXECVE:          result = (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2); break;
+        case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
+        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
+        case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
+        case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
+        case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
+        case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
+        case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
+        case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
+        case SYS_RENAME:          result = (uint64_t)sys_rename((const char*)arg0, (const char*)arg1); break;
+        case SYS_MKDIR:           result = (uint64_t)sys_mkdir((const char*)arg0, (int)arg1); break;
+        case SYS_RMDIR:           result = (uint64_t)sys_rmdir((const char*)arg0); break;
+        case SYS_UNLINK:          result = (uint64_t)sys_unlink((const char*)arg0); break;
 
-        case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
-        case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
-        case SYS_CHMOD:           return (uint64_t)sys_chmod((const char*)arg0, (int)arg1);
-        case SYS_FCHMOD:          return (uint64_t)sys_fchmod((int)arg0, (int)arg1);
-        case SYS_CHOWN:           return (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2);
-        case SYS_FCHOWN:          return (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2);
-        case SYS_SYSINFO:         return (uint64_t)sys_sysinfo((void*)arg0);
-        case SYS_GETUID:          return (uint64_t)sys_getuid();
-        case SYS_GETGID:          return (uint64_t)sys_getgid();
-        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
-        case SYS_GETEGID:         return (uint64_t)sys_getegid();
-        case SYS_GETPPID:         return (uint64_t)sys_getppid();
-        case SYS_SETSID:          return (uint64_t)sys_setsid();
-        case SYS_GETGROUPS:       return (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1);
+        case SYS_SYMLINK:         result = (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1); break;
+        case SYS_READLINK:        result = (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2); break;
+        case SYS_CHMOD:           result = (uint64_t)sys_chmod((const char*)arg0, (int)arg1); break;
+        case SYS_FCHMOD:          result = (uint64_t)sys_fchmod((int)arg0, (int)arg1); break;
+        case SYS_CHOWN:           result = (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2); break;
+        case SYS_FCHOWN:          result = (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2); break;
+        case SYS_SYSINFO:         result = (uint64_t)sys_sysinfo((void*)arg0); break;
+        case SYS_GETUID:          result = (uint64_t)sys_getuid(); break;
+        case SYS_GETGID:          result = (uint64_t)sys_getgid(); break;
+        case SYS_GETEUID:         result = (uint64_t)sys_geteuid(); break;
+        case SYS_GETEGID:         result = (uint64_t)sys_getegid(); break;
+        case SYS_GETPPID:         result = (uint64_t)sys_getppid(); break;
+        case SYS_SETSID:          result = (uint64_t)sys_setsid(); break;
+        case SYS_GETGROUPS:       result = (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1); break;
 
-        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
-        case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
-        case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
-        case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
-        case SYS_CLOCK_GETTIME:   return (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1);
-        case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
-        case SYS_TGKILL:          return (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2);
-        case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
-        case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
-        case SYS_NEWFSTATAT:      return (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3);
-        case SYS_UNLINKAT:        return (uint64_t)sys_unlinkat((int)arg0, (const char*)arg1, (int)arg2);
-        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
-        case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
-        case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
-        case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
-        case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
+        case SYS_PRCTL:           result = (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0); break;
+        case SYS_ARCH_PRCTL:      result = (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1); break;
+        case SYS_GETDENTS64:      result = (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2); break;
+        case SYS_SET_TID_ADDRESS: result = (uint64_t)sys_set_tid_address((int*)arg0); break;
+        case SYS_CLOCK_GETTIME:   result = (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1); break;
+        case SYS_EXIT_GROUP:      sys_exit((int)arg0); result = 0; break;
+        case SYS_TGKILL:          result = (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2); break;
+        case SYS_UTIMES:          result = (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1); break;
+        case SYS_FUTIMESAT:       result = (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2); break;
+        case SYS_NEWFSTATAT:      result = (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3); break;
+        case SYS_UNLINKAT:        result = (uint64_t)sys_unlinkat((int)arg0, (const char*)arg1, (int)arg2); break;
+        case SYS_FACCESSAT:       result = (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3); break;
+        case SYS_SET_ROBUST_LIST: result = (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1); break;
+        case SYS_UTIMENSAT:       result = (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3); break;
+        case SYS_GETRANDOM:       result = (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2); break;
+        case SYS_RSEQ:            result = (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3); break;
 
         /* --- donix-private numbers (500+) --- */
-        case SYS_REBOOT:          kernel_do_reboot(); return 0;
+        case SYS_REBOOT:          kernel_do_reboot(); result = 0; break;
 
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");
-            return -(long)ENOSYS_;
+            result = -(long)ENOSYS_; break;
     }
+    /*
+     * STEP-A delivery-on-the-way-out
+     *
+     * Deliver a pending signal on the way OUT of the syscall, with
+     * the interrupted syscall's result preserved in ucontext[13]
+     * (RAX).  Unix: the handler can read the interrupted syscall's
+     * return value, and rt_sigreturn restores it so the caller sees
+     * it.
+     *
+     * NEVER deliver on the way out of:
+     *   SYS_EXIT (60), SYS_EXIT_GROUP (231) -- noreturn.
+     *   SYS_RT_SIGRETURN (15) -- its job is to reconstruct this
+     *     frame from a ucontext; delivering on top of it writes a
+     *     handler frame over the one it just restored, and the
+     *     inner rt_sigreturn restores from a ucontext the outer
+     *     delivery overwrote (corrupted sysret RIP/RSP).  This was
+     *     the 3b52bf3 bug.
+     *   SYS_EXECVE (59) -- rewrites the frame itself; excluded
+     *     conservatively.  A later step tests pending-across-exec.
+     *
+     * The stub's frame is at g_syscall_stack_top - 120 before and
+     * after the switch; only the timing of the rewrite changes.
+     * Interrupts are off here (the stub issued cli, no sti yet).
+     */
+    {
+        pcb_t* _sd_self = process_get_current();
+        if (_sd_self &&
+            num != SYS_EXIT && num != SYS_EXIT_GROUP &&
+            num != SYS_RT_SIGRETURN && num != SYS_EXECVE &&
+            (_sd_self->sig_pending & ~_sd_self->sig_blocked) != 0) {
+            signal_deliver_frame(result);
+        }
+    }
+    return result;
 }
