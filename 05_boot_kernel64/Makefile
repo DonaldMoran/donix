@@ -262,6 +262,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/sigsegv_probe.elf"  SIGSEGV_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/kill_self.elf"      KILL_SELF ; \
 	mcopy_one "$(USERLAND_BIN)/sigspin.elf"     SIGSPIN ; \
+	mcopy_one "$(USERLAND_BIN)/sigchld_probe.elf"  SIGCHLD_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio.elf"  PIPE7E_STDIO ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_sjlj.elf"  PIPE7E_STDIO_SJLJ ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_heapjmp.elf"  PIPE7E_STDIO_HEAPJMP ; \
