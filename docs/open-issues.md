@@ -142,17 +142,46 @@ action could not be exercised.  `tkill(tid, sig)` is
 thin wrapper over `sys_kill` so the raise path stays
 single-sourced (`b976b40`).
 
-**The `-120` frame-base constant is consistent with what is
-tested, not proven.**  `signal_deliver_frame` and
-`sys_rt_sigreturn` both compute the frame base as
-`g_syscall_stack_top - 120`, while `user_syscall_entry.asm`
-pushes 128 bytes (48 callee-saved + 16 RIP/RFLAGS + 8 user RSP
-+ 16 r8/r9 + 32 rdi/rsi/rdx/r10, plus a return address and a
-discarded arg5 slot).  The signal gate passing means the
-constant agrees with every tested delivery point; it does not
-prove the derivation.  Any change to the stub's pushes or to a
-delivery point must re-derive it, and a change to one without
-the other is a bug.
+**The `g_syscall_stack_top - 120` frame base is derived and
+correct.**  `user_syscall_entry.asm` pushes, in order, six
+callee-saved GPRs (48 bytes), user RIP and RFLAGS (16), user RSP
+(8), r8 and r9 (16), and rdi/rsi/rdx/r10 (32) — 120 bytes total,
+from `g_syscall_stack_top` down.  The frame is:
+
+    g_syscall_stack_top -  8   rbx
+                         - 16   rbp
+                         - 24   r12
+                         - 32   r13
+                         - 40   r14
+                         - 48   r15
+                         - 56   user RIP
+                         - 64   user RFLAGS
+                         - 72   user RSP
+                         - 80   r8
+                         - 88   r9
+                         - 96   rdi
+                         -104   rsi
+                         -112   rdx
+                         -120   r10    <- frame base
+
+`signal_deliver_frame` and `sys_rt_sigreturn` both compute
+`g_syscall_stack_top - 120` as `kf`, and `kf[0]` is the r10 slot
+at -120, `kf[4]` is r9 at -88, `kf[6]` is user RSP at -72,
+`kf[7]` is user RFLAGS at -64, `kf[8]` is user RIP at -56, and
+`kf[14]` is rbx at -8.  Every offset lines up with the push
+order.
+
+The number that confused an earlier note — 128 — is the value of
+`rsp` during the `call syscall_dispatch`, because the call's
+return address adds 8 bytes below the frame (and `add rsp, 8`
+after the call discards the stacked arg5).  It is not the frame
+base.  The frame base is 120, and both functions are right to
+use it.
+
+Fragility worth naming: the constant is coupled to the stub's
+push sequence.  If a push is added, removed, or reordered,
+`kf[]` must be re-derived and the two C functions updated in the
+same commit.  A change to one side without the other is a bug.
 
 **The pipe lost-wakeup equality is a standing question, not a
 live bug.**  `wake_no_waiter == writers_nonzero` was observed on
