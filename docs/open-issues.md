@@ -64,13 +64,18 @@ job-control code is gated behind `CONFIG_ASH_JOB_CONTROL`, which
 this build does not set.  When a child faults and `sys_wait4`
 returns a signal-kill status, ash's default message is printed,
 but the shell does not do job-control bookkeeping (no `[1]+
-Done` lines, no `fg`/`bg`, no `kill %1`).  Signal delivery now
-exists (see handoff), so what remains is the job-control surface
-itself: SIGSTOP/SIGTSTP stopping a process instead of
-terminating it (the default-action table maps STOP and CORE to
-TERMINATE until this lands), SIGCONT resuming a stopped process,
-process groups, a controlling terminal, and `tcsetpgrp`.  Not
-small.
+Done` lines, no `fg`/`bg`, no `kill %1`).
+
+Signals are done (see handoff): raise, delivery at three points,
+dispositions including `SIG_IGN`, the default-action table, and
+`SIGCHLD` reaching `wait4` all work.  What is not built is the
+job-control surface *on top of* that machinery: there is no
+stopped process state (`signal_default_action` maps SIGSTOP and
+SIGTSTP to TERMINATE, the documented placeholder), no SIGCONT
+resume path, no process groups (`sys_kill` refuses `pid <= 0`),
+no controlling terminal, no `tcsetpgrp`/`setpgid`, and
+`CONFIG_ASH_JOB_CONTROL` is unset so ash has no job table.  Not
+small, but the hard half -- the signal substrate -- is in.
 
 **14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
 works only because busybox ash falls back on `ENOEXEC` and runs
@@ -151,8 +156,8 @@ the other is a bug.
 
 **The pipe lost-wakeup equality is a standing question, not a
 live bug.**  `wake_no_waiter == writers_nonzero` was observed on
-a 2026-10-23 capture (`P12`: 8 and 8) and not on the
-`20261023-sigign` boot (`P12`: 0 and 0).  The reader's
+two 2026-10-23 captures (`P12`: 8 and 8, and 2 and 2) and not on
+the `20261023-sigign` boot (`P12`: 0 and 0).  The reader's
 self-clear of `pipe->reader_waiting` was removed at `7aaaafd`,
 which closed the lost-wakeup mechanism; the equality itself was
 never explained.  Do not chase it as a signal bug and do not
@@ -179,6 +184,27 @@ in a base register, or a segment violation.  It needs its own
 instrument — a first-party reproduction of the `find` sequence,
 or a kernel-side `#GP` handler trace — before it is guessed at.
 It is not the same fault as 7a and must not be folded into 7a.
+
+**Observed again, 2026-10-23, and not reproduced.**  A user-mode
+`#PF` fired during 5000 iterations of `echo hi | wc` in a boot
+that had first run `sigchld_probe`, `kill_self`, `sigsegv_probe`,
+and `sigterm_ignore`.  CR2 `0x876CA6`, RIP `0x413962`, error
+`0x5` (present + user + read), the CR2 inside the 2 MB page at
+phys base `0x800000` — a user-mode read of a kernel physical
+address, which is the 7b/7e signature.  The boot's capture
+contained exactly one `#PF`; the nine signal probes were clean.
+The kernel killed the faulting busybox and returned to the
+fallback `musl_sh` prompt; the system survived.
+
+Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
+boot all completed cleanly; a probe-then-5000 run on a later
+boot reached 5000.  So the loop is not the cause and 5000 is not
+a threshold; the fault is intermittent.  Do not chase it as a
+signal bug (the probes are not implicated) and do not call it
+closed on one clean run.  It is the same family as the
+`0x42F1A7` `#GP` (7b) and the ash stale-`jmp_buf` (7e), and the
+next session that touches the VFS, fork, or exec paths should
+read this first.
 
 **Disassembly of the current build (2026-10-18).**  `third_party/busybox/busybox` is non-PIE (`Type: EXEC`, load base `0x400000`); `0x42F1A7` is inside the executable PT_LOAD but is **not an instruction boundary** -- it falls inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.  Starting a disassembly at `0x42F1A7` yields a spurious `movabs`, which is the tell.  The nearest real instructions that can raise a user `#GP(0)` are `0x42F1A3` (`mov 0xa0(%r12),%rdi`, a non-canonical `%r12`) and `0x42F1AB` (`cmpb $0x0,0x1(%rbp)`, a non-canonical `%rbp` set by `xchg %rax,%rbp` at `0x42F197` from a returned pointer).  No SSE/XMM instruction appears in the window, so 7b is **not** a face of item 10.  The recorded address is therefore either a fault/operand address, a transcription slip, or from an older build.  Suspected (not proven) to be a downstream symptom of a pre-v0.6.13 corruption race (heap cycle / pipe wake / `C`); unobserved since those closed.  The standing test is a 100 Hz soak (PIPE7E-ALL-PASS, 250000 iterations @ 100 Hz over >3.5 hours, 2026-10-18); if it recurs, inspect `%r12`/`%rbp` at `0x42F1A3`/`0x42F1AB` and trace the corruption upstream of `find`.
 
