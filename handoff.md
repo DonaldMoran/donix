@@ -5,9 +5,10 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-23.  **`v0.6.17` is the last release.
-Signals slices 1-5 are DONE on `dev`.**  The restore point is
-`20261023-sigign`.  Every path syscall reaches its filesystem
+**Last updated:** 2026-10-28.  **`v0.6.18` is released.**  Signals
+slices 1-5 are in it, with `tkill`, the busybox `KILL` applet, and
+the `SIG_IGN` fix.  The release tag carries the per-release
+summary.  Every path syscall reaches its filesystem
 through the mount table (`mount_driver(backend)->op(...)`); the
 resolver is `vfs_resolve(path, follow_final)`; symlinks work end to
 end.  `test.sh` is 57/57 and `canary --full` is 28/28, verified
@@ -39,16 +40,15 @@ SIGCHLD does not interrupt a blocked `wait4`, there is no
 than stop.  SSE state is not saved (open-issues item 10).  No
 privilege model (item 9).
 
-**THE RELEASE TAGS.**  `v0.6.16` (the VFS) and `v0.6.17` (FAT
-`st_ino`, `tar`, `chmod`/`chown`) are the release record; their
-annotations carry the per-release summary.  The scratch
-`2026MMDD-*` tags since `v0.6.17` are development restore points
-and are dropped when `v0.6.18` ships.
+**THE RELEASE TAGS.**  `v0.6.16` (the VFS), `v0.6.17` (FAT
+`st_ino`, `tar`, `chmod`/`chown`), and `v0.6.18` (signals slices
+1-5) are the release record; their annotations carry the
+per-release summary.  `v0.6.18`'s scratch tags have been dropped.
 
 **WHERE WE ARE.**  `v0.6.15` (busybox batch 1), `v0.6.16` (the
-VFS), and `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`) are
-released.  The working tree is `dev`, ahead of `origin/dev` by 37
-commits, nothing pushed.  Pre-`v0.6.18`.
+VFS), `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`), and
+`v0.6.18` (signals slices 1-5) are released.  Work is now
+pre-`v0.6.19`.  The working tree is `dev`, clean.
 
 **NEXT.**  Signals are done for the scope they were given.  The
 three remaining gaps are real work, not probes, and each is its
@@ -330,10 +330,10 @@ be dropped.
 Do not use `git push --tags` -- it would push the scratch tags.
 Push `vX.Y.Z` by name.
 
-**Current release state.**  **`v0.6.17` is released.**  Work is
-now pre-**`v0.6.18`**.  The release tags `v0.6.15`, `v0.6.16`,
-and `v0.6.17` carry their summaries; the scratch tags they were
-drawn from have been dropped.
+**Current release state.**  **`v0.6.18` is released.**  Work is
+now pre-**`v0.6.19`**.  The release tags `v0.6.15` through
+`v0.6.18` carry their summaries; the scratch tags they were drawn
+from have been dropped.
 
 ---
 
@@ -450,21 +450,11 @@ before dropping them.
 
 ## One-line summary
 
-**`v0.6.17` is the last release (VFS, FAT `st_ino`, `tar`,
-`chmod`/`chown`).  Since then, on `dev` (37 commits, nothing
-pushed): `ps -l` via `sys_sysinfo` (99) and a real
-`creation_time`; the kernel shell's echo goes to serial
-(`b06787d`); and **signals slices 1-5 are DONE** -- slice 1
-`588ae53`/`3f60a19`/`ce69a7b`; slice 2 `866588f`/`d2126d8`;
-slice 3 `17ffeb9`/`a1c90ff`/`c4b3ba7`; slice 4
-`1d256ed`/`f90d517`; slice 5 `7245390` plus the SIGCHLD half
-`593b349`/`dfd5240`/`42302e7`; `tkill` `b976b40`; busybox
-`CONFIG_KILL` `33c4384`; `SIG_IGN` fix `6de2d63`.  Gate:
-`test.sh` 57/57, `canary --full` 28/28, three times interleaved.
-Default actions verified by exit status: SIGKILL 137, SIGTERM
-143, SIGINT 130; SIGPIPE by `yes | head`; SIG_IGN by
-`sigterm_ignore` status 0.  Restore point: `20261023-sigign`.
-Next: the three signal gaps (SIGCHLD-interrupts-wait,
-`sigsuspend`, job control), then shebang+/bin/sh, SSE,
-privilege.  Read `docs/contract.md` and "NEXT" in this file
-before any code.**
+**`v0.6.18` is the last release: signals slices 1-5, `tkill`,
+busybox `KILL`, `SIG_IGN` fixed.**  The signal work is verified
+by running -- nine probes, two full probe runs, four consecutive
+gate runs at 28/28 + 57/57 -- and the three remaining signal gaps
+(SIGCHLD-interrupts-wait, `sigsuspend`, job control) are named in
+"NEXT" and open-issues item 13.  Next: those three, then
+shebang+/bin/sh, SSE, privilege.  Read `docs/contract.md` and
+"NEXT" in this file before any code.**
