@@ -10,6 +10,7 @@
 #include "include/user_syscall.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/interrupts.h"
 #include <string.h>
 #include <stddef.h>
 
@@ -138,6 +139,7 @@ static void process_initialize_pcb(pcb_t* pcb) {
     pcb->parent_pid = 0;
     pcb->exit_status = 0;
     pcb->wait_pid = 0;
+    pcb->creation_time = g_ticks;   /* 100 Hz; /proc/<pid>/stat field 22 */
     process_count++;
 }
 
@@ -830,6 +832,17 @@ void process_dump_all(void) {
     serial_print("\n=== PROCESS LIST ===\n");
     serial_print("PID  Name                State    Entry     Kernel Stack\n");
     serial_print("---  -------------------  -------  ----------  ----------\n");
+    /*
+     * Signal counters -- slice 1 of docs/signal-design.md,
+     * question 6.  g_sig_deliver_count is 0 in slice 1; slice 2
+     * is the commit that increments it.  Defined in
+     * user_syscall.c.
+     */
+    extern volatile uint64_t g_sig_raise_count;
+    extern volatile uint64_t g_sig_deliver_count;
+    serial_print("sig_raise=");   serial_print_dec(g_sig_raise_count);
+    serial_print(" sig_deliver="); serial_print_dec(g_sig_deliver_count);
+    serial_print("\n");
     serial_unlock();
 
 #if RACE_PROBE_DUMP_VGA
@@ -1007,6 +1020,15 @@ void process_reclaim(pcb_t* pcb) {
      */
     for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
     pcb->in_signal_handler = 0;
+    /*
+     * Clear the signal masks too.  sig_pending and sig_blocked
+     * are per-process (see pcb_t); a reused PCB slot must not
+     * carry the previous process's pending bits or blocked
+     * mask, for the same reason signal_handler[] is cleared.
+     */
+    pcb->sig_pending = 0;
+    pcb->sig_blocked = 0;
+    for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
     process_count--;
 }
 
@@ -1024,6 +1046,11 @@ void process_destroy(pcb_t* pcb) {
     pcb->fault_signal = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_handler[_i] = 0;
     pcb->in_signal_handler = 0;
+    /* See the comment in process_reclaim: the signal masks are
+     * per-process and must not survive slot reuse. */
+    pcb->sig_pending = 0;
+    pcb->sig_blocked = 0;
+    for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) scheduler_set_current(NULL);

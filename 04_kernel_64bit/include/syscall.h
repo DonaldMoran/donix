@@ -61,6 +61,7 @@
  *  12  brk               sys_brk
  *  13  rt_sigaction      sys_rt_sigaction  (stub)
  *  14  rt_sigprocmask    sys_rt_sigprocmask(stub)
+ *  15  rt_sigreturn      sys_rt_sigreturn  (slice 2: restores from user-stack frame)
  *  16  ioctl             sys_ioctl
  *  19  readv             sys_readv
  *  20  writev            sys_writev
@@ -74,6 +75,7 @@
  *  59  execve            sys_execve
  *  60  exit              sys_exit
  *  61  wait4             sys_wait4
+ *  62  kill              sys_kill           (slice 1: pending bit, no delivery)
  *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
  *  77  ftruncate         sys_ftruncate     (session 31)
@@ -98,10 +100,12 @@
  * 115  getgroups         sys_getgroups     (returns 0 groups)
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
+ * 200  tkill            sys_tkill         (slice 5: alias of kill; busybox `kill`)
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
  * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
  * 231  exit_group        sys_exit_group -> sys_exit
+ * 234  tgkill            sys_tgkill         (slice 1: pending bit, no delivery)
  * 235  utimes            sys_utimes        (session 31; no-op stub)
  * 257  openat            sys_openat        (resolve_at; find needs it)
  * 261  futimesat         sys_futimesat     (session 31; no-op stub)
@@ -117,9 +121,7 @@
  * CANONICAL NUMBERS — known gaps (not yet implemented)
  * ------------------------------------------------------------
  *
- *  99  gettimeofday      -- `ps -l` reaches it; a small
- *                           syscall from g_ticks.  See
- *                           docs/open-issues.md.
+ *  99  sysinfo           sys_sysinfo        (from g_ticks + PMM)
  *
  * ------------------------------------------------------------
  * DONIX-PRIVATE NUMBERS (500+)
@@ -152,6 +154,7 @@
 #define SYS_BRK             12
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
+#define SYS_RT_SIGRETURN    15
 #define SYS_IOCTL           16
 #define SYS_READV           19
 #define SYS_WRITEV          20
@@ -165,6 +168,7 @@
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
+#define SYS_KILL            62
 #define SYS_UNAME           63
 #define SYS_FCNTL           72
 #define SYS_FTRUNCATE       77
@@ -176,6 +180,11 @@
 #define SYS_UNLINK          87
 #define SYS_SYMLINK         88
 #define SYS_READLINK        89
+#define SYS_CHMOD           90
+#define SYS_FCHMOD          91
+#define SYS_CHOWN           92
+#define SYS_FCHOWN          93
+#define SYS_SYSINFO          99
 #define SYS_GETUID          102
 #define SYS_GETGID          104
 #define SYS_GETEUID         107
@@ -183,16 +192,14 @@
 #define SYS_GETPPID         110
 #define SYS_SETSID          112
 #define SYS_GETGROUPS       115
-#define SYS_CHMOD            90
-#define SYS_FCHMOD           91
-#define SYS_CHOWN            92
-#define SYS_FCHOWN           93
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
+#define SYS_TKILL           200
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
+#define SYS_TGKILL          234
 #define SYS_UTIMES          235
 #define SYS_OPENAT          257
 #define SYS_FUTIMESAT       261
@@ -284,6 +291,43 @@ long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_newfstatat(int dirfd, const char* pathname, void* user_stat, int flags);
 long sys_wait4(long pid, int* user_status, int options);
+/*
+ * kill(62) and tgkill(234) -- slice 1 of docs/signal-design.md.
+ *
+ * Declared here, not in include/user_syscall.h, because they are
+ * reached from two translation units: the syscall dispatcher and
+ * kmain.c's killtest child (the kernel-side twin of kill_self,
+ * which makes the sigdump acceptance line observable in the one
+ * shell that has a process dump).
+ *
+ * sys_kill sets the target's sig_pending bit and wakes it if it
+ * is BLOCKED and the signal is unblocked.  It does not deliver:
+ * that is slice 2's frame work.  pid <= 0 is -EINVAL (donix has
+ * no process groups); sig == 0 is the existence check; -ESRCH
+ * for a pid that names no live process.
+ *
+ * sys_tgkill requires tgid == tid (donix has one thread per
+ * process) and is otherwise kill(tid, sig).
+ */
+long sys_kill(long pid, int sig);
+long sys_tgkill(long tgid, long tid, int sig);
+/*
+ * sys_tkill -- Linux x86_64 tkill(2), syscall 200.
+ *
+ * The obsolete predecessor of tgkill.  tkill(tid, sig) signals
+ * one thread; donix is single-threaded per process, so tid == pid
+ * and this is exactly kill(tid, sig).  It delegates to sys_kill
+ * rather than duplicating the raise path -- one place the
+ * SIGKILL special case, the pending-bit critical section, and
+ * the wake-if-blocked live.
+ *
+ * Added because busybox's `kill` applet issues raw syscall 200
+ * when signalling itself; without it, `kill -2 $$` returned
+ * "Unknown syscall: 200" and SIGINT's default action could not
+ * be exercised.
+ */
+long sys_tkill(long tid, int sig);
+
 /*
  * sys_pipe -- Linux x86_64 pipe(2), syscall 22.
  *

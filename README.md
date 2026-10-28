@@ -67,7 +67,9 @@ That's the point. That's the whole point.
   `prctl`, `ftruncate`, `lseek`, `rename`, `utimensat`, `unlink`,
   `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
   `symlink`, `chmod`, `fchmod`, `chown`, `fchown`,
-  `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`) -
+  `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`), `kill`,
+  `tgkill`, `tkill`, `rt_sigaction`, `rt_sigprocmask`,
+  `rt_sigreturn` -
   the numbers
   and semantics match Linux x86_64. musl's `printf`, `malloc`, and
   `opendir` work unmodified.
@@ -90,12 +92,30 @@ That's the point. That's the whole point.
   `mkdir`, `rm`, `rmdir`, `touch`, `false`, `true`, `yes`, `seq`,
   `clear`, `basename`, `dirname`, `unlink`, `ttysize`, `tty`,
   `stty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
-  `printenv`, `bc`, `dc`, `diff`, `du`, `awk` - run
+  `printenv`, `bc`, `dc`, `diff`, `du`, `awk`, `tar` - run
   in-process via standalone mode, and `/bin/busybox` is a real path
   on the image. It forks and execs external binaries, and it shares
   the working directory with the rest of the system. This is the
   strongest evidence that the syscall ABI is right - busybox expects
   a real Unix kernel underneath it, and on donix it gets one.
+- **Handles signals.** `kill`, `tgkill`, and `tkill` raise;
+  `rt_sigaction` installs a disposition (`SIG_DFL`, `SIG_IGN`, or
+  a handler and restorer); the handler runs and `rt_sigreturn`
+  restores the interrupted context, returning the interrupted
+  syscall's own result.  Delivery happens at three points — syscall
+  exit, the timer tick's `iretq`, and a faulting instruction — each
+  refusing a kernel-mode frame and refusing to dispatch mid-syscall.
+  `SIGCHLD` is raised on child exit and reaches `wait4`; `SIGPIPE`
+  is raised in the pipe write path.  Default actions are terminate
+  (`SIGKILL`, `SIGTERM`, `SIGINT`, `SIGPIPE` — verified by exit
+  status 137/143/130 and by `yes | head`) or ignore (`SIGCHLD`,
+  `SIGURG`, `SIGWINCH`, `SIGCONT`); `SIG_IGN` is honored
+  (`sigterm_ignore` survives SIGTERM).  `SIGSEGV`, `SIGILL`,
+  `SIGFPE`, `SIGTRAP` raise with handlers, and a handler can edit
+  the saved `RIP` and resume past the fault.  Not done: `SIGCHLD`
+  does not interrupt a blocked `wait4`; there is no
+  `sigsuspend`/`pause`; `SIGSTOP`/`SIGTSTP` terminate instead of
+  stop.  See `open-issues.md`.
 - **Lists processes.** `ps` works: it reads `/proc`, and prints a
   process table with pid, user, vsize, state, and command - for
   `idle`, `musl_sh`, `busybox`, and every process you start.

@@ -37,6 +37,24 @@ uint64_t g_sys14_slots[8];
 int      g_sys14_valid;
 
 volatile uint64_t g_pipe_stamp_counter = 0;
+
+/*
+ * Signal raise/deliver counters -- slice 1 of docs/signal-design.md,
+ * question 6 ("what does unobserved mean").
+ *
+ * g_sig_raise_count is incremented each time kill/tgkill sets a
+ * pending bit.  g_sig_deliver_count is incremented each time a
+ * pending bit is OBSERVED on the way out to user mode.  Slice 1
+ * has no observation point, so g_sig_deliver_count is defined and
+ * printed but never incremented -- a zero that is zero because the
+ * code that would raise it is slice 2's, not a zero hiding a bug.
+ *
+ * Read by process_dump_all (process.c) so a recurrence of an
+ * "observed but never raised" or "raised but never observed"
+ * divergence is visible in one ps-adjacent dump.
+ */
+volatile uint64_t g_sig_raise_count = 0;
+volatile uint64_t g_sig_deliver_count = 0;
 volatile uint64_t g_last_fs_base = 0;
 volatile uint64_t g_arch_prctl_addr[32];
 
@@ -6368,6 +6386,23 @@ long sys_write(int fd, const void* buf, size_t count) {
              * this code.  Track it in open-issues.
              */
             if (pipe->readers_open == 0) {
+                /*
+                 * Slice 5: raise SIGPIPE.  The write still returns
+                 * -EPIPE -- a caller must see it whether or not it
+                 * handles the signal -- and the signal is delivered
+                 * on the way out to user mode (signal_deliver_frame,
+                 * at the top of syscall_dispatch).  With no handler,
+                 * signal_default_action terminates; the parent's
+                 * wait4 then reports SIGPIPE (13), which is what
+                 * makes `yes | head` behave.
+                 *
+                 * The raise is under the cli already held by the
+                 * enclosing loop, same critical section as the
+                 * readers_open check, so a close racing this write
+                 * cannot slip between the check and the bit set.
+                 */
+                self->sig_pending |= (1ULL << 13);   /* SIGPIPE */
+                g_sig_raise_count++;
                 __asm__ volatile("sti");
                 return -(long)EPIPE_;
             }
@@ -7563,6 +7598,89 @@ long sys_clock_gettime(int clk_id, void* user_ts) {
  * Validation, matching Linux: tv_sec < 0 is -EINVAL; tv_nsec
  * must be in [0, 999999999] or -EINVAL.  NULL req is -EFAULT.
  */
+/*
+ * Linux x86_64 sysinfo(2) -- syscall 99.
+ *
+ * struct sysinfo, exactly as musl's <sys/sysinfo.h> defines it for
+ * x86_64 (third_party/musl-install/include/sys/sysinfo.h):
+ *
+ *   offset  size  field
+ *     0      8    uptime          (seconds since boot)
+ *     8     24    loads[3]        (fixed-point, SI_LOAD_SHIFT 16)
+ *    32      8    totalram        (in units of mem_unit)
+ *    40      8    freeram
+ *    48      8    sharedram
+ *    56      8    bufferram
+ *    64      8    totalswap
+ *    72      8    freeswap
+ *    80      2    procs           (unsigned short)
+ *    82      2    pad
+ *    88      8    totalhigh
+ *    96      8    freehigh
+ *   104      4    mem_unit        (unsigned int; scales the ram fields)
+ *   108    256    __reserved
+ *   364          total
+ *
+ * Filled honestly:
+ *   uptime   g_ticks / 100           (100 Hz PIT, same source as
+ *                                     sys_clock_gettime)
+ *   procs    live PCB count          (walk MAX_PROCESSES, skip UNUSED)
+ *   totalram pmm_get_total_pages()   (bytes, via mem_unit = 4096)
+ *   freeram  pmm_get_free_pages()
+ *   mem_unit 4096                    (PAGE_SIZE; scales ram fields)
+ *
+ * Zeroed, because donix does not track them: loads, sharedram,
+ * bufferram, totalswap, freeswap, totalhigh, freehigh.  busybox's
+ * ps reads uptime/procs/totalram/freeram; a zero elsewhere is the
+ * truth, not a placeholder that hides something.
+ *
+ * One read of g_ticks into a local, as sys_clock_gettime does.
+ * A read that races the timer IRQ is one tick off, which is fine
+ * for an uptime field.
+ */
+struct donix_sysinfo {
+    unsigned long  uptime;
+    unsigned long  loads[3];
+    unsigned long  totalram;
+    unsigned long  freeram;
+    unsigned long  sharedram;
+    unsigned long  bufferram;
+    unsigned long  totalswap;
+    unsigned long  freeswap;
+    unsigned short procs;
+    unsigned short pad;
+    unsigned long  totalhigh;
+    unsigned long  freehigh;
+    unsigned int   mem_unit;
+    char           __reserved[256];
+};
+
+long sys_sysinfo(void* user_info) {
+    if (!user_info) return -(long)EFAULT_;
+
+    struct donix_sysinfo si;
+    for (size_t i = 0; i < sizeof(si); i++) ((uint8_t*)&si)[i] = 0;
+
+    uint64_t ticks = g_ticks;            /* one read */
+
+    si.uptime    = (unsigned long)(ticks / 100);
+    si.totalram  = (unsigned long)pmm_get_total_pages();
+    si.freeram   = (unsigned long)pmm_get_free_pages();
+    si.mem_unit  = 4096;                 /* PAGE_SIZE */
+
+    unsigned short nprocs = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcb_t* p = process_get_pcb(i);
+        if (p && p->state != PROC_STATE_UNUSED) nprocs++;
+    }
+    si.procs = nprocs;
+
+    if (safe_copy_to_user(user_info, &si, sizeof(si)) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
 long sys_nanosleep(const void* user_req, void* user_rem) {
     (void)user_rem;   /* never written; see the header comment */
 
@@ -8193,6 +8311,171 @@ long sys_set_tid_address(int* tidptr) {
 }
 
 /*
+ * Linux x86_64 kill(2) -- syscall 62.
+ *
+ * Slice 1 of docs/signal-design.md: set the target's pending bit
+ * and, if the target is BLOCKED and the signal is not blocked,
+ * wake it (question 3).  No delivery -- nothing observes the bit
+ * on the way out to user mode; that is slice 2's frame work.
+ *
+ * sig == 0 is the existence check: return 0 if the target exists
+ * and would be permitted to receive a signal, without setting a
+ * bit.  On donix every signal is permitted (no privilege model),
+ * so this reduces to "does the pid name a live process".
+ *
+ * SCOPE.  pid > 0 only.  donix has no process groups: setsid is a
+ * no-op that returns the caller's pid (see sys_setsid), and
+ * nothing tracks a pgid.  So kill(0, sig) and kill(-pgid, sig)
+ * -- "signal every process in my group" -- cannot be implemented
+ * honestly, and returning -EINVAL is the honest answer rather
+ * than silently doing nothing.  If process groups ever land,
+ * this is the function that grows the pid <= 0 branches.
+ *
+ * The pending-bit set and the wake are one critical section
+ * (question 2): the check-and-act is the same shape as
+ * pipe_wake_waiter, and cli keeps the waker from running between
+ * the bit set and the state change.  No signal path calls
+ * context_switch -- the wake does state = READY,
+ * block_kind = NONE, scheduler_ready_queue_add, and the timer's
+ * next dispatch picks the process up.
+ *
+ * RETURN.  0 on success (or an existence check that found the
+ * process), -EINVAL for a bad signal number or an unsupported
+ * pid, -ESRCH for a pid that names no live process.
+ */
+#define ESRCH_ 3
+
+/*
+ * signal_kill_other -- terminate a process other than the caller.
+ * Called from sys_kill for SIGKILL on a target that is not the
+ * current process.  Cannot use signal_terminate_current: that is
+ * noreturn and the caller is still running.
+ *
+ * ORDER: close_all_files(target); fault_signal = sig;
+ * state = TERMINATED; remove from ready queue; wake parent.
+ * Does NOT free the PCB -- process_reclaim does, when the parent
+ * reaps.
+ */
+static void signal_kill_other(pcb_t* target, int sig) {
+    if (!target) return;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    if (target->state == PROC_STATE_TERMINATED ||
+        target->state == PROC_STATE_UNUSED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+        return;
+    }
+
+    close_all_files(target);
+
+    target->fault_signal = sig;
+    target->state        = PROC_STATE_TERMINATED;
+    scheduler_ready_queue_remove(target);
+
+    process_wake_parent_if_waiting(target);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+}
+
+long sys_kill(long pid, int sig) {
+    if (sig < 0 || sig > 63) return -(long)EINVAL_;
+    if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
+    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
+
+    pcb_t* target = process_find_by_pid((uint64_t)pid);
+    if (!target) return -(long)ESRCH_;
+
+    if (sig == 0) return 0;   /* existence check: no bit set */
+
+    /*
+     * Slice 5: SIGKILL acts at the raise, not at a deliver point.
+     * It cannot be caught, blocked, or ignored, so a target in a
+     * hlt loop must die without waiting for a safe point.  It does
+     * not set sig_pending -- there is no point at which a
+     * SIGKILL would be observed as pending; it is acted on here.
+     */
+    if (sig == 9) {   /* SIGKILL */
+        g_sig_raise_count++;
+        if (target == process_get_current()) {
+            signal_terminate_current(9);
+            __builtin_unreachable();
+        }
+        signal_kill_other(target, 9);
+        return 0;
+    }
+
+    uint64_t bit = 1ULL << (uint64_t)sig;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+
+    target->sig_pending |= bit;
+    g_sig_raise_count++;
+
+    if (target->state == PROC_STATE_BLOCKED &&
+        (target->sig_pending & ~target->sig_blocked & bit) != 0) {
+        target->state      = PROC_STATE_READY;
+        target->block_kind = BLOCK_KIND_NONE;
+        scheduler_ready_queue_add(target);
+    }
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return 0;
+}
+
+/*
+ * Linux x86_64 tgkill(2) -- syscall 234.
+ *
+ * tgkill(tgid, tid, sig): signal one thread of a thread group.
+ * donix has one thread per process, so the only well-formed call
+ * is tgid == tid, and it is exactly kill(tid, sig).  Anything
+ * else names a thread that does not exist, and -EINVAL is the
+ * honest answer -- the same honesty as kill's pid <= 0 case.
+ */
+long sys_tgkill(long tgid, long tid, int sig) {
+    if (tgid != tid) return -(long)EINVAL_;   /* no threads */
+    return sys_kill(tid, sig);
+}
+
+/*
+ * Linux x86_64 tkill(2) -- syscall 200.
+ *
+ * tkill(tid, sig) is the obsolete predecessor of tgkill.  It
+ * signals one thread; in donix every process is its own thread
+ * group, so tid == pid and tkill(tid, sig) is exactly
+ * kill(tid, sig).
+ *
+ * WHY IT EXISTS AT ALL.  busybox's `kill` applet, when signalling
+ * itself, issues raw syscall 200 rather than going through the
+ * libc kill() wrapper.  Without a handler here, `kill -2 $$` hit
+ * the default case and printed "Unknown syscall: 200", so SIGINT's
+ * default action could not be exercised from the shell.
+ *
+ * WHY IT DELEGATES.  The signal-raise path -- the SIGKILL
+ * special case, the pending-bit set, the cli critical section,
+ * the wake-if-blocked -- lives in sys_kill and must not be
+ * duplicated.  A second copy would drift from the first, and the
+ * two would disagree about exactly the things that matter
+ * (SIGKILL, pid 1, the blocked-and-unblocked wake).  Delegating
+ * means tkill and kill cannot give different answers for the
+ * same pid, which is the property a caller relies on.
+ *
+ * The only thing tkill does that tgkill(tid, tid, sig) would not
+ * is nothing -- tgkill(tid, tid, sig) is already defined as
+ * kill(tid, sig) when tgid == tid.  So this is a two-argument
+ * spelling of the same call, and that is the whole of it.
+ *
+ * RETURN.  Same as kill: 0 on success, -EINVAL for a bad signal
+ * or an unsupported pid, -ESRCH for a pid that names no live
+ * process, -EPERM for pid 1.
+ */
+long sys_tkill(long tid, int sig) {
+    return sys_kill(tid, sig);
+}
+
+/*
  * Linux x86_64 ioctl(2) — syscall 16.
  *
  * Previously returned -ENOTTY for every request.  That is fine for
@@ -8728,24 +9011,775 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
      * For the real subsystem (masks, SA_* flags, oldact, queued
      * signals) see open-issues item 12.  This is not it.
      */
-    if (signum < 0 || signum >= 64) return -(long)EINVAL_;
+    if (signum < 1 || signum >= 64) return -(long)EINVAL_;
     pcb_t *self = process_get_current();
     if (!self) return -(long)EINVAL_;
 
     if (!act) return 0;
 
-    const uint64_t *a = (const uint64_t *)act;
-    uint64_t handler = a[0];
-    if (handler == 1) handler = 0;   /* SIG_IGN -> no handler */
+    /*
+     * Read the caller's struct through safe_copy_from_user.
+     * The probe (sigsegv_probe.c) and musl both pass a valid
+     * user pointer, but a bad one must EFAULT, not fault the
+     * kernel -- every other user-pointer read in this file goes
+     * through safe_copy_from_user for that reason.
+     *
+     * SLICE 2 WIDENS THE READ TO 32 BYTES.  musl's k_sigaction on
+     * x86_64 is 32 bytes: handler (0), flags (8), restorer (16),
+     * mask[2] (24..32).  Slice 1 read 16 bytes (handler, flags),
+     * which is the first half of the same struct and is why the
+     * 7e probe's two-uint64_t struct matched.  Slice 2 needs the
+     * restorer, so the read widens; the 7e probe's struct will
+     * be widened to 32 bytes in a follow-up commit.
+     *
+     * oldact is written back as 32 bytes for the same reason: a
+     * caller that reads oldact must see the same shape it wrote.
+     * The write is a no-op for a caller that does not read it.
+     */
+    uint64_t a[4];
+    if (safe_copy_from_user(a, act, sizeof(a)) != 0) {
+        return -(long)EFAULT_;
+    }
+    uint64_t handler  = a[0];
+    uint64_t restorer = a[2];
+    /* SIG_IGN (1) is kept as 1: it is a disposition, not a
+     * handler address and not SIG_DFL.  Collapsing it to 0 made
+     * it indistinguishable from SIG_DFL, and the deliver helpers
+     * then terminated the process on a signal it had asked to
+     * ignore.  sigterm_ignore found this: SIG_IGN for SIGTERM
+     * followed by kill(SIGTERM) died with status 143.
+     *
+     * SIG_DFL (0) clears the restorer; SIG_IGN does not need one
+     * and does not use one. */
+    if (handler == 0) restorer = 0;  /* SIG_DFL -> no restorer  */
 
-    self->signal_handler[signum] = handler;
-    (void)oldact;
+    uint64_t prev_h = self->signal_handler[signum];
+    uint64_t prev_r = self->signal_restorer[signum];
+    self->signal_handler[signum]  = handler;
+    self->signal_restorer[signum] = restorer;
+    if (oldact) {
+        uint64_t old[4];
+        old[0] = prev_h;
+        old[1] = 0;
+        old[2] = prev_r;
+        old[3] = 0;
+        if (safe_copy_to_user(oldact, old, sizeof(old)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
     return 0;
+}
+
+/*
+ * sys_rt_sigreturn -- syscall 15, slice 2 of docs/signal-design.md.
+ *
+ * musl's __restore_rt is 'mov $15, %rax; syscall' and reads no
+ * arguments.  At entry, the user %rsp saved by the syscall stub
+ * (g_user_rsp_save, then [kernel_rsp+48] after the stub's add
+ * rsp,8) points at the ucontext_t's first byte: the handler's
+ * ret popped the restorer pointer off the frame top and advanced
+ * RSP by 8.
+ *
+ * This function reads the ucontext_t from that saved user RSP,
+ * and writes its gregs[] back into the kernel-side 20-slot frame
+ * the stub is about to pop.  The gregs[] offsets are musl's
+ * _GNU_SOURCE layout (third_party/musl-install/include/bits/
+ * signal.h): gregs base is ucontext+40, each 8 bytes, and
+ * RSP=15, RIP=16, EFL=17.  See signal-design.md slice 2 for the
+ * full table.
+ *
+ * Returns 0 so the stub's epilogue runs; the frame it pops is
+ * now the interrupted context, and sysret resumes there.
+ */
+static uint64_t uctx_read_u64(pcb_t* self, uint64_t uva) {
+    (void)self;   /* cr3 comes from the current process */
+    uint64_t v = 0;
+    if (safe_copy_from_user(&v, (const void*)uva, 8) != 0) return 0;
+    return v;
+}
+
+long sys_rt_sigreturn(void) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EFAULT_;
+
+    /*
+     * The user RSP at syscall entry.  The stub stored it in
+     * g_user_rsp_save and pushed it at [kernel_rsp+48] after the
+     * add rsp,8; but this function runs INSIDE syscall_dispatch,
+     * which was called before the stub's add.  So the saved user
+     * RSP is g_user_rsp_save, which the stub wrote at entry and
+     * which no one has overwritten (it is written only at entry).
+     */
+    extern volatile uint64_t g_user_rsp_save;
+    uint64_t frame = g_user_rsp_save;   /* ucontext_t base */
+
+    /* gregs base at ucontext+40; each greg is 8 bytes. */
+    enum { G_R8=0, G_R9=1, G_R10=2, G_R11=3, G_R12=4, G_R13=5,
+           G_R14=6, G_R15=7, G_RDI=8, G_RSI=9, G_RBP=10, G_RBX=11,
+           G_RDX=12, G_RAX=13, G_RCX=14, G_RSP=15, G_RIP=16, G_EFL=17 };
+
+    uint64_t v[18];
+    for (int i = 0; i < 18; i++) {
+        v[i] = uctx_read_u64(self, frame + 40 + (uint64_t)i * 8);
+    }
+
+    /*
+     * The kernel-side 20-slot frame, as user_syscall_entry.asm
+     * has it after 'add rsp,8' (post-add offsets):
+     *   [rsp+0]   r10      [rsp+8]   rdx
+     *   [rsp+16]  rsi      [rsp+24]  rdi
+     *   [rsp+32]  r9       [rsp+40]  r8
+     *   [rsp+48]  user RSP [rsp+56]  user RFLAGS
+     *   [rsp+64]  user RIP [rsp+72]  r15
+     *   [rsp+80]  r14      [rsp+88]  r13
+     *   [rsp+96]  r12      [rsp+104] rbp
+     *   [rsp+112] rbx
+     *
+     * The kernel stack pointer at this moment is the one the
+     * stub had after 'add rsp,8'.  We do not have it in a
+     * register here; the stub pushed g_user_rsp_save at
+     * [rsp+48], and we can recover the kernel RSP from
+     * g_syscall_stack_top minus the fixed offset the stub has
+     * advanced to.  Simpler: the stub's frame is at a fixed
+     * offset from g_syscall_stack_top, and the offset is known
+     * from the push sequence.  See the deliver block in
+     * user_syscall_entry.asm for the exact layout; the numbers
+     * below are its post-add offsets, relative to that frame.
+     */
+    self->in_signal_handler = 0;
+
+    extern uint64_t g_syscall_stack_top;
+    /*
+     * g_syscall_stack_top is the pre-push top.  The stub pushes:
+     *   6 callee-saved (rbx rbp r12 r13 r14 r15)      48 bytes
+     *   rcx (user RIP), r11 (user RFLAGS)            16
+     *   g_user_rsp_save (user RSP)                    8
+     *   r8, r9                                       16
+     *   rdi, rsi, rdx, r10                           32
+     *   arg5                                          8
+     *   call syscall_dispatch (return address)        8
+     *   add rsp,8 (discard arg5)                      -
+     * Total from top: 48+16+8+16+32 = 120 before call,
+     * +8 return = 128, -8 discard = 120 at return.
+     * At the deliver point (after exit-check cli, before pop):
+     * kernel RSP = top - 120.
+     */
+    uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
+
+    /* Write the 16 GPRs the slot layout holds + RIP/RFLAGS/RSP. */
+    kf[0]  = v[G_R10];
+    kf[1]  = v[G_RDX];
+    kf[2]  = v[G_RSI];
+    kf[3]  = v[G_RDI];
+    kf[4]  = v[G_R9];
+    kf[5]  = v[G_R8];
+    kf[6]  = v[G_RSP];    /* user RSP   */
+    kf[7]  = v[G_EFL];    /* user RFLAGS */
+    kf[8]  = v[G_RIP];    /* user RIP   */
+    kf[9]  = v[G_R15];
+    kf[10] = v[G_R14];
+    kf[11] = v[G_R13];
+    kf[12] = v[G_R12];
+    kf[13] = v[G_RBP];
+    kf[14] = v[G_RBX];
+    /* rcx and r11 are syscall-clobbered; the stub reloads them
+     * from the frame at [rsp+?] -- but the stub does not keep
+     * rcx/r11 separate: it loads RFLAGS from [rsp+8] and RIP
+     * from [rsp+16] in its own post-add layout, which is
+     * [kf+7] and [kf+8] here.  So rcx/r11 need no restore. */
+
+    /*
+     * FIX-SIGRETURN rax: return the interrupted syscall's return
+     * value, not 0.  v[G_RAX] is ucontext.gregs[13], which
+     * signal_deliver_frame stored when it delivered.  Returning 0
+     * made every syscall that a signal was delivered on appear to
+     * return 0 -- wait4 returned 0 instead of the child's pid, and
+     * the shell treated that as "no child reaped".  That was the
+     * sigchld_probe failure and the test.sh cascade.
+     */
+    return (long)v[G_RAX];
+}
+
+/*
+ * signal_deliver_frame -- slice 2's deliver helper.
+ *
+ * Called from user_syscall_entry.asm after the exit-check cli and
+ * before the first pop.  Reads sig_pending & ~sig_blocked; if
+ * nonzero, builds the user-stack frame and rewrites the
+ * kernel-side 20-slot frame, then returns 1.  Returns 0 if
+ * nothing to deliver.
+ *
+ * The user-stack frame, from the frame base upward:
+ *   [0]  restorer  (signal_restorer[n])
+ *   [8]  ucontext_t (816 bytes), with gregs[] at +48 (i.e.
+ *        frame+8+40 = frame+48) holding the interrupted context,
+ *        and ucontext[296] = frame+8+296 = frame+304 holding
+ *        the current sig_blocked mask.
+ *
+ * The handler is entered with RSP = frame + 8 (so its ret pops
+ * restorer from [frame]), RIP = signal_handler[n], RDI = n.
+ */
+/*
+ * The saved user context, in one shape, so the user-stack frame
+ * builder can serve both delivery wrappers.  This is NOT a ucontext_t
+ * and NOT a kernel frame: it is the 15 GPRs plus user RSP/RFLAGS/RIP
+ * that a wrapper reads out of its own kernel-side frame and hands to
+ * signal_build_user_frame().
+ *
+ * gpr[0..14] in POP_ALL_GPRS order: r15 r14 r13 r12 r11 r10 r9 r8
+ * rbp rdi rsi rdx rcx rbx rax.  That is the iretq frame's stack order
+ * and the reverse of the push order, so a wrapper reads
+ * frame[+0x00] .. frame[+0x70] straight into gpr[0] .. gpr[14].
+ */
+struct sig_frame_regs {
+    uint64_t gpr[15];   /* r15..rax, POP_ALL_GPRS stack order */
+    uint64_t rsp;       /* user RSP */
+    uint64_t rflags;    /* user RFLAGS */
+    uint64_t rip;       /* user RIP */
+};
+
+/*
+ * Build the user-stack signal frame from `regs`.  Returns the
+ * handler-entry RSP (the frame base) on success, or 0 if nothing
+ * can be delivered or a user copy faulted.
+ *
+ * On success:
+ *   [frame + 0]   = restorer
+ *   [frame + 8]   = ucontext_t (816 bytes), zeroed then filled
+ *   gregs at frame + 48  (ucontext + 40), 18 entries
+ *   uc_sigmask at frame + 304  (ucontext + 296)
+ *
+ * The gregs are ordered as musl's _GNU_SOURCE ucontext_t expects:
+ * R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI RBP RBX RDX RAX RCX
+ * RSP RIP EFL.  `regs->gpr[]` is in POP_ALL_GPRS order; the mapping
+ * below is the one place the two orders are reconciled.
+ *
+ * No kmalloc: this runs at interrupt and syscall-return depth.
+ * Everything goes through safe_copy_to_user.
+ */
+static uint64_t signal_build_user_frame(const struct sig_frame_regs* regs,
+                                        uint64_t handler, uint64_t restorer) {
+    uint64_t frame = (regs->rsp - (8 + 816 + 128)) & ~0xFULL;
+
+    if (safe_copy_to_user((void*)frame, &restorer, 8) != 0) return 0;
+
+    {
+        uint8_t zero[816];
+        for (int i = 0; i < 816; i++) zero[i] = 0;
+        if (safe_copy_to_user((void*)(frame + 8), zero, 816) != 0) return 0;
+    }
+
+    /*
+     * POP_ALL_GPRS stack order (low -> high):
+     *   gpr[0]=r15 gpr[1]=r14 gpr[2]=r13 gpr[3]=r12
+     *   gpr[4]=r11 gpr[5]=r10 gpr[6]=r9  gpr[7]=r8
+     *   gpr[8]=rbp gpr[9]=rdi gpr[10]=rsi gpr[11]=rdx
+     *   gpr[12]=rcx gpr[13]=rbx gpr[14]=rax
+     *
+     * musl gregs order (index -> value):
+     *   0 R8   1 R9   2 R10  3 R11  4 R12  5 R13  6 R14  7 R15
+     *   8 RDI  9 RSI 10 RBP 11 RBX 12 RDX 13 RAX 14 RCX
+     *  15 RSP 16 RIP 17 EFL
+     */
+    #define UCTX_G(uc_idx, val) do { \
+        uint64_t _v = (val); \
+        if (safe_copy_to_user((void*)(frame + 48 + ((uc_idx) * 8)), \
+                              &_v, 8) != 0) return 0; \
+    } while (0)
+
+    UCTX_G(0,  regs->gpr[7]);    /* R8  */
+    UCTX_G(1,  regs->gpr[6]);    /* R9  */
+    UCTX_G(2,  regs->gpr[5]);    /* R10 */
+    UCTX_G(3,  regs->gpr[4]);    /* R11 */
+    UCTX_G(4,  regs->gpr[3]);    /* R12 */
+    UCTX_G(5,  regs->gpr[2]);    /* R13 */
+    UCTX_G(6,  regs->gpr[1]);    /* R14 */
+    UCTX_G(7,  regs->gpr[0]);    /* R15 */
+    UCTX_G(8,  regs->gpr[9]);    /* RDI */
+    UCTX_G(9,  regs->gpr[10]);   /* RSI */
+    UCTX_G(10, regs->gpr[8]);    /* RBP */
+    UCTX_G(11, regs->gpr[13]);   /* RBX */
+    UCTX_G(12, regs->gpr[11]);   /* RDX */
+    UCTX_G(13, regs->gpr[14]);   /* RAX */
+    UCTX_G(14, regs->gpr[12]);   /* RCX */
+    UCTX_G(15, regs->rsp);       /* RSP */
+    UCTX_G(16, regs->rip);       /* RIP */
+    UCTX_G(17, regs->rflags);    /* EFL */
+
+    #undef UCTX_G
+
+    /* uc_sigmask at ucontext+296 = frame + 8 + 296 = frame + 304.
+     * Filled by the caller (it needs `self`); zero here, the wrapper
+     * overwrites it. */
+    {
+        uint64_t zero_sm = 0;
+        if (safe_copy_to_user((void*)(frame + 304), &zero_sm, 8) != 0)
+            return 0;
+    }
+
+    (void)handler;
+    return frame;
+}
+
+/*
+ * signal_terminate_current -- the one signal-terminate path.
+ *
+ * Sets fault_signal (the sys_wait4 signal-kill view) and calls
+ * process_exit.  fault_kill_current and signal_default_action both
+ * call this, so fault_signal has exactly one writer and a process
+ * dies from a signal exactly one way.
+ */
+void signal_terminate_current(int sig) {
+    pcb_t* self = process_get_current();
+    if (self) self->fault_signal = sig;
+    process_exit();
+    __builtin_unreachable();
+}
+
+/*
+ * signal_default_action -- slice 5's default-action table.
+ *
+ * Called by the three deliver helpers when a pending signal has no
+ * handler installed.  The bit has already been cleared by the
+ * caller.
+ *
+ *   IGNORE     SIGCHLD (17), SIGURG (23), SIGWINCH (28),
+ *              SIGCONT (18).  The bit is cleared and the process
+ *              resumes normally; returns 0.
+ *   TERMINATE  everything else, including SIGKILL (9), SIGTERM
+ *              (15), SIGPIPE (13), and -- with the caveat below --
+ *              SIGSTOP (19), SIGTSTP (20), SIGQUIT (3).
+ *
+ * STOP AND CORE ARE NOT IMPLEMENTED.  A default "stop" needs
+ * PROC_STATE_STOPPED and a SIGCONT that resumes the saved frame;
+ * a default "core" needs a core dump.  Neither exists.  Mapping
+ * them to TERMINATE kills loudly instead of hanging forever, which
+ * is the honest placeholder until job control (open-issues item 13)
+ * lands.  See docs/signal-design.md, slice 5.
+ *
+ * Never returns for TERMINATE (signal_terminate_current is
+ * noreturn).  Returns 0 for IGNORE.
+ */
+static long signal_default_action(pcb_t* self, int sig) {
+    switch (sig) {
+        case 17:   /* SIGCHLD  */
+        case 23:   /* SIGURG   */
+        case 28:   /* SIGWINCH */
+        case 18:   /* SIGCONT  */
+            return 0;
+        default:
+            (void)self;
+            signal_terminate_current(sig);
+    }
+}
+
+/*
+ * signal_deliver_frame -- slice 2's deliver helper, unchanged in
+ * net effect.  Reads the syscall-entry stub's frame at
+ * g_syscall_stack_top - 120, builds the user-stack frame via
+ * signal_build_user_frame, and rewrites the syscall-stub slots:
+ *   kf[8]=handler kf[6]=frame kf[7]=rflags kf[3]=n kf[2]=0
+ *   kf[1]=frame+8
+ * The ucontext gregs are read from the kf[] slots (kf[5]=r8,
+ * kf[4]=r9, kf[0]=r10, kf[12]=r12, kf[11]=r13, kf[10]=r14,
+ * kf[9]=r15, kf[3]=rdi, kf[2]=rsi, kf[13]=rbp, kf[14]=rbx,
+ * kf[1]=rdx), the same mapping the original used.
+ */
+long signal_deliver_frame(uint64_t syscall_result) {
+    /* STEP-A2 deliver-result:
+     * syscall_result is the interrupted syscall's return value.
+     * It goes into ucontext.gregs[13] (RAX) so the handler can
+     * read it and rt_sigreturn restores it -- Unix: the caller
+     * sees its own return value after the handler runs.  At
+     * 7245390 the value was hardcoded 0 because delivery ran
+     * before the syscall. */
+    pcb_t* self = process_get_current();
+    if (!self) return 0;
+    if (self->in_signal_handler) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = 0;
+    while (n < 64 && !(pend & (1ULL << n))) n++;
+    if (n >= 64) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
+    }
+    if (restorer == 0) return 0;
+
+    extern uint64_t g_syscall_stack_top;
+    uint64_t* kf = (uint64_t*)(g_syscall_stack_top - 120);
+
+    struct sig_frame_regs r;
+    r.gpr[0]  = kf[9];   /* r15 */
+    r.gpr[1]  = kf[10];  /* r14 */
+    r.gpr[2]  = kf[11];  /* r13 */
+    r.gpr[3]  = kf[12];  /* r12 */
+    r.gpr[4]  = 0;       /* r11: syscall-clobbered */
+    r.gpr[5]  = kf[0];   /* r10 */
+    r.gpr[6]  = kf[4];   /* r9  */
+    r.gpr[7]  = kf[5];   /* r8  */
+    r.gpr[8]  = kf[13];  /* rbp */
+    r.gpr[9]  = kf[3];   /* rdi */
+    r.gpr[10] = kf[2];   /* rsi */
+    r.gpr[11] = kf[1];   /* rdx */
+    r.gpr[12] = 0;       /* rcx: syscall-clobbered */
+    r.gpr[13] = kf[14];  /* rbx */
+    r.gpr[14] = syscall_result;  /* rax: interrupted syscall's result */
+    r.rsp    = kf[6];
+    r.rflags = kf[7];
+    r.rip    = kf[8];
+
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
+
+    /* uc_sigmask: the current blocked mask. */
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
+    }
+
+    kf[8] = handler;
+    kf[6] = frame;        /* handler-entry RSP: frame, not frame+8 */
+    kf[7] = r.rflags;
+    kf[3] = (uint64_t)n;  /* rdi = signum */
+    kf[2] = 0;            /* rsi = siginfo* (NULL) */
+    kf[1] = frame + 8;    /* rdx = ucontext_t* */
+
+    self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
+    g_sig_deliver_count++;
+    return 1;
+}
+
+/*
+ * signal_deliver_frame_iretq -- slice 3's deliver helper, tick path.
+ *
+ * `self` is the process whose frame is being rewritten.  It is a
+ * PARAMETER, not process_get_current(): the tick path runs outside
+ * any syscall, and the scheduler's current_process and process.c's
+ * current_process are two copies (contract rule 5).  Passing the
+ * target explicitly makes the helper correct regardless of whether
+ * the two copies have agreed.
+ *
+ * frame_base is a 20-slot iretq frame built by irq0_stub's
+ * PUSH_ALL_GPRS (POP_ALL_GPRS layout):
+ *   [+0x00] r15  [+0x08] r14  [+0x10] r13  [+0x18] r12
+ *   [+0x20] r11  [+0x28] r10  [+0x30] r9   [+0x38] r8
+ *   [+0x40] rbp  [+0x48] rdi  [+0x50] rsi  [+0x58] rdx
+ *   [+0x60] rcx  [+0x68] rbx  [+0x70] rax
+ *   [+0x78] RIP  [+0x80] CS   [+0x88] RFLAGS
+ *   [+0x90] RSP  [+0x98] SS
+ *
+ * The user-stack frame is identical to slice 2's.  The kernel-side
+ * rewrite differs only in offsets: handler at RIP, frame at RSP,
+ * signum at RDI, 0 at RSI, ucontext at RDX.  CS and SS are left
+ * alone (the handler runs in user mode with the same segments).
+ */
+long signal_deliver_frame_iretq(pcb_t* self, uint64_t frame_base) {
+    if (!self) return 0;
+    if (self->in_signal_handler) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = 0;
+    while (n < 64 && !(pend & (1ULL << n))) n++;
+    if (n >= 64) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
+    }
+    if (restorer == 0) return 0;
+
+    uint64_t* f = (uint64_t*)frame_base;
+    if (!f) return 0;
+
+    /*
+     * FIX-GUARD kernel frame: only deliver to a USER-mode iretq
+     * frame.  A process blocked in a syscall (wait4, read, ...)
+     * has an iretq frame whose CS slot (f[0x80/8]) is 0x18 --
+     * kernel -- and whose RSP slot is a KERNEL stack pointer.
+     * signal_build_user_frame would build a handler frame on that
+     * kernel stack, and rt_sigreturn would then restore a kernel
+     * context as if it were user.  That was the hang: a process
+     * blocked in wait4 got a SIGCHLD handler frame on its kernel
+     * stack, and never returned to wait4.
+     *
+     * Refuse here.  The bit stays pending, and the syscall-return
+     * delivery (Step A) handles it when the process returns from
+     * the syscall -- for wait4, after the reap, which is the
+     * correct Unix point.  This is the same check
+     * signal_deliver_frame_exc uses for the fault path.
+     */
+    if ((f[0x80 / 8] & 3) != 3) return 0;
+
+    struct sig_frame_regs r;
+    r.gpr[0]  = f[0x00 / 8];   /* r15 */
+    r.gpr[1]  = f[0x08 / 8];   /* r14 */
+    r.gpr[2]  = f[0x10 / 8];   /* r13 */
+    r.gpr[3]  = f[0x18 / 8];   /* r12 */
+    r.gpr[4]  = f[0x20 / 8];   /* r11 */
+    r.gpr[5]  = f[0x28 / 8];   /* r10 */
+    r.gpr[6]  = f[0x30 / 8];   /* r9  */
+    r.gpr[7]  = f[0x38 / 8];   /* r8  */
+    r.gpr[8]  = f[0x40 / 8];   /* rbp */
+    r.gpr[9]  = f[0x48 / 8];   /* rdi */
+    r.gpr[10] = f[0x50 / 8];   /* rsi */
+    r.gpr[11] = f[0x58 / 8];   /* rdx */
+    r.gpr[12] = f[0x60 / 8];   /* rcx */
+    r.gpr[13] = f[0x68 / 8];   /* rbx */
+    r.gpr[14] = f[0x70 / 8];   /* rax */
+    r.rsp    = f[0x90 / 8];
+    r.rflags = f[0x88 / 8];
+    r.rip    = f[0x78 / 8];
+
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
+
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
+    }
+
+    f[0x78 / 8] = handler;
+    f[0x90 / 8] = frame;        /* handler-entry RSP */
+    f[0x88 / 8] = r.rflags;
+    f[0x48 / 8] = (uint64_t)n;  /* rdi = signum */
+    f[0x50 / 8] = 0;            /* rsi = siginfo* (NULL) */
+    f[0x58 / 8] = frame + 8;    /* rdx = ucontext_t* */
+
+    self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
+    g_sig_deliver_count++;
+    return 1;
+}
+
+/*
+ * signal_deliver_frame_exc -- slice 4's deliver helper, fault path.
+ *
+ * Called from the user-mode exit of isr0_handler / isr6_handler /
+ * isr13_handler / isr14_handler, after the raise (sig_pending bit
+ * set, fault_signal recorded) and after the diagnostic prints.
+ *
+ * The exception frame is NOT the irq0_stub 20-slot frame.  Its
+ * layout, as every handler in interrupts.c already reads it via
+ * `uint64_t *raw = (uint64_t *)frame`:
+ *
+ *   raw[0x00/8]=r15  raw[0x08/8]=r14  raw[0x10/8]=r13
+ *   raw[0x18/8]=r12  raw[0x20/8]=r11  raw[0x28/8]=r10
+ *   raw[0x30/8]=r9   raw[0x38/8]=r8   raw[0x40/8]=rbp
+ *   raw[0x48/8]=rdi  raw[0x50/8]=rsi  raw[0x58/8]=rdx
+ *   raw[0x60/8]=rcx  raw[0x68/8]=rbx  raw[0x70/8]=rax
+ *   raw[EXC_OFF_RIP]=16  raw[EXC_OFF_CS]=17
+ *   raw[EXC_OFF_RFLAGS]=18  raw[EXC_OFF_RSP]=19
+ *   raw[EXC_OFF_SS]=20
+ *
+ * The user-stack frame is identical to slice 2/3's: signal_build_user_frame
+ * does all the work.  The writeback differs only in offsets.  The faulting
+ * instruction's context becomes the ucontext, so a handler that returns
+ * without editing gregs[16] re-executes the faulting instruction -- which
+ * is Unix: a SIGSEGV that the handler does not fix is fatal on the second
+ * fault, and the re-entry guard (in_signal_handler) makes the second fault
+ * take the fault_kill_current path, not the deliver path.
+ *
+ * CS and SS are not rewritten: the handler runs in user mode with the
+ * same segments the fault came from, and iretq reads them from the
+ * frame unchanged.
+ */
+#define EXC_OFF_ERROR_CODE_ 15
+#define EXC_OFF_RIP_        16
+#define EXC_OFF_CS_         17
+#define EXC_OFF_RFLAGS_     18
+#define EXC_OFF_RSP_        19
+#define EXC_OFF_SS_         20
+
+long signal_deliver_frame_exc(pcb_t* self, uint64_t* raw, int sig) {
+    if (!self || !raw) return 0;
+    if (self->in_signal_handler) return 0;
+
+    if ((raw[EXC_OFF_CS_] & 3) != 3) return 0;
+
+    uint64_t pend = self->sig_pending & ~self->sig_blocked;
+    if (pend == 0) return 0;
+
+    int n = sig;
+    if (n <= 0 || n >= 64) return 0;
+    if (!(pend & (1ULL << n))) return 0;
+
+    uint64_t handler  = self->signal_handler[n];
+    uint64_t restorer = self->signal_restorer[n];
+    if (handler == 0) {
+        /*
+         * Clear the bit under cli: a SIGCHLD raise on another
+         * tick (process_exit's, from the exiting child) is a
+         * read-modify-write of the same field, and the clear must
+         * be atomic with respect to it.  signal_default_action
+         * then runs with interrupts restored; the TERMINATE path
+         * is noreturn and takes process_exit's own cli.
+         */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return signal_default_action(self, n);
+    }
+    if (handler == 1) {
+        /* SIG_IGN: clear the bit and continue.  There is no
+         * handler to run and no restorer needed; the process
+         * resumes exactly where it was.  Clearing under cli is
+         * the same discipline as the SIG_DFL branch above:
+         * sig_pending is read-modify-written by the raise
+         * paths. */
+        uint64_t _sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+        self->sig_pending &= ~(1ULL << n);
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return 0;
+    }
+    if (restorer == 0) return 0;
+
+    struct sig_frame_regs r;
+    r.gpr[0]  = raw[0x00 / 8];   /* r15 */
+    r.gpr[1]  = raw[0x08 / 8];   /* r14 */
+    r.gpr[2]  = raw[0x10 / 8];   /* r13 */
+    r.gpr[3]  = raw[0x18 / 8];   /* r12 */
+    r.gpr[4]  = raw[0x20 / 8];   /* r11 */
+    r.gpr[5]  = raw[0x28 / 8];   /* r10 */
+    r.gpr[6]  = raw[0x30 / 8];   /* r9  */
+    r.gpr[7]  = raw[0x38 / 8];   /* r8  */
+    r.gpr[8]  = raw[0x40 / 8];   /* rbp */
+    r.gpr[9]  = raw[0x48 / 8];   /* rdi */
+    r.gpr[10] = raw[0x50 / 8];   /* rsi */
+    r.gpr[11] = raw[0x58 / 8];   /* rdx */
+    r.gpr[12] = raw[0x60 / 8];   /* rcx */
+    r.gpr[13] = raw[0x68 / 8];   /* rbx */
+    r.gpr[14] = raw[0x70 / 8];   /* rax */
+    r.rsp    = raw[EXC_OFF_RSP_];
+    r.rflags = raw[EXC_OFF_RFLAGS_];
+    r.rip    = raw[EXC_OFF_RIP_];
+
+    uint64_t frame = signal_build_user_frame(&r, handler, restorer);
+    if (frame == 0) return 0;
+
+    {
+        uint64_t sm = self->sig_blocked;
+        if (safe_copy_to_user((void*)(frame + 304), &sm, 8) != 0) return 0;
+    }
+
+    raw[EXC_OFF_RIP_]    = handler;
+    raw[EXC_OFF_RSP_]    = frame;
+    raw[EXC_OFF_RFLAGS_] = r.rflags;
+    raw[0x48 / 8]        = (uint64_t)n;   /* rdi = signum */
+    raw[0x50 / 8]        = 0;             /* rsi = siginfo* (NULL) */
+    raw[0x58 / 8]        = frame + 8;     /* rdx = ucontext_t* */
+
+    self->sig_pending &= ~(1ULL << n);
+    self->in_signal_handler = 1;
+    g_sig_deliver_count++;
+    return 1;
 }
 
 long sys_rt_sigprocmask(int how, const void* set, void* oldset,
                         size_t sigsetsize) {
-    (void)how; (void)set; (void)oldset; (void)sigsetsize;
+    /*
+     * Slice 1 stores the blocked mask.  Delivery (slice 2) is
+     * what consults it; nothing reads it yet.
+     *
+     * Linux requires sigsetsize == sizeof(sigset_t), which on
+     * x86_64 is 8.  do not validate: musl and the probes pass
+     * 8, but a future raw caller may pass 0 and the design's
+     * slice 1 acceptance does not depend on the check.  When
+     * something needs the strictness, add it here and update
+     * the callers first.
+     */
+    (void)sigsetsize;
+
+    if (how != 0 && how != 1 && how != 2) {
+        return -(long)EINVAL_;   /* SIG_BLOCK/UNBLOCK/SETMASK */
+    }
+
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    uint64_t newset = 0;
+    if (set) {
+        if (safe_copy_from_user(&newset, set, sizeof(newset)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    uint64_t prev = self->sig_blocked;
+    if (set) {
+        if (how == 0)      self->sig_blocked |= newset;   /* BLOCK   */
+        else if (how == 1) self->sig_blocked &= ~newset;  /* UNBLOCK */
+        else               self->sig_blocked = newset;    /* SETMASK */
+    }
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+
+    if (oldset) {
+        if (safe_copy_to_user(oldset, &prev, sizeof(prev)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
     return 0;
 }
 
@@ -9173,6 +10207,21 @@ long sys_fork(void) {
      */
     child->fs_base = parent->fs_base;
 
+    /*
+     * Signal state across fork, slice 1 of docs/signal-design.md.
+     *
+     * sig_blocked is inherited, as on Linux: a child runs with the
+     * parent's blocked mask.  sig_pending starts clear -- the
+     * parent's pending signals belong to the parent, and
+     * process_create's memset already zeroed the child's PCB.  The
+     * explicit clear is belt and braces on the one field where a
+     * stale bit would be a delivered signal to the wrong process.
+     */
+    child->sig_blocked = parent->sig_blocked;
+    child->sig_pending = 0;
+    for (int _i = 0; _i < 64; _i++)
+        child->signal_restorer[_i] = parent->signal_restorer[_i];
+
 
     /*
      * Child inherits the parent's cwd.
@@ -9348,26 +10397,28 @@ uint64_t syscall_dispatch(uint64_t num,
     }
     (void)arg3; (void)arg4; (void)arg5;
 
+    uint64_t result = 0;
     switch (num) {
 
         /* --- Linux x86_64 numbers, strictly ascending --- */
-        case SYS_READ:            return (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2);
-        case SYS_WRITE:           return (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2);
-        case SYS_OPEN:            return (uint64_t)sys_open((const char*)arg0, (int)arg1);
-        case SYS_OPENAT:          return (uint64_t)sys_openat((int)arg0, (const char*)arg1, (int)arg2);
-        case SYS_CLOSE:           return (uint64_t)sys_close((int)arg0);
-        case SYS_STAT:            return (uint64_t)sys_stat((const char*)arg0, (void*)arg1);
-        case SYS_FSTAT:           return (uint64_t)sys_fstat((int)arg0, (void*)arg1);
-        case SYS_LSTAT:           return (uint64_t)sys_lstat((const char*)arg0, (void*)arg1);
-        case SYS_POLL:            return (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2);
-        case SYS_LSEEK:           return (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2);
-        case SYS_MMAP:            return (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5);
-        case SYS_MPROTECT:        return (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2);
-        case SYS_MUNMAP:          return (uint64_t)sys_munmap((void*)arg0, (size_t)arg1);
-        case SYS_BRK:             return (uint64_t)sys_brk((void*)arg0);
-        case SYS_RT_SIGACTION:    return (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-        // case SYS_RT_SIGPROCMASK:  return (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3);
-                case SYS_RT_SIGPROCMASK: {
+        case SYS_READ:            result = (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2); break;
+        case SYS_WRITE:           result = (uint64_t)sys_write((int)arg0, (const void*)arg1, (size_t)arg2); break;
+        case SYS_OPEN:            result = (uint64_t)sys_open((const char*)arg0, (int)arg1); break;
+        case SYS_OPENAT:          result = (uint64_t)sys_openat((int)arg0, (const char*)arg1, (int)arg2); break;
+        case SYS_CLOSE:           result = (uint64_t)sys_close((int)arg0); break;
+        case SYS_STAT:            result = (uint64_t)sys_stat((const char*)arg0, (void*)arg1); break;
+        case SYS_FSTAT:           result = (uint64_t)sys_fstat((int)arg0, (void*)arg1); break;
+        case SYS_LSTAT:           result = (uint64_t)sys_lstat((const char*)arg0, (void*)arg1); break;
+        case SYS_POLL:            result = (uint64_t)sys_poll((void*)arg0, (unsigned long)arg1, (int)arg2); break;
+        case SYS_LSEEK:           result = (uint64_t)sys_lseek((int)arg0, (long)arg1, (int)arg2); break;
+        case SYS_MMAP:            result = (uint64_t)sys_mmap((void*)arg0, (size_t)arg1, (int)arg2, (int)arg3, (int)arg4, (long)arg5); break;
+        case SYS_MPROTECT:        result = (uint64_t)sys_mprotect((void*)arg0, (size_t)arg1, (int)arg2); break;
+        case SYS_MUNMAP:          result = (uint64_t)sys_munmap((void*)arg0, (size_t)arg1); break;
+        case SYS_BRK:             result = (uint64_t)sys_brk((void*)arg0); break;
+        case SYS_RT_SIGACTION:    result = (uint64_t)sys_rt_sigaction((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3); break;
+        // case SYS_RT_SIGPROCMASK:  result = (uint64_t)sys_rt_sigprocmask((int)arg0, (const void*)arg1, (void*)arg2, (size_t)arg3); break;
+                case SYS_RT_SIGRETURN:    result = (uint64_t)sys_rt_sigreturn(); break;
+        case SYS_RT_SIGPROCMASK: {
             /* Snapshot the user stack around g_user_rsp_save before
              * the handler runs.  Diagnostic for item 7e only. */
             uint64_t rs = g_user_rsp_save;
@@ -9386,71 +10437,109 @@ uint64_t syscall_dispatch(uint64_t num,
                     g_sys14_valid = 1;
                 }
             }
-            return (uint64_t)sys_rt_sigprocmask((int)arg0,
+            result = (uint64_t)sys_rt_sigprocmask((int)arg0,
                                                 (const void*)arg1,
                                                 (void*)arg2,
-                                                (size_t)arg3);
+                                                (size_t)arg3); break;
         }
         
-        case SYS_IOCTL:           return (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2);
-        case SYS_READV:           return (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2);
-        case SYS_WRITEV:          return (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2);
-        case SYS_ACCESS:          return (uint64_t)sys_access((const char*)arg0, (int)arg1);
-        case SYS_PIPE:            return (uint64_t)sys_pipe((int*)arg0);
-        case SYS_DUP:             return (uint64_t)sys_dup((int)arg0);
-        case SYS_DUP2:            return (uint64_t)sys_dup2((int)arg0, (int)arg1);
-        case SYS_NANOSLEEP:       return (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1);
-        case SYS_GETPID:          return (uint64_t)sys_getpid();
-        case SYS_FORK:            return (uint64_t)sys_fork();
-        case SYS_EXECVE:          return (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2);
-        case SYS_EXIT:            sys_exit((int)arg0); return 0;
-        case SYS_WAIT4:           return (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2);
-        case SYS_UNAME:           return (uint64_t)sys_uname((void*)arg0);
-        case SYS_FCNTL:           return (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2);
-        case SYS_FTRUNCATE:       return (uint64_t)sys_ftruncate((int)arg0, (long)arg1);
-        case SYS_GETCWD:          return (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1);
-        case SYS_CHDIR:           return (uint64_t)sys_chdir((const char*)arg0);
-        case SYS_RENAME:          return (uint64_t)sys_rename((const char*)arg0, (const char*)arg1);
-        case SYS_MKDIR:           return (uint64_t)sys_mkdir((const char*)arg0, (int)arg1);
-        case SYS_RMDIR:           return (uint64_t)sys_rmdir((const char*)arg0);
-        case SYS_UNLINK:          return (uint64_t)sys_unlink((const char*)arg0);
+        case SYS_IOCTL:           result = (uint64_t)sys_ioctl((int)arg0, (unsigned long)arg1, (void*)arg2); break;
+        case SYS_READV:           result = (uint64_t)sys_readv((int)arg0, (const struct iovec*)arg1, (int)arg2); break;
+        case SYS_WRITEV:          result = (uint64_t)sys_writev((int)arg0, (const struct iovec*)arg1, (int)arg2); break;
+        case SYS_ACCESS:          result = (uint64_t)sys_access((const char*)arg0, (int)arg1); break;
+        case SYS_PIPE:            result = (uint64_t)sys_pipe((int*)arg0); break;
+        case SYS_DUP:             result = (uint64_t)sys_dup((int)arg0); break;
+        case SYS_DUP2:            result = (uint64_t)sys_dup2((int)arg0, (int)arg1); break;
+        case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
+        case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
+        case SYS_FORK:            result = (uint64_t)sys_fork(); break;
+        case SYS_EXECVE:          result = (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2); break;
+        case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
+        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
+        case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
+        case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
+        case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
+        case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
+        case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
+        case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
+        case SYS_RENAME:          result = (uint64_t)sys_rename((const char*)arg0, (const char*)arg1); break;
+        case SYS_MKDIR:           result = (uint64_t)sys_mkdir((const char*)arg0, (int)arg1); break;
+        case SYS_RMDIR:           result = (uint64_t)sys_rmdir((const char*)arg0); break;
+        case SYS_UNLINK:          result = (uint64_t)sys_unlink((const char*)arg0); break;
 
-        case SYS_SYMLINK:         return (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1);
-        case SYS_READLINK:        return (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2);
-        case SYS_GETUID:          return (uint64_t)sys_getuid();
-        case SYS_GETGID:          return (uint64_t)sys_getgid();
-        case SYS_GETEUID:         return (uint64_t)sys_geteuid();
-        case SYS_GETEGID:         return (uint64_t)sys_getegid();
-        case SYS_GETPPID:         return (uint64_t)sys_getppid();
-        case SYS_SETSID:          return (uint64_t)sys_setsid();
-        case SYS_GETGROUPS:       return (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1);
+        case SYS_SYMLINK:         result = (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1); break;
+        case SYS_READLINK:        result = (uint64_t)sys_readlink((const char*)arg0, (char*)arg1, (size_t)arg2); break;
+        case SYS_CHMOD:           result = (uint64_t)sys_chmod((const char*)arg0, (int)arg1); break;
+        case SYS_FCHMOD:          result = (uint64_t)sys_fchmod((int)arg0, (int)arg1); break;
+        case SYS_CHOWN:           result = (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2); break;
+        case SYS_FCHOWN:          result = (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2); break;
+        case SYS_SYSINFO:         result = (uint64_t)sys_sysinfo((void*)arg0); break;
+        case SYS_GETUID:          result = (uint64_t)sys_getuid(); break;
+        case SYS_GETGID:          result = (uint64_t)sys_getgid(); break;
+        case SYS_GETEUID:         result = (uint64_t)sys_geteuid(); break;
+        case SYS_GETEGID:         result = (uint64_t)sys_getegid(); break;
+        case SYS_GETPPID:         result = (uint64_t)sys_getppid(); break;
+        case SYS_SETSID:          result = (uint64_t)sys_setsid(); break;
+        case SYS_GETGROUPS:       result = (uint64_t)sys_getgroups((int)arg0, (unsigned int*)arg1); break;
 
-        case SYS_CHMOD:           return (uint64_t)sys_chmod((const char*)arg0, (int)arg1);
-        case SYS_FCHMOD:          return (uint64_t)sys_fchmod((int)arg0, (int)arg1);
-        case SYS_CHOWN:           return (uint64_t)sys_chown((const char*)arg0, (int)arg1, (int)arg2);
-        case SYS_FCHOWN:          return (uint64_t)sys_fchown((int)arg0, (int)arg1, (int)arg2);
-        case SYS_PRCTL:           return (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0);
-        case SYS_ARCH_PRCTL:      return (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1);
-        case SYS_GETDENTS64:      return (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2);
-        case SYS_SET_TID_ADDRESS: return (uint64_t)sys_set_tid_address((int*)arg0);
-        case SYS_CLOCK_GETTIME:   return (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1);
-        case SYS_EXIT_GROUP:      sys_exit((int)arg0); return 0;
-        case SYS_UTIMES:          return (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1);
-        case SYS_FUTIMESAT:       return (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2);
-        case SYS_NEWFSTATAT:      return (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3);
-        case SYS_UNLINKAT:        return (uint64_t)sys_unlinkat((int)arg0, (const char*)arg1, (int)arg2);
-        case SYS_FACCESSAT:       return (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3);
-        case SYS_SET_ROBUST_LIST: return (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1);
-        case SYS_UTIMENSAT:       return (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3);
-        case SYS_GETRANDOM:       return (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2);
-        case SYS_RSEQ:            return (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3);
+        case SYS_PRCTL:           result = (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0); break;
+        case SYS_ARCH_PRCTL:      result = (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1); break;
+        case SYS_GETDENTS64:      result = (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2); break;
+        case SYS_SET_TID_ADDRESS: result = (uint64_t)sys_set_tid_address((int*)arg0); break;
+        case SYS_CLOCK_GETTIME:   result = (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1); break;
+        case SYS_EXIT_GROUP:      sys_exit((int)arg0); result = 0; break;
+        case SYS_TGKILL:          result = (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2); break;
+        case SYS_TKILL:           result = (uint64_t)sys_tkill((long)arg0, (int)arg1); break;
+        case SYS_UTIMES:          result = (uint64_t)sys_utimes((const char*)arg0, (const void*)arg1); break;
+        case SYS_FUTIMESAT:       result = (uint64_t)sys_futimesat((int)arg0, (const char*)arg1, (const void*)arg2); break;
+        case SYS_NEWFSTATAT:      result = (uint64_t)sys_newfstatat((int)arg0, (const char*)arg1, (void*)arg2, (int)arg3); break;
+        case SYS_UNLINKAT:        result = (uint64_t)sys_unlinkat((int)arg0, (const char*)arg1, (int)arg2); break;
+        case SYS_FACCESSAT:       result = (uint64_t)sys_faccessat((int)arg0, (const char*)arg1, (int)arg2, (int)arg3); break;
+        case SYS_SET_ROBUST_LIST: result = (uint64_t)sys_set_robust_list((void*)arg0, (size_t)arg1); break;
+        case SYS_UTIMENSAT:       result = (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3); break;
+        case SYS_GETRANDOM:       result = (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2); break;
+        case SYS_RSEQ:            result = (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3); break;
 
         /* --- donix-private numbers (500+) --- */
-        case SYS_REBOOT:          kernel_do_reboot(); return 0;
+        case SYS_REBOOT:          kernel_do_reboot(); result = 0; break;
 
         default:
             serial_print("Unknown syscall: ");
             serial_print_dec(num); serial_print("\n");
-            return -(long)ENOSYS_;
+            result = -(long)ENOSYS_; break;
     }
+    /*
+     * STEP-A delivery-on-the-way-out
+     *
+     * Deliver a pending signal on the way OUT of the syscall, with
+     * the interrupted syscall's result preserved in ucontext[13]
+     * (RAX).  Unix: the handler can read the interrupted syscall's
+     * return value, and rt_sigreturn restores it so the caller sees
+     * it.
+     *
+     * NEVER deliver on the way out of:
+     *   SYS_EXIT (60), SYS_EXIT_GROUP (231) -- noreturn.
+     *   SYS_RT_SIGRETURN (15) -- its job is to reconstruct this
+     *     frame from a ucontext; delivering on top of it writes a
+     *     handler frame over the one it just restored, and the
+     *     inner rt_sigreturn restores from a ucontext the outer
+     *     delivery overwrote (corrupted sysret RIP/RSP).  This was
+     *     the 3b52bf3 bug.
+     *   SYS_EXECVE (59) -- rewrites the frame itself; excluded
+     *     conservatively.  A later step tests pending-across-exec.
+     *
+     * The stub's frame is at g_syscall_stack_top - 120 before and
+     * after the switch; only the timing of the rewrite changes.
+     * Interrupts are off here (the stub issued cli, no sti yet).
+     */
+    {
+        pcb_t* _sd_self = process_get_current();
+        if (_sd_self &&
+            num != SYS_EXIT && num != SYS_EXIT_GROUP &&
+            num != SYS_RT_SIGRETURN && num != SYS_EXECVE &&
+            (_sd_self->sig_pending & ~_sd_self->sig_blocked) != 0) {
+            signal_deliver_frame(result);
+        }
+    }
+    return result;
 }

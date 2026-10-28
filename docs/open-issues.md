@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-10-20** (HEAD `v0.6.17`).  This file lists
-**only open issues**.  Closed items are removed, not struck
+**Last updated: 2026-10-23** (HEAD `20261023-sigign`).  This file
+lists **only open issues**.  Closed items are removed, not struck
 through; their history is in `git log` and `docs/session-log.md`.
 An item appears here only while it is a defect, a missing
 feature, or an unverified claim about the tree.
@@ -14,24 +14,6 @@ not reused.
 ---
 
 ## Open items
-
-**5.  `-EPIPE` is delivered without `SIGPIPE`.**  `sys_write` on
-a pipe with no reader returns `-EPIPE` (32), matching Linux's
-errno.  Real Linux also raises `SIGPIPE` first, which by default
-terminates the process before `write` returns.  donix's signal
-path is a stub (item 12), so the signal is not delivered and the
-process sees the errno instead of dying.  A program that checks
-`write`'s return value sees the right answer; a program that
-relies on dying from `SIGPIPE` does not.
-
-The exposure is narrow: busybox apps generally check `write`'s
-return, and `yes | head -n 1` does not hang.  The remaining
-exposure is a program that expects to be *killed* by `SIGPIPE`
-and does not check `write` — none has been found.
-
-Fixing this means implementing signal delivery (item 12).  Same
-subsystem a Wayland `wl_shm` client needs for `SIGBUS` on buffer
-overrun.  Doing it once serves both.
 
 **9.  No privilege model: uid/gid are 0 for every process.**
 No per-process uid/euid split, no setuid bit (FAT has no mode
@@ -77,52 +59,33 @@ No test currently fails because of this; the corruption is
 latent, and the surface is *any* 64-bit computation that gcc
 chooses to vectorize.
 
-**12.  Signal delivery is a stub; a faulted process cannot catch
-its own signal.**  `sys_rt_sigaction` returns 0 and installs
-nothing; `sys_rt_sigprocmask` returns 0 and does nothing.  A
-process that faults is killed; a process that receives `-EPIPE`
-on a write with no reader (item 5) sees the errno and is not
-killed by `SIGPIPE`.
-
-The exit path is honest: a faulted child's wait status is a
-signal-kill encoding, so the parent's shell prints `Segmentation
-fault` and can tell a crash from a clean exit.  But the signal
-is not delivered to the process itself.
-
-A minimal instrument exists — a first-party process can install
-a `SIGSEGV` handler via a minimal `sys_rt_sigaction`, fault, and
-run it (`sigsegv_probe`, staged as `/usr/bin/SIGSEGV_PROBE`).
-The handler does not return; there is no `rt_sigreturn`, no
-masks, no `SA_*` flags, no `oldact`, no queued signals, no
-cross-process delivery.  **That is an instrument, not this
-subsystem.**
-
-Fixing this means implementing signal delivery: a real
-`sys_rt_sigaction`, per-process signal handlers, a raise on the
-fault path that runs the handler if installed, an `rt_sigreturn`
-that restores the frame after the handler returns, and a
-`SIGPIPE` raise on the `-EPIPE` write path.  That is a
-subsystem, not a small change.  Same subsystem a Wayland
-`wl_shm` client needs for `SIGBUS` on buffer overrun.  Doing it
-once serves both.
-
 **13.  `CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's
 job-control code is gated behind `CONFIG_ASH_JOB_CONTROL`, which
 this build does not set.  When a child faults and `sys_wait4`
 returns a signal-kill status, ash's default message is printed,
 but the shell does not do job-control bookkeeping (no `[1]+
-Done` lines, no `fg`/`bg`, no `kill %1`).  It needs the same
-signal delivery as item 12 plus the job-control surface
-(process groups, a controlling terminal, `tcsetpgrp`).  Not
-small.
+Done` lines, no `fg`/`bg`, no `kill %1`).
+
+Signals are done (see handoff): raise, delivery at three points,
+dispositions including `SIG_IGN`, the default-action table, and
+`SIGCHLD` reaching `wait4` all work.  What is not built is the
+job-control surface *on top of* that machinery: there is no
+stopped process state (`signal_default_action` maps SIGSTOP and
+SIGTSTP to TERMINATE, the documented placeholder), no SIGCONT
+resume path, no process groups (`sys_kill` refuses `pid <= 0`),
+no controlling terminal, no `tcsetpgrp`/`setpgid`, and
+`CONFIG_ASH_JOB_CONTROL` is unset so ash has no job table.  Not
+small, but the hard half -- the signal substrate -- is in.
 
 **14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
 works only because busybox ash falls back on `ENOEXEC` and runs
 `sh script.sh`.  The kernel's `sys_execve` opens the file, checks
 for ELF magic, finds `#!`, prints `sys_execve: not an ELF file`,
-and returns `-ENOEXEC`; there is no shebang handling.  And
-`/bin/sh` does not exist on the image — `/bin` contains only
-`busybox`.
+and returns `-ENOEXEC`; there is no shebang handling.
+**The image half is now done**: `/bin/sh` exists as a soft
+link to busybox (after the one-time
+`/bin/busybox --install -s /bin`; see handoff).  What remains
+is the kernel half -- `#!` parsing in `sys_execve`.
 
 Both must land together: `#!` parsing in `sys_execve` (read the
 first line, build argv `[interp, optional_arg, script, ...]`,
@@ -142,13 +105,21 @@ fallback.
 
 ## Un-numbered open items
 
-**`chmod`/`chown` accept and drop.**  Syscalls 90-93 (path and
-fd forms) return 0 and store nothing: FAT has no mode bits and
-no ownership, everything is uid 0, and `stat` reports the
-synthesized 0644/0755.  This is so `tar -x`, `cp -a`, and
-`install` complete instead of printing "Unknown syscall" for
-every file.  It is not a privilege model -- items 9 and 10 own
-the real answer.
+**`chmod`/`chown` accept and drop, and their applets are not
+compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and
+store nothing: FAT has no mode bits and no ownership, everything
+is uid 0, and `stat` reports the synthesized 0644/0755.  This is
+so `tar -x`, `cp -a`, and `install` complete instead of printing
+"Unknown syscall" for every file.  It is not a privilege model --
+items 9 and 10 own the real answer.
+
+`CONFIG_CHMOD` and `CONFIG_CHOWN` are **unset** in
+`configs/busybox.config`, so no command on the image calls 90-93
+and `chmod`/`chown` say "not found".  Enabling them would make
+the commands run and report success while changing nothing (FAT
+has no mode store).  Honoring FAT's read-only attribute via
+FatFs's `f_chmod` would be a real but two-state mode change, and
+a separate, larger decision.
 
 **`tar` is enabled, and link restoration is verified.**  The
 v0.6.16 note that called its creation path a busybox applet
@@ -161,6 +132,67 @@ records a symlink as `lrwxrwxrwx ... -> target`.  One limit
 remains: two empty files with the same name in different
 directories collide in `st_ino`, because `FILINFO` carries no
 parent -- see `fat_ino`.
+
+**`tkill` (200) is implemented as `kill(tid, sig)`.**  Not an
+open issue; noted so it is not re-added.  busybox's `kill`
+applet, signalling itself, issues raw syscall 200; without a
+handler it printed "Unknown syscall: 200" and SIGINT's default
+action could not be exercised.  `tkill(tid, sig)` is
+`kill(tid, sig)` in a single-threaded process, implemented as a
+thin wrapper over `sys_kill` so the raise path stays
+single-sourced (`b976b40`).
+
+**The `g_syscall_stack_top - 120` frame base is derived and
+correct.**  `user_syscall_entry.asm` pushes, in order, six
+callee-saved GPRs (48 bytes), user RIP and RFLAGS (16), user RSP
+(8), r8 and r9 (16), and rdi/rsi/rdx/r10 (32) — 120 bytes total,
+from `g_syscall_stack_top` down.  The frame is:
+
+    g_syscall_stack_top -  8   rbx
+                         - 16   rbp
+                         - 24   r12
+                         - 32   r13
+                         - 40   r14
+                         - 48   r15
+                         - 56   user RIP
+                         - 64   user RFLAGS
+                         - 72   user RSP
+                         - 80   r8
+                         - 88   r9
+                         - 96   rdi
+                         -104   rsi
+                         -112   rdx
+                         -120   r10    <- frame base
+
+`signal_deliver_frame` and `sys_rt_sigreturn` both compute
+`g_syscall_stack_top - 120` as `kf`, and `kf[0]` is the r10 slot
+at -120, `kf[4]` is r9 at -88, `kf[6]` is user RSP at -72,
+`kf[7]` is user RFLAGS at -64, `kf[8]` is user RIP at -56, and
+`kf[14]` is rbx at -8.  Every offset lines up with the push
+order.
+
+The number that confused an earlier note — 128 — is the value of
+`rsp` during the `call syscall_dispatch`, because the call's
+return address adds 8 bytes below the frame (and `add rsp, 8`
+after the call discards the stacked arg5).  It is not the frame
+base.  The frame base is 120, and both functions are right to
+use it.
+
+Fragility worth naming: the constant is coupled to the stub's
+push sequence.  If a push is added, removed, or reordered,
+`kf[]` must be re-derived and the two C functions updated in the
+same commit.  A change to one side without the other is a bug.
+
+**The pipe lost-wakeup equality is a standing question, not a
+live bug.**  `wake_no_waiter == writers_nonzero` was observed on
+two 2026-10-23 captures (`P12`: 8 and 8, and 2 and 2) and not on
+the `20261023-sigign` boot (`P12`: 0 and 0).  The reader's
+self-clear of `pipe->reader_waiting` was removed at `7aaaafd`,
+which closed the lost-wakeup mechanism; the equality itself was
+never explained.  Do not chase it as a signal bug and do not
+call it closed on one clean run: it is a standing question about
+the pipe wake counts, separate from signals.  If it reproduces
+as a hang, the ring's `P13` events are the place to read.
 
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
@@ -181,6 +213,27 @@ in a base register, or a segment violation.  It needs its own
 instrument — a first-party reproduction of the `find` sequence,
 or a kernel-side `#GP` handler trace — before it is guessed at.
 It is not the same fault as 7a and must not be folded into 7a.
+
+**Observed again, 2026-10-23, and not reproduced.**  A user-mode
+`#PF` fired during 5000 iterations of `echo hi | wc` in a boot
+that had first run `sigchld_probe`, `kill_self`, `sigsegv_probe`,
+and `sigterm_ignore`.  CR2 `0x876CA6`, RIP `0x413962`, error
+`0x5` (present + user + read), the CR2 inside the 2 MB page at
+phys base `0x800000` — a user-mode read of a kernel physical
+address, which is the 7b/7e signature.  The boot's capture
+contained exactly one `#PF`; the nine signal probes were clean.
+The kernel killed the faulting busybox and returned to the
+fallback `musl_sh` prompt; the system survived.
+
+Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
+boot all completed cleanly; a probe-then-5000 run on a later
+boot reached 5000.  So the loop is not the cause and 5000 is not
+a threshold; the fault is intermittent.  Do not chase it as a
+signal bug (the probes are not implicated) and do not call it
+closed on one clean run.  It is the same family as the
+`0x42F1A7` `#GP` (7b) and the ash stale-`jmp_buf` (7e), and the
+next session that touches the VFS, fork, or exec paths should
+read this first.
 
 **Disassembly of the current build (2026-10-18).**  `third_party/busybox/busybox` is non-PIE (`Type: EXEC`, load base `0x400000`); `0x42F1A7` is inside the executable PT_LOAD but is **not an instruction boundary** -- it falls inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.  Starting a disassembly at `0x42F1A7` yields a spurious `movabs`, which is the tell.  The nearest real instructions that can raise a user `#GP(0)` are `0x42F1A3` (`mov 0xa0(%r12),%rdi`, a non-canonical `%r12`) and `0x42F1AB` (`cmpb $0x0,0x1(%rbp)`, a non-canonical `%rbp` set by `xchg %rax,%rbp` at `0x42F197` from a returned pointer).  No SSE/XMM instruction appears in the window, so 7b is **not** a face of item 10.  The recorded address is therefore either a fault/operand address, a transcription slip, or from an older build.  Suspected (not proven) to be a downstream symptom of a pre-v0.6.13 corruption race (heap cycle / pipe wake / `C`); unobserved since those closed.  The standing test is a 100 Hz soak (PIPE7E-ALL-PASS, 250000 iterations @ 100 Hz over >3.5 hours, 2026-10-18); if it recurs, inspect `%r12`/`%rbp` at `0x42F1A3`/`0x42F1AB` and trace the corruption upstream of `find`.
 
@@ -206,11 +259,14 @@ the path shape, not on `process_find_by_pid`.  `ps` only stats
 pids `readdir` gave it, so it does not affect the consumer.
 Worth one line when `/proc` is next touched.
 
-**`sys_gettimeofday` (99) is not implemented.**  `clock_gettime`
-(228) is, and is what musl reaches for in most cases, but
-`PS_LONG`/`PS_TIME` in `ps` call `time()`/`localtime()`, which
-reach 99, and `ps -l` therefore hits `Unknown syscall: 99`.  A
-small syscall from `g_ticks`, like `clock_gettime`.
+**`gettimeofday` (96) and `time` (201) are unimplemented.**
+Neither is reached by anything on the image today.  `ps -l`
+reaches **99**, which is `sysinfo`, not `gettimeofday` -- that
+number was recorded wrong in earlier notes.  `sys_sysinfo` now
+fills `struct sysinfo` from `g_ticks` and the PMM (uptime,
+procs, totalram, freeram; the rest zero).  Implement 96 and 201
+when a caller appears -- e.g. `date` (needs 201) or a
+`CONFIG_FEATURE_PS_TIME` path that actually uses `time()`.
 
 **A live pipe slot's `end` field is 0; no writer is in the
 source.**  Latent, not active.  A `file_slot_t` of kind
@@ -295,8 +351,12 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 - **`mmap_nx`** proves `sys_mmap`'s `PT_NX` gate is enforced.
   Run it when changing `sys_mmap`, the `PROT_*` handling, or the
   leaf-PTE construction.
-- **`sigsegv_probe`** installs a `SIGSEGV` handler via a minimal
-  `sys_rt_sigaction`.  The handler does not return.
+- **`sigsegv_probe`** installs a `SIGSEGV` handler, faults, and
+  edits `ucontext.gregs[16]` so `rt_sigreturn` resumes past the
+  fault.  It is the acceptance check for slice 4.
+- **`sigterm_ignore`** installs `SIG_IGN` for SIGTERM, raises
+  SIGTERM, and prints whether it survived.  It is the acceptance
+  check for the `SIG_IGN` disposition (`20261023-sigign`).
 - **`at_step1` sections**, as of session 41: sections 1–7
   `resolve_at`; 8–9 `faccessat`; 11 `utimensat`.  (There is no
   section 10.)

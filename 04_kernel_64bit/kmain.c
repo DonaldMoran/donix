@@ -88,6 +88,39 @@ void test_process_entry(void) {
     process_exit();
 }
 
+/*
+ * Kernel-mode entry point for the sigdump acceptance test.
+ *
+ * Calls sys_kill on itself with SIGUSR1 and exits.  It is the
+ * kernel-side twin of userland/musl/tests/kill_self.c: same
+ * sys_kill, same pending-bit set, same g_sig_raise_count
+ * increment.  The only difference is that this runs in kernel
+ * mode, which is what lets the kernel shell -- the only shell
+ * with a process-dump command -- do the raise and the dump in
+ * one boot.
+ *
+ * The kernel shell and the user shell are mutually exclusive per
+ * boot (kmain's 'k' branch switches to the kernel shell and does
+ * not fall through to musl_sh), so kill_self cannot be followed
+ * by proclist in one boot.  This entry point closes that gap
+ * without adding a syscall.
+ *
+ * SIGUSR1 is 10 (Linux x86_64).  sys_kill is the same function
+ * the syscall dispatcher reaches, not a parallel path.
+ */
+void test_kill_entry(void) {
+    long pid = (long)process_get_current()->pid;
+    long r = sys_kill(pid, 10);   /* SIGUSR1 */
+    if (r != 0) {
+        serial_print("KILLTEST: sys_kill failed: ");
+        serial_print_dec((uint64_t)r);
+        serial_print("\n");
+    } else {
+        serial_print("KILLTEST: sys_kill returned 0 (raise ok)\n");
+    }
+    process_exit();
+}
+
 extern void user_syscall_entry(void);
 
 static int cpu_has_syscall(void) {
@@ -1108,16 +1141,16 @@ static int test_create_fail(void) {
 
 static void handle_command(const char *cmd) {
     if (cmd == NULL || cmd[0] == '\0') {
-        vga_print("> ");
+        PRINT_BOTH("> ");
         return;
     }
 
     if (strcmp(cmd, "help") == 0) {
-        vga_print("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
+        PRINT_BOTH("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  sigdump, killtest,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.17\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.18\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.17 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.18 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1128,7 +1161,7 @@ static void handle_command(const char *cmd) {
         } else {
             vga_print("  No boot info struct found.\n");
         }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "mem") == 0) {
         vga_print("\nMem Info (4KB Pages):\n");
         if (g_bootinfo && g_bootinfo->memory_map_count > 0) {
@@ -1139,13 +1172,13 @@ static void handle_command(const char *cmd) {
             }
             vga_print("  Usable RAM: "); vga_print_dec_cur(total_usable / (1024 * 1024)); vga_print(" MB\n");
         } else { vga_print("  MMap unavailable\n"); }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "reboot") == 0) {
         vga_print("\nResetting...\n");
         handle_reboot_sequence();
     } else if (strcmp(cmd, "pmmtest") == 0) {
         test_pmm();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "test") == 0) {
         vga_print("\n=== Exception Test ===\n  1 - #DE\n  2 - #PF\n  3 - #GP\nSelect: ");
         char c = 0;
@@ -1161,10 +1194,10 @@ static void handle_command(const char *cmd) {
         } else {
             vga_print("Aborted.\n");
         }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "vmmtest") == 0) {
         test_vmm();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "serialtest") == 0) {
         vga_print("\nSending COM1 packets...\n");
         serial_print("\n=== COM1 UART TEST PASSED ===\n");
@@ -1172,28 +1205,28 @@ static void handle_command(const char *cmd) {
     } else if (strcmp(cmd, "heapstat") == 0) {
         vga_print("\nHeap stats streamed to serial.\n");
         heap_stats();                 // serial only, includes its own banner
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "maptest") == 0) {
         test_map();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "testrec") == 0) {
         test_recursive();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "heaptest") == 0) {
         test_heap();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "heapcheck") == 0) {
         test_heap_validate();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "heapstress") == 0) {
         test_heap_stress();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "nxtest") == 0) {
         test_nx();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "syscall") == 0) {
         test_syscall();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "elfload") == 0) {
         vga_print("\n--- ELF Loader ---\n");
         if (test_program_len == 0) { vga_print("Binary missing.\n> "); return; }
@@ -1207,22 +1240,55 @@ static void handle_command(const char *cmd) {
                 scheduler_switch_to(proc);
             } else { vga_print("Load failure.\n"); process_destroy(proc); }
         }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "proclist") == 0) {
-        vga_print("\nTrace streamed to serial logs.\n"); process_dump_all(); vga_print("> ");
+        vga_print("\nTrace streamed to serial logs.\n"); process_dump_all(); PRINT_BOTH("> ");
+    } else if (strcmp(cmd, "sigdump") == 0) {
+        /*
+         * Slice 1 of docs/signal-design.md, question 6: the
+         * two signal counters, without the rest of the process
+         * dump.  g_sig_deliver_count is 0 in slice 1 -- the
+         * code that would increment it is slice 2's -- so a
+         * healthy dump reads "sig_raise=N sig_deliver=0".
+         */
+        extern volatile uint64_t g_sig_raise_count;
+        extern volatile uint64_t g_sig_deliver_count;
+        PRINT_BOTH("\nsig_raise=");
+        PRINT_BOTH_DEC(g_sig_raise_count);
+        PRINT_BOTH(" sig_deliver=");
+        PRINT_BOTH_DEC(g_sig_deliver_count);
+        PRINT_BOTH("\n> ");
+    } else if (strcmp(cmd, "killtest") == 0) {
+        /*
+         * Spawn a kernel-mode child that calls sys_kill on
+         * itself, the same way the sigsegv selftest spawns a
+         * kernel-mode child that faults.  suspend_self_for_
+         * diagnostic keeps the shell off the ready queue
+         * while the child runs; scheduler_switch_to runs it.
+         * When it exits, process_exit resumes the shell.
+         */
+        extern void test_kill_entry(void);
+        pcb_t* proc = process_create("killtest", (uint64_t)test_kill_entry, 0);
+        if (proc) {
+            suspend_self_for_diagnostic();
+            scheduler_switch_to(proc);
+        } else {
+            PRINT_BOTH("killtest: process_create failed\n");
+        }
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "vmmclone") == 0) {
-        process_test_clone(); vga_print("> ");
+        process_test_clone(); PRINT_BOTH("> ");
     } else if (strcmp(cmd, "proccreate") == 0) {
         pcb_t* test = process_create("testproc", 0xDEADBEEF, 0);
         if (test) { scheduler_ready_queue_remove(test); vga_print("\nPCB alloc OK\n"); }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "runproc") == 0) {
         pcb_t* proc = process_create("testproc", (uint64_t)test_process_entry, 0);
         if (proc) {
             suspend_self_for_diagnostic();
             scheduler_switch_to(proc);
         }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "schstat") == 0) {
         PRINT_BOTH("\n=== Scheduler Dashboard ===\n");
         scheduler_stats();
@@ -1241,27 +1307,27 @@ static void handle_command(const char *cmd) {
             if (p1) process_destroy(p1);
             if (p2) process_destroy(p2);
         }
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "racedump") == 0) {
 #if RACE_PROBE_ANY
         race_probe_dump();
 #else
         vga_print("race probes disabled\n");
 #endif
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "gdtdump") == 0) {
-        gdt_dump(); vga_print("> ");
+        gdt_dump(); PRINT_BOTH("> ");
     } else if (strcmp(cmd, "tssdump") == 0) {
-        tss_dump(); vga_print("> ");
+        tss_dump(); PRINT_BOTH("> ");
     } else if (strcmp(cmd, "atatest") == 0) {
         test_ata();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "fatmount") == 0) {
         test_fat_mount();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "fatls") == 0) {
         test_fat_ls();
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "fatcat") == 0 || strncmp(cmd, "fatcat ", 7) == 0) {
         PRINT_BOTH("\n=== FatFs File Viewer ===\n");
 
@@ -1317,7 +1383,7 @@ static void handle_command(const char *cmd) {
         }
 
         kfree(file_buf);
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else if (strcmp(cmd, "selftest") == 0) {
         PRINT_BOTH("\n=== Kernel Self-Test ===\n");
         int pass = 0, fail = 0;
@@ -1353,13 +1419,13 @@ static void handle_command(const char *cmd) {
         PRINT_BOTH("  ---\n  ");
         PRINT_BOTH_DEC((uint64_t)pass); PRINT_BOTH(" passed, ");
         PRINT_BOTH_DEC((uint64_t)fail); PRINT_BOTH(" failed\n");
-        vga_print("> ");
+        PRINT_BOTH("> ");
     } else {
-        vga_print("\nUnknown command.\n> ");
+        PRINT_BOTH("\nUnknown command.\n> ");
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    vga_print("donix v0.6.17\n> ");
+    PRINT_BOTH("donix v0.6.18\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
@@ -1384,14 +1450,22 @@ __attribute__((noreturn)) void kmain_shell_loop(void) {
              * unaffected by what the keyboard delivers.
              */
             if (c == 0x7F) {
-                if (cmd_pos > 0) { cmd_pos--; vga_putc('\b'); }
+                if (cmd_pos > 0) {
+                    cmd_pos--;
+                    vga_putc('\b');
+                    serial_putc('\b'); serial_putc(' '); serial_putc('\b');
+                }
                 continue;
             }
             if (c == '\r') {
-                vga_putc('\n'); cmd_buffer[cmd_pos] = '\0';
+                vga_putc('\n'); serial_putc('\n'); cmd_buffer[cmd_pos] = '\0';
                 handle_command(cmd_buffer); cmd_pos = 0; continue;
             }
-            if (c >= ' ' && c <= '~' && cmd_pos < 127) { cmd_buffer[cmd_pos++] = c; vga_putc(c); }
+            if (c >= ' ' && c <= '~' && cmd_pos < 127) {
+                cmd_buffer[cmd_pos++] = c;
+                vga_putc(c);
+                serial_putc(c);
+            }
         }
     }
 }

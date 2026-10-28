@@ -195,27 +195,28 @@ typedef struct pcb {
     uint64_t signal_handler[64];
 
     /*
-     * Re-entry guard for the minimal signal redirect (item 7e
-     * instrument).
+     * Re-entry guard for signal delivery, slices 2-4.
      *
-     * signal_maybe_redirect points the interrupt frame at a
-     * process's installed handler and returns 1 so the caller
-     * resumes into it.  Without this field, a handler that
-     * itself faulted re-entered itself forever: the handler
-     * stayed installed, so signal_maybe_redirect returned 1 on
-     * every subsequent fault, and the process looped on a
-     * faulting handler instruction instead of being killed.
+     * Set by each of the three deliver helpers
+     * (signal_deliver_frame, signal_deliver_frame_iretq,
+     * signal_deliver_frame_exc) when a handler frame is built;
+     * cleared by sys_rt_sigreturn when the handler returns.  All
+     * three helpers refuse to deliver when it is already set, so
+     * a fault taken inside a handler is killed by
+     * fault_kill_current rather than re-delivered into the same
+     * handler forever.  That is the Unix behavior for a SIGSEGV
+     * with SA_NODEFER off: the handler runs once, and a fault in
+     * it is fatal.
      *
-     * Set when the redirect fires; if it is already set, the
-     * redirect returns 0 and the caller kills the process the
-     * normal way -- which is what the comment above
-     * signal_maybe_redirect has always claimed happens.
+     * It previously guarded only the deleted 7e signal_maybe_
+     * redirect instrument; slice 4 moved the semantics to the
+     * deliver helpers and the rt_sigreturn clear.
      *
      * APPENDED AT THE END so no offset that context_switch.asm
      * reads (which stops at block_kind, offset 0x158) moves.
      * Same rule as the cwd, fault_signal, and signal_handler
-     * fields above.  Cleared by process_reclaim so a reused PCB
-     * slot starts clean.
+     * fields above.  Cleared by process_reclaim and
+     * process_destroy so a reused PCB slot starts clean.
      */
     int in_signal_handler;
 
@@ -232,6 +233,60 @@ typedef struct pcb {
      * _Static_assert in process.c pins that offset.
      */
     uint64_t user_rsp;
+
+    /*
+     * Signal state -- slice 1 of docs/signal-design.md.
+     *
+     * Pending mask and blocked mask, one bit per signal, matching
+     * signal_handler[]'s indexing: bit N for signal N, with
+     * signal_handler[N] the handler for signal N.  Signals 1..63
+     * are the usable range; bit 0 is unused (signal 0 is not a
+     * deliverable signal) and bit 64 is unused (signal_handler[]
+     * has 64 entries, indexed 0..63).
+     *
+     * SLICE 1 HAS NO DELIVERY.  These fields are written by
+     * sys_rt_sigprocmask (sig_blocked) and by kill/tgkill
+     * (sig_pending), and read only by the counters and the
+     * wake-on-raise path.  Nothing consults them on the way out
+     * to user mode; that is slice 2's frame work.
+     *
+     * APPENDED AT THE END, after user_rsp, so no asserted offset
+     * moves.  Nothing asserts sizeof(pcb_t); the _Static_assert
+     * block in process.c pins named offsets through user_rsp at
+     * 0x610, all of which are before these fields.
+     *
+     * CLEARED in process_reclaim and process_destroy, like
+     * signal_handler[] and in_signal_handler: a reused PCB slot
+     * must not carry the previous process's pending bits or
+     * blocked mask.  COPIED in sys_fork: the child inherits the
+     * parent's blocked mask (as on Linux) and starts with no
+     * pending signals (process_create's memset already zeroed
+     * it, and sys_fork sets it explicitly as well).
+     */
+    uint64_t sig_pending;
+    uint64_t sig_blocked;
+
+    /*
+     * Restorer per signal -- slice 2 of docs/signal-design.md.
+     *
+     * musl's k_sigaction is 32 bytes on x86_64: handler (0),
+     * flags (8), restorer (16), mask[2] (24).  sys_rt_sigaction
+     * reads all 32 and stores handler in signal_handler[] and
+     * restorer here.  The deliver path writes signal_restorer[n]
+     * into the user-stack frame's first slot; the handler rets
+     * to it, and it is __restore_rt ('mov \$15, %rax; syscall').
+     *
+     * APPENDED AT THE END, after sig_blocked, so no asserted
+     * offset moves.  sizeof(pcb_t) grows from 0x628 to 0x828.
+     * context_switch.asm reads nothing past block_kind (0x158)
+     * or user_rsp (0x610); both are untouched.
+     *
+     * Cleared in process_reclaim and process_destroy alongside
+     * the other signal fields.  Copied in sys_fork: Linux
+     * inherits handlers across fork, and the restorer is part of
+     * the handler.
+     */
+    uint64_t signal_restorer[64];
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)
