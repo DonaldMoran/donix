@@ -182,6 +182,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENAMETOOLONG_ 36
 
 #define DEBUG_GETCWD 0
+#define DEBUG_SIGDELIVER 1
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -9211,6 +9212,15 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
     if (signum < 1 || signum >= 64) return -(long)EINVAL_;
     pcb_t *self = process_get_current();
     if (!self) return -(long)EINVAL_;
+#if DEBUG_SIGDELIVER
+    serial_print("DBG-SIGACTION-ENTRY self->pid=");
+    serial_print_dec(self->pid);
+    serial_print(" signum=");
+    serial_print_dec((uint64_t)signum);
+    serial_print(" act=");
+    serial_print_hex((uint64_t)(uintptr_t)act);
+    serial_print("\n");
+#endif
 
     if (!act) return 0;
 
@@ -9254,6 +9264,17 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
     uint64_t prev_r = self->signal_restorer[signum];
     self->signal_handler[signum]  = handler;
     self->signal_restorer[signum] = restorer;
+#if DEBUG_SIGDELIVER
+    serial_print("DBG-SIGACTION self->pid=");
+    serial_print_dec(self->pid);
+    serial_print(" signum=");
+    serial_print_dec((uint64_t)signum);
+    serial_print(" handler=");
+    serial_print_hex(handler);
+    serial_print(" stored=");
+    serial_print_hex(self->signal_handler[signum]);
+    serial_print("\n");
+#endif
     if (oldact) {
         uint64_t old[4];
         old[0] = prev_h;
@@ -9593,6 +9614,22 @@ long signal_deliver_frame(uint64_t syscall_result) {
     pcb_t* self = process_get_current();
     if (!self) return 0;
     if (self->in_signal_handler) return 0;
+#if DEBUG_SIGDELIVER
+    {
+        uint64_t _p = self->sig_pending & ~self->sig_blocked;
+        int _n = 0;
+        while (_n < 64 && !(_p & (1ULL << _n))) _n++;
+        serial_print("DBG-SIGDELIVER self->pid=");
+        serial_print_dec(self->pid);
+        serial_print(" n=");
+        serial_print_dec((uint64_t)_n);
+        serial_print(" handler=");
+        serial_print_hex(self->signal_handler[_n]);
+        serial_print(" pend=0x");
+        serial_print_hex(self->sig_pending);
+        serial_print("\n");
+    }
+#endif
 
     uint64_t pend = self->sig_pending & ~self->sig_blocked;
     if (pend == 0) return 0;
@@ -10416,8 +10453,10 @@ long sys_fork(void) {
      */
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
-    for (int _i = 0; _i < 64; _i++)
+    for (int _i = 0; _i < 64; _i++) {
+        child->signal_handler[_i]  = parent->signal_handler[_i];
         child->signal_restorer[_i] = parent->signal_restorer[_i];
+    }
 
 
     /*
@@ -10579,6 +10618,16 @@ static void kernel_do_reboot(void) {
 uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+#if DEBUG_SIGDELIVER
+    {
+        pcb_t* _d = process_get_current();
+        serial_print("DBG-SYSCALL pid=");
+        serial_print_dec(_d ? _d->pid : 0);
+        serial_print(" num=");
+        serial_print_dec(num);
+        serial_print("\n");
+    }
+#endif
     g_last_syscall_num = num;
     /* Record the calling process's %fs base at syscall entry.
      * Done here in C, not in the asm stub: the asm stub has no
