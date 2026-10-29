@@ -1438,7 +1438,14 @@ void process_yield(void) {
      * whatever it is executing on.
      */
     if (next == current_process) {
-        current_process->state = PROC_STATE_RUNNING;
+        /* Restore the caller to its pre-yield state.  A BLOCKED caller
+         * (e.g. the nanosleep probe) must NOT be forced RUNNING: that
+         * clobbers BLOCKED with no valid saved frame, and the next tick
+         * preempts it mid-hlt and context_switch resumes garbage ->
+         * user RSP=0 #PF.  Only a READY caller (the normal yield) is
+         * promoted to RUNNING here; it is about to resume on the CPU. */
+        if (current_process->state == PROC_STATE_READY)
+            current_process->state = PROC_STATE_RUNNING;
         __asm__ volatile("sti");
         return;
     }
@@ -1468,7 +1475,13 @@ void process_yield(void) {
         serial_print(next->name);
         serial_print(" state=RUNNING\n");
         serial_unlock();
-        current_process->state = PROC_STATE_RUNNING;
+        /* Same restore rule as the next == current_process guard above:
+         * a BLOCKED caller stays BLOCKED.  Forcing RUNNING here was the
+         * YIELD-REFUSE setting a BLOCKED process to RUNNING that produced
+         * the user RSP=0 #PF.  Contract rule 2: check (current state) and
+         * act (write it) must have the same subject. */
+        if (current_process->state == PROC_STATE_READY)
+            current_process->state = PROC_STATE_RUNNING;
         __asm__ volatile("sti");
         return;
     }
