@@ -69,6 +69,7 @@
  *  22  pipe              sys_pipe          (Step 1: non-blocking; see note)
  *  32  dup               sys_dup           (alias of fcntl F_DUPFD)
  *  33  dup2              sys_dup2
+ *  34  pause             sys_pause         (block until a deliverable signal)
  *  35  nanosleep         sys_nanosleep (g_ticks deadline loop; 10 ms granularity)
  *  39  getpid            sys_getpid
  *  57  fork              sys_fork
@@ -154,6 +155,8 @@
 #define SYS_BRK             12
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
+#define SYS_PAUSE           34
+#define SYS_RT_SIGSUSPEND   130
 #define SYS_RT_SIGRETURN    15
 #define SYS_IOCTL           16
 #define SYS_READV           19
@@ -281,6 +284,8 @@ long sys_close(int fd);
 long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_nanosleep(const void* req, void* rem);
+long sys_pause(void);
+long sys_rt_sigsuspend(const void* user_mask, size_t size);
 long sys_unlink(const char* path);
 long sys_readlink(const char* path, char* buf, size_t bufsiz);
 long sys_rmdir(const char* path);

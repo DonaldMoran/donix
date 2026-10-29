@@ -7761,6 +7761,74 @@ long sys_sysinfo(void* user_info) {
     return 0;
 }
 
+/*
+ * Linux x86_64 pause(2) -- syscall 34.
+ *
+ * Suspend the calling thread until a signal whose action is to
+ * execute a handler or terminate the process is delivered.
+ * Signals that are blocked, ignored (SIG_IGN), or whose default
+ * action is ignore do NOT wake pause.
+ *
+ * The implementation is a block loop: set state = BLOCKED with
+ * block_kind = BLOCK_KIND_PAUSE, yield, and check sig_pending
+ * on wake.  sys_kill's wake path sees us BLOCKED and marks us
+ * READY, so we are woken.  The timer's process_wake_all_blocked
+ * skips us because block_kind != NONE, so we do not spin.
+ */
+long sys_pause(void) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    for (;;) {
+        /*
+         * If a deliverable signal is already pending, return
+         * -EINTR immediately.  This covers the case where the
+         * signal arrived between the caller's last syscall and
+         * this one.
+         */
+        if ((self->sig_pending & ~self->sig_blocked) != 0) {
+            return -(long)4;   /* -EINTR */
+        }
+
+        uint64_t saved_flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+        self->state      = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_PAUSE;
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+
+        process_yield();
+
+        /*
+         * Resumed.  Check the pending mask again.  If a signal
+         * was delivered while we were blocked, return -EINTR.
+         * If the wake was spurious (e.g. a SIGKILL that set
+         * pending but also terminated us, we would not be here),
+         * loop and block again.
+         */
+        self->state      = PROC_STATE_RUNNING;
+        self->block_kind = BLOCK_KIND_NONE;
+    }
+}
+
+/*
+ * Linux x86_64 rt_sigsuspend(2) -- syscall 130.
+ *
+ * Atomically replace the signal mask with the one in user_mask,
+ * block until a signal outside that mask is delivered, then
+ * restore the old mask.  This is the primitive that a race-free
+ * "wait for a signal" loop is built on.
+ *
+ * Not implemented yet.  The mask swap and restore are simple;
+ * the wake path and the -EINTR delivery need the same check as
+ * sys_pause.  For now, return -ENOSYS so a caller that probes
+ * it gets a clean answer.
+ */
+long sys_rt_sigsuspend(const void* user_mask, size_t size) {
+    (void)user_mask;
+    (void)size;
+    return -(long)38;   /* -ENOSYS */
+}
+
 long sys_nanosleep(const void* user_req, void* user_rem) {
     (void)user_rem;   /* never written; see the header comment */
 
@@ -10530,6 +10598,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_PIPE:            result = (uint64_t)sys_pipe((int*)arg0); break;
         case SYS_DUP:             result = (uint64_t)sys_dup((int)arg0); break;
         case SYS_DUP2:            result = (uint64_t)sys_dup2((int)arg0, (int)arg1); break;
+        case SYS_PAUSE:           result = (uint64_t)sys_pause(); break;
+        case SYS_RT_SIGSUSPEND:   result = (uint64_t)sys_rt_sigsuspend((const void*)arg0, (size_t)arg1); break;
         case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
         case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
         case SYS_FORK:            result = (uint64_t)sys_fork(); break;

@@ -46,6 +46,7 @@ typedef enum {
  */
 #define BLOCK_KIND_PIPE_READ  2
 #define BLOCK_KIND_PIPE_WRITE 3
+#define BLOCK_KIND_PAUSE      4
 
 // Process Control Block
 typedef struct pcb {
