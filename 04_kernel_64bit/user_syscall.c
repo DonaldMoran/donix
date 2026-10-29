@@ -6097,7 +6097,7 @@ long sys_wait4(long pid, int* user_status, int options) {
             if (c->parent_pid != self->pid) continue;
             if (target != (uint64_t)-1 && c->pid != target) continue;
 
-            if (c->state == PROC_STATE_ZOMBIE) {
+            if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) {
                 zombie = c;
                 break;
             }
@@ -6199,7 +6199,7 @@ long sys_wait4(long pid, int* user_status, int options) {
                 if (!c) continue;
                 if (c->parent_pid != self->pid) continue;
                 if (target != (uint64_t)-1 && c->pid != target) continue;
-                if (c->state == PROC_STATE_ZOMBIE) { late_zombie = c; break; }
+                if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) { late_zombie = c; break; }
             }
             if (late_zombie) {
                 self->state = PROC_STATE_RUNNING;
