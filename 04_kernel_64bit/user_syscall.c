@@ -6209,6 +6209,42 @@ long sys_wait4(long pid, int* user_status, int options) {
                 continue;
             }
         }
+
+        /*
+         * Signals slice 6: a pending, unblocked signal interrupts
+         * the wait.  The wake that brought us here came from
+         * sys_kill, which sets sig_pending and marks us READY (and
+         * adds us to the ready queue) under cli -- so we are on the
+         * queue as we run this.  The late re-scan above gives a
+         * reap priority: a zombie that is ready wins over EINTR,
+         * which is the Unix ordering.  With no zombie and a
+         * deliverable signal pending, return -EINTR (4).
+         *
+         * scheduler_ready_queue_remove(self) before the return is
+         * the same pattern as scheduler_switch_to's tail: the
+         * process is running, so it must not remain on the ready
+         * queue in RUNNING state (the stranded-RUNNING shape the
+         * YIELD-TO-IDLE dump showed).  _remove is idempotent; if
+         * the sys_kill wake did not reach us (it ran before we
+         * re-blocked), there is nothing to remove.
+         *
+         * STEP-A delivery then runs on the way out of
+         * syscall_dispatch: the handler runs, and -EINTR is
+         * preserved in ucontext.gregs[RAX] for rt_sigreturn.
+         *
+         * No handler + no restorer means the bit stays set and no
+         * handler runs; that is a probe-installation bug (musl
+         * always sets SA_RESTORER), not a kernel bug, and the
+         * syscall's -EINTR is still correct.
+         */
+        if ((self->sig_pending & ~self->sig_blocked) != 0) {
+            scheduler_ready_queue_remove(self);
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            self->wait_pid   = 0;
+            __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+            return -(long)4;   /* -EINTR */
+        }
         /* End of the critical section.  The state is BLOCKED and the
          * waker has not run; restore interrupts before yielding. */
         __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
