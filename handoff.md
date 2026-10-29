@@ -122,9 +122,16 @@ is commit `6de2d63`, tag `20261023-sigign`.
 **Known limits carried forward:**
 - SIGCHLD interrupts a blocked `wait4` (slice 6, `sys_wait4`
   checks `sig_pending & ~sig_blocked` after the late re-scan).
-  A program that blocks in `read` and expects SIGCHLD's handler
-  to run stays blocked until something else wakes it -- the pipe
-  and console block sites do not yet check `sig_pending`.
+  It also interrupts `sys_read` on a pipe and `sys_write` on a
+  full pipe (the check is after the EOF/EPIPE checks).
+- `sys_nanosleep` CANNOT be interrupted.  Its loop is a
+  `sti; hlt` spin in kernel mode.  The timer does not preempt a
+  kernel-mode `hlt` to run a READY child, so another process
+  cannot run to send the signal.  The `sig_pending` check we
+  would add is unreachable.  A signal delivered while in
+  `nanosleep` will be observed at the next syscall boundary
+  (the return from `nanosleep`), but the sleep itself runs to
+  completion.
 - No `sigsuspend`/`pause`/`sigwait`; there is no atomic
   unblock-and-wait.
 - SIGSTOP/SIGTSTP default-terminate (STOP is not implemented);
