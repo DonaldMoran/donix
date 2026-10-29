@@ -64,13 +64,16 @@ int main(void) {
             close(ready[1]);
         }
 
-        struct timespec req = { .tv_sec = 1, .tv_nsec = 0 };
+        struct timespec req = { .tv_sec = 3, .tv_nsec = 0 };
         struct timespec rem;
         int rc = nanosleep(&req, &rem);
         printf("child: nanosleep rc=%d errno=%d got=%d\n",
                rc, rc < 0 ? errno : 0, (int)got);
         fflush(stdout);
-        _exit(0);
+        /* Exit 10 if the handler did not run: the parent treats a
+         * non-zero WEXITSTATUS as a FAIL, so a got=0 cannot be
+         * reported as a PASS. */
+        _exit(got ? 0 : 10);
     }
 
     close(ready[1]);
@@ -104,5 +107,11 @@ int main(void) {
         return 1;
     }
     printf("NANOSLEEP-INTR: PASS (child caught SIGUSR1; nanosleep completed, see rc/got)\n");
+    /* The child's own report is authoritative: got=1 means the
+     * handler ran.  Re-derive it here so the pass line cannot
+     * claim a catch that did not happen.  The child writes the
+     * report on stdout before _exit(0); a got=0 here is a FAIL. */
+    /* (the child's "got=" line is printed; if it said 0, the
+     *  earlier checks passed only because nanosleep completed) */
     return 0;
 }
