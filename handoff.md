@@ -120,11 +120,11 @@ collapse `SIG_IGN` (1) to 0, making it indistinguishable from
 is commit `6de2d63`, tag `20261023-sigign`.
 
 **Known limits carried forward:**
-- SIGCHLD does not interrupt a blocked `wait4`.  The shell's
-  `wait` loop works because `process_wake_parent_if_waiting`
-  wakes the parent; a program that blocks in `read` and expects
-  SIGCHLD's handler to run stays blocked until something else
-  wakes it.
+- SIGCHLD interrupts a blocked `wait4` (slice 6, `sys_wait4`
+  checks `sig_pending & ~sig_blocked` after the late re-scan).
+  A program that blocks in `read` and expects SIGCHLD's handler
+  to run stays blocked until something else wakes it -- the pipe
+  and console block sites do not yet check `sig_pending`.
 - No `sigsuspend`/`pause`/`sigwait`; there is no atomic
   unblock-and-wait.
 - SIGSTOP/SIGTSTP default-terminate (STOP is not implemented);
@@ -370,10 +370,11 @@ Concurrency rules: `docs/contract.md`.
 
 ### Next -- the highest-value work
 
-1. **SIGCHLD interrupting a blocked `wait4`.**  A program that
-  blocks in `read`/`pause` and expects the handler to run does
-  not get it.  This is a scheduler change (a signal-arrival wake
-  for a blocked syscall), not a delivery change.
+1. **SIGCHLD interrupting a blocked syscall.**  `wait4` is done
+  (slice 6, `-EINTR` after the late re-scan).  The remaining
+  block sites -- pipe read, pipe write, console read,
+  `sys_nanosleep` -- need the same `sig_pending & ~sig_blocked`
+  check on wake.  Each is its own commit with its own probe.
 2. **`sigsuspend`/`pause`/`sigwait`.**  Atomic unblock-and-wait.
 3. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
   SIGCONT resume, process groups, controlling terminal,
