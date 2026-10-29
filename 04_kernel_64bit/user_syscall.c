@@ -6009,6 +6009,23 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
 
+    /* POSIX exec: caught signal dispositions reset to SIG_DFL,
+     * SIG_IGN is preserved, the blocked mask is preserved, and
+     * pending is cleared.  Without this a forked-then-exec'd
+     * process carries a handler address from its pre-exec image;
+     * delivery jumps to a page the new image does not map
+     * (0x41E1A1 #PF, 2026-10-29).  The fork-side inheritance
+     * (c7a7962) and this exec-side reset are one change: either
+     * alone is a bug. */
+    for (int _si = 1; _si < 64; _si++) {
+        if (self->signal_handler[_si] != 1) {   /* keep SIG_IGN */
+            self->signal_handler[_si]  = 0;      /* SIG_DFL */
+            self->signal_restorer[_si] = 0;
+        }
+    }
+    self->sig_pending       = 0;
+    self->in_signal_handler = 0;
+
     {
         int i = 0;
         while (proc_name[i] && i < PROC_NAME_LEN - 1) {

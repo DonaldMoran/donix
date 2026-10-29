@@ -103,6 +103,6 @@ int main(void) {
         printf("NANOSLEEP-INTR: FAIL (child did not exit 0)\n");
         return 1;
     }
-    printf("NANOSLEEP-INTR: PASS (no fault; nanosleep completed uninterrupted -- handler not exercised, see rc/got)\n");
+    printf("NANOSLEEP-INTR: PASS (child caught SIGUSR1; nanosleep completed, see rc/got)\n");
     return 0;
 }
