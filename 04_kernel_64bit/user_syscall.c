@@ -6462,6 +6462,27 @@ long sys_write(int fd, const void* buf, size_t count) {
             }
 
             /*
+             * Signals slice 6: a pending, unblocked signal interrupts
+             * the write.  The wake that brought us here came from
+             * sys_kill, which sets sig_pending and marks us READY
+             * under cli.  The EPIPE and free_space checks above
+             * give a reader's disappearance or a freeing of space
+             * priority over EINTR, which is the Unix ordering.
+             * With the pipe still full, return -EINTR (4).
+             *
+             * scheduler_ready_queue_remove(self) is the same
+             * pattern as sys_read and sys_wait4: the process is
+             * running, so it must not remain on the queue.
+             */
+            if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                scheduler_ready_queue_remove(self);
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return -(long)4;   /* -EINTR */
+            }
+
+            /*
              * Record the waiter and block, with interrupts still
              * off from the cli above.  Both the store and the
              * state change are inside the critical section so a
