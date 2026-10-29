@@ -70,10 +70,12 @@ int main(void) {
         printf("child: nanosleep rc=%d errno=%d got=%d\n",
                rc, rc < 0 ? errno : 0, (int)got);
         fflush(stdout);
-        /* Exit 10 if the handler did not run: the parent treats a
-         * non-zero WEXITSTATUS as a FAIL, so a got=0 cannot be
-         * reported as a PASS. */
-        _exit(got ? 0 : 10);
+        /* Pass: the handler ran (got == 1) AND nanosleep was
+         * interrupted by the signal (rc == -1, errno == EINTR).
+         * nanosleep blocks now, so the parent's kill lands during
+         * the sleep and delivery happens at the wake. */
+        int ok = (got == 1) && (rc == -1) && (errno == EINTR);
+        _exit(ok ? 0 : 10);
     }
 
     close(ready[1]);
@@ -106,7 +108,7 @@ int main(void) {
         printf("NANOSLEEP-INTR: FAIL (child did not exit 0)\n");
         return 1;
     }
-    printf("NANOSLEEP-INTR: PASS (child caught SIGUSR1; nanosleep completed, see rc/got)\n");
+    printf("NANOSLEEP-INTR: PASS (child caught SIGUSR1; nanosleep returned -EINTR)\n");
     /* The child's own report is authoritative: got=1 means the
      * handler ran.  Re-derive it here so the pass line cannot
      * claim a catch that did not happen.  The child writes the

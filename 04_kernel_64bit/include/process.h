@@ -47,6 +47,7 @@ typedef enum {
 #define BLOCK_KIND_PIPE_READ  2
 #define BLOCK_KIND_PIPE_WRITE 3
 #define BLOCK_KIND_PAUSE      4
+#define BLOCK_KIND_NANOSLEEP 5
 
 // Process Control Block
 typedef struct pcb {
@@ -288,6 +289,16 @@ typedef struct pcb {
      * the handler.
      */
     uint64_t signal_restorer[64];
+
+    /* Absolute g_ticks deadline for BLOCK_KIND_NANOSLEEP (0 = none).
+     * APPENDED AT THE END, like the signal fields above: the
+     * _Static_assert block pins offsets only through user_rsp
+     * (0x610), and context_switch.asm reads nothing past it.
+     * Placing this after block_kind (0x158) shifted user_rsp to
+     * 0x618 and failed the assert -- the assert exists for exactly
+     * this.  Set by sys_nanosleep, cleared by the timer wake and
+     * on wake; nothing else reads it. */
+    uint64_t wake_tick;
 } pcb_t;
 
 #define KERNEL_STACK_SLOT_NONE (-1)

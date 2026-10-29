@@ -379,6 +379,23 @@ timer_preempt_handler(uint64_t stack_pointer) {
      * IRQ context -- the PS/2 handler already does.
      */
     process_wake_all_blocked();
+    /* Wake any process whose nanosleep deadline has arrived.
+     * Runs in IRQ context with interrupts off (cli held by the
+     * stub), so the state changes are one critical section --
+     * scheduler contract rule 1.  scheduler_ready_queue_add is
+     * idempotent. */
+    for (int _wi = 0; _wi < MAX_PROCESSES; _wi++) {
+        pcb_t* _wp = process_get_pcb(_wi);
+        if (!_wp) continue;
+        if (_wp->state != PROC_STATE_BLOCKED) continue;
+        if (_wp->block_kind != BLOCK_KIND_NANOSLEEP) continue;
+        if (_wp->wake_tick == 0) continue;
+        if (_wp->wake_tick > g_ticks) continue;
+        _wp->wake_tick  = 0;
+        _wp->block_kind = BLOCK_KIND_NONE;
+        _wp->state      = PROC_STATE_READY;
+        scheduler_ready_queue_add(_wp);
+    }
     #define SCHED_QUANTUM 2
 
     pcb_t* current = process_get_current();

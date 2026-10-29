@@ -182,7 +182,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENAMETOOLONG_ 36
 
 #define DEBUG_GETCWD 0
-#define DEBUG_SIGDELIVER 0
+#define DEBUG_SIGDELIVER 1
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -7921,12 +7921,33 @@ long sys_nanosleep(const void* user_req, void* user_rem) {
 
     if (ticks == 0) return 0;
 
-    uint64_t deadline = g_ticks + ticks;
-    while (g_ticks < deadline) {
-        __asm__ volatile("sti");
-        __asm__ volatile("hlt");
-    }
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
 
+    /* A signal already deliverable: don't sleep at all. */
+    if ((self->sig_pending & ~self->sig_blocked) != 0)
+        return -(long)4;   /* -EINTR */
+
+    uint64_t deadline = g_ticks + ticks;
+
+    /* Block instead of spinning: park BLOCKED with a wake_tick the
+     * timer checks.  process_yield's refuse guards now leave a
+     * BLOCKED caller BLOCKED (scheduler fix), so this parks
+     * correctly.  The timer wakes us at the deadline; a signal
+     * (kill) sets sig_pending and wakes us early. */
+    self->block_kind = BLOCK_KIND_NANOSLEEP;
+    self->wake_tick  = deadline;
+    self->state      = PROC_STATE_BLOCKED;
+    __asm__ volatile("sti");
+    process_yield();
+
+    /* Woken (deadline or signal).  Clear the park state. */
+    self->wake_tick  = 0;
+    self->block_kind = BLOCK_KIND_NONE;
+    self->state      = PROC_STATE_RUNNING;
+
+    if ((self->sig_pending & ~self->sig_blocked) != 0)
+        return -(long)4;   /* -EINTR: a caught signal interrupted the sleep */
     return 0;
 }
 
