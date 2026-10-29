@@ -7028,6 +7028,29 @@ long sys_read(int fd, void* buf, size_t count) {
                 return 0;
             }
 
+            /*
+             * Signals slice 6: a pending, unblocked signal interrupts
+             * the read.  The wake that brought us here came from
+             * sys_kill, which sets sig_pending and marks us READY
+             * under cli.  The writers_open re-check above gives a
+             * closed pipe priority (returning 0 for EOF wins over
+             * EINTR, which is the Unix ordering).  With the pipe
+             * still open and no data, return -EINTR (4).
+             *
+             * scheduler_ready_queue_remove(self) is the same
+             * pattern as sys_wait4's -EINTR path: the process is
+             * running, so it must not remain on the queue in
+             * RUNNING state.  The sys_kill wake added us to the
+             * queue; if it did not reach us, _remove is a no-op.
+             */
+            if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                scheduler_ready_queue_remove(self);
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return -(long)4;   /* -EINTR */
+            }
+
             /* PROBE (session 61): save the live caller-saved
              * registers before halting, so the ring-0 resume
              * restores them instead of the stale pcb slots. */
