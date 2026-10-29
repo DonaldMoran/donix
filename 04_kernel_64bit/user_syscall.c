@@ -7824,9 +7824,58 @@ long sys_pause(void) {
  * it gets a clean answer.
  */
 long sys_rt_sigsuspend(const void* user_mask, size_t size) {
-    (void)user_mask;
-    (void)size;
-    return -(long)38;   /* -ENOSYS */
+    /*
+     * Linux x86_64 rt_sigsuspend(2) -- syscall 130.
+     *
+     * Atomically replace sig_blocked with the mask at user_mask,
+     * block until a signal outside that mask is delivered (and
+     * caught or terminates), then restore the old mask and
+     * return -EINTR.
+     *
+     * The whole point of this syscall is that the mask swap and
+     * the wait are ONE critical section: a signal that arrives
+     * after the swap but before the yield is caught, and a
+     * signal that arrived before the swap is also caught (the
+     * loop checks the pending mask after the swap).  A caller
+     * that does sigprocmask(UNBLOCK) then pause() has a window
+     * between the two calls where the signal can arrive while
+     * still blocked.
+     *
+     * The restore MUST happen before the -EINTR return: STEP-A
+     * delivery runs on the way out of syscall_dispatch and reads
+     * sig_blocked to build uc_sigmask.  If we did not restore
+     * first, the handler would run with the new (temporary) mask.
+     */
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (!user_mask) return -(long)EFAULT_;
+
+    uint64_t newmask = 0;
+    if (safe_copy_from_user(&newmask, user_mask, sizeof(newmask)) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    uint64_t saved = self->sig_blocked;
+
+    for (;;) {
+        uint64_t sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(sf));
+        self->sig_blocked = newmask;
+        uint64_t deliverable = self->sig_pending & ~self->sig_blocked;
+        if (deliverable != 0) {
+            self->sig_blocked = saved;
+            __asm__ volatile("pushq %0; popfq" :: "r"(sf));
+            return -(long)4;   /* -EINTR */
+        }
+        self->state      = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_PAUSE;
+        __asm__ volatile("pushq %0; popfq" :: "r"(sf));
+
+        process_yield();
+
+        self->state      = PROC_STATE_RUNNING;
+        self->block_kind = BLOCK_KIND_NONE;
+    }
 }
 
 long sys_nanosleep(const void* user_req, void* user_rem) {
