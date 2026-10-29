@@ -105,6 +105,33 @@ fallback.
 
 ## Un-numbered open items
 
+**fork inherits signal dispositions.**  Closed by the commit that
+adds `signal_handler[]` to `sys_fork`'s copy loop: before it, a
+child of a parent that installed a handler ran with SIG_DFL for
+that signal.  `sig_blocked` was already inherited and
+`sig_pending` already cleared; only `signal_handler[]` was
+missing.  Kept here as the record of the shape, because the same
+"inherit this field too" review applies to any future per-process
+signal field.
+
+**The probe-race lesson (2026-10-29).**  `nanosleep_intr_probe`'s
+first two versions failed with the child killed by SIGUSR1, and
+the failure was chased through four wrong kernel hypotheses
+(stale `current_process`, fork disposition, `sigaction`
+mis-targeting, an iretq-vs-pop `rax` mismatch) before the actual
+cause was found: **the parent used a fixed `usleep` before
+`kill`, and the child was still inside musl's `__post_fork` when
+the signal arrived, so its handler was not installed yet.**  The
+fix is a pipe handshake -- the child reports readiness after
+installing the handler and before sleeping.  The `DBG-SYSCALL`
+per-syscall trace is what ended the guessing: it showed the child
+ran only `218/14/14` (musl's `__post_fork`) and no `open`, no
+`sigaction`, no `nanosleep`.  Rule 6 restated: a probe that fails
+is signal, but the failure's *location* must be observed, not
+deduced; a fixed sleep is a race, and a handshake is the
+deterministic form.
+
+
 **`chmod`/`chown` accept and drop, and their applets are not
 compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and
 store nothing: FAT has no mode bits and no ownership, everything
