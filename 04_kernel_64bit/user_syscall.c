@@ -182,7 +182,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENAMETOOLONG_ 36
 
 #define DEBUG_GETCWD 0
-#define DEBUG_SIGDELIVER 1
+#define DEBUG_SIGDELIVER 0
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
