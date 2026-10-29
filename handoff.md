@@ -5,10 +5,17 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-28.  **`v0.6.18` is released.**  Signals
+**Last updated:** 2026-10-29.  **`v0.6.18` is released; work is
+pre-`v0.6.19`.**  Signals
 slices 1-5 are in it, with `tkill`, the busybox `KILL` applet, and
-the `SIG_IGN` fix.  The release tag carries the per-release
-summary.  Every path syscall reaches its filesystem
+the `SIG_IGN` fix.  Slice 6 (signals interrupt blocking syscalls)
+is complete for `wait4`, pipe `read`, pipe `write`, `pause`, and
+`sigsuspend`, each with a probe in `userland/musl/tests/` and a
+per-step restore tag (`20261029-slice6-*`).  `sys_wait4` also now
+reaps `PROC_STATE_TERMINATED`, closing the deadlock
+`SIGINTR_WAIT4_PROBE` exposed.  `nanosleep` interruption is a
+documented limitation (the `sti; hlt` loop monopolizes the CPU in
+kernel mode).  Every path syscall reaches its filesystem
 through the mount table (`mount_driver(backend)->op(...)`); the
 resolver is `vfs_resolve(path, follow_final)`; symlinks work end to
 end.  `test.sh` is 57/57 and `canary --full` is 28/28, verified
@@ -34,10 +41,8 @@ device number.
 const`); file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store
 them); shebang + `/bin/sh` in the kernel (the image half is done);
 `chmod`/`chown` (90-93) accept and drop, FAT has no mode or owner;
-and three signal gaps, named in "Signals: what remains" below --
-SIGCHLD does not interrupt a blocked `wait4`, there is no
-`sigsuspend`/`pause`, and SIGSTOP/SIGTSTP default-terminate rather
-than stop.  SSE state is not saved (open-issues item 10).  No
+and one signal gap, named in "Signals: what remains" below --
+SIGSTOP/SIGTSTP default-terminate rather than stop (job control).  SSE state is not saved (open-issues item 10).  No
 privilege model (item 9).
 
 **THE RELEASE TAGS.**  `v0.6.16` (the VFS), `v0.6.17` (FAT
