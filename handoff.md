@@ -55,18 +55,27 @@ VFS), `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`), and
 `v0.6.18` (signals slices 1-5) are released.  Work is now
 pre-`v0.6.19`.  The working tree is `dev`, clean.
 
-**NEXT.**  Signals are done for the scope they were given.  The
-three remaining gaps are real work, not probes, and each is its
-own session: (a) SIGCHLD interrupting a blocked `wait4` -- a
-signal-arrival wake for a blocked syscall, which is a scheduler
-change, not a delivery change; (b) `sigsuspend`/`pause` -- an
-atomic unblock-and-wait, which is a syscall addition; (c)
-SIGSTOP/SIGTSTP stop + SIGCONT resume -- job control, open-issues
-item 13.  After those, in order: shebang + `/bin/sh` kernel half
-(item 14); SSE save/restore then remove the userland `-mno-sse*`
-flags (item 10); the privilege model (item 9); busybox batch 2.
-`test.sh`'s md5 is still listed in the old work list; it is not
-blocking anything.
+**NEXT.**  Signals are done for the scope they were given.
+Slice 6 (interrupt on a pending signal) covers `wait4`, pipe
+`read`, pipe `write`, `pause`, and `sigsuspend`.  The remaining
+signal work is **job control**, and it has three parts, all of
+which are needed: (a) the kernel side -- SIGSTOP/SIGTSTP stop,
+SIGCONT resume, a `PROC_STATE_STOPPED` state, process groups,
+controlling terminal, `tcsetpgrp` (open-issues item 13); (b)
+the busybox side -- `CONFIG_ASH_JOB_CONTROL=y`; without it, ash
+does not put foreground jobs in their own process group and
+does not issue `tcsetpgrp`, so `Ctrl-Z` does not work even when
+the kernel is correct; (c) the tty side -- `console_read` /
+`keyboard` must map `Ctrl-Z` to SIGTSTP (and the other control
+chars to their signals) and must track the foreground process
+group.  Job control also depends on the `process_yield`
+re-entrancy fix described under "Where we are -> Next":
+`YIELD-REFUSE` on a `BLOCKED` process is a scheduler bug that a
+stop/resume transition will hit.  After job control, in order:
+shebang + `/bin/sh` kernel half (item 14); SSE save/restore then
+remove the userland `-mno-sse*` flags (item 10); the privilege
+model (item 9); busybox batch 2.  `test.sh`'s md5 is still
+listed in the old work list; it is not blocking anything.
 
 ### Signals: what is in, and what was proven
 
@@ -137,8 +146,8 @@ is commit `6de2d63`, tag `20261023-sigign`.
   `nanosleep` will be observed at the next syscall boundary
   (the return from `nanosleep`), but the sleep itself runs to
   completion.
-- No `sigsuspend`/`pause`/`sigwait`; there is no atomic
-  unblock-and-wait.
+- No `sigwait` (the synchronous wait-for-a-specific-signal
+  primitive); `pause` and `sigsuspend` are implemented.
 - SIGSTOP/SIGTSTP default-terminate (STOP is not implemented);
   SIGCONT's default is ignore, which is correct, but there is no
   stopped state to continue.  Job control is open-issues item 13.
@@ -222,14 +231,13 @@ echo and command output go to the serial terminal.
 - `6de2d63` = `20261023-sigign`: `SIG_IGN` is a disposition, not
   `SIG_DFL`; `sigterm_ignore` added and surviving.
 
-**The scratch tags since `v0.6.17` are the restore points**:
-`20261020-psl-sysinfo`, `20261021-signal-slice1-base`,
-`-slice1-pre-docs`, `-slice1-docs-post`, `-slice2-done`,
-`-slice3-done`, `-slice4-done`, `-slice5-done`,
-`-shell-echo-pre-fix`, `-shell-echo-post-fix`, `20261023-session-work`,
-`20261023-tkill`, `20261023-sigign`.  Nothing is pushed: the
-policy is not to push until `v0.6.18` is ready and verified.  The
-release procedure draws the summary from these and drops them.
+**The current restore points are the slice-6 tags**:
+`20261029-slice6-wait4`, `-pipe-read`, `-pipe-write`, `-pause`,
+`-sigsuspend`, and the single `20261029-slice6-done` marker.
+The pre-`v0.6.18` scratch tags they replaced were dropped at the
+`v0.6.18` release.  Nothing is pushed: the policy is not to push
+until `v0.6.19` is ready and verified.  The release procedure
+draws the `v0.6.19` summary from these and drops them.
 
 **Working style -- how this project gets changed**
 
@@ -377,20 +385,39 @@ Concurrency rules: `docs/contract.md`.
 - Signals slices 1-5 complete and verified (see "Signals: what is
   in" above).  `tkill` (200) in; `CONFIG_KILL=y`;
   `SIG_IGN` fixed and proven.
+- Signals slice 6 complete: `wait4`, pipe `read`, pipe `write`,
+  `pause`, `sigsuspend` return `-EINTR` on a pending signal;
+  `sys_wait4` reaps `PROC_STATE_TERMINATED`.  Five probes, each
+  with a `20261029-slice6-*` tag.  `nanosleep` interruption is a
+  documented limitation.
 - `docs/contract.md` is the durable concurrency rule; read it
   before any shared-state change.
 
 ### Next -- the highest-value work
 
-1. **SIGCHLD interrupting a blocked syscall.**  `wait4` is done
-  (slice 6, `-EINTR` after the late re-scan).  The remaining
-  block sites -- pipe read, pipe write, console read,
-  `sys_nanosleep` -- need the same `sig_pending & ~sig_blocked`
-  check on wake.  Each is its own commit with its own probe.
-2. **`sigsuspend`/`pause`/`sigwait`.**  Atomic unblock-and-wait.
-3. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
+1. **`sys_nanosleep` interruption + the `process_yield`
+  re-entrancy bug it exposed.**  The `sti; hlt` loop monopolizes
+  the CPU in kernel mode; making it block (so the timer can
+  schedule a peer) hit `YIELD-REFUSE` setting a `BLOCKED`
+  process to `RUNNING`, which produced a user `RSP = 0` `#PF`.
+  That is a scheduler change: the `YIELD-REFUSE` path must leave
+  a `BLOCKED` caller alone.  Fix this first; job control depends
+  on it.
+2. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
   SIGCONT resume, process groups, controlling terminal,
-  `tcsetpgrp`.  Needs (1) and (2).
+  `tcsetpgrp`.  Three parts, all needed:
+  - the kernel state machine (`PROC_STATE_STOPPED`, stop/resume),
+  - `CONFIG_ASH_JOB_CONTROL=y` in the busybox build -- without
+    it ash does not put foreground jobs in their own process
+    group and does not issue `tcsetpgrp`, so `Ctrl-Z` does not
+    work from the shell even when the kernel is correct,
+  - the tty side: `console_read` / `keyboard` maps `Ctrl-Z` to
+    SIGTSTP (and the other control chars to their signals) and
+    tracks the foreground process group.
+3. **`console_read` interruption.**  It blocks with
+  `BLOCK_KIND_NONE`; it needs the same `sig_pending` check as
+  pipe read/write, so a keyboard-blocked reader can be
+  interrupted by a signal.
 4. **Shebang + `/bin/sh` kernel half** (item 14): `#!` parsing in
   `sys_execve` with a depth guard.  Image half is done.
 5. **SSE** (item 10): save/restore XMM on context switch and the
@@ -420,12 +447,14 @@ Concurrency rules: `docs/contract.md`.
 
 ## Open issues (top 6)
 
-1. **Signals: three gaps remain** -- SIGCHLD does not interrupt a
-  blocked `wait4`; no `sigsuspend`/`pause`; SIGSTOP/SIGTSTP
-  default-terminate.  See "Signals: what remains" in this file.
+1. **Signals: one gap remains -- job control.**  SIGSTOP/SIGTSTP
+  default-terminate rather than stop.  Slice 6 (interrupt on a
+  pending signal) is done for `wait4`, pipe `read`, pipe `write`,
+  `pause`, and `sigsuspend`; `sys_nanosleep` is a documented
+  limitation (kernel-mode `sti; hlt` monopolizes the CPU).
   Delivery, dispositions (including `SIG_IGN`), the default-action
-  table, SIGPIPE, SIGCHLD-to-`wait4`, and `tkill` are done and
-  verified.
+  table, SIGPIPE, SIGCHLD-to-`wait4`, `tkill`, and the slice-6
+  probes are done and verified.
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
@@ -464,10 +493,14 @@ before dropping them.
 ## One-line summary
 
 **`v0.6.18` is the last release: signals slices 1-5, `tkill`,
-busybox `KILL`, `SIG_IGN` fixed.**  The signal work is verified
-by running -- nine probes, two full probe runs, four consecutive
-gate runs at 28/28 + 57/57 -- and the three remaining signal gaps
-(SIGCHLD-interrupts-wait, `sigsuspend`, job control) are named in
-"NEXT" and open-issues item 13.  Next: those three, then
+busybox `KILL`, `SIG_IGN` fixed.**  Slice 6 (interrupt on a
+pending signal) is done for `wait4`, pipe `read`, pipe `write`,
+`pause`, and `sigsuspend`, each with a probe and a
+`20261029-slice6-*` restore tag; `sys_wait4` also reaps
+`PROC_STATE_TERMINATED`.  `nanosleep` interruption is a
+documented limitation.  Next is the `YIELD-REFUSE`-on-`BLOCKED`
+scheduler bug that the `nanosleep` probe exposed, then job
+control (kernel stop/resume + `CONFIG_ASH_JOB_CONTROL=y` + tty
+control chars), then `console_read` interruption, then
 shebang+/bin/sh, SSE, privilege.  Read `docs/contract.md` and
 "NEXT" in this file before any code.**
