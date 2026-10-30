@@ -355,6 +355,28 @@ typedef struct pcb {
     uint8_t  stop_pending;
     uint8_t  in_stop_safe_point;
 
+    /*
+     * stop_signal: the signal that put this process in
+     * PROC_STATE_STOPPED (SIGSTOP 19 or SIGTSTP 20), 0 otherwise.
+     * sys_wait4 reports it in a WUNTRACED wait status as
+     * (stop_signal << 8) | 0x7f, so a shell can name the stop.
+     * Written by process_stop (and its callers), cleared by
+     * process_continue.
+     *
+     * stop_reported: 1 once the parent has reaped the stop status
+     * with WUNTRACED, so a second wait4 without WCONTINUED does
+     * not return the same stop again.  Cleared by
+     * process_continue (a continued child can be stopped again and
+     * reported again).
+     *
+     * Both are appended after in_stop_safe_point, the last field
+     * the _Static_assert block in process.c pins; appending is the
+     * rule that keeps every asserted offset (user_rsp 0x610 and
+     * below) intact.
+     */
+    uint8_t  stop_signal;
+    uint8_t  stop_reported;
+
     /* Declarations for the helpers (defined in user_syscall.c next
      * to signal_default_action).  They are declared in this header
      * so process.c and the probe's compile-time view agree. */
@@ -363,7 +385,7 @@ typedef struct pcb {
 /* Job-control helpers.  Defined in user_syscall.c.  Called from
  * signal_default_action (SIGSTOP/SIGTSTP -> process_stop; SIGCONT ->
  * process_continue). */
-void process_stop(pcb_t* self);
+void process_stop(pcb_t* self, int sig);
 void process_continue(pcb_t* self);
 int  process_try_stop_iretq(pcb_t* target);
 

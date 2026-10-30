@@ -6117,8 +6117,9 @@ long sys_wait4(long pid, int* user_status, int options) {
     uint64_t target = (pid <= 0) ? (uint64_t)-1 : (uint64_t)pid;
 
     for (;;) {
-        pcb_t* zombie = NULL;
-        pcb_t* live   = NULL;
+        pcb_t* zombie  = NULL;
+        pcb_t* stopped = NULL;
+        pcb_t* live    = NULL;
 
         /*
          * Walk the PCB pool by INDEX, not by pid.
@@ -6147,9 +6148,42 @@ long sys_wait4(long pid, int* user_status, int options) {
                 zombie = c;
                 break;
             }
+            /*
+             * A stopped child is reportable only with WUNTRACED, and
+             * only once per stop (stop_reported).  Without WUNTRACED
+             * a shell that did not ask for stops keeps waiting, which
+             * is the pre-WUNTRACED behavior.
+             */
+            if ((options & WUNTRACED) &&
+                c->state == PROC_STATE_STOPPED &&
+                c->stop_reported == 0) {
+                stopped = c;
+                break;
+            }
             if (c->state != PROC_STATE_UNUSED) {
                 live = c;
             }
+        }
+
+        if (stopped) {
+            /*
+             * A stopped child, WUNTRACED.  The status is Linux's
+             * stopped encoding: WIFSTOPPED(status) is true when the
+             * low byte is 0x7f, and WSTOPSIG(status) is the signal
+             * in the next byte.  Do NOT reclaim: a stopped child is
+             * alive, and its parent will see it again on exit or a
+             * later stop.
+             */
+            long spid = (long)stopped->pid;
+            int  sstatus = ((int)stopped->stop_signal << 8) | 0x7f;
+            stopped->stop_reported = 1;
+            if (user_status) {
+                if (safe_copy_to_user(user_status, &sstatus,
+                                      sizeof(sstatus)) != 0) {
+                    return -(long)EFAULT_;
+                }
+            }
+            return spid;
         }
 
         if (zombie) {
@@ -10045,7 +10079,7 @@ void signal_terminate_current(int sig) {
  * A second call while stop_pending is already set is a no-op; a
  * call on a process that has already stopped is a no-op.
  */
-void process_stop(pcb_t* self) {
+void process_stop(pcb_t* self, int sig) {
     if (!self) return;
     uint64_t _sf;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
@@ -10064,6 +10098,7 @@ void process_stop(pcb_t* self) {
          * this function with in_stop_safe_point != 0.
          */
         self->stop_pending = 1;
+        self->stop_signal  = (uint8_t)sig;
         __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
         return;
     }
@@ -10077,9 +10112,30 @@ void process_stop(pcb_t* self) {
      * refuse guard only runs for the current process.  Nothing
      * requeues a STOPPED process except process_continue. */
     scheduler_ready_queue_remove(self);
+    self->stop_signal   = (uint8_t)sig;
+    self->stop_reported = 0;
     self->state        = PROC_STATE_STOPPED;
     self->block_kind   = BLOCK_KIND_NONE;
     self->stop_pending = 0;
+
+    /*
+     * Wake a parent blocked in wait4 for this child.
+     *
+     * process_exit wakes the parent when a child EXITS; a child
+     * that STOPS must wake it too, or a wait4(WUNTRACED) parent
+     * sleeps through the stop.  The 2026-10-30 test showed it: the
+     * shell (pid 3) called wait4 with opts=0x2, the scan ran while
+     * cat was still live (live=1), the shell blocked, and no second
+     * scan ever happened -- nothing woke it when cat stopped.
+     *
+     * The state and stop_reported writes above happen first, so a
+     * parent woken here re-scans and sees STOPPED with
+     * stop_reported == 0.  process_wake_parent_if_waiting is the
+     * same helper process_exit uses; it checks state == BLOCKED
+     * and block_kind == WAITPID under cli, which is exactly the
+     * parent we want.
+     */
+    process_wake_parent_if_waiting(self);
 
     __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
 }
@@ -10123,10 +10179,10 @@ void process_stop(pcb_t* self) {
  * syscall-return delivery above, so 02b covers what a probe can
  * actually exercise today.
  */
-static void process_stop_and_yield(pcb_t* self) {
+static void process_stop_and_yield(pcb_t* self, int sig) {
     if (!self) return;
     self->in_stop_safe_point = 1;
-    process_stop(self);
+    process_stop(self, sig);
     self->in_stop_safe_point = 0;
     /*
      * Refuse a spurious resume.  process_yield dispatches some other
@@ -10195,9 +10251,13 @@ int process_try_stop_iretq(pcb_t* target) {
     if (deliverable == 0) return 0;
 
     target->sig_pending &= ~deliverable;
-    target->in_stop_safe_point = 1;
-    process_stop(target);
-    target->in_stop_safe_point = 0;
+    {
+        int _bs = 0;
+        while (_bs < 64 && !(deliverable & (1ULL << _bs))) _bs++;
+        target->in_stop_safe_point = 1;
+        process_stop(target, _bs);
+        target->in_stop_safe_point = 0;
+    }
     return 1;
 }
 
@@ -10222,7 +10282,9 @@ void process_continue(pcb_t* self) {
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
 
     /* SIGCONT before the safe point cancels a pending stop. */
-    self->stop_pending = 0;
+    self->stop_pending  = 0;
+    self->stop_signal   = 0;
+    self->stop_reported = 0;
 
     if (self->state != PROC_STATE_STOPPED) {
         __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
@@ -10271,7 +10333,7 @@ static long signal_default_action(pcb_t* self, int sig) {
             return 0;
         case 19:   /* SIGSTOP -- cannot be caught; stop now */
         case 20:   /* SIGTSTP -- default is stop */
-            process_stop_and_yield(self);
+            process_stop_and_yield(self, sig);
             return 0;
         default:
             (void)self;

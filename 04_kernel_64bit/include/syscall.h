@@ -261,6 +261,7 @@
  *          -1 on error
  */
 #define WNOHANG 1
+#define WUNTRACED 2   /* report a stopped child once */
 
 /* --- kernel-side handlers (called by the dispatcher) --- */
 long sys_write(int fd, const void* buf, size_t count);
