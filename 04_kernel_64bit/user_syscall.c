@@ -8664,6 +8664,18 @@ long sys_kill(long pid, int sig) {
     if (sig == 18) {   /* SIGCONT */
         if (target->state == PROC_STATE_STOPPED) {
             g_sig_raise_count++;
+            /*
+             * 04b: set the pending bit so the resumed child's next
+             * delivery point runs a SIGCONT handler if one is
+             * installed.  process_continue requeues the child; the
+             * bit is delivered at the child's next syscall return
+             * or tick iretq, where a non-zero signal_handler[18]
+             * enters the handler (the SIGSTOP_PEER_PROBE child's
+             * on_cont, which _exit(0)s).  Without the bit the
+             * child resumes without a delivery point and never
+             * exits -- the SIGSTOP_PEER_PROBE FAIL with T_seen=1.
+             */
+            target->sig_pending |= (1ULL << 18);
             process_continue(target);
             return 0;
         }
