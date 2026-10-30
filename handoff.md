@@ -214,6 +214,99 @@ prove it.
 - Ctrl-C on the serial console is **not** mapped to SIGINT.
   (Host `intr = ^C` usually eats it before it reaches the guest.)
 
+**CORRECTIONS FROM THE FOURTH SESSION** (diagnosis; no fix landed):
+
+- **The `&` bug is `fs->win`/`fs->winsect` incoherence with
+  `dp->sect`/`dp->dir`.** `dir_sdi` and `dir_next` set
+  `dp->dir = fs->win + ofs` **before** any `move_window` loads
+  `dp->sect` into `fs->win`.  `move_window` skips when
+  `sect == winsect`, so `dp->dir` can point into a stale
+  `fs->win`, and `dir_find`/`dir_read` scan the wrong data ->
+  `FR_NO_FILE` with zero `disk_read`.  This is the mechanism
+  behind: (a) the DRT trace -- zero `disk_read` across six
+  `f_open`s in the `&` fork; (b) the WARM trace --
+  `f_opendir("0:/")` returning 2/0 entries where the root has 9;
+  (c) `cat /bin/busybox &` failing the same way as `sleep N &`.
+
+- **`sleep 1` is flaky and is the cleanest reproduction.**  A
+  cold boot, one command, no `&`, no fork: `sleep 1` from `/`
+  sometimes returns to the prompt and sometimes prints
+  `sh: sleep: not found`.  It failed on an incremental build of
+  `0a08db0` and worked on a clean build of `88ae548`.  **That
+  A/B was confounded**: `./run` does `make clean` and rebuilds
+  the image, so the two boots differed in build and image, not
+  only in the source.  **The next session must re-run the A/B
+  with the same build procedure (`make clean` + `./run`) on
+  both commits before drawing any conclusion about the trace or
+  about `sleep`.**
+
+- **`TRACE_EXECVE_ERR` is `1` (on).  The trace-off commit
+  `0a08db0` is reverted by `88ae548`.**  All 23
+  `#if TRACE_EXECVE_ERR` blocks in `user_syscall.c` are
+  `serial_print`-only: no block assigns a variable used later, no
+  block returns from inside itself, no block has an `#else` that
+  runs when the trace is off.  The trace-off commit therefore
+  **cannot** have changed `sleep` behavior by skipping a side
+  effect.  It is not re-applied until the confounded A/B above
+  is re-run.
+
+- **No code change this session affects `sleep`.**  Every code
+  edit -- `diskio.c` DRT trace, `user_syscall.c` strip removal /
+  warm-up / WARM trace / remount, `kmain.c` `fatfs_root`, the
+  new `include/fatfs_root.h`, `ff.c` `dir_sdi`/`dir_next`
+  `move_window`, `include/trace.h` trace-off -- was reverted.
+  `git diff 9d6ec02 88ae548` is empty: the tree is byte-identical
+  to `9d6ec02`.
+
+- **Refuted shapes (do not retry, in addition to the prior
+  sessions'):**
+  (1) `cli`-depth lock (`irq_save` shape) around the ATA
+      transfer in `disk_read`/`disk_write`.  Crashed on boot:
+      `TIMER-REFUSE musl_sh rsp=0` -> user #PF `0x400047`
+      `pte=0x3` phys 0 -> kernel #GP in `idle`.  Second time for
+      this crash class (see the `FF_FS_REENTRANT` entry).
+  (2) `f_sync` on inherited `FIL`s.  `f_sync` does not reset
+      `winsect`.
+  (3) `f_opendir("/tmp")` + `f_opendir("/")` warm-up.
+      `f_opendir` goes through `move_window`; if `winsect` is
+      stale at the directory sector, the warm-up skips too.
+  (4) `user_syscall_clear_file_table(self)` alone.
+      `put_file_slot`'s refcount-2 early return means a forked
+      child's `put_file_slot` does NOT `f_close` the parent's
+      `FIL`.
+  (5) Removing `strip_dot_prefix(exec_path)`.  The strip IS a
+      real latent bug (the comment claiming FatFs rejects a
+      leading `/` is stale; `FF_FS_RPATH` is on and a leading `/`
+      is correct), but it is NOT the `&` bug.  Record it for a
+      separate one-line cleanup.
+  (6) `f_mount(NULL)` + `f_mount(fs)` in `sys_execve`.  Hung
+      the boot: `user_syscall_clear_file_table` closes fds 0/1/2
+      (the console) and `sys_execve` does not repopulate them.
+      The remount also cannot `f_close` the parent's `FIL`
+      (refcount 2 -> `put_file_slot` early-returns), so it would
+      not fix the stale window even if the console survived.
+  (7) `f_read`/`f_write` `winsect = -1`.  Under `FF_FS_TINY=0`
+      these functions do not touch `fs->win` (they use
+      `fp->buf`), so invalidating `winsect` there does nothing.
+  (8) `move_window` in `dir_sdi` and `dir_next` tails.  Broke
+      the boot: raw ELF bytes on the serial port.  `dir_next` is
+      called from `dir_register`/`dir_remove` where `dp->sect`
+      may name a sector that has not been written;
+      `move_window` there reads uninitialized disk contents into
+      `fs->win` and corrupts the write.  Reverted.
+
+- **The fix is in `ff.c`'s `dir_*` / `move_window` contract.**  The
+  next session starts by reading `dir_sdi`, `dir_next`,
+  `dir_read`, `dir_find`, `dir_register`, `dir_remove`,
+  `create_name`, `follow_path`, and `get_fileinfo` **in full**
+  before writing any change.  The two `ff.c` attempts this
+  session were both written against a contract that was not
+  fully read; both were refuted by the next boot.
+
+- **The current tree: `88ae548`, byte-identical to `9d6ec02`.**
+  Nothing else landed.  The `20261030-*` tags are intact.
+  Nothing pushed.
+
 **WHERE WE ARE, the rest** (unchanged from the prior handoff): no
 real `mount(2)`; file-backed `mmap`; `link(2)`/`mknod(2)`;
 `chmod`/`chown` accept and drop; SSE state is not saved (item 5);
