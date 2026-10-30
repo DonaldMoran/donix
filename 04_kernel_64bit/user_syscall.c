@@ -8208,13 +8208,43 @@ long sys_nanosleep(const void* user_req, void* user_rem) {
     __asm__ volatile("sti");
     process_yield();
 
-    /* Woken (deadline or signal).  Clear the park state. */
+    /* Woken (deadline, signal, or a stop/continue).  Clear the
+     * park state, then decide whether the sleep is actually done. */
     self->wake_tick  = 0;
     self->block_kind = BLOCK_KIND_NONE;
     self->state      = PROC_STATE_RUNNING;
 
     if ((self->sig_pending & ~self->sig_blocked) != 0)
         return -(long)4;   /* -EINTR: a caught signal interrupted the sleep */
+
+    /*
+     * The yield can return before the deadline without a signal:
+     * a SIGTSTP stops the process, process_continue clears
+     * block_kind and requeues it on SIGCONT, and the resumed
+     * process lands here with the deadline still in the future.
+     * Returning 0 told userland the sleep had completed -- `sleep
+     * 1000` stopped, `fg`'d, and exited immediately (2026-10-30).
+     *
+     * Re-enter the wait for the remaining time, the same shape
+     * console_read uses: loop back into process_yield until the
+     * deadline has passed.  A deadline that elapsed while stopped
+     * falls straight through with return 0, which is correct --
+     * the sleep's time has passed.  No change to process_stop or
+     * process_continue is needed; block_kind and wake_tick are
+     * re-armed here.
+     */
+    while (g_ticks < deadline) {
+        self->block_kind = BLOCK_KIND_NANOSLEEP;
+        self->wake_tick  = deadline;
+        self->state      = PROC_STATE_BLOCKED;
+        __asm__ volatile("sti");
+        process_yield();
+        self->wake_tick  = 0;
+        self->block_kind = BLOCK_KIND_NONE;
+        self->state      = PROC_STATE_RUNNING;
+        if ((self->sig_pending & ~self->sig_blocked) != 0)
+            return -(long)4;   /* -EINTR on a later signal */
+    }
     return 0;
 }
 
