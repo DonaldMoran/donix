@@ -6342,6 +6342,15 @@ static long console_write(const void* buf, size_t count) {
     return (long)count;
 }
 
+/*
+ * console_read: signal-aware EINTR.
+ *
+ * signal_default_action is defined below, after the delivery
+ * helpers; console_read needs it here to stop on a default-action
+ * signal instead of returning -EINTR (see the block in the body).
+ */
+static long signal_default_action(pcb_t* self, int sig);
+
 static long console_read(void* buf, size_t count) {
     pcb_t* self = process_get_current();
     char c; size_t bytes_read = 0; uint8_t* dest_ptr = (uint8_t*)buf;
@@ -6371,12 +6380,68 @@ static long console_read(void* buf, size_t count) {
          * sys_kill wake did not reach us (it ran before we
          * re-blocked), there is nothing to remove.
          */
-        if ((self->sig_pending & ~self->sig_blocked) != 0) {
-            scheduler_ready_queue_remove(self);
-            self->state      = PROC_STATE_RUNNING;
-            self->block_kind = BLOCK_KIND_NONE;
-            __asm__ volatile("sti");
-            return -(long)4;   /* -EINTR */
+        /*
+         * Signal-aware EINTR.
+         *
+         * A pending, unblocked signal here means the raise happened
+         * while this process was blocked on the console.  What to do
+         * with it depends on its disposition:
+         *
+         *   caught (signal_handler[sig] != 0): interrupt the read
+         *   and return -EINTR.  The handler runs at the syscall-
+         *   return delivery point, and the application decides what
+         *   a read that was cut short means.  This is Unix, and it is
+         *   what the pipe read/write and sys_wait4 already do.
+         *
+         *   default action (signal_handler[sig] == 0): do NOT return
+         *   -EINTR.  A default-action SIGTSTP/SIGSTOP is a stop, not
+         *   an interrupted read; returning -EINTR lets the
+         *   application retry read(2) and lose the stop entirely.
+         *   busybox cat is exactly that application: it treats
+         *   EINTR as "try again" and re-blocks.  The 2026-10-30
+         *   serial Ctrl-Z test showed it -- cat echoed the next
+         *   keystroke after the -EINTR, sig_deliver stayed 0, and
+         *   the process never stopped.
+         *
+         *   So for a default-action signal, deliver it HERE, at this
+         *   safe point: clear the bit and call signal_default_action,
+         *   which stops the process (process_stop_and_yield) or
+         *   terminates it.  The process is RUNNING at this instant
+         *   (we are in its context), so the stop is taken now, not
+         *   deferred -- process_stop_and_yield sets in_stop_safe_point
+         *   around the call, which is what tells process_stop to take
+         *   the write rather than set stop_pending.
+         *
+         *   If the default action is IGNORE (SIGCHLD, SIGURG, ...),
+         *   signal_default_action returns 0 and the loop continues;
+         *   the read was not interrupted and should not be.
+         */
+        {
+            uint64_t del = self->sig_pending & ~self->sig_blocked;
+            if (del != 0) {
+                int n = 0;
+                while (n < 64 && !(del & (1ULL << n))) n++;
+                if (n < 64 && self->signal_handler[n] != 0) {
+                    /* caught: Unix -EINTR; delivery runs on the way out */
+                    scheduler_ready_queue_remove(self);
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    __asm__ volatile("sti");
+                    return -(long)4;   /* -EINTR */
+                }
+                if (n < 64) {
+                    /* default action: deliver now, at this safe point */
+                    self->sig_pending &= ~(1ULL << n);
+                    __asm__ volatile("sti");
+                    signal_default_action(self, n);
+                    /* IGNORE returns; loop and keep reading.  A stop
+                     * parks the process until SIGCONT, and resumes
+                     * here; a terminate does not return. */
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    continue;
+                }
+            }
         }
 
         self->state = PROC_STATE_BLOCKED;
@@ -10063,6 +10128,29 @@ static void process_stop_and_yield(pcb_t* self) {
     self->in_stop_safe_point = 1;
     process_stop(self);
     self->in_stop_safe_point = 0;
+    /*
+     * Refuse a spurious resume.  process_yield dispatches some other
+     * process and switches away; when it returns, this process is on
+     * the CPU again.  It must have been resumed by SIGCONT
+     * (process_continue, which sets state back to READY/RUNNING) for
+     * that to be legitimate.  If it is still STOPPED, the scheduler
+     * picked it without a continue -- the empty-queue self-pick, a
+     * tick, or a requeue guard that treats STOPPED as dispatchable --
+     * and letting it return into console_read resumes a stopped
+     * process.  The 2026-10-30 serial Ctrl-Z test showed exactly
+     * that: after the stop (state 6), process_yield returned with no
+     * further default_action, and the next six keystrokes echoed.
+     *
+     * So loop: yield again while still STOPPED.  process_yield does
+     * not return for a process with no runnable peer (it parks on
+     * idle), and process_continue is the only writer that clears
+     * STOPPED, so this terminates exactly when a real SIGCONT has
+     * run.  It does not bypass the dispatcher -- each iteration is a
+     * normal process_yield -- and it adds no state of its own.
+     */
+    while (self->state == PROC_STATE_STOPPED) {
+        process_yield();
+    }
     /* Contract rule 1: process_stop already left the state change
      * under cli; this yield is the dispatch decision itself.  If
      * the scheduler refuses the yield (nothing runnable), the

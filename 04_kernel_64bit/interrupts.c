@@ -1018,10 +1018,12 @@ void irq1_handler(void) {
         serial_print(" sc=0x"); serial_print_hex(sc);
 #endif
         if (fg > 1) {
-            long r = sys_kill(-fg, 20);   /* SIGTSTP */
 #if TRACE_CTRLZ
+            long r = sys_kill(-fg, 20);   /* SIGTSTP */
             serial_print(" kill="); serial_print_dec((uint64_t)(r < 0 ? -r : r));
             serial_print(r < 0 ? " (err)" : " (ok)");
+#else
+            sys_kill(-fg, 20);            /* SIGTSTP */
 #endif
         }
 #if TRACE_CTRLZ
