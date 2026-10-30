@@ -9742,6 +9742,45 @@ static void process_stop_and_yield(pcb_t* self) {
 }
 
 /*
+ * process_try_stop_iretq -- timer-path stop delivery.
+ *
+ * A peer SIGSTOP/SIGTSTP raised on a process running in user mode
+ * never reaches the syscall-return delivery point (the process is
+ * not making a syscall).  The timer's dispatch (interrupts.c) is the
+ * delivery point that observes it.  Called from the tick for the
+ * process the tick is about to resume; returns 1 if it stopped the
+ * target, 0 if there was nothing to do.
+ *
+ * Clears every deliverable stop bit before stopping: a second
+ * SIGSTOP raised while the first is still pending is discarded
+ * (POSIX: SIGSTOP is not queued).  A SIGCONT that arrives between
+ * the raise and this call also cancels the stop (process_stop
+ * sets stop_pending on the deferred path, but here in_stop_safe_point
+ * is 1, so it takes the transition now).  That is the correct Unix
+ * shape: SIGCONT cancels a pending SIGSTOP.
+ *
+ * Called with interrupts off (the tick's cli); process_stop
+ * preserves that (its own cli/popfq are nested but harmless).  The
+ * caller (interrupts.c) must NOT resume the target after this
+ * returns 1 -- it must fall to idle and return idle->rsp.
+ */
+int process_try_stop_iretq(pcb_t* target) {
+    if (!target) return 0;
+    /* SIGSTOP (19) and SIGTSTP (20); SIGTTIN (21) / SIGTTOU (22)
+     * not implemented yet; join them here when the tty raises
+     * them. */
+    uint64_t stop_bits = (1ULL << 19) | (1ULL << 20);
+    uint64_t deliverable = target->sig_pending & ~target->sig_blocked & stop_bits;
+    if (deliverable == 0) return 0;
+
+    target->sig_pending &= ~deliverable;
+    target->in_stop_safe_point = 1;
+    process_stop(target);
+    target->in_stop_safe_point = 0;
+    return 1;
+}
+
+/*
  * process_continue -- SIGCONT handler helper.
  *
  * Clears a pending stop and, if the process is actually STOPPED,

@@ -365,6 +365,7 @@ typedef struct pcb {
  * process_continue). */
 void process_stop(pcb_t* self);
 void process_continue(pcb_t* self);
+int  process_try_stop_iretq(pcb_t* target);
 
 #define KERNEL_STACK_SLOT_NONE (-1)
 

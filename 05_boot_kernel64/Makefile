@@ -95,6 +95,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/pipe7e_sjlj_stale.elf \
 	$(USERLAND_BIN)/realpath_probe.elf \
 	$(USERLAND_BIN)/sigstop_probe.elf \
+	$(USERLAND_BIN)/sigstop_peer_probe.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -272,6 +273,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/pause_intr_probe.elf"  PAUSE_INTR_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/nanosleep_intr_probe.elf"  NANOSLEEP_INTR_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/sigstop_probe.elf"  SIGSTOP_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/sigstop_peer_probe.elf"  SIGSTOP_PEER_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/sigsuspend_probe.elf"  SIGSUSPEND_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio.elf"  PIPE7E_STDIO ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_sjlj.elf"  PIPE7E_STDIO_SJLJ ; \

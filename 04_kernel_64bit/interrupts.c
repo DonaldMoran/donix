@@ -729,6 +729,31 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * current, targeting stack_pointer, before the
              * no-op return.
              */
+            if (process_try_stop_iretq(current)) {
+                /* current is STOPPED and off the ready queue.  Do not
+                 * resume it (returning stack_pointer would).  Fall to
+                 * idle: the same state changes the !next fallback
+                 * does below.  A peer SIGSTOP on a user-mode process
+                 * has no syscall-return delivery point; this is the
+                 * tick that observes it. */
+                pcb_t* _idle = process_find_by_pid(1);
+                if (_idle && _idle != current) {
+                    _idle->state = PROC_STATE_RUNNING;
+                    scheduler_set_current(_idle);
+                    extern void tss_set_kernel_stack(uint64_t stack);
+                    extern void tss_set_syscall_stack(uint64_t stack);
+                    tss_set_kernel_stack(_idle->kernel_stack_top);
+                    tss_set_syscall_stack(_idle->kernel_stack_top);
+                    current->fs_base = rdmsr(0xC0000100);
+                    wrmsr(0xC0000100, _idle->fs_base);
+                    __asm__ volatile("mov %0, %%cr3" : : "r"(_idle->cr3));
+                    return _idle->rsp;
+                }
+                /* No idle to fall to: resume current; its stop will
+                 * be observed at the next dispatch. */
+                current->timeslice_ticks = 0;
+                return stack_pointer;
+            }
             if (current->sig_pending & ~current->sig_blocked) {
                 signal_deliver_frame_iretq(current, stack_pointer);
             }
@@ -770,6 +795,23 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * unchanged; a pending signal on current must be
              * delivered here, targeting stack_pointer.
              */
+            if (process_try_stop_iretq(current)) {
+                pcb_t* _idle = process_find_by_pid(1);
+                if (_idle && _idle != current) {
+                    _idle->state = PROC_STATE_RUNNING;
+                    scheduler_set_current(_idle);
+                    extern void tss_set_kernel_stack(uint64_t stack);
+                    extern void tss_set_syscall_stack(uint64_t stack);
+                    tss_set_kernel_stack(_idle->kernel_stack_top);
+                    tss_set_syscall_stack(_idle->kernel_stack_top);
+                    current->fs_base = rdmsr(0xC0000100);
+                    wrmsr(0xC0000100, _idle->fs_base);
+                    __asm__ volatile("mov %0, %%cr3" : : "r"(_idle->cr3));
+                    return _idle->rsp;
+                }
+                current->timeslice_ticks = 0;
+                return stack_pointer;
+            }
             if (current->sig_pending & ~current->sig_blocked) {
                 signal_deliver_frame_iretq(current, stack_pointer);
             }
@@ -895,6 +937,21 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * current resumes from its own frame unchanged, and its
          * pending signal will be observed on its next dispatch.
          */
+        if (process_try_stop_iretq(next)) {
+            /* next is STOPPED and off the ready queue.  Do not resume
+             * it (returning next->rsp would).  Resume the interrupted
+             * current from its own frame -- the same refuse shape the
+             * range/rsp checks above use.  current is still RUNNING;
+             * the state and cr3 changes for next were already made
+             * above, but next is not resumable, and the next tick
+             * will pick a different next.  current->cr3 is still
+             * loaded (we changed it for next, so we must restore it). */
+            current->timeslice_ticks = 0;
+            /* Restore current's address space: the cr3 switch for
+             * next happened above; resume current in current's. */
+            __asm__ volatile("mov %0, %%cr3" : : "r"(current->cr3));
+            return stack_pointer;
+        }
         if (next->sig_pending & ~next->sig_blocked) {
             signal_deliver_frame_iretq(next, next->rsp);
         }
