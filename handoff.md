@@ -13,7 +13,7 @@ console** (stop, report, `jobs`, and `fg` resume for both
 parsing plus `/bin/sh` on both images** (open-issues item 14).
 Baseline on `HEAD`: `canary --full` 28/28, `test.sh` 57/57,
 job-control, shebang, and resume transcripts green, `HEAD` builds
-alone.  `dev` is ahead of `origin/dev` by **47 commits**, nothing
+alone.  `dev` is ahead of `origin/dev` by **52 commits**, nothing
 pushed.
 
 **Read "The concurrency contract" in `docs/contract.md` before
@@ -23,6 +23,9 @@ this file carries only conclusions.
 
 **THE TEN COMMITS THIS SESSION** (on `dev`, tagged, nothing
 pushed): six job-control, two shebang, `run`, and the resume fix.
+
+Follow-up on top of the ten: `2407c98` `run: add a gtk display mode`
+(tag `20261030-run-gtk`) -- not part of the job-control/shebang arc.
 
 - `7f83b52` `tty: console_read blocks via process_yield and returns
   -EINTR` (tag `20261030-console-read-eintr`) -- `console_read` was
@@ -114,21 +117,9 @@ messages are right; older notes are not):
   shape `console_read` uses.  Any future blocking syscall should
   re-check its own condition after `process_yield`, not infer the
   reason from the absence of a signal.
-- **`cf0619a`'s message overstates what was verified.**  It says
-  "with susp undef, Ctrl-Z in the host terminal stops a foreground
-  `sleep 100`."  Every job-control transcript this session is the
-  **framebuffer/PS/2** path.  In headless mode (`-display none`,
-  serial on stdio) `stty susp undef` applied, `echo hello` reached
-  the guest, and plain `Ctrl-Z` and `Ctrl-V Ctrl-Z` both did
-  nothing.  The commit is not amended (tagged, local, nothing
-  pushed); the correction lives here.
 - **`stty susp undef` is session-level only.**  It applies to the
-  tty of the terminal it ran in and dies with that terminal.  The
-  `run` change has no restore: the terminal is left with
-  `susp = <undef>` after QEMU exits.  The follow-up is a
-  `stty -g` save / `stty "$old"` restore around the QEMU launch
-  (not a bare `stty susp ^Z`, which assumes the original value),
-  as its own commit.
+  tty of the terminal it ran in and dies with that terminal.  The `run`
+  change has no restore; NEXT item 6 carries the fix.
 
 **WHAT THE SHELL IS.**  Unchanged: boot shell is `musl_sh` ->
 fork/exec `/bin/busybox sh` -> ash.  The busybox is now built with
@@ -150,18 +141,6 @@ works end to end:
 The foreground pgrp is `g_console_fg_pgrp`, set by `TIOCSPGRP`
 (lazily by the first `TIOCGPGRP`), read under `cli` via
 `console_fg_pgrp_get()`.
-
-**Headless serial `Ctrl-Z` is unverified on this host.**  With
-`-display none` + `-serial stdio` and `susp = <undef>` confirmed
-live, typed input reaches the guest (`echo hello` works) but
-`Ctrl-Z` does not arrive, plain or `Ctrl-V`-quoted.  Candidates:
-the terminal emulator eating the key before the pty, or QEMU's
-`-serial stdio` terminal handling.  The one untried experiment is
-`-serial mon:stdio` in place of `-serial stdio -s -monitor none`.
-This is a **host-environment item, not a kernel defect** -- the
-kernel handles both paths, and the serial byte `0x1A` is mapped.
-`sendkey ctrl-z` is **not** a substitute: it injects a PS/2 event,
-and the headless console is the UART.
 
 **Shebang / `/bin/sh` is done (open-issues item 14 closed by
 `0d93f8c` + `62ee388`).**  Verified by running: from `/root`,
@@ -303,7 +282,8 @@ prove it.
   session were both written against a contract that was not
   fully read; both were refuted by the next boot.
 
-- **The current tree: `88ae548`, byte-identical to `9d6ec02`.**
+- **The current tree: `2407c98` (`run`: gtk mode) on `b95902d` (fourth-session
+docs) on `88ae548`.**
   Nothing else landed.  The `20261030-*` tags are intact.
   Nothing pushed.
 
@@ -323,19 +303,13 @@ no privilege model (item 6).
    the applet-resolving path?  That decides whether the fix is
    busybox config/PATH or kernel-side.  Fix before building
    anything new on top of the shell.
-2. **Headless serial `Ctrl-Z`** (host item): a ten-minute
-   experiment, not a feature -- try `-serial mon:stdio` in place
-   of `-serial stdio -s -monitor none`.  If it works, a `run`
-   commit with a `stty -g` save / `stty "$old"` restore around the
-   launch.  If it does not, record it as a host limitation and
-   drop it.  It is worth clearing early because `cf0619a`'s
-   commit message currently claims a verification that was not
-   performed; settling it turns that into a real verification or
-   a clean "host limitation, recorded".
-3. **SSE** (item 5): save/restore XMM, then remove `-mno-sse*`.
-4. **Privilege model** (item 6).
-5. busybox batch 2; `test.sh`'s md5.
-6. **A completed PIPE7E soak** at 100 Hz.
+2. **SSE** (item 5): save/restore XMM, then remove `-mno-sse*`.
+3. **Privilege model** (item 6).
+4. busybox batch 2; `test.sh`'s md5.
+5. **A completed PIPE7E soak** at 100 Hz.
+6. **`run`'s `stty susp undef` has no restore.**  Save with `stty -g`
+   before QEMU and restore with `stty "$old"` after it exits (not a
+   bare `stty susp ^Z`, which assumes the original value).  Own commit.
 7. The follow-ups this session surfaced: the `wait4` stopped-child
    late re-scan; the no-peer stop soak; and the optional
    interpreter-argument proof.
@@ -482,12 +456,12 @@ prompts.  Two commits landed the shebang kernel half plus
 `::/bin/sh` on both images (item 14); a third fixed the
 cwd-doubling bug in the script argument; a fourth fixed
 `nanosleep` exiting on a stop/continue resume.  The `run` script's
-host-side `stty susp undef` landed but headless serial `Ctrl-Z`
-remains unverified (host item).  Gate: 28/28 + 57/57 + the
+host-side `stty susp undef` is retained; headless serial `Ctrl-Z` is a
+host limitation, dropped.  Gate: 28/28 + 57/57 + the
 job-control, shebang, and resume transcripts on `HEAD`, and `HEAD`
 builds alone.  **Next is the backgrounded-applet dispatch bug,
-then settling headless serial Ctrl-Z, then SSE and privilege.**
-Open threads: backgrounded applet dispatch, headless serial Ctrl-Z
-(host), the `wait4` stopped-child late re-scan, a no-peer stop
+then SSE and privilege.**
+Open threads: backgrounded applet dispatch, the `wait4` stopped-child
+late re-scan, a no-peer stop
 soak, and the one-off `SWITCH-REFUSE`.  Read `docs/contract.md`
 and "NEXT" before any code.
