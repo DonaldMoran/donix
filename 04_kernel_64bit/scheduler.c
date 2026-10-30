@@ -643,6 +643,19 @@ void __attribute__((noreturn)) process_exit(void) {
              */
             if (_p == current_process) continue;
             if (_p->pid == 1) continue;   /* idle is never queued */
+            /*
+             * A stale RUNNING process is not on the CPU (it is not
+             * current_process) but every requeue guard tests
+             * state == RUNNING and skips it.  Make it READY so the
+             * test below requeues it.  The write is under the cli
+             * this block holds (contract rule 1).  This is what the
+             * comment above describes; before this line the code
+             * only requeued READY and the stranded RUNNING process
+             * fell through.  Item 7d.
+             */
+            if (_p->state == PROC_STATE_RUNNING) {
+                _p->state = PROC_STATE_READY;
+            }
             if (_p->state != PROC_STATE_READY) continue;
             if (scheduler_ready_queue_contains(_p)) continue;
             scheduler_ready_queue_add(_p);
@@ -1425,6 +1438,17 @@ void process_yield(void) {
                  */
                 if (_p == current_process) continue;
                 if (_p->pid == 1) continue;   /* idle is never queued */
+                /*
+                 * A stale RUNNING process is not on the CPU (it is
+                 * not current_process) but every requeue guard tests
+                 * state == RUNNING and skips it.  Make it READY so
+                 * the test below requeues it.  The write is under
+                 * the cli process_yield holds from its top (contract
+                 * rule 1).  Item 7d.
+                 */
+                if (_p->state == PROC_STATE_RUNNING) {
+                    _p->state = PROC_STATE_READY;
+                }
                 if (_p->state != PROC_STATE_READY) continue;
                 if (scheduler_ready_queue_contains(_p)) continue;
                 scheduler_ready_queue_add(_p);
