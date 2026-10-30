@@ -5,23 +5,42 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-29.  **`v0.6.18` is released; work is
-pre-`v0.6.19`.**  Signals
-slices 1-5 are in it, with `tkill`, the busybox `KILL` applet, and
-the `SIG_IGN` fix.  Slice 6 (signals interrupt blocking syscalls)
-is complete for `wait4`, pipe `read`, pipe `write`, `pause`, and
-`sigsuspend`, each with a probe in `userland/musl/tests/` and a
-per-step restore tag (`20261029-slice6-*`).  `sys_wait4` also now
-reaps `PROC_STATE_TERMINATED`, closing the deadlock
-`SIGINTR_WAIT4_PROBE` exposed.  `nanosleep` interruption is a
-documented limitation (the `sti; hlt` loop monopolizes the CPU in
-kernel mode).  Every path syscall reaches its filesystem
-through the mount table (`mount_driver(backend)->op(...)`); the
-resolver is `vfs_resolve(path, follow_final)`; symlinks work end to
-end.  `test.sh` is 57/57 and `canary --full` is 28/28, verified
-from `/` on a freshly built image, three times interleaved.  Read
-"The concurrency contract" in `docs/contract.md` before touching
-shared state, then "Where we are".
+**Last updated:** 2026-10-29 (session close).  **`v0.6.18` is
+released; work is pre-`v0.6.19`.**  Signals slices 1-5 are in it,
+with `tkill`, the busybox `KILL` applet, and the `SIG_IGN` fix.
+Slice 6 (signals interrupt blocking syscalls) covers `wait4`, pipe
+`read`, pipe `write`, `pause`, and `sigsuspend`.  **Session
+2026-10-29 (evening) landed three things the previous handoff
+listed as next:**
+
+1. **The `YIELD-REFUSE`-on-`BLOCKED` scheduler fix** -- a refused
+   yield leaves a `BLOCKED` caller `BLOCKED` instead of forcing it
+   `RUNNING` with no saved frame (the `RSP=0` `#PF` shape).
+2. **Fork inherits signal dispositions, exec resets them** (one
+   POSIX pair, landed in two commits: `c7a7962` + `14c50a0`).
+3. **`nanosleep` blocks and is interruptible** -- the documented
+   limitation is gone.  `BLOCK_KIND_NANOSLEEP`, a `pcb_t.wake_tick`
+   deadline, the timer waking the deadline, `-EINTR` on a caught
+   signal.  `NANOSLEEP_INTR_PROBE` is the acceptance test and it
+   passes (`rc=-1 errno=4 got=1`).
+
+Plus an idle-dispatch cleanup (`7f43ac4`): `process_yield` now
+dispatches idle instead of refusing it, so `sleep` no longer prints
+`YIELD-REFUSE`.  Every path syscall reaches its filesystem through
+the mount table (`mount_driver(backend)->op(...)`); the resolver is
+`vfs_resolve(path, follow_final)`; symlinks work end to end.
+`test.sh` is 57/57 and `canary --full` is 28/28, verified from `/`
+on a freshly built image twice interleaved after the scheduler
+changes, with `NANOSLEEP_INTR_PROBE` PASS.  Read "The concurrency
+contract" in `docs/contract.md` before touching shared state, then
+"Where we are".
+
+**THE RESTORE TAGS FROM THIS SESSION.**
+`20261029-nanosleep-blocks-verified` (probe PASS, gate clean,
+`wake_tick` landed) and `20261029-idle-dispatch-fixed` (idle
+dispatch, `sleep` silent, gate clean x2).  Both on `dev`.  The
+slice-6 tags (`20261029-slice6-wait4`, `-pipe-read`, `-pipe-write`,
+`-pause`, `-sigsuspend`, `-done`) remain.  Nothing is pushed.
 
 **WHAT THE VFS IS NOW, in one paragraph.**  `g_mounts` maps `/`
 (FAT), `/dev`, and `/proc` to `fs_driver_t` vtables: `unlink`,
@@ -39,11 +58,27 @@ device number.
 
 **WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static
 const`); file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store
-them); shebang + `/bin/sh` in the kernel (the image half is done);
-`chmod`/`chown` (90-93) accept and drop, FAT has no mode or owner;
-and one signal gap, named in "Signals: what remains" below --
-SIGSTOP/SIGTSTP default-terminate rather than stop (job control).  SSE state is not saved (open-issues item 10).  No
-privilege model (item 9).
+them); **shebang (`#!`) parsing is not implemented in the kernel**
+(the image half of `/bin/sh` exists; see "Shebang" below and
+open-issues item 14); `chmod`/`chown` (90-93) accept and drop, FAT
+has no mode or owner; and job control -- SIGSTOP/SIGTSTP
+default-terminate rather than stop.  SSE state is not saved
+(open-issues item 10).  No privilege model (item 9).
+
+**Shebang (`#!`) is not parsed by the kernel.**  `sys_execve`
+opens the file, checks for ELF magic, finds `#!` (or any non-ELF),
+prints `sys_execve: not an ELF file`, and returns `-ENOEXEC`.
+**`./script.sh` works only because busybox ash catches `ENOEXEC`
+and runs `sh script.sh`** -- a shell fallback, not a kernel
+feature.  A script with `#!/bin/sh` at the top, invoked directly
+(`./script.sh`) from a non-shell caller, fails; a script whose
+interpreter is not a shell (`#!/usr/bin/python`, `#!/usr/bin/awk`)
+has no fallback and fails outright.  **The kernel never reads the
+`#!` line.**  The image half of `/bin/sh` exists (busybox soft
+link, after the one-time `--install -s /bin`); the **kernel half --
+`#!` parsing in `sys_execve` with a `[interp, optional_arg,
+script, ...]` argv and a depth guard -- is not done** (open-issues
+item 14).
 
 **THE RELEASE TAGS.**  `v0.6.16` (the VFS), `v0.6.17` (FAT
 `st_ino`, `tar`, `chmod`/`chown`), and `v0.6.18` (signals slices
@@ -53,29 +88,51 @@ per-release summary.  `v0.6.18`'s scratch tags have been dropped.
 **WHERE WE ARE.**  `v0.6.15` (busybox batch 1), `v0.6.16` (the
 VFS), `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`), and
 `v0.6.18` (signals slices 1-5) are released.  Work is now
-pre-`v0.6.19`.  The working tree is `dev`, clean.
+pre-`v0.6.19`.  The working tree is `dev`, clean, ahead of
+`origin/dev` by 24 commits, nothing pushed.
 
-**NEXT.**  Signals are done for the scope they were given.
-Slice 6 (interrupt on a pending signal) covers `wait4`, pipe
-`read`, pipe `write`, `pause`, and `sigsuspend`.  The remaining
-signal work is **job control**, and it has three parts, all of
-which are needed: (a) the kernel side -- SIGSTOP/SIGTSTP stop,
-SIGCONT resume, a `PROC_STATE_STOPPED` state, process groups,
-controlling terminal, `tcsetpgrp` (open-issues item 13); (b)
-the busybox side -- `CONFIG_ASH_JOB_CONTROL=y`; without it, ash
-does not put foreground jobs in their own process group and
-does not issue `tcsetpgrp`, so `Ctrl-Z` does not work even when
-the kernel is correct; (c) the tty side -- `console_read` /
-`keyboard` must map `Ctrl-Z` to SIGTSTP (and the other control
-chars to their signals) and must track the foreground process
-group.  Job control also depends on the `process_yield`
-re-entrancy fix described under "Where we are -> Next":
-`YIELD-REFUSE` on a `BLOCKED` process is a scheduler bug that a
-stop/resume transition will hit.  After job control, in order:
-shebang + `/bin/sh` kernel half (item 14); SSE save/restore then
-remove the userland `-mno-sse*` flags (item 10); the privilege
-model (item 9); busybox batch 2.  `test.sh`'s md5 is still
-listed in the old work list; it is not blocking anything.
+**NEXT.**  Signals are done for the scope they were given, **and
+`nanosleep` is now interruptible**.  The remaining signal work is
+**job control** (open-issues item 13), and it has three parts, all
+of which are needed:
+
+(a) **the kernel side** -- SIGSTOP/SIGTSTP stop, SIGCONT resume, a
+    `PROC_STATE_STOPPED` state, process groups, controlling
+    terminal, `tcsetpgrp`;
+(b) **the busybox side** -- `CONFIG_ASH_JOB_CONTROL=y`; without it
+    ash does not put foreground jobs in their own process group
+    and does not issue `tcsetpgrp`, so `Ctrl-Z` does not work even
+    when the kernel is correct;
+(c) **the tty side** -- `console_read` / `keyboard` must map
+    `Ctrl-Z` to SIGTSTP (and the other control chars to their
+    signals) and must track the foreground process group.
+
+**The three prerequisites job control needed all landed this
+session:** a blocked process parks and wakes correctly
+(`YIELD-REFUSE`-on-`BLOCKED` fix + idle dispatch), a signal
+interrupts a blocking syscall (`nanosleep` and the slice-6
+syscalls return `-EINTR`), and dispositions cross fork and reset
+on exec.  Job control opens from a correct substrate.
+
+After job control, in order: `console_read` interruption (it
+blocks with `BLOCK_KIND_NONE`; needs the `sig_pending` check the
+pipe read/write paths have); **shebang + `/bin/sh` kernel half**
+(item 14 -- see "Shebang" above and the `NEXT` item below); SSE
+save/restore then remove the userland `-mno-sse*` flags (item 10);
+the privilege model (item 9); busybox batch 2.  `test.sh`'s md5 is
+still listed in the old work list; it is not blocking anything.
+
+**Two open observations from this session, neither a live bug:**
+
+- **KVM was slower than TCG on the author's host** during this
+  session's gate.  That is backwards from the usual; a one-line
+  check next session (`-cpu host` vs `-cpu max`, nested-virt) is
+  worth it.  Not chased.
+- **PIPE7E soak bound:** the last run reached `iter 5000`+ and was
+  clean there.  It was **not** confirmed through the full 250000.
+  Treat the session's pipe evidence as "clean past 5000", not "a
+  completed soak."  A full soak is still the standard for a change
+  that touches the timer (the `nanosleep` wake loop did).
 
 ### Signals: what is in, and what was proven
 
@@ -103,141 +160,156 @@ and enter the handler.  `signal_default_action` is ignore for
 SIGCHLD, SIGURG, SIGWINCH, SIGCONT and terminate for everything
 else.
 
-**Verified by running, 2026-10-23, on the `20261023-sigign`
-build:**
+**Fork and exec, the POSIX pair (landed 2026-10-29):**
+- **fork** copies `signal_handler[]` and `signal_restorer[]`,
+  copies `sig_blocked`, clears `sig_pending` (`c7a7962`).
+- **exec** resets caught dispositions to `SIG_DFL`, preserves
+  `SIG_IGN`, preserves the blocked mask, clears pending and
+  `in_signal_handler` (`14c50a0`, in `sys_execve` step 8).
+- **Landing fork without exec was a regression:** a
+  forked-then-exec'd busybox child carried the pre-exec handler
+  address (`0x41E1A1`) into a new image that did not map it;
+  SIGCHLD delivery jumped there and faulted (`CR2 == RIP ==
+  0x41E1A1`, PTE not present).  `canary` and the probe's parent
+  hit it.  The pair is one change; either half alone is a bug.
 
-- Gate: `echo hi | wc` -> `1 1 3`; `sigchld_probe` -> handler
-  ran, `wait4` returned 5, reaped; `sleep 1` returns;
-  `canary --full` 28/28; `sh /root/scripts/test.sh` 57/57.
-  Run three times interleaved.
-- SIGPIPE: `yes | head -n 1 ; echo after` -> `y` / `after`.
-- Default-terminate: `kill -9 $$` -> `Killed`, status 137;
-  `kill -15 $$` -> `Terminated`, status 143; `kill -2 $$` ->
-  silent, status 130 (busybox suppresses the SIGINT message;
-  the exit status is the proof).  Parent shell survives all
-  three.
-- SIG_IGN: `sigterm_ignore` -> `survived kill(SIGTERM)`,
-  status 0.
-- Real handlers unchanged: `kill_self` (handler before `kill`
-  returns), `sigsegv_probe` (handler round-trip, resumes, exit
-  0), `sigspin` (tick delivery, `HANDLER-RAN i=1`).
+**`nanosleep` is now interruptible (landed 2026-10-29):** it was
+a `sti; hlt` spin that held the CPU; the timer does not preempt a
+kernel-mode `hlt` to run a peer, so a parent could not run `kill`
+until the sleeper exited (trace: `kill` num 62 landed after the
+child's `exit_group` num 231; SIGUSR1 raised on a zombie, never
+delivered).  Now: `BLOCK_KIND_NANOSLEEP` (5), `pcb_t.wake_tick`
+(absolute `g_ticks` deadline, **appended at the END of `pcb_t`**
+next to the signal fields -- placing it after `block_kind` shifted
+`user_rsp` to `0x618` and the `_Static_assert` caught it),
+`sys_nanosleep` parks `BLOCKED` with `wake_tick`, `process_yield`,
+and returns `-EINTR` on a deliverable signal (before and after
+sleeping); `timer_preempt_handler` wakes
+`BLOCK_KIND_NANOSLEEP` PCBs with `wake_tick <= g_ticks` in the
+IRQ's existing `cli`.  Acceptance test: `NANOSLEEP_INTR_PROBE` ->
+`child: nanosleep rc=-1 errno=4 got=1` / `PASS`.
 
-`tkill` (200) is implemented as `kill(tid, sig)`, a thin wrapper
-over `sys_kill`; busybox `kill` uses it to signal itself, and
-without it `kill -2 $$` printed `Unknown syscall: 200`.
+**`process_yield` dispatches idle (landed 2026-10-29):** the
+`!next` fallback selects idle (pid 1), which is `RUNNING` by
+design, so guard 2 refused it and printed `YIELD-REFUSE` on every
+`sleep` once `nanosleep` started yielding.  Guard 2 now exempts
+idle (`next->pid != 1`); a non-idle `RUNNING` target is still
+refused.  `sleep` is silent; the gate is clean x2.
 
-**SIG_IGN was broken and is fixed.**  `sys_rt_sigaction` used to
-collapse `SIG_IGN` (1) to 0, making it indistinguishable from
-`SIG_DFL`; a process that ignored a signal was terminated by it.
-`sigterm_ignore` found it (status 143).  The collapse is deleted;
-`SIG_IGN` stays 1 and the deliver helpers clear-and-resume.  This
-is commit `6de2d63`, tag `20261023-sigign`.
+**Verified by running, 2026-10-29 (evening):**
+
+- `NANOSLEEP_INTR_PROBE`: `child: nanosleep rc=-1 errno=4 got=1`,
+  `WEXITSTATUS=0`, `PASS (child caught SIGUSR1; nanosleep
+  returned -EINTR)`.
+- `echo hi | wc` -> `1 1 3`.
+- `SIGCHLD_PROBE`: handler ran, `wait4` returned the child pid,
+  reaped.
+- `sleep 1` returns, **no `YIELD-REFUSE` line**.
+- `canary --full`: 28/28, no `#PF`.
+- `test.sh`: 57/57.
+- Gate x2 interleaved after the scheduler changes; PIPE7E clean
+  past 5000 (not a completed soak -- see the open observation).
 
 **Known limits carried forward:**
-- SIGCHLD interrupts a blocked `wait4` (slice 6, `sys_wait4`
-  checks `sig_pending & ~sig_blocked` after the late re-scan).
-  It also interrupts `sys_read` on a pipe and `sys_write` on a
-  full pipe (the check is after the EOF/EPIPE checks).
-- `sys_nanosleep` CANNOT be interrupted.  Its loop is a
-  `sti; hlt` spin in kernel mode.  The timer does not preempt a
-  kernel-mode `hlt` to run a READY child, so another process
-  cannot run to send the signal.  The `sig_pending` check we
-  would add is unreachable.  A signal delivered while in
-  `nanosleep` will be observed at the next syscall boundary
-  (the return from `nanosleep`), but the sleep itself runs to
-  completion.
+- SIGCHLD interrupts a blocked `wait4`; `sys_read` on a pipe and
+  `sys_write` on a full pipe also interrupt.
+- **`sys_nanosleep` is interruptible now**, but it returns
+  `-EINTR` only when a *deliverable* signal arrives; an ignored
+  or blocked signal does not interrupt it.  `rem` is still not
+  written back.
 - No `sigwait` (the synchronous wait-for-a-specific-signal
   primitive); `pause` and `sigsuspend` are implemented.
 - SIGSTOP/SIGTSTP default-terminate (STOP is not implemented);
   SIGCONT's default is ignore, which is correct, but there is no
-  stopped state to continue.  Job control is open-issues item 13.
+  stopped state to continue.  **Job control is the next item.**
 - `signal_deliver_frame*` requires a nonzero restorer (musl
-  always sets `SA_RESTORER`; a caller that installs a handler
-  with `restorer == 0` gets no delivery and the bit stays set).
-- No SIGBUS generator: x86 has no `#BUS` vector and donix's
-  `mmap` is anonymous-only.
-- `siginfo` is passed as NULL; the handler is the simple
-  `void(int)` shape.  `sigaction` masks and `SA_*` flags beyond
-  `SA_RESTORER` are not honored.
+  always sets `SA_RESTORER`).
+- No SIGBUS generator.
+- `siginfo` is passed as NULL; `sigaction` masks and `SA_*` flags
+  beyond `SA_RESTORER` are not honored.
 - `signal_deliver_frame` and `sys_rt_sigreturn` both compute the
-  frame base as `g_syscall_stack_top - 120` while
-  `user_syscall_entry.asm` pushes 128 bytes.  The gate passing
-  means the constant is consistent with what is tested, not that
-  it is right.  A change to the stub's pushes or the delivery
-  point must re-derive it.
+  frame base as `g_syscall_stack_top - 120`; the stub pushes 120
+  bytes, the 128 is the `call`'s return address.  See
+  `docs/open-issues.md` "The `g_syscall_stack_top - 120` frame
+  base is derived and correct."  A change to the stub's pushes or
+  the delivery point must re-derive it.
 
 **What slice 2 taught the slice-3 author, so it is not re-walked:**
 
 - **Do NOT call `signal_deliver_frame` from the asm stub.**  The
-  first attempt did; the extra call + return address + callee
-  frame pushed the 16 KB kernel stack over on the deepest
-  syscalls (`musl_sh`'s `read(0)` at its prompt), and the stub's
-  `pop`s read user-stack data as the resume frame.  Boot-time
-  `#PF` at RIP `0x40B845`, CR2 `0x1000`.  The deliver check runs
-  at the top of `syscall_dispatch`, inside the C frame every
-  syscall already returns through.
-- **The handler entry `RSP` is `frame`, not `frame + 8`.**  The
-  frame is `[restorer][ucontext_t]`; the handler is a normal C
-  function whose epilogue `pop rbp; ret` pops `frame[0]`.  If
-  entry RSP is `frame + 8`, the `ret` pops `frame[16]`
-  (`uc_link = 0`) and jumps to address 0.  `sys_rt_sigreturn`
-  reads the `ucontext_t` from the user RSP saved at syscall
-  entry, which is `frame + 8`.
+  deliver check runs at the top of `syscall_dispatch`, inside the
+  C frame every syscall already returns through.
+- **The handler entry `RSP` is `frame`, not `frame + 8`.**
 - **`killtest` cannot close a slice's delivery acceptance.**  Use
-  `kill_self` for delivery-and-restore, `sigspin` for the tick
-  path, `sigsegv_probe` for the fault path, `sigchld_probe` for
-  SIGCHLD, `sigterm_ignore` for SIG_IGN.
+  `kill_self` (delivery-and-restore), `sigspin` (tick path),
+  `sigsegv_probe` (fault path), `sigchld_probe` (SIGCHLD),
+  `sigterm_ignore` (SIG_IGN), `nanosleep_intr_probe` (blocking
+  syscall interrupted; asserts `got=1` and `-EINTR`).
+
+**Probe discipline (learned 2026-10-29 the hard way):**
+`nanosleep_intr_probe` failed four different ways before it passed,
+and three of the four were probe bugs, not kernel bugs:
+
+- a fixed `usleep(300ms)` in the parent raced the child out of
+  musl's `__post_fork`, so the handler was not yet installed and
+  SIGUSR1 default-terminated it.  **Use a pipe handshake, not a
+  sleep.**
+- a 1s nanosleep raced the parent's read-then-kill, so the signal
+  arrived after the child had exited.  **Sleep long enough that
+  the kill lands inside it (3s).**
+- the pass line said "child caught SIGUSR1" while nothing
+  asserted it; a `got=0` run printed PASS.  **A pass line must be
+  backed by the code that proves it** -- the child `_exit(10)`s
+  when `got != 1`, and the parent's `WEXITSTATUS` check turns
+  that into FAIL.
+
+The `DBG-SYSCALL` per-syscall trace is what ended the guessing: it
+showed the child ran only `218/14/14` (`__post_fork`) and no
+`open`, no `sigaction`, no `nanosleep` -- and later showed the
+`kill` landing after the child's `exit_group`.  **A probe that
+fails is signal, but the failure's location must be observed, not
+deduced.**
 
 **DONE SINCE `v0.6.17`** (restore points: `20261021-slice5-done`,
-`20261023-tkill`, `20261023-sigign`, on `dev`, no version bump):
+`20261023-tkill`, `20261023-sigign`, the `20261029-slice6-*`
+tags, `20261029-nanosleep-blocks-verified`,
+`20261029-idle-dispatch-fixed`, on `dev`, no version bump):
 
 *Batch 1 -- `ps -l` / sysinfo* (`20261020-psl-sysinfo`): `ps -l`
-works -- busybox gained `FEATURE_PS_LONG`/`PS_TIME`, and the
-kernel gained `sys_sysinfo` (99).  **99 is `sysinfo`, not
-`gettimeofday`** (96; `time` is 201).  `ps -l`'s `STIME` was a
-separate defect: `proc_build_stat` emits `p->creation_time`,
-which was never assigned; `process_initialize_pcb` now records
-`g_ticks`.
+works; the kernel gained `sys_sysinfo` (99).  **99 is `sysinfo`,
+not `gettimeofday`** (96; `time` is 201).  `ps -l`'s `STIME` was a
+separate defect: `proc_build_stat` emits `p->creation_time`, now
+recorded in `process_initialize_pcb`.
 
 *Batch 2 -- kernel shell echo* (`b06787d`): the kernel shell's
 echo and command output go to the serial terminal.
 
-*Batch 3 -- signals slices 1-5:*
-- Slice 1 (`588ae53`, `3f60a19`, `ce69a7b`): pending and blocked
-  masks, `kill`/`tgkill` raise, `sigdump`/`killtest`.  No
-  delivery.
-- Slice 2 (`866588f` design, `d2126d8` code): delivery at the top
-  of `syscall_dispatch`, `sys_rt_sigreturn` (15), the
-  `ucontext_t` frame at `restorer (8) + 816 bytes`.  Verified by
-  `kill_self`.
-- Slice 3 (`17ffeb9`, `a1c90ff`, `c4b3ba7`): delivery on `iretq`,
-  `signal_deliver_frame_iretq` taking the target PCB as a
-  parameter.  Verified by `sigspin`.
-- Slice 4 (`1d256ed`, `f90d517`): fault raises.  Verified by
-  `sigsegv_probe`.
-- Slice 5 (`7245390` = `20261021-slice5-done`): SIGPIPE,
-  default-action table, SIGKILL.  Then the SIGCHLD half:
-  `593b349` (deliver on the way out, result preserved),
-  `dfd5240` (stage `sigchld_probe`), `42302e7` (SIGCHLD raise in
-  `process_exit`, result preserved via `v[G_RAX]`).  Verified by
-  `sigchld_probe`, `yes | head`, and the `kill -9/-15/-2 $$`
-  exit statuses 137/143/130.
-- `7994fce`: `sigchld_probe` source brought into the tree -- it
-  had existed only on the scratch copy, and a clean build failed
-  without it.
-- `b976b40`: `tkill` (200).
-- `33c4384` = `20261023-tkill`: busybox `CONFIG_KILL=y`, so the
-  default-action table could be exercised.
-- `6de2d63` = `20261023-sigign`: `SIG_IGN` is a disposition, not
-  `SIG_DFL`; `sigterm_ignore` added and surviving.
+*Batch 3 -- signals slices 1-5:* (slice 1 `588ae53`/`3f60a19`/
+`ce69a7b`; slice 2 `866588f` design, `d2126d8` code; slice 3
+`17ffeb9`/`a1c90ff`/`c4b3ba7`; slice 4 `1d256ed`/`f90d517`;
+slice 5 `7245390`; SIGCHLD half `593b349`/`dfd5240`/`42302e7`;
+`sigchld_probe` source brought in `7994fce`; `tkill` `b976b40`;
+`CONFIG_KILL` `33c4384`; `SIG_IGN` `6de2d63`.)
 
-**The current restore points are the slice-6 tags**:
-`20261029-slice6-wait4`, `-pipe-read`, `-pipe-write`, `-pause`,
-`-sigsuspend`, and the single `20261029-slice6-done` marker.
-The pre-`v0.6.18` scratch tags they replaced were dropped at the
-`v0.6.18` release.  Nothing is pushed: the policy is not to push
-until `v0.6.19` is ready and verified.  The release procedure
-draws the `v0.6.19` summary from these and drops them.
+*Session 2026-10-29 (evening) -- the "next" work, landed:*
+- `5854566` scheduler: a `BLOCKED` caller stays `BLOCKED` on a
+  refused yield (the `YIELD-REFUSE` clobber; contract rule 2).
+- `c7a7962` fork: the child inherits the parent's signal
+  dispositions.
+- `14c50a0` exec: reset signal dispositions (the missing half;
+  the `0x41E1A1` `#PF` fix).
+- `1226dee`, `6d3a0b4` debug: gate the signal-delivery
+  instrumentation off (twice).
+- `af0f9f6` probe: `nanosleep_intr_probe` asserts `got=1`.
+- `4939ca8` nanosleep: block instead of spinning; interruptible
+  by a caught signal.
+- `7f43ac4` scheduler: dispatch idle from a yield instead of
+  refusing it.
+
+The slice-6 scratch tags (`20261029-slice6-*`) and the two new
+restore tags are the source for the `v0.6.19` summary.  Nothing
+is pushed: the policy is not to push until `v0.6.19` is ready and
+verified.
 
 **Working style -- how this project gets changed**
 
@@ -270,14 +342,33 @@ write the expected number from that count, not from memory.**
 
 **ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.**  Grep the
 file, confirm the count is 1 **and** the match is in the intended
-function.
+function.  **A bare line like `process_wake_all_blocked();` can
+appear in two functions** (`timer_preempt_handler` and
+`irq1_handler`); anchor on the surrounding lines that make it
+unique (this session's second anchor miss).  **`next->state ==
+PROC_STATE_RUNNING` appears three times** (`process_exit`,
+`scheduler_switch_to`, `process_yield`); the guard that prints
+`YIELD-REFUSE` is `process_yield`'s (this session's third anchor
+miss).
 
 **A post-write check string must be copied from the `new`
-literal, not retyped.**
+literal, not retyped.**  **And an anchor must be read from the
+file's current bytes (`cat -A`), not from memory of what was
+written a few turns ago** -- the probe's `_exit` block gained a
+comment between the write and the next edit, and the anchor that
+omitted it counted 0.
 
 **Ask for source you do not have.**  Before patching a file it
 has not seen **in this session**, ask for it.  **Before writing
 an anchor, read the file with `cat -A` and quote the bytes.**
+
+**A `_Static_assert` failing the build is the guard working.**
+`pcb_t` layout is pinned by `process.c`'s `_Static_assert` block
+(offsets through `user_rsp` at `0x610`).  New fields go **after
+the last asserted field**, appended at the end of the struct next
+to `sig_pending`/`sig_blocked`/`signal_restorer[]`.  A field
+inserted before `user_rsp` moves it and the build fails -- which
+is what happened to `wake_tick` and is the intended safety net.
 
 **The build is TWO steps.**  `make -C 04_kernel_64bit
 FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
@@ -293,15 +384,18 @@ the FAILURE path is signal.**  `SW2-*`, `HEAP_TRACE_MERGE`, the
 `HEAP: corrupt` prints, and `heap_validate`'s check prints are
 success-or-transient-path; they are gated.  The refuse lines
 (`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`, `EXIT-REFUSE`)
-and the `C` report are failure-path (kept).
+and the `C` report are failure-path (kept).  **Corollary learned
+this session:** if a failure-path line becomes routine (the
+`YIELD-REFUSE` on every `sleep`), that is a scheduler decision
+defect to fix, not noise to filter -- the line printed because
+`process_yield` refused a dispatch it should have made.
 
 **GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
 `-g`).  Use raw offsets: `pid` 0x000, `name` 0x008, `state`
 0x028, `cr3` 0x030, `entry_point` 0x038,
 `kernel_stack_virt` 0x048, `kernel_stack_top` 0x050, `rsp`
 0x110, `rip` 0x118, `next` 0x120, `prev` 0x128, `block_kind`
-0x158.  `sizeof(pcb_t)` = 0x618.  **CONSIDER BUILDING WITH
-`-g`.**
+0x158.  `user_rsp` is 0x610.  **CONSIDER BUILDING WITH `-g`.**
 
 **Do not run `git reset --hard` without stashing first.  Do not
 edit `third_party/`.  Do not commit `kmain.c`'s `pit_init` knob
@@ -376,70 +470,106 @@ Concurrency rules: `docs/contract.md`.
 
 ### Current baseline
 
-- `test.sh` 57/57; canary `--full` 28/28; pipe7e clean at 100 kHz
-  and on a >3.5-hour 100 Hz soak.  The 2026-10-23 signal gate ran
-  28/28 + 57/57 three times interleaved.
-- Busybox batch 1 (prompt, readlink, `ls` features,
-  human-readable, long options) and five applets (`bc`, `dc`,
-  `diff`, `du`, `awk`) enabled and verified by running them.
-- Signals slices 1-5 complete and verified (see "Signals: what is
-  in" above).  `tkill` (200) in; `CONFIG_KILL=y`;
-  `SIG_IGN` fixed and proven.
+- `test.sh` 57/57; `canary --full` 28/28; `NANOSLEEP_INTR_PROBE`
+  PASS.  Verified 2026-10-29 on a freshly built image, twice
+  interleaved, on the KVM gate (which was, unusually, slower than
+  TCG on the author's host -- see the open observation).
+- PIPE7E clean past 5000 iterations on the 2026-10-29 build; the
+  250000 soak was **not** completed this session.
+- Busybox batch 1 and five applets enabled and verified.
+- Signals slices 1-5 complete and verified; `tkill` (200) in;
+  `CONFIG_KILL=y`; `SIG_IGN` fixed.
 - Signals slice 6 complete: `wait4`, pipe `read`, pipe `write`,
-  `pause`, `sigsuspend` return `-EINTR` on a pending signal;
-  `sys_wait4` reaps `PROC_STATE_TERMINATED`.  Five probes, each
-  with a `20261029-slice6-*` tag.  `nanosleep` interruption is a
-  documented limitation.
+  `pause`, `sigsuspend` return `-EINTR`.
+- **`nanosleep` blocks and is interruptible** (`4939ca8`); the
+  old "cannot be interrupted" limitation is gone.
+- **Fork inherits dispositions; exec resets them** (`c7a7962` +
+  `14c50a0`), the POSIX pair.
+- **`process_yield` dispatches idle** (`7f43ac4`); `sleep` is
+  silent.
 - `docs/contract.md` is the durable concurrency rule; read it
   before any shared-state change.
 
 ### Next -- the highest-value work
 
-1. **`sys_nanosleep` interruption + the `process_yield`
-  re-entrancy bug it exposed.**  The `sti; hlt` loop monopolizes
-  the CPU in kernel mode; making it block (so the timer can
-  schedule a peer) hit `YIELD-REFUSE` setting a `BLOCKED`
-  process to `RUNNING`, which produced a user `RSP = 0` `#PF`.
-  That is a scheduler change: the `YIELD-REFUSE` path must leave
-  a `BLOCKED` caller alone.  Fix this first; job control depends
-  on it.
-2. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
-  SIGCONT resume, process groups, controlling terminal,
-  `tcsetpgrp`.  Three parts, all needed:
-  - the kernel state machine (`PROC_STATE_STOPPED`, stop/resume),
-  - `CONFIG_ASH_JOB_CONTROL=y` in the busybox build -- without
-    it ash does not put foreground jobs in their own process
-    group and does not issue `tcsetpgrp`, so `Ctrl-Z` does not
-    work from the shell even when the kernel is correct,
-  - the tty side: `console_read` / `keyboard` maps `Ctrl-Z` to
-    SIGTSTP (and the other control chars to their signals) and
-    tracks the foreground process group.
-3. **`console_read` interruption.**  It blocks with
-  `BLOCK_KIND_NONE`; it needs the same `sig_pending` check as
-  pipe read/write, so a keyboard-blocked reader can be
-  interrupted by a signal.
-4. **Shebang + `/bin/sh` kernel half** (item 14): `#!` parsing in
-  `sys_execve` with a depth guard.  Image half is done.
-5. **SSE** (item 10): save/restore XMM on context switch and the
-  interrupt path, then remove the userland `-mno-sse*` flags.
-6. **Privilege model** (item 9).
-7. busybox batch 2; `test.sh`'s md5.
+1. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
+   SIGCONT resume, `PROC_STATE_STOPPED`, process groups,
+   controlling terminal, `tcsetpgrp`.  Three parts, all needed:
+   - the kernel state machine (`PROC_STATE_STOPPED`, stop/resume;
+     `signal_default_action` currently maps SIGSTOP/SIGTSTP to
+     TERMINATE -- that is the placeholder to replace),
+   - `CONFIG_ASH_JOB_CONTROL=y` in the busybox build,
+   - the tty side: `console_read` / `keyboard` maps `Ctrl-Z` to
+     SIGTSTP (and the other control chars to their signals) and
+     tracks the foreground process group.
+
+   The three prerequisites landed this session (park/wake, signal
+   interrupting a blocking syscall, dispositions across fork and
+   exec).  A `PROC_STATE_STOPPED` process is a third non-READY
+   state; the `process_yield` refuse guards and the timer wake
+   path must treat it as "not dispatchable, not woken by the
+   deadline loop," which is the same discipline as `BLOCKED`.
+2. **`console_read` interruption.**  It blocks with
+   `BLOCK_KIND_NONE`; it needs the same `sig_pending` check as
+   pipe read/write.
+3. **Shebang + `/bin/sh` kernel half** (open-issues item 14).
+   **What exists:** a `/bin/sh` file exists on the image
+   (busybox soft link); a shell that catches `ENOEXEC` can run a
+   script by hand.
+   **What does not:** `sys_execve` reads the ELF header and, on
+   no ELF magic, prints `sys_execve: not an ELF file` and returns
+   `-ENOEXEC`.  It does not read the first line, does not
+   recognize `#!`, does not build
+   `argv[interp, optional_arg, script, ...]`, and has no
+   recursion depth guard.
+   **Why a script with `#!/bin/sh` fails today:** the kernel
+   never looks at the `#!` line.  The shell fallback is what
+   makes `./script.sh` appear to work -- and only when the caller
+   is a shell.  A direct `execve("./script.sh")` from a non-shell
+   process, or a script whose interpreter is not a shell, fails.
+   **What the kernel half must do:** in `sys_execve`, after the
+   ELF magic check fails, read the first two bytes; if `#!`,
+   parse the interpreter path (and one optional argument),
+   rewrite argv as `[interp, opt_arg, script_path, original
+   argv[1..]]`, and `sys_execve` the interpreter -- with a depth
+   guard (e.g. 4) so a shebang pointing at itself cannot loop.
+   **Image half prerequisite:** `/bin/sh` must exist and be
+   executable; the current busybox `--install -s /bin` step
+   creates it, but only as a manual post-boot step (see "State
+   on disk").
+4. **SSE** (item 10): save/restore XMM on context switch and the
+   interrupt path, then remove the userland `-mno-sse*` flags.
+5. **Privilege model** (item 9).
+6. busybox batch 2; `test.sh`'s md5.
+7. **A completed PIPE7E soak** at 100 Hz on the post-nanosleep
+   build -- the timer wake loop touched every tick, and "clean
+   past 5000" is not the soak standard.
 
 ### Refuted -- do NOT re-walk
 
 - **The reserve / frame placement.**  `67701df` + `5587d70`.
 - **The `next->rsp = 0` clear.**  Broke blocking; reverted.
-- **The pipe-waiter fields as the `C`'s stale holder.**  The
-  pipe7e helper writes 2 bytes and never blocks, so they are
-  never set.
-- **The `current_process` dual-copy divergence at the `C`.**  Both
-  copies agreed.  (The `process_destroy` fix is still correct.)
-- **A switch-to-self guard in `scheduler_switch_to`'s TAIL.**  It
-  fires after `current_process = next` and refuses every dispatch.
-  The tail check is `state != READY`, not `next == current_process`.
-- **A caller heap overflow.**  The enriched trace + the merge trace
-  proved the merge arithmetic correct; the "corruption" was an
-  interleaved `kfree`.  The heap had a race, not an overflow.
+- **The pipe-waiter fields as the `C`'s stale holder.**
+- **The `current_process` dual-copy divergence at the `C`.**
+- **A switch-to-self guard in `scheduler_switch_to`'s TAIL.**
+- **A caller heap overflow.**
+- **`YIELD-REFUSE` on `sleep` as a real refusal.**  It was
+  `process_yield` selecting idle (RUNNING by design) in its
+  `!next` fallback; idle is now exempt from guard 2 (`7f43ac4`).
+- **"The `nanosleep` limitation is permanent."**  It was a
+  `sti; hlt` spin; it blocks now (`4939ca8`).
+- **"`./script.sh` works, so shebang works."**  It does not.
+  busybox ash catches `ENOEXEC` and runs `sh script.sh`.  The
+  kernel never reads the `#!` line.  This is why a script
+  `#!/usr/bin/python` has no fallback and fails, and why the
+  `sys_execve: not an ELF file` print appears for a `.sh`
+  invocation from a non-shell caller.  The bug is **in the
+  kernel**, and the fix is item 14.
+- **Probe hypotheses for the `got=0` failure** (stale
+  `current_process`, fork disposition, `sigaction`
+  mis-targeting, an iretq-vs-pop `rax` mismatch).  All four were
+  wrong; the cause was the probe's fixed `usleep` racing the
+  child out of `__post_fork`, then a 1s sleep racing the kill.
 - Do not re-open: item 11, the session-48 zone scan,
   the `fs_base` path, the `longjmp`/`setjmp` family.
 
@@ -447,24 +577,22 @@ Concurrency rules: `docs/contract.md`.
 
 ## Open issues (top 6)
 
-1. **Signals: one gap remains -- job control.**  SIGSTOP/SIGTSTP
-  default-terminate rather than stop.  Slice 6 (interrupt on a
-  pending signal) is done for `wait4`, pipe `read`, pipe `write`,
-  `pause`, and `sigsuspend`; `sys_nanosleep` is a documented
-  limitation (kernel-mode `sti; hlt` monopolizes the CPU).
-  Delivery, dispositions (including `SIG_IGN`), the default-action
-  table, SIGPIPE, SIGCHLD-to-`wait4`, `tkill`, and the slice-6
-  probes are done and verified.
+1. **Job control is the remaining signal gap.**
+   SIGSTOP/SIGTSTP default-terminate rather than stop.  Delivery,
+   dispositions (including `SIG_IGN`), the default-action table,
+   SIGPIPE, SIGCHLD-to-`wait4`, `tkill`, slice 6, `nanosleep`
+   interruption, fork/exec dispositions are all done and
+   verified.
 2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
 3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
 4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
-  process bug.
+   process bug.
 5. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
 6. **`gettimeofday` (96) / `time` (201) not implemented** -- no
-  caller on the image today; `date`/`time` need them if enabled.
+   caller on the image today; `date`/`time` need them if enabled.
 
-Plus: **the VFS** (see Next), **shebang + `/bin/sh`**, and the
-open-issues list.
+Plus: **the VFS** (see Next), **shebang + `/bin/sh`** (item 14),
+and the open-issues list.
 
 ---
 
@@ -481,11 +609,18 @@ busybox reads `/proc/self/exe` to find itself, donix has no
 start with `/`.  This is a manual step, not part of the build;
 automating it is a Makefile/boot change and is not done.
 
-`v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  The
-scratch tags listed above are the current restore points; there
-is no single `20261021-slice5-done` tag as a release, and nothing
-is pushed until `v0.6.18` is complete and verified.  The next
-release procedure draws the release summary from these tags
+**The `/bin/sh` symlink is a soft link to busybox, and without
+`--install -s /bin` it does not exist.**  If `./script.sh` with
+`#!/bin/sh` fails, check `ls -l /bin/sh` first -- that is the
+common cause; the kernel's shebang parsing (item 14) is the
+second.
+
+`v0.6.15`, `v0.6.16`, `v0.6.17`, and `v0.6.18` are the release
+record.  The slice-6 tags and the two 2026-10-29 restore tags
+(`20261029-nanosleep-blocks-verified`,
+`20261029-idle-dispatch-fixed`) are the current restore points;
+nothing is pushed until `v0.6.19` is complete and verified.  The
+next release procedure draws the release summary from these tags
 before dropping them.
 
 ---
@@ -493,14 +628,18 @@ before dropping them.
 ## One-line summary
 
 **`v0.6.18` is the last release: signals slices 1-5, `tkill`,
-busybox `KILL`, `SIG_IGN` fixed.**  Slice 6 (interrupt on a
-pending signal) is done for `wait4`, pipe `read`, pipe `write`,
-`pause`, and `sigsuspend`, each with a probe and a
-`20261029-slice6-*` restore tag; `sys_wait4` also reaps
-`PROC_STATE_TERMINATED`.  `nanosleep` interruption is a
-documented limitation.  Next is the `YIELD-REFUSE`-on-`BLOCKED`
-scheduler bug that the `nanosleep` probe exposed, then job
-control (kernel stop/resume + `CONFIG_ASH_JOB_CONTROL=y` + tty
-control chars), then `console_read` interruption, then
-shebang+/bin/sh, SSE, privilege.  Read `docs/contract.md` and
-"NEXT" in this file before any code.**
+busybox `KILL`, `SIG_IGN` fixed.**  Since then: slice 6
+(`wait4`/pipe read/write/`pause`/`sigsuspend` interrupt on a
+pending signal), **`nanosleep` blocks and is interruptible** (the
+old limitation gone), **fork inherits dispositions and exec resets
+them** (the POSIX pair, after a regression and its completion),
+**a `BLOCKED` caller stays `BLOCKED` on a refused yield**, and
+**`process_yield` dispatches idle** so `sleep` is silent.
+**Shebang (`#!`) is still not parsed in `sys_execve`** -- `./script.sh`
+works only via busybox ash's `ENOEXEC` fallback; a non-shell
+interpreter has no fallback (open-issues item 14).  Gate
+57/57 + 28/28 + probe PASS, twice.  **Next is job control**
+(kernel stop/resume + `PROC_STATE_STOPPED` + process groups +
+`CONFIG_ASH_JOB_CONTROL=y` + tty control chars), then
+`console_read` interruption, shebang+/bin/sh, SSE, privilege.
+Read `docs/contract.md` and "NEXT" in this file before any code.

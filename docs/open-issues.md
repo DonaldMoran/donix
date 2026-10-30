@@ -1,10 +1,10 @@
 # Open issues
 
-**Last updated: 2026-10-23** (HEAD `20261023-sigign`).  This file
-lists **only open issues**.  Closed items are removed, not struck
-through; their history is in `git log` and `docs/session-log.md`.
-An item appears here only while it is a defect, a missing
-feature, or an unverified claim about the tree.
+**Last updated: 2026-10-29** (session evening; HEAD on `dev` past
+`7f43ac4`).  This file lists **only open issues**.  Closed items
+are removed, not struck through; their history is in `git log` and
+`docs/session-log.md`.  An item appears here only while it is a
+defect, a missing feature, or an unverified claim about the tree.
 
 Read top to bottom.  The numbered items are the long-standing
 list; the un-numbered entries below them are smaller and were
@@ -66,16 +66,17 @@ returns a signal-kill status, ash's default message is printed,
 but the shell does not do job-control bookkeeping (no `[1]+
 Done` lines, no `fg`/`bg`, no `kill %1`).
 
-Signals are done (see handoff): raise, delivery at three points,
-dispositions including `SIG_IGN`, the default-action table, and
-`SIGCHLD` reaching `wait4` all work.  What is not built is the
-job-control surface *on top of* that machinery: there is no
-stopped process state (`signal_default_action` maps SIGSTOP and
-SIGTSTP to TERMINATE, the documented placeholder), no SIGCONT
-resume path, no process groups (`sys_kill` refuses `pid <= 0`),
-no controlling terminal, no `tcsetpgrp`/`setpgid`, and
-`CONFIG_ASH_JOB_CONTROL` is unset so ash has no job table.  Not
-small, but the hard half -- the signal substrate -- is in.
+Signals are done (see handoff), including slice 6 and
+`nanosleep` interruption, and dispositions now cross fork and
+reset on exec; the job-control surface on top of that machinery
+is not built.  What is not built is the job-control surface *on
+top of* that machinery: there is no stopped process state
+(`signal_default_action` maps SIGSTOP and SIGTSTP to TERMINATE,
+the documented placeholder), no SIGCONT resume path, no process
+groups (`sys_kill` refuses `pid <= 0`), no controlling terminal,
+no `tcsetpgrp`/`setpgid`, and `CONFIG_ASH_JOB_CONTROL` is unset
+so ash has no job table.  Not small, but the hard half -- the
+signal substrate -- is in.
 
 **14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
 works only because busybox ash falls back on `ENOEXEC` and runs
@@ -104,33 +105,6 @@ fallback.
 ---
 
 ## Un-numbered open items
-
-**fork inherits signal dispositions.**  Closed by the commit that
-adds `signal_handler[]` to `sys_fork`'s copy loop: before it, a
-child of a parent that installed a handler ran with SIG_DFL for
-that signal.  `sig_blocked` was already inherited and
-`sig_pending` already cleared; only `signal_handler[]` was
-missing.  Kept here as the record of the shape, because the same
-"inherit this field too" review applies to any future per-process
-signal field.
-
-**The probe-race lesson (2026-10-29).**  `nanosleep_intr_probe`'s
-first two versions failed with the child killed by SIGUSR1, and
-the failure was chased through four wrong kernel hypotheses
-(stale `current_process`, fork disposition, `sigaction`
-mis-targeting, an iretq-vs-pop `rax` mismatch) before the actual
-cause was found: **the parent used a fixed `usleep` before
-`kill`, and the child was still inside musl's `__post_fork` when
-the signal arrived, so its handler was not installed yet.**  The
-fix is a pipe handshake -- the child reports readiness after
-installing the handler and before sleeping.  The `DBG-SYSCALL`
-per-syscall trace is what ended the guessing: it showed the child
-ran only `218/14/14` (musl's `__post_fork`) and no `open`, no
-`sigaction`, no `nanosleep`.  Rule 6 restated: a probe that fails
-is signal, but the failure's *location* must be observed, not
-deduced; a fixed sleep is a race, and a handshake is the
-deterministic form.
-
 
 **`chmod`/`chown` accept and drop, and their applets are not
 compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and
@@ -384,6 +358,10 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 - **`sigterm_ignore`** installs `SIG_IGN` for SIGTERM, raises
   SIGTERM, and prints whether it survived.  It is the acceptance
   check for the `SIG_IGN` disposition (`20261023-sigign`).
+- **`nanosleep_intr_probe`** blocks in `nanosleep`, has a peer
+  signal it, and asserts `got=1` and `rc=-1/errno=EINTR`.  It
+  is the acceptance check for `nanosleep` interruption and the
+  `-EINTR` return on a blocking syscall.
 - **`at_step1` sections**, as of session 41: sections 1–7
   `resolve_at`; 8–9 `faccessat`; 11 `utimensat`.  (There is no
   section 10.)
