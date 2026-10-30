@@ -8760,16 +8760,22 @@ long sys_setpgid(long pid, long pgid) {
     return 0;
 }
 
-long sys_kill(long pid, int sig) {
-    if (sig < 0 || sig > 63) return -(long)EINVAL_;
-    if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
-    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
-
-    pcb_t* target = process_find_by_pid((uint64_t)pid);
-    if (!target) return -(long)ESRCH_;
-
-    if (sig == 0) return 0;   /* existence check: no bit set */
-
+/*
+ * kill_one -- deliver one signal to one already-resolved process.
+ *
+ * This is sys_kill's single-target body, factored out so the
+ * process-group loop (sys_kill's pid < 0 branch) calls the SAME
+ * raise the single-pid path does.  A second copy of the SIGKILL /
+ * SIGCONT / generic-set-and-wake logic would drift from this one,
+ * and a shell's kill(-pgid, sig) must not disagree with
+ * kill(pid, sig) about SIGKILL, pid 1, or the blocked-and-
+ * unblocked wake.
+ *
+ * `target` is non-NULL and not pid 1 (callers check).  `sig` is
+ * in [1,63]; sig == 0 is the existence check, handled by the
+ * caller, and is not passed here.
+ */
+static long kill_one(pcb_t* target, int sig) {
     /*
      * Slice 5: SIGKILL acts at the raise, not at a deliver point.
      * It cannot be caught, blocked, or ignored, so a target in a
@@ -8843,6 +8849,77 @@ long sys_kill(long pid, int sig) {
 
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return 0;
+}
+
+long sys_kill(long pid, int sig) {
+    if (sig < 0 || sig > 63) return -(long)EINVAL_;
+
+    if (sig == 0) {
+        /*
+         * Existence check.  For a pid it is "does the pid name a
+         * live process"; for a group it is "does any process
+         * belong to it".  Both are answered without a raise.
+         */
+        if (pid > 0) {
+            if (pid == 1) return -(long)EPERM_;
+            return process_find_by_pid((uint64_t)pid) ? 0
+                                                      : -(long)ESRCH_;
+        }
+        if (pid == 0) return -(long)EINVAL_;   /* no "my group" yet */
+        {
+            long pg = -pid;
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                pcb_t* c = process_get_pcb(i);
+                if (!c || c->pid == 1) continue;
+                if (c->pgrp == (uint64_t)pg) return 0;
+            }
+            return -(long)ESRCH_;
+        }
+    }
+
+    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
+
+    if (pid > 0) {
+        pcb_t* target = process_find_by_pid((uint64_t)pid);
+        if (!target) return -(long)ESRCH_;
+        return kill_one(target, sig);
+    }
+
+    if (pid == 0) return -(long)EINVAL_;   /* no "my group" yet */
+
+    /*
+     * pid < 0: signal every process in process group -pid.
+     *
+     * This is the Unix kill(-pgid, sig) form, and it is what the
+     * tty-side Ctrl-Z uses: irq1_handler resolves the console
+     * foreground pgrp (g_console_fg_pgrp, set by TIOCSPGRP) and
+     * calls sys_kill(-fg, SIGTSTP).  Before this branch existed,
+     * kill(-pgid) was -EINVAL and the tty had no way to name the
+     * group it means to stop.
+     *
+     * pid 1 is excluded: it is never on the ready queue and
+     * sys_kill refuses it as a single target; the group form must
+     * not sneak past that.  The walk is MAX_PROCESSES entries and
+     * each kill_one does its own cli around the raise, so a tick
+     * between members is safe: the group is stopped one member at
+     * a time, and each stop is a complete raise.
+     *
+     * Returns 0 if at least one member matched, -ESRCH otherwise,
+     * matching Linux (kill to a group with no members is ESRCH).
+     */
+    {
+        long pg = -pid;
+        int matched = 0;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            pcb_t* c = process_get_pcb(i);
+            if (!c) continue;
+            if (c->pid == 1) continue;
+            if (c->pgrp != (uint64_t)pg) continue;
+            matched = 1;
+            kill_one(c, sig);
+        }
+        return matched ? 0 : -(long)ESRCH_;
+    }
 }
 
 /*
@@ -9077,6 +9154,24 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
  * every access under cli.
  */
 static uint64_t g_console_fg_pgrp = 0;
+
+/*
+ * Read the console foreground pgrp for the keyboard IRQ.
+ *
+ * g_console_fg_pgrp is private to this file (TIOCGPGRP/TIOCSPGRP
+ * write and read it), but irq1_handler in interrupts.c needs it to
+ * decide who receives a Ctrl-Z.  This is the one exported reader,
+ * and it reads under cli like TIOCGPGRP does, so the IRQ observes
+ * exactly what TIOCSPGRP wrote.  0 means "no foreground group set
+ * yet"; the caller must not signal group 0.
+ */
+uint64_t console_fg_pgrp_get(void) {
+    uint64_t v;
+    __asm__ volatile("cli");
+    v = g_console_fg_pgrp;
+    __asm__ volatile("sti");
+    return v;
+}
 
 static int fd_is_console(int fd) {
     file_slot_t* slot = get_file_slot_any(fd);

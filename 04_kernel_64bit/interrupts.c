@@ -10,6 +10,7 @@
 #include "include/pmm.h"
 #include "include/vmm.h"
 #include "include/user_syscall.h"
+#include "include/syscall.h"   /* sys_kill (irq1_handler Ctrl-Z) */
 
 /* Written by user_syscall_entry.asm immediately before sysret.  Read
  * here when a fault lands at RIP < 0x1000 in user mode, which is the
@@ -979,6 +980,38 @@ void irq1_handler(void) {
          * concern and left Ctrl is enough for Ctrl-[). */
         case 0x1D: g_ctrl = 1; outb(PIC1_CMD, PIC_EOI); return;
         case 0x9D: g_ctrl = 0; outb(PIC1_CMD, PIC_EOI); return;
+    }
+
+    /*
+     * Ctrl-Z -> SIGTSTP to the foreground process group.
+     *
+     * scancode 0x2C is the Z key (set 1); 0x1A is `[`, not Z --
+     * Ctrl+[ is already mapped to ESC in scancode_to_ascii, and
+     * that is a different key.  The break code (high bit set)
+     * is dropped so the key release does not raise a second
+     * time.
+     *
+     * The tty eats ^Z when ISIG is on, which is what the termios
+     * fill reports (T_ISIG | T_ICANON); so this raises and does
+     * NOT also enqueue 0x1A.  Passing ^Z through to a raw-mode
+     * reader is a later commit, and it needs TCSETS to actually
+     * store per-fd termios and sys_read to consult ISIG first --
+     * donix does not have that store yet.
+     *
+     * The raise goes through sys_kill(-fg, SIGTSTP), the same
+     * raise the single-pid path uses, so the contract's
+     * SIGTSTP entry (safe point, cli, dispatcher, pending
+     * representation) is unchanged.  fg > 1 refuses pid 1 as a
+     * group: it is never on the ready queue and sys_kill refuses
+     * it as a single target.
+     */
+    if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2C) {
+        long fg = (long)console_fg_pgrp_get();
+        if (fg > 1) {
+            sys_kill(-fg, 20);   /* SIGTSTP */
+        }
+        outb(PIC1_CMD, PIC_EOI);
+        return;
     }
 
     char c = scancode_to_ascii(sc, g_shift, g_caps, g_ctrl);
