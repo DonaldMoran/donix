@@ -376,6 +376,16 @@ typedef struct pcb {
      */
     uint8_t  stop_signal;
     uint8_t  stop_reported;
+    /*
+     * shebang_depth: 0 for a normal exec; 1 while a shebang
+     * re-exec is in flight.  A script whose interpreter is itself
+     * a script would recurse without bound, so the re-exec refuses
+     * at depth >= 1 with -ENOEXEC (ELOOP is not defined in this
+     * tree).  Reset to 0 on a successful ELF load.  Appended after
+     * stop_reported to keep every asserted offset intact, per the
+     * rule above.
+     */
+    uint8_t  shebang_depth;
 
     /* Declarations for the helpers (defined in user_syscall.c next
      * to signal_default_action).  They are declared in this header

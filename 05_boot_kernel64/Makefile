@@ -158,9 +158,14 @@ fat.img: musl-userland $(USERLAND_ELFS)
 	        mcopy -i fat.img "$$f" "::/root/scripts/$$base" || exit 1; \
 	    fi \
 	done
+# /bin/sh is a second copy of busybox.  FAT has no symlink store
+# (see the tar/st_ino note in docs/open-issues.md), so sh is a full
+# copy, not a link.  ~414 KB of image for a working shebang
+# interpreter, which open-issues item 14 requires.
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    mcopy -i fat.img "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox"; \
+	    mcopy -i fat.img "$(USERLAND_BIN)/busybox.elf" "::/bin/sh"; \
 	else \
 	    echo "ERROR: busybox.elf missing"; exit 1; \
 	fi
@@ -300,11 +305,18 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	    fi \
 	done
 
+# /bin/sh is a second copy of busybox.  FAT has no symlink store
+# (see the tar/st_ino note in docs/open-issues.md), so sh is a full
+# copy, not a link.  ~414 KB of image for a working shebang
+# interpreter, which open-issues item 14 requires.
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
 	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
 	        "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox" ; \
+	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/sh"; \
+	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	        "$(USERLAND_BIN)/busybox.elf" "::/bin/sh" ; \
 	else \
 	    echo "ERROR: $(USERLAND_BIN)/busybox.elf missing — did the busybox build fail?"; \
 	    exit 1; \

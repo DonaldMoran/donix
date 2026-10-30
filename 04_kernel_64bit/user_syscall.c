@@ -5597,6 +5597,84 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * when execve returns ENOEXEC; on EIO it prints "I/O error"
      * and gives up.
      */
+    /*
+     * ---- 1b. Shebang (#!) handling. ----
+     *
+     * A file that starts "#!" is a script: re-exec the
+     * interpreter named on the first line, with argv
+     *   [interp, optional_arg?, script_path, user_argv[1..]]
+     * exactly as execve(2) specifies.
+     *
+     * The script_path passed to the interpreter is exec_path --
+     * the resolved, dot-prefix-stripped path from section 1, not
+     * the caller's raw `path`.  The interpreter's own sys_execve
+     * will re-resolve it against *its* cwd, and a "./x" form is
+     * exactly what f_open rejects; passing the stripped form is
+     * what lets the same open succeed twice.
+     *
+     * Depth guard: a script whose interpreter is itself a script
+     * would recurse without bound.  self->shebang_depth is
+     * incremented across the recursive call and refused at >= 1.
+     * ELOOP is not defined in this tree, so the refusal is
+     * -ENOEXEC -- the same errno a shell keys its fallback on.
+     *
+     * The interpreter line is parsed from the bytes already in
+     * ehdr (the first f_read above).  A line longer than the
+     * 64-byte header window is treated as ENOEXEC, not guessed.
+     */
+    if (got >= 2 && ehdr.e_ident[0] == '#' && ehdr.e_ident[1] == '!') {
+        if (self->shebang_depth >= 1) {
+            serial_print("sys_execve: shebang depth\n");
+            f_close(&file);
+            __asm__ volatile("sti");
+            return -(long)ENOEXEC;
+        }
+        char interp[64];
+        char optarg[64];
+        int  have_opt = 0;
+        int  ip = 0, op = 0;
+        int  i = 2;
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               (ehdr.e_ident[i] == ' ' || ehdr.e_ident[i] == '\t')) i++;
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               ehdr.e_ident[i] != '\n' && ehdr.e_ident[i] != ' ' &&
+               ehdr.e_ident[i] != '\t' && ip < (int)sizeof(interp) - 1) {
+            interp[ip++] = (char)ehdr.e_ident[i++];
+        }
+        interp[ip] = '\0';
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               (ehdr.e_ident[i] == ' ' || ehdr.e_ident[i] == '\t')) i++;
+        if (i < (int)sizeof(ehdr.e_ident) && ehdr.e_ident[i] != '\n') {
+            have_opt = 1;
+            while (i < (int)sizeof(ehdr.e_ident) && ehdr.e_ident[i] != '\n' &&
+                   ehdr.e_ident[i] != ' ' && ehdr.e_ident[i] != '\t' &&
+                   op < (int)sizeof(optarg) - 1) {
+                optarg[op++] = (char)ehdr.e_ident[i++];
+            }
+            optarg[op] = '\0';
+        }
+        f_close(&file);
+        if (ip == 0) {
+            serial_print("sys_execve: empty shebang interp\n");
+            __asm__ volatile("sti");
+            return -(long)ENOEXEC;
+        }
+        int argc_in = 0;
+        while (user_argv && user_argv[argc_in] && argc_in < 250) argc_in++;
+        char *new_argv[254];
+        int na = 0;
+        new_argv[na++] = interp;
+        if (have_opt) new_argv[na++] = optarg;
+        new_argv[na++] = exec_path;
+        for (int k = 1; k < argc_in; k++) new_argv[na++] = user_argv[k];
+        new_argv[na] = 0;
+        self->shebang_depth++;
+        long rc = sys_execve(interp, new_argv, user_envp);
+        self->shebang_depth--;
+        __asm__ volatile("sti");
+        return rc;
+    }
+
     if (got < 4 ||
         ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
@@ -5819,6 +5897,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->brk_virt        = 0;
 
     uint64_t entry = elf_load_into_process(self, elf_buf);
+    self->shebang_depth = 0;  /* a real ELF resets the guard */
     kfree(elf_buf);
     if (entry == 0) {
         #if TRACE_EXECVE_ERR
