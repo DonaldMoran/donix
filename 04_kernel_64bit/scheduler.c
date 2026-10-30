@@ -1467,7 +1467,19 @@ void process_yield(void) {
      * here is at the decision point.  Same shape as the
      * next == current_process guard above.
      */
-    if (next->state == PROC_STATE_RUNNING) {
+    /*
+     * Idle (pid 1) is exempt from the RUNNING check below.  Idle
+     * is RUNNING by design whenever nothing else is, and the
+     * !next fallback above selects it as the fall-to-idle target.
+     * Dispatching idle is the legitimate "nothing runnable, park
+     * the CPU" path the timer already uses; refusing it here left
+     * a caller (e.g. nanosleep's blocked sleeper) spinning in a
+     * refused yield instead of falling to idle, and printed
+     * YIELD-REFUSE on every `sleep`.  Non-idle RUNNING targets
+     * are still refused: a RUNNING non-idle process is on the CPU
+     * elsewhere and must not be dispatched from a stale frame.
+     */
+    if (next->state == PROC_STATE_RUNNING && next->pid != 1) {
         serial_lock();
         serial_print("YIELD-REFUSE: next pid=");
         serial_print_dec(next->pid);
