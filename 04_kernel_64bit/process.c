@@ -140,6 +140,10 @@ static void process_initialize_pcb(pcb_t* pcb) {
     pcb->exit_status = 0;
     pcb->wait_pid = 0;
     pcb->creation_time = g_ticks;   /* 100 Hz; /proc/<pid>/stat field 22 */
+    /* Job control: a process starts as the leader of its own group. */
+    pcb->pgrp = pcb->pid;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
     process_count++;
 }
 
@@ -1029,6 +1033,12 @@ void process_reclaim(pcb_t* pcb) {
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
+    /* Job-control fields: a reused slot must not inherit a pending
+     * stop or a stale pgrp.  See the pcb_t comment in process.h. */
+    pcb->pgrp = 0;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
+    pcb->wake_tick = 0;
     process_count--;
 }
 
@@ -1051,6 +1061,12 @@ void process_destroy(pcb_t* pcb) {
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
+    /* Job-control fields: a reused slot must not inherit a pending
+     * stop or a stale pgrp.  See the pcb_t comment in process.h. */
+    pcb->pgrp = 0;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
+    pcb->wake_tick = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) scheduler_set_current(NULL);

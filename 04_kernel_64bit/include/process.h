@@ -17,7 +17,20 @@ typedef enum {
     PROC_STATE_RUNNING,
     PROC_STATE_BLOCKED,
     PROC_STATE_ZOMBIE,       // exited; waiting for parent to reap
-    PROC_STATE_TERMINATED    // exited; parent never existed; reclaimed immediately
+    PROC_STATE_TERMINATED,   // exited; parent never existed; reclaimed immediately
+    /*
+     * Job control (open-issues item 13).  A stopped process has not
+     * exited; it resumes at the same RIP/RSP when SIGCONT arrives.
+     * It is a third non-READY state, alongside BLOCKED: not
+     * dispatchable, not woken by the timer's deadline loop, and
+     * not forced RUNNING by process_yield's refuse guards.
+     *
+     * APPENDED to the enum so the existing numeric values are
+     * unchanged (PROC_STATE_UNUSED=0 ... TERMINATED=5, STOPPED=6).
+     * Nothing serializes proc_state_t; the values are read by the
+     * scheduler and process_dump_all only.
+     */
+    PROC_STATE_STOPPED
 } proc_state_t;
 
 /*
@@ -299,7 +312,59 @@ typedef struct pcb {
      * this.  Set by sys_nanosleep, cleared by the timer wake and
      * on wake; nothing else reads it. */
     uint64_t wake_tick;
+
+    /* -----------------------------------------------------------------
+     * Job control fields (open-issues item 13).
+     *
+     * APPENDED AT THE END, after wake_tick, like every signal field
+     * above: the _Static_assert block in process.c pins offsets only
+     * through user_rsp (0x610), and context_switch.asm reads nothing
+     * past block_kind (0x158) or user_rsp (0x610).  Adding these
+     * after the last asserted field is the same rule wake_tick
+     * followed -- and the same rule that failed when wake_tick was
+     * inserted after block_kind and shifted user_rsp to 0x618.
+     *
+     * pgrp: the process group id.  Defaults to the process's own
+     * pid at create (every process starts as the leader of its own
+     * group, POSIX).  setpgid/tcsetpgrp write it; the tty-side
+     * Ctrl-Z raise reads it to decide who receives SIGTSTP.  It is
+     * not yet wired through the tty (that is commit 03); this commit
+     * only introduces it so the STOPPED state machine can be tested
+     * by kill(self, SIGSTOP) without a tty.
+     *
+     * stop_pending: a stop was requested (SIGSTOP/SIGTSTP delivered)
+     * but the process was mid-syscall or mid-fault, so the stop has
+     * not yet taken effect.  The safe points -- the syscall-return
+     * deliver path and the iretq deliver path -- check it.  This
+     * mirrors the contract's safe-point discipline
+     * (docs/contract.md question 1): the pending bit is set under
+     * cli by signal_default_action; the transition to
+     * PROC_STATE_STOPPED happens at the delivery point, in the same
+     * critical section as the dispatch decision.
+     *
+     * in_stop_safe_point: re-entrancy guard.  process_continue can
+     * be called from the SIGCONT delivery point while the process
+     * is already being woken from a stop; the guard keeps the two
+     * from both touching state and queue membership.
+     *
+     * Cleared in process_reclaim and process_destroy alongside
+     * signal_handler[] etc.: a reused PCB slot must not inherit a
+     * pending stop or a stale pgrp.
+     */
+    uint64_t pgrp;
+    uint8_t  stop_pending;
+    uint8_t  in_stop_safe_point;
+
+    /* Declarations for the helpers (defined in user_syscall.c next
+     * to signal_default_action).  They are declared in this header
+     * so process.c and the probe's compile-time view agree. */
 } pcb_t;
+
+/* Job-control helpers.  Defined in user_syscall.c.  Called from
+ * signal_default_action (SIGSTOP/SIGTSTP -> process_stop; SIGCONT ->
+ * process_continue). */
+void process_stop(pcb_t* self);
+void process_continue(pcb_t* self);
 
 #define KERNEL_STACK_SLOT_NONE (-1)
 

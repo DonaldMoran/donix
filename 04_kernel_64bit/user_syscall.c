@@ -1173,6 +1173,7 @@ static size_t proc_build_stat(uint64_t pid, char* out, size_t cap) {
             case PROC_STATE_READY:   sc = 'R'; break;
             case PROC_STATE_BLOCKED: sc = 'S'; break;
             case PROC_STATE_ZOMBIE:  sc = 'Z'; break;
+            case PROC_STATE_STOPPED: sc = 'T'; break;
             default:                 sc = 'S'; break;
         }
         if (o + 1 < cap) out[o++] = sc;
@@ -9593,6 +9594,162 @@ void signal_terminate_current(int sig) {
 }
 
 /*
+ * process_stop / process_continue -- job control (open-issues item 13).
+ *
+ * Contract.md question 1 (safe point): a SIGSTOP delivered while the
+ * process is mid-syscall must not rewrite its state out from under
+ * the syscall's return path.  process_stop is called from two shapes:
+ *
+ *   - the raise path (a SIGSTOP raised by another process) -- self
+ *     is not current, or is current and RUNNING, so the write is
+ *     deferred: stop_pending is set, and the safe point takes the
+ *     stop on the next delivery.
+ *
+ *   - the safe point itself (process_stop_and_yield, called from
+ *     signal_default_action's SIGSTOP/SIGTSTP branch, reached only
+ *     from the syscall-return delivery) -- in_stop_safe_point is 1,
+ *     so the state change happens now, in the same critical section
+ *     as the dispatch decision.
+ *
+ * stop_pending is the deferred write.  The transition is READY or
+ * RUNNING -> STOPPED, never BLOCKED -> STOPPED: a BLOCKED process
+ * is not preempted to be stopped; it stops when it wakes and takes
+ * its own delivery.  (POSIX disagrees slightly, but that is the
+ * scope of 02b.)
+ *
+ * A second call while stop_pending is already set is a no-op; a
+ * call on a process that has already stopped is a no-op.
+ */
+void process_stop(pcb_t* self) {
+    if (!self) return;
+    uint64_t _sf;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+
+    if (self->state == PROC_STATE_STOPPED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+    if (self == process_get_current() &&
+        self->state == PROC_STATE_RUNNING &&
+        self->in_stop_safe_point == 0) {
+        /*
+         * Stop delivered on the running process, but the safe point
+         * has not yet been entered (mid-syscall or mid-fault).  Set
+         * the pending bit; the delivery point will call back into
+         * this function with in_stop_safe_point != 0.
+         */
+        self->stop_pending = 1;
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+
+    /* At the safe point: take the stop now.  Remove from the ready
+     * queue (idempotent), set STOPPED, and do NOT add it back.  The
+     * timer's process_wake_all_blocked only touches BLOCKED, so a
+     * STOPPED process will not be woken by the keyboard; the
+     * nanosleep deadline loop only touches BLOCK_KIND_NANOSLEEP,
+     * so it is not woken by a deadline; and process_yield's RUNNING
+     * refuse guard only runs for the current process.  Nothing
+     * requeues a STOPPED process except process_continue. */
+    scheduler_ready_queue_remove(self);
+    self->state        = PROC_STATE_STOPPED;
+    self->block_kind   = BLOCK_KIND_NONE;
+    self->stop_pending = 0;
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+}
+
+/*
+ * process_stop_and_yield -- the syscall-return safe-point wrapper.
+ *
+ * Called ONLY from signal_default_action's SIGSTOP/SIGTSTP branch,
+ * which is reached only from signal_deliver_frame's SIG_DFL branch,
+ * which is reached only from syscall_dispatch's delivery-on-the-way-
+ * out block.  That block runs with interrupts off (the syscall stub
+ * issued cli and has not sti'd), and signal_deliver_frame returns
+ * into syscall_dispatch, which returns result to the stub, which
+ * sysret's with %rax = result and RFLAGS = kf[7] -- the interrupted
+ * syscall's user RFLAGS, IF=1.  The user-visible shape is therefore
+ * "the syscall returned its value only after SIGCONT", which is
+ * Unix: a process stopped in a system call returns from it only
+ * once it is continued.
+ *
+ * The helper is what makes the stop take effect at the safe point.
+ * process_stop alone would see self == current && RUNNING &&
+ * in_stop_safe_point == 0 and re-set stop_pending -- the raise-path
+ * deferral -- which is exactly wrong here: this IS the safe point.
+ * Setting in_stop_safe_point around the call tells process_stop to
+ * take the write now.
+ *
+ * process_yield never returns until the scheduler dispatches this
+ * process again -- that is, until SIGCONT's process_continue has
+ * set it STOPPED->READY and requeued it.  When it returns, the
+ * stack above is intact: signal_default_action returns 0,
+ * signal_deliver_frame returns 0, syscall_dispatch returns result,
+ * the stub sysret's.  No sentinel return value is needed and
+ * syscall_dispatch's tail is unchanged.
+ *
+ * Not called from the timer's signal_deliver_frame_iretq yet: a
+ * process that is in user mode can receive SIGSTOP and is stopped
+ * at the tick's iretq delivery point, but that path yields from
+ * inside the timer handler, which is its own contract and is 02c.
+ * A process that is in user mode is reached by a SIGSTOP from
+ * another process; the STOPPED self-raise path goes through the
+ * syscall-return delivery above, so 02b covers what a probe can
+ * actually exercise today.
+ */
+static void process_stop_and_yield(pcb_t* self) {
+    if (!self) return;
+    self->in_stop_safe_point = 1;
+    process_stop(self);
+    self->in_stop_safe_point = 0;
+    /* Contract rule 1: process_stop already left the state change
+     * under cli; this yield is the dispatch decision itself.  If
+     * the scheduler refuses the yield (nothing runnable), the
+     * process stays STOPPED and the next process_continue -- or a
+     * keyboard IRQ's process_wake_all_blocked, which does not
+     * touch STOPPED -- is what requeues it.  process_yield handles
+     * the "idle is the only target" case by switching to idle,
+     * which is the correct park. */
+    process_yield();
+}
+
+/*
+ * process_continue -- SIGCONT handler helper.
+ *
+ * Clears a pending stop and, if the process is actually STOPPED,
+ * puts it back on the ready queue through the dispatcher.  Idempotent
+ * on a RUNNING/READY process: SIGCONT on a running process is a
+ * no-op (except clearing a pending stop, which is POSIX -- a SIGCONT
+ * that arrives between a SIGSTOP and the safe point cancels the
+ * stop).
+ *
+ * Contract rule 4: the requeue goes through scheduler_ready_queue_add
+ * (not the internal head/tail), so the dispatcher's guards see it.
+ * Contract rule 1: the state and the queue change are one cli
+ * section.
+ */
+void process_continue(pcb_t* self) {
+    if (!self) return;
+    uint64_t _sf;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+
+    /* SIGCONT before the safe point cancels a pending stop. */
+    self->stop_pending = 0;
+
+    if (self->state != PROC_STATE_STOPPED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+
+    self->state      = PROC_STATE_READY;
+    self->block_kind = BLOCK_KIND_NONE;
+    scheduler_ready_queue_add(self);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+}
+
+/*
  * signal_default_action -- slice 5's default-action table.
  *
  * Called by the three deliver helpers when a pending signal has no
@@ -9621,7 +9778,13 @@ static long signal_default_action(pcb_t* self, int sig) {
         case 17:   /* SIGCHLD  */
         case 23:   /* SIGURG   */
         case 28:   /* SIGWINCH */
-        case 18:   /* SIGCONT  */
+            return 0;
+        case 18:   /* SIGCONT -- resume a stopped process */
+            process_continue(self);
+            return 0;
+        case 19:   /* SIGSTOP -- cannot be caught; stop now */
+        case 20:   /* SIGTSTP -- default is stop */
+            process_stop_and_yield(self);
             return 0;
         default:
             (void)self;
