@@ -44,7 +44,7 @@ CAPTURE=capture.txt
 # diagnosis.
 DEFAULT_MODE=clean-nofreeze
 
-MODES=(clean-nofreeze nofreeze sdl headless debug monitor int verbose clean-sdl clean-headless)
+MODES=(clean-nofreeze nofreeze sdl gtk headless debug monitor int verbose clean-sdl clean-headless)
 
 # ---- build + stage ---------------------------------------------------
 build() {
@@ -85,6 +85,7 @@ mode_qemu() {
         clean-nofreeze) echo "$nf -display sdl" ;;
         nofreeze)       echo "$nf -display sdl" ;;
         sdl)            echo "$base -display sdl" ;;
+        gtk)            echo "$base -display gtk" ;;
         headless)       echo "$base -display none" ;;
         debug)          echo "$base -display sdl -S" ;;
         monitor)        echo "$base -display sdl -monitor unix:/tmp/donix-mon,server,nowait" ;;
@@ -101,6 +102,7 @@ mode_desc() {
         clean-nofreeze) echo "make clean + SDL, no freeze     fault reboots; reboot works [default]" ;;
         nofreeze)       echo "SDL, no freeze                  fault reboots; reboot works" ;;
         sdl)            echo "SDL window, incremental         fault freezes" ;;
+        gtk)            echo "GTK window, incremental         fault freezes" ;;
         headless)       echo "no display, incremental        fault freezes" ;;
         debug)          echo "SDL, QEMU waits for gdb (-S)   fault freezes, break before boot" ;;
         monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
