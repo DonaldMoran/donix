@@ -26,6 +26,9 @@
 # The tick rate is `pit_init` in kmain.c.  It is a compiled constant
 # and is NOT a run-script option; edit kmain.c and rebuild.
 
+# Disable host side Ctrl-Z
+stty susp undef
+
 set -e
 set -o pipefail
 cd "$(dirname "$0")"
