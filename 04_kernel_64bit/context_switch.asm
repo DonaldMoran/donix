@@ -163,6 +163,36 @@ context_switch:
     test rax, rax
     jnz .ring0_save
 
+    ; A STOPPED process is not user-preempted: it parked in
+    ; process_yield inside a syscall, on its kernel stack, at the
+    ; syscall-return delivery point.  Its pcb->user_rsp was never
+    ; written by a user-mode timer preemption, and pcb->rip still
+    ; holds the last user RIP from before the syscall.  Without this
+    ; check the selector falls through to .user_preempted_save and
+    ; builds a USER frame with RSP = prev->user_rsp (0) and
+    ; RIP = prev->rip (a user address) -- the user RSP=0 #PF.  The
+    ; kernel-mode save path builds the correct kernel frame and the
+    ; resume returns up through process_yield and syscall_dispatch to
+    ; sysret, which is what a process stopped at the syscall-return
+    ; delivery point needs.
+    ;
+    ; PROC_STATE_STOPPED is 6 (process.h; appended to proc_state_t
+    ; so the existing values are unchanged).  A _Static_assert in
+    ; process.c pins the value; if the enum is ever extended before
+    ; STOPPED, that build fails, and this compare must be updated to
+    ; match.  That is the same append-only rule every asserted offset
+    ; follows.
+    ;
+    ; This is the THIRD instance of the same shape: a process that
+    ; parked in kernel mode is not user-preempted, whatever the
+    ; pcb->rip happens to be.  BLOCKED parks there (block_kind != 0
+    ; catches it).  STOPPED parks there (this check).  Any future
+    ; state that parks in kernel mode must join this list, not rely
+    ; on rip.
+    mov rax, [r15 + 0x028]              ; prev->state
+    cmp rax, 6                          ; PROC_STATE_STOPPED
+    je .ring0_save
+
     mov rax, [r15 + 0x118]              ; prev->rip
     cmp rax, KERNEL_BASE
     jae .ring0_save

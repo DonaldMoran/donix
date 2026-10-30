@@ -1097,3 +1097,13 @@ _Static_assert(offsetof(pcb_t, rsp)              == 0x110, "context_switch.asm: 
 _Static_assert(offsetof(pcb_t, rip)              == 0x118, "context_switch.asm: rip offset");
 _Static_assert(offsetof(pcb_t, block_kind)       == 0x158, "context_switch.asm: block_kind offset");
 _Static_assert(offsetof(pcb_t, user_rsp)         == 0x610, "context_switch.asm: user_rsp offset");
+
+/*
+ * PROC_STATE_STOPPED is compared by number in context_switch.asm's
+ * save-path selector (offset 0x028, value 6).  The assembly has no
+ * way to know the enum; this pins the value the way the offset
+ * asserts pin the layout.  If proc_state_t is ever extended before
+ * STOPPED, this fails the build, and both the enum comment and the
+ * assembly compare must be updated together.
+ */
+_Static_assert(PROC_STATE_STOPPED == 6, "context_switch.asm: PROC_STATE_STOPPED value");
