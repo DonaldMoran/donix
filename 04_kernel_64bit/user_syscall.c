@@ -5605,12 +5605,18 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      *   [interp, optional_arg?, script_path, user_argv[1..]]
      * exactly as execve(2) specifies.
      *
-     * The script_path passed to the interpreter is exec_path --
-     * the resolved, dot-prefix-stripped path from section 1, not
-     * the caller's raw `path`.  The interpreter's own sys_execve
-     * will re-resolve it against *its* cwd, and a "./x" form is
-     * exactly what f_open rejects; passing the stripped form is
-     * what lets the same open succeed twice.
+     * The script_path passed to the interpreter is the caller's
+     * raw `path`, not section 1's exec_path.  exec_path is already
+     * resolved against the caller's cwd and dot-prefix-stripped for
+     * FatFs, so it is cwd-RELATIVE.  The interpreter inherits that
+     * same cwd, and its own sys_execve resolves the argument against
+     * it again -- so a cwd-relative exec_path doubles the prefix.
+     * The 2026-10-30 test showed it: from /root, "./don.sh" became
+     * exec_path "root/don.sh", the interpreter re-resolved that
+     * against /root to "root/root/don.sh", and ash reported
+     * "can't open 'root/don.sh'".  The caller's raw path "./don.sh"
+     * resolves correctly the second time, because the cwd is the
+     * same one it resolved against the first time.
      *
      * Depth guard: a script whose interpreter is itself a script
      * would recurse without bound.  self->shebang_depth is
@@ -5665,7 +5671,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
         int na = 0;
         new_argv[na++] = interp;
         if (have_opt) new_argv[na++] = optarg;
-        new_argv[na++] = exec_path;
+        new_argv[na++] = path;
         for (int k = 1; k < argc_in; k++) new_argv[na++] = user_argv[k];
         new_argv[na] = 0;
         self->shebang_depth++;
