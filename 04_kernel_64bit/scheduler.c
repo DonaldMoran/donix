@@ -4,6 +4,7 @@
 #include "include/user_msr.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/user_syscall.h"
 
 /*
  * SW2_TRACE -- dispatch-trace instrumentation for scheduler_switch_to.
@@ -919,6 +920,39 @@ void scheduler_switch_to(pcb_t* next) {
         return;
     }
 
+    /*
+     * Stop-check: a READY next with a pending SIGSTOP/SIGTSTP must
+     * be stopped before it is dispatched, not after.  process_yield
+     * dispatches via this function (not the timer's return-next->rsp
+     * path), so a peer SIGSTOP on a process the parent's yield is
+     * about to dispatch never reaches 03b's timer-tail check.
+     *
+     * process_try_stop_iretq is idempotent on a process without a
+     * pending stop, and returns 1 after process_stop has set the
+     * target STOPPED and removed it from the ready queue.  The
+     * caller (process_yield) re-picks on 1.
+     */
+    if (process_try_stop_iretq(next)) {
+        return;
+    }
+
+    /*
+     * 04c: signal delivery at the scheduler_switch_to dispatch
+     * point.  The timer's tail delivers at return-next->rsp; this
+     * path (process_yield's dispatch of next) resumes via
+     * context_switch_resume, and the child is dispatched here, not
+     * by the timer (the tick's next is the parent, woken by
+     * nanosleep).  A SIGCONT handler installed by the child (the
+     * SIGSTOP_PEER_PROBE case) is only reachable if the child is
+     * resumed to it, and the child is resumed here.
+     * signal_deliver_frame_iretq refuses a kernel-mode frame (the
+     * CS slot != 0x33), so a process resumed in kernel mode is not
+     * delivered to -- correct.
+     */
+    if (next->sig_pending & ~next->sig_blocked) {
+        signal_deliver_frame_iretq(next, next->rsp);
+    }
+
     SW2_PRINT(
         serial_print("SW2-ENTRY next=0x"); serial_print_hex((uint64_t)next);
         serial_print(" pid="); serial_print_dec(next->pid);
@@ -1499,6 +1533,26 @@ void process_yield(void) {
     }
 
     scheduler_switch_to(next);
+
+    /*
+     * scheduler_switch_to returned: the dispatch was refused.  In
+     * this function, the only refuse that can happen here is the
+     * stop-check (process_try_stop_iretq(next) returned 1); the
+     * guards above rule out every other refuse.  The target is
+     * STOPPED and off the ready queue.  Do NOT re-pick here:
+     * re-picking calls context_switch(prev = current, next = _re)
+     * and the second save of current corrupts current's resume
+     * frame (the parent's nanosleep sysret returned to user with a
+     * user RSP 0x88 lower than g_user_rsp_save — the 04a first
+     * attempt's fault).  A refused dispatch leaves the caller on
+     * the CPU; it was requeued by the main path above, so the next
+     * tick's scheduler_ready_queue_next will pick it.  The child
+     * is STOPPED and off the queue; the parent is READY on the
+     * queue and will be re-dispatched.
+     */
+    if (current_process->state == PROC_STATE_READY)
+        current_process->state = PROC_STATE_RUNNING;
+    __asm__ volatile("sti");
 }
 
 pcb_t* scheduler_get_current(void) {
