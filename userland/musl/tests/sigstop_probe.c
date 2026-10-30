@@ -155,9 +155,36 @@ int main(void) {
     }
 
     /* Wait for the child's 'D' handshake.  This returns only when
-     * the child's kill(SIGSTOP) syscall has returned. */
-    char d;
-    int got_d = read_byte(done_pipe[0], &d) && (d == 'D');
+     * the child's kill(SIGSTOP) syscall has returned.
+     *
+     * BOUNDED, not blocking.  A blocking read here turned the
+     * "sys_kill does not requeue a STOPPED target for SIGCONT"
+     * defect into a machine-wide hang: the parent blocked, the
+     * child stayed STOPPED, idle ran hlt, nothing woke either.
+     * The capture showed "parent: T_seen=1" and then nothing --
+     * the parent was in this read.  A bounded wait fails the
+     * probe with a clean diagnostic instead, and the failure
+     * signature ("T_seen=1, resumed=0") names exactly the shape
+     * the 02d commit fixed in sys_kill.  The 02c probe's own
+     * contract should never be "hang on the way to the assertion."
+     *
+     * 200 x 10ms = 2s; on the success path 'D' arrives in
+     * microseconds, so this changes nothing when the kernel is
+     * correct. */
+    int flags = fcntl(done_pipe[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(done_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
+    char d = 0;
+    int got_d = 0;
+    for (int i = 0; i < 200 && !got_d; i++) {
+        if (read_byte(done_pipe[0], &d) && d == 'D') {
+            got_d = 1;
+            break;
+        }
+        struct timespec wait10 = { .tv_sec = 0, .tv_nsec = 10000000L };
+        struct timespec rem10;
+        nanosleep(&wait10, &rem10);
+    }
     close(done_pipe[0]);
     printf("parent: child signaled resumed=%d\n", got_d);
     fflush(stdout);

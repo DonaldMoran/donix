@@ -8643,6 +8643,33 @@ long sys_kill(long pid, int sig) {
         return 0;
     }
 
+    /*
+     * SIGCONT acts at the raise when the target is STOPPED.  A
+     * stopped process has no deliver point: it is not running, so
+     * its syscall_dispatch tail never runs, so the generic pending-
+     * bit path below can never be observed.  SIGCONT's whole purpose
+     * is to requeue a stopped process, so the requeue happens here,
+     * at the raise, through process_continue (which holds cli and
+     * calls scheduler_ready_queue_add).
+     *
+     * This is the same shape as the SIGKILL special case above:
+     * an action that must land on a target that is not deliverable.
+     *
+     * If the target is not STOPPED, fall through to the generic
+     * pending-bit path.  When the target next delivers, case 18
+     * calls process_continue, which clears stop_pending (POSIX:
+     * SIGCONT between a SIGSTOP and the safe point cancels the
+     * stop) and is a no-op for a RUNNING/READY process.
+     */
+    if (sig == 18) {   /* SIGCONT */
+        if (target->state == PROC_STATE_STOPPED) {
+            g_sig_raise_count++;
+            process_continue(target);
+            return 0;
+        }
+        /* else: fall through to the generic path. */
+    }
+
     uint64_t bit = 1ULL << (uint64_t)sig;
 
     uint64_t saved_flags;
