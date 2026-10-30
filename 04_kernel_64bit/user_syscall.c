@@ -6354,6 +6354,31 @@ static long console_read(void* buf, size_t count) {
             break;
         }
         if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
+
+        /*
+         * Signals item 2: a pending, unblocked signal interrupts
+         * the console read.  Same shape as the pipe read/write
+         * EINTR checks: the wake that brought us here came from
+         * sys_kill, which sets sig_pending and marks us READY
+         * (and adds us to the ready queue) under cli.  Return
+         * -EINTR (4) before blocking, so a signal that arrived
+         * between the kbd check and this point is not lost.
+         *
+         * scheduler_ready_queue_remove(self) is the same
+         * pattern as sys_wait4's -EINTR path: the process is
+         * running, so it must not remain on the queue in
+         * RUNNING state.  _remove is idempotent; if the
+         * sys_kill wake did not reach us (it ran before we
+         * re-blocked), there is nothing to remove.
+         */
+        if ((self->sig_pending & ~self->sig_blocked) != 0) {
+            scheduler_ready_queue_remove(self);
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            __asm__ volatile("sti");
+            return -(long)4;   /* -EINTR */
+        }
+
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_NONE;
         __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
@@ -6365,7 +6390,37 @@ static long console_read(void* buf, size_t count) {
         __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
         __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
         __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
-        __asm__ volatile("sti"); __asm__ volatile("hlt");
+
+        /*
+         * Block via process_yield, not sti; hlt.  sti; hlt
+         * leaves self->rsp at its LAST SAVE -- the frame from
+         * the previous context_switch -- which the stack has
+         * since moved past.  When the timer (or a peer) wakes
+         * us, the scheduler resumes from that stale frame and
+         * halts.  The GPR slots saved above do not help: the
+         * resume needs a 20-slot frame at self->rsp, and
+         * sti; hlt builds none.  This is the same fix the pipe
+         * read/write block paths already carry; console_read
+         * was the outlier.
+         *
+         * process_yield does the right thing: it marks us
+         * BLOCKED (already done above), calls
+         * scheduler_switch_to, and context_switch builds a
+         * proper 20-slot resume frame and stores its base in
+         * self->rsp.  The timer's process_wake_all_blocked
+         * does NOT filter on block_kind (it guards pid 1,
+         * ZOMBIE/TERMINATED, and double-add only), so a
+         * BLOCK_KIND_NONE reader is still woken every 10 ms
+         * to re-check the keyboard and the pending mask.
+         */
+        process_yield();
+            /* Resumed.  Reset state so the requeue guards (which test
+             * state == RUNNING) see us correctly, matching the pipe
+             * read block.  Then loop and re-check. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Loop; the EINTR check at the top of the loop catches a
+             * signal that arrived while we were parked. */
     }
     return (long)bytes_read;
 }
