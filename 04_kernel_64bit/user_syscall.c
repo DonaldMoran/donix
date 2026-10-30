@@ -8643,6 +8643,68 @@ static void signal_kill_other(pcb_t* target, int sig) {
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
+/*
+ * Process group syscalls -- setpgid(109), getpgrp(111), getpgid(121).
+ *
+ * `pgrp` is a pcb_t field (see the pcb_t comment in process.h): it
+ * defaults to the process's own pid at create and is cleared on
+ * destroy.  busybox ash calls getpgid(0) at startup; before these
+ * existed the dispatch `default:` returned -ENOSYS and ash looped
+ * on "Unknown syscall: 121" without ever printing a prompt.
+ *
+ * CONCURRENCY.  `pgrp` is shared state (docs/contract.md rule 1):
+ * the tty-side Ctrl-Z raise (a later commit) reads it from the
+ * keyboard IRQ path, so sys_setpgid's write is under cli and its
+ * target-lookup check is in the same critical section.  sys_getpgid
+ * reads under cli so it observes exactly what setpgid wrote.
+ *
+ * There are no process groups in sys_kill yet: kill(-pgid, sig)
+ * still returns -EINVAL.  That is a separate change; these three
+ * only make the group id itself readable and writable.
+ */
+static long sys_getpgid_impl(long pid) {
+    pcb_t* target;
+    if (pid == 0) {
+        target = process_get_current();
+    } else {
+        target = process_find_by_pid((uint64_t)pid);
+    }
+    if (!target) return -(long)ESRCH_;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    uint64_t pgrp = target->pgrp;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return (long)pgrp;
+}
+
+long sys_getpgid(long pid) {
+    return sys_getpgid_impl(pid);
+}
+
+long sys_getpgrp(void) {
+    return sys_getpgid_impl(0);
+}
+
+long sys_setpgid(long pid, long pgid) {
+    pcb_t* target;
+    if (pid == 0) {
+        target = process_get_current();
+        pid = (long)target->pid;
+    } else {
+        target = process_find_by_pid((uint64_t)pid);
+    }
+    if (!target) return -(long)ESRCH_;
+    if (pid == 1) return -(long)EPERM_;
+    if (pgid == 0) pgid = pid;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    target->pgrp = (uint64_t)pgid;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return 0;
+}
+
 long sys_kill(long pid, int sig) {
     if (sig < 0 || sig > 63) return -(long)EINVAL_;
     if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
@@ -9022,10 +9084,32 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
             if (!argp) {
                 return -(long)EFAULT_;
             }
-            uint64_t fg;
+            /*
+             * tcgetpgrp(0) is compared against getpgid(0) by
+             * busybox's startup (0x4205db).  Until a TIOCSPGRP
+             * names a foreground group, answer with the caller's
+             * own pgrp and remember it: the first process to ask
+             * is the terminal's foreground group, which is what a
+             * boot shell is before it calls tcsetpgrp.  Returning
+             * 0 here made tcgetpgrp(0) != getpgid(0) forever and
+             * the shell retried without ever reaching a prompt.
+             *
+             * The check (== 0) and the lazy set are one cli
+             * region (contract rule 1: shared state).
+             */
+            uint32_t fg;
             __asm__ volatile("cli");
-            fg = g_console_fg_pgrp;
+            if (g_console_fg_pgrp == 0) {
+                pcb_t* self = process_get_current();
+                if (self) g_console_fg_pgrp = self->pgrp;
+            }
+            fg = (uint32_t)g_console_fg_pgrp;
             __asm__ volatile("sti");
+            /*
+             * The wire type is pid_t (4 bytes).  musl's tcgetpgrp
+             * reads into a 4-byte stack slot; writing 8 would stomp
+             * the word after it.
+             */
             if (safe_copy_to_user(argp, &fg, sizeof(fg)) != 0) {
                 return -(long)EFAULT_;
             }
@@ -9046,12 +9130,12 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
             if (!argp) {
                 return -(long)EFAULT_;
             }
-            uint64_t fg = 0;
-            if (safe_copy_from_user(&fg, argp, sizeof(fg)) != 0) {
+            uint32_t fg32 = 0;
+            if (safe_copy_from_user(&fg32, argp, sizeof(fg32)) != 0) {
                 return -(long)EFAULT_;
             }
             __asm__ volatile("cli");
-            g_console_fg_pgrp = fg;
+            g_console_fg_pgrp = (uint64_t)fg32;
             __asm__ volatile("sti");
             return 0;
         }
@@ -11071,6 +11155,9 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
         case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
         case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
+        case SYS_SETPGID:         result = (uint64_t)sys_setpgid((long)arg0, (long)arg1); break;
+        case SYS_GETPGRP:         result = (uint64_t)sys_getpgrp(); break;
+        case SYS_GETPGID:         result = (uint64_t)sys_getpgid((long)arg0); break;
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
