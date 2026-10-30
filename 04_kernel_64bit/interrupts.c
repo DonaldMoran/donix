@@ -34,6 +34,12 @@ extern volatile uint64_t g_arch_prctl_addr[32];
 #define PIT_MODE     0x36
 
 #define KBD_DATA   0x60
+
+/* Gated diagnostic for the Ctrl-Z raise.  1 = print what
+ * irq1_handler decided (fg value and sys_kill result) on every
+ * Ctrl-Z.  Leave 0 in any committed tree; flip to 1 only to
+ * capture a run. */
+#define TRACE_CTRLZ 0
 #define KBD_STATUS 0x64
 
 /* Boot fingerprint: dump the raw interrupt frame for the first few
@@ -1007,9 +1013,20 @@ void irq1_handler(void) {
      */
     if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2C) {
         long fg = (long)console_fg_pgrp_get();
+#if TRACE_CTRLZ
+        serial_print("CTRLZ: fg="); serial_print_dec((uint64_t)(fg < 0 ? 0 : fg));
+        serial_print(" sc=0x"); serial_print_hex(sc);
+#endif
         if (fg > 1) {
-            sys_kill(-fg, 20);   /* SIGTSTP */
+            long r = sys_kill(-fg, 20);   /* SIGTSTP */
+#if TRACE_CTRLZ
+            serial_print(" kill="); serial_print_dec((uint64_t)(r < 0 ? -r : r));
+            serial_print(r < 0 ? " (err)" : " (ok)");
+#endif
         }
+#if TRACE_CTRLZ
+        serial_print("\n");
+#endif
         outb(PIC1_CMD, PIC_EOI);
         return;
     }

@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include "include/keyboard.h"
 #include "include/serial.h"
+#include "include/syscall.h"        /* sys_kill (serial Ctrl-Z) */
+#include "include/user_syscall.h"   /* console_fg_pgrp_get */
 
 #define KBD_BUFFER_SIZE 128
 
@@ -213,15 +215,51 @@ int kbd_buffer_get(char *c) {
  * keeps the two sources independent.
  */
 int kbd_buffer_get_mux(char *c) {
-    if (kbd_buffer_get(c)) {
+    for (;;) {
+        if (kbd_buffer_get(c)) {
+            return 1;
+        }
+        int ch = serial_rx_poll();
+        if (ch < 0) {
+            return 0;
+        }
+
+        /*
+         * Serial Ctrl-Z -> SIGTSTP to the console foreground pgrp.
+         *
+         * The PS/2 path raises this in irq1_handler (9b1a4ed), but a
+         * serial console sends no PS/2 scan code: the byte 0x1A
+         * arrives on the UART and reaches a reader through this
+         * function.  Without this branch, Ctrl-Z on a serial console
+         * is just a byte, and the reader echoes it as a glyph -- the
+         * "backward question mark" the 2026-10-30 test showed.  That
+         * is correct for a PS/2 keyboard and unimplemented for the
+         * UART; this is the UART half.
+         *
+         * The raise is the same sys_kill(-fg, SIGTSTP) the PS/2
+         * branch calls, so there is one raise path, not two.  fg > 1
+         * refuses pid 1 as a group, as the PS/2 branch does.  When no
+         * foreground group is set (fg == 0) the byte is passed
+         * through unchanged: a tty with no job-control owner is not
+         * a tty whose Ctrl-Z means "stop someone."
+         *
+         * The byte is consumed (loop, do not return) so the caller
+         * sees "no character yet" rather than 0x1A.  console_read
+         * then re-checks sig_pending and returns -EINTR (7f83b52),
+         * or blocks again if the raise matched nobody.
+         */
+        if ((uint8_t)ch == 0x1A) {
+            long fg = (long)console_fg_pgrp_get();
+            if (fg > 1) {
+                sys_kill(-fg, 20);   /* SIGTSTP */
+                continue;            /* byte eaten; look again */
+            }
+            /* No foreground group: fall through and pass 0x1A. */
+        }
+
+        *c = (char)ch;
         return 1;
     }
-    int ch = serial_rx_poll();
-    if (ch < 0) {
-        return 0;
-    }
-    *c = (char)ch;
-    return 1;
 }
 
 /*
