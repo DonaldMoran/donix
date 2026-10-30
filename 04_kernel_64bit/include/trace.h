@@ -40,7 +40,11 @@
 /* sys_execve: real errors -- I/O failed, out of memory, ELF
  * corrupt, arg/argv layout overflow.  These indicate a genuine
  * problem, not a script being exec'd.  On by default. */
-#define TRACE_EXECVE_ERR     1
+/* CHANGED BY DON MORAN 2026-10-30: off for session close.
+ * sys_execve's f_open diagnostic printed six lines per failed
+ * execve; it is a baseline tree define, not a session artifact,
+ * and it is flipped back on when execve is being traced again. */
+#define TRACE_EXECVE_ERR     0
 
 /* open_resolved: the f_open failure diagnostic (path, flags,
  * mode, FRESULT). */
