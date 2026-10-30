@@ -3390,6 +3390,33 @@ static long dev_open(const char* in_path, const char* local_path,
         file_slot_t* dslot = NULL;
         int dfd = alloc_file_slot(&dslot);
         if (dfd == -1) return -(long)EIO_;
+        /*
+         * The console and tty rows are TTY slots, not generic
+         * character devices.  Every consumer that answers "is this
+         * fd a tty?" -- fd_is_console (ioctl TCGETS/TIOCGPGRP),
+         * sys_read's fd-0 guard, sys_write's fd-1/2 guard -- tests
+         * FILE_KIND_CONSOLE, matching the sentinels alloc_console_slot
+         * installs on fds 0/1/2.  An opened /dev/tty must be the same
+         * kind, or busybox ash's tcgetpgrp(fd 10) is refused with
+         * -ENOTTY and it prints "can't access tty; job control
+         * turned off".
+         *
+         * Major 5 is the tty major (console 5,1; tty 5,0).  The
+         * other devices (null/zero/urandom, major 1) keep
+         * FILE_KIND_DEV with obj = d, which is what their read/
+         * write dispatch in sys_read/sys_write expects.
+         */
+        if (d->major == 5) {
+            dslot->kind     = FILE_KIND_CONSOLE;
+            dslot->obj      = NULL;
+            dslot->refcount = 1;
+            dslot->dir_path = NULL;
+            FDTRACE({ serial_print("open  tty -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" dev=");
+                      serial_print(d->name); });
+            return dfd;
+        }
         dslot->kind = FILE_KIND_DEV;
         dslot->obj  = (void*)d;
         FDTRACE({ serial_print("open  dev -> fd=");
@@ -8811,6 +8838,8 @@ long sys_tkill(long tid, int sig) {
 #define TCSETSF_ 0x5404
 #define TIOCGWINSZ_ 0x5413
 #define TIOCSWINSZ_ 0x5414
+#define TIOCGPGRP_  0x540F
+#define TIOCSPGRP_  0x5410
 
 /* termios flag bits (musl bits/termios.h, x86_64). */
 #define T_ICRNL  0x0100   /* c_iflag: map CR to NL on input       */
@@ -8923,6 +8952,15 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
  * A NULL slot (fd not open) and a non-console slot both yield
  * -ENOTTY, which is what isatty() reports as "not a tty".
  */
+/*
+ * The console's foreground process group (tcgetpgrp/tcsetpgrp).
+ * One tty today, so one static.  Written by TIOCSPGRP under cli,
+ * read by TIOCGPGRP under cli, and (in a later commit) read by the
+ * Ctrl-Z raise on the keyboard path.  This is shared state: keep
+ * every access under cli.
+ */
+static uint64_t g_console_fg_pgrp = 0;
+
 static int fd_is_console(int fd) {
     file_slot_t* slot = get_file_slot_any(fd);
     return slot && slot->kind == FILE_KIND_CONSOLE;
@@ -8966,6 +9004,55 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
             if (safe_copy_to_user(argp, &ws, sizeof(ws)) != 0) {
                 return -(long)EFAULT_;
             }
+            return 0;
+        }
+        case TIOCGPGRP_: {
+            /*
+             * tcgetpgrp().  busybox ash calls this to learn the
+             * terminal's foreground process group; -ENOTTY here is
+             * what makes it print "can't access tty; job control
+             * turned off".  Answer for the console only, matching
+             * TCGETS.  A foreground pgrp of 0 means "none set",
+             * which is a valid answer (ash then makes itself the
+             * foreground group via TIOCSPGRP).
+             */
+            if (!fd_is_console(fd)) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            uint64_t fg;
+            __asm__ volatile("cli");
+            fg = g_console_fg_pgrp;
+            __asm__ volatile("sti");
+            if (safe_copy_to_user(argp, &fg, sizeof(fg)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TIOCSPGRP_: {
+            /*
+             * tcsetpgrp().  Record the foreground pgrp.  This is
+             * shared state: the Ctrl-Z raise (a later commit) reads
+             * it from the keyboard IRQ path, so the write is under
+             * cli.  No queue or state change -- the process stays
+             * RUNNING and no dispatch follows (contract rules 1-5:
+             * no state write, no wake, no dispatch).
+             */
+            if (!fd_is_console(fd)) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            uint64_t fg = 0;
+            if (safe_copy_from_user(&fg, argp, sizeof(fg)) != 0) {
+                return -(long)EFAULT_;
+            }
+            __asm__ volatile("cli");
+            g_console_fg_pgrp = fg;
+            __asm__ volatile("sti");
             return 0;
         }
         case TCSETS_:
