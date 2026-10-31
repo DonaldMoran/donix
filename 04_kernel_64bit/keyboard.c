@@ -249,8 +249,10 @@ int kbd_buffer_get_mux(char *c) {
          * or blocks again if the raise matched nobody.
          */
         if ((uint8_t)ch == 0x1A) {
-            long fg = (long)console_fg_pgrp_get();
-            if (fg > 1) {
+            long fg    = (long)console_fg_pgrp_get();
+            long owner = (long)console_owner_pgrp_get();
+            /* Same owner rule as irq1_handler. */
+            if (fg > 1 && fg != owner) {
                 sys_kill(-fg, 20);   /* SIGTSTP */
                 continue;            /* byte eaten; look again */
             }

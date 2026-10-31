@@ -38,6 +38,7 @@ void user_syscall_clear_file_table(struct pcb* pcb);
  * definition in user_syscall.c.
  */
 uint64_t console_fg_pgrp_get(void);
+uint64_t console_owner_pgrp_get(void);
 
 /* Slice 2/3 signal delivery.  signal_deliver_frame() reads the
  * syscall-entry stub's frame at g_syscall_stack_top - 120;

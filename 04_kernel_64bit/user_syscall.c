@@ -9387,6 +9387,17 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
  * every access under cli.
  */
 static uint64_t g_console_fg_pgrp = 0;
+/*
+ * The console's OWNER pgrp: the pgrp of the first process to
+ * call tcgetpgrp (the boot shell).  Set once at the lazy latch
+ * and NEVER changed by TIOCSPGRP.  This is what separates
+ * "^Z at the shell's prompt" (owner == fg -> suppress) from
+ * "^Z on a foreground child" (fg == child's pgrp != owner ->
+ * raise).  g_console_fg_pgrp alone cannot: it equals the current
+ * process's pgrp in BOTH cases, which is what made the first
+ * guard wrong.
+ */
+static uint64_t g_console_owner_pgrp = 0;
 
 /*
  * Read the console foreground pgrp for the keyboard IRQ.
@@ -9402,6 +9413,17 @@ uint64_t console_fg_pgrp_get(void) {
     uint64_t v;
     __asm__ volatile("cli");
     v = g_console_fg_pgrp;
+    __asm__ volatile("sti");
+    return v;
+}
+
+/* The owner pgrp (the boot shell's).  Read by the ^Z raise paths to
+ * suppress a stop that would deadlock the console.  Under cli like
+ * its sibling. */
+uint64_t console_owner_pgrp_get(void) {
+    uint64_t v;
+    __asm__ volatile("cli");
+    v = g_console_owner_pgrp;
     __asm__ volatile("sti");
     return v;
 }
@@ -9484,7 +9506,10 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
             __asm__ volatile("cli");
             if (g_console_fg_pgrp == 0) {
                 pcb_t* self = process_get_current();
-                if (self) g_console_fg_pgrp = self->pgrp;
+                if (self) {
+                    g_console_fg_pgrp    = self->pgrp;
+                    g_console_owner_pgrp = self->pgrp;   /* set once */
+                }
             }
             fg = (uint32_t)g_console_fg_pgrp;
             __asm__ volatile("sti");

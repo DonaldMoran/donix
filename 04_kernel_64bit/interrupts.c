@@ -1012,12 +1012,19 @@ void irq1_handler(void) {
      * it as a single target.
      */
     if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2C) {
-        long fg = (long)console_fg_pgrp_get();
+        long fg    = (long)console_fg_pgrp_get();
+        long owner = (long)console_owner_pgrp_get();
+        /* ^Z at the shell's own prompt must be a no-op: the shell is
+         * the only keyboard reader and stopping it deadlocks the
+         * console.  fg == owner identifies that case; a foreground
+         * child has fg == its own pgrp != owner and is stopped as
+         * before.  (The earlier guard compared cur->pgrp, which is
+         * equal to fg in both cases and wrongly suppressed the child.) */
 #if TRACE_CTRLZ
         serial_print("CTRLZ: fg="); serial_print_dec((uint64_t)(fg < 0 ? 0 : fg));
         serial_print(" sc=0x"); serial_print_hex(sc);
 #endif
-        if (fg > 1) {
+        if (fg > 1 && fg != owner) {
 #if TRACE_CTRLZ
             long r = sys_kill(-fg, 20);   /* SIGTSTP */
             serial_print(" kill="); serial_print_dec((uint64_t)(r < 0 ? -r : r));
