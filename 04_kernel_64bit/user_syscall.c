@@ -5561,7 +5561,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (fr != FR_OK) {
         #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_open(");
-        serial_print(path);
+        serial_print(exec_path);
         serial_print(") -> ");
         serial_print_dec(fr);
         serial_print("\n");
