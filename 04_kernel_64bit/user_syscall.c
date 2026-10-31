@@ -11415,78 +11415,8 @@ long sys_fork(void) {
     for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
         file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
         if (!_slot) continue;
-        if (_slot->kind == FILE_KIND_DIR && _slot->obj != SYNTH_DIR_SENTINEL) {
-            /*
-             * A DIR object is not reentrant: f_readdir/dir_sdi/
-             * f_opendir mutate dp->sect/clust and the volume-global
-             * fs->win/winsect.  Sharing the parent's DIR across fork
-             * lets the child's first f_open flip the window under the
-             * parent's traversal.  Observed: a backgrounded
-             * `sleep N &` that fails leaves a later `ls` listing
-             * nothing.  The child gets its own DIR, opened fresh at
-             * the same path.  POSIX leaves the directory-stream
-             * position unspecified across fork, so starting at the
-             * first entry is correct.
-             *
-             * dir_path is stored in Unix form ("/bin", "/"); f_opendir
-             * wants FatFs form ("bin", "0:/").  The child slot's
-             * dir_path is a fresh copy of the Unix form, because
-             * put_file_slot frees it.
-             */
-            file_slot_t* _cs = (file_slot_t*)kmalloc(sizeof(file_slot_t));
-            DIR*         _cd = (DIR*)kmalloc(sizeof(DIR));
-            char*        _cp = NULL;
-            char*        _cf = NULL;
-            if (_cs && _cd && _slot->dir_path) {
-                size_t _n = 0;
-                while (_slot->dir_path[_n]) _n++;
-                _cp = (char*)kmalloc(_n + 1);
-                if (_cp) {
-                    for (size_t _k = 0; _k <= _n; _k++)
-                        _cp[_k] = _slot->dir_path[_k];
-                    if (_n == 1 && _cp[0] == '/') {
-                        _cf = (char*)kmalloc(4);
-                        if (_cf) {
-                            _cf[0] = '0'; _cf[1] = ':';
-                            _cf[2] = '/'; _cf[3] = '\0';
-                        }
-                    } else {
-                        _cf = (char*)kmalloc(_n + 1);
-                        if (_cf) {
-                            for (size_t _k = 0; _k <= _n; _k++)
-                                _cf[_k] = _cp[_k];
-                            strip_dot_prefix(_cf);
-                        }
-                    }
-                }
-            }
-            if (_cs && _cd && _cp && _cf &&
-                f_opendir(_cd, _cf) == FR_OK) {
-                kfree(_cf);
-                _cs->kind     = FILE_KIND_DIR;
-                _cs->refcount = 1;
-                _cs->end      = 0;
-                _cs->obj      = _cd;
-                _cs->dir_path = _cp;
-                child->file_table[_fd] = _cs;
-            } else {
-                /*
-                 * A child whose DIR cannot be re-opened is not given
-                 * the parent's shared DIR -- that is the corruption.
-                 * Fail the fork, as the eager-copy path above does.
-                 */
-                if (_cf) kfree(_cf);
-                if (_cp) kfree(_cp);
-                if (_cd) kfree(_cd);
-                if (_cs) kfree(_cs);
-                process_destroy(child);
-                __asm__ volatile("sti");
-                return -(long)EAGAIN_;
-            }
-        } else {
-            __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
-            child->file_table[_fd] = _slot;
-        }
+        __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
+        child->file_table[_fd] = _slot;
     }
 
     /*
