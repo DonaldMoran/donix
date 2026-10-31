@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-10-29** (session evening; HEAD on `dev` past
-`7f43ac4`).  This file lists **only open issues**.  Closed items
+**Last updated: 2026-10-30** (third session; HEAD on `dev` at
+`701dcc1`).  This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
 defect, a missing feature, or an unverified claim about the tree.
@@ -58,51 +58,6 @@ switch and on the interrupt path, then to remove the
 No test currently fails because of this; the corruption is
 latent, and the surface is *any* 64-bit computation that gcc
 chooses to vectorize.
-
-**13.  `CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's
-job-control code is gated behind `CONFIG_ASH_JOB_CONTROL`, which
-this build does not set.  When a child faults and `sys_wait4`
-returns a signal-kill status, ash's default message is printed,
-but the shell does not do job-control bookkeeping (no `[1]+
-Done` lines, no `fg`/`bg`, no `kill %1`).
-
-Signals are done (see handoff), including slice 6 and
-`nanosleep` interruption, and dispositions now cross fork and
-reset on exec; the job-control surface on top of that machinery
-is not built.  What is not built is the job-control surface *on
-top of* that machinery: there is no stopped process state
-(`signal_default_action` maps SIGSTOP and SIGTSTP to TERMINATE,
-the documented placeholder), no SIGCONT resume path, no process
-groups (`sys_kill` refuses `pid <= 0`), no controlling terminal,
-no `tcsetpgrp`/`setpgid`, and `CONFIG_ASH_JOB_CONTROL` is unset
-so ash has no job table.  Not small, but the hard half -- the
-signal substrate -- is in.
-
-**14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
-works only because busybox ash falls back on `ENOEXEC` and runs
-`sh script.sh`.  The kernel's `sys_execve` opens the file, checks
-for ELF magic, finds `#!`, prints `sys_execve: not an ELF file`,
-and returns `-ENOEXEC`; there is no shebang handling.
-**The image half is now done**: `/bin/sh` exists as a soft
-link to busybox (after the one-time
-`/bin/busybox --install -s /bin`; see handoff).  What remains
-is the kernel half -- `#!` parsing in `sys_execve`.
-
-Both must land together: `#!` parsing in `sys_execve` (read the
-first line, build argv `[interp, optional_arg, script, ...]`,
-recurse with a depth guard) **and** an interpreter on the image
-(a copy of busybox at `/bin/sh`, or a kernel alias — a decision,
-not a one-liner).  Fixing only the kernel gives `ENOENT` instead
-of `ENOEXEC`, still a fallback.  Fixing only `/bin/sh` does
-nothing, because the kernel never looks at the shebang.
-
-This is a **feature gap**, not a bug: `./test.sh` runs, and the
-printed line is the kernel correctly reporting that the script is
-not an ELF.  It becomes a defect when a script's interpreter is
-not a shell (e.g. `#!/usr/bin/python`), where there is no
-fallback.
-
----
 
 ## Un-numbered open items
 
@@ -301,6 +256,15 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open
 
+- `kill(0, sig)` ("my group") still returns `-EINVAL`.
+  `kill(-pgid, sig)` works (`9b1a4ed`).  Retired from item 13.
+- `setpgid`/`setsid`-as-pgrp: verify whether a process can join
+  or create a process group beyond `TIOCSPGRP`'s foreground
+  assignment.  Retired from item 13; state unverified.
+- The optional shebang interpreter argument reaching the
+  interpreter as a real argv is unproven.  A test with an
+  interpreter that can observe argv is the proof.  Retired from
+  item 14.
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are
   latent collisions.
 - Real FatFs timestamp storage: the three timestamp syscalls
