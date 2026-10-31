@@ -3202,9 +3202,7 @@ static FRESULT follow_path (	/* FR_OK(0): successful, !=0: error code */
 			} else
 #endif
 			{
-				res = move_window(fs, dp->sect);
-				if (res != FR_OK) break;
-				dp->obj.sclust = ld_clust(fs, dp->dir);	/* Open next directory */
+				dp->obj.sclust = ld_clust(fs, fs->win + dp->dptr % SS(fs));	/* Open next directory */
 			}
 		}
 	}
