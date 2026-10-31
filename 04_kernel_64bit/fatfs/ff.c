@@ -3491,7 +3491,7 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 			if (!FF_FS_READONLY && mode && (stat & STA_PROTECT)) {	/* Check write protection if needed */
 				return FR_WRITE_PROTECTED;
 			}
-			fs->winsect = (LBA_t)0 - 1;	/* Invalidate window: shared across processes */
+			fs->wflag = 0; fs->winsect = (LBA_t)0 - 1;	/* Invalidate window: shared across processes */
 			return FR_OK;				/* The filesystem object is already valid */
 		}
 	}
