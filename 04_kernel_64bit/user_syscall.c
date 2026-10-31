@@ -6359,14 +6359,33 @@ long sys_wait4(long pid, int* user_status, int options) {
          */
         {
             pcb_t* late_zombie = NULL;
+            pcb_t* late_stopped = NULL;
             for (int i = 0; i < MAX_PROCESSES; i++) {
                 pcb_t* c = process_get_pcb(i);
                 if (!c) continue;
                 if (c->parent_pid != self->pid) continue;
                 if (target != (uint64_t)-1 && c->pid != target) continue;
                 if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) { late_zombie = c; break; }
+                /*
+                 * A stopped child, same window as the zombie above:
+                 * the first scan ran while the child was live, the
+                 * parent was still RUNNING when process_stop_and_yield
+                 * called process_wake_parent_if_waiting, and the wake
+                 * missed.  Un-block and loop so the first scan's
+                 * WUNTRACED branch reports the stop.  The WUNTRACED
+                 * guard must match the first scan's, or a wait4
+                 * without WUNTRACED would un-block on a stopped child
+                 * that the first scan will not report, and spin.
+                 * Do not reclaim: a stopped child is alive.
+                 */
+                if ((options & WUNTRACED) &&
+                    c->state == PROC_STATE_STOPPED &&
+                    c->stop_reported == 0) {
+                    late_stopped = c;
+                    break;
+                }
             }
-            if (late_zombie) {
+            if (late_zombie || late_stopped) {
                 self->state = PROC_STATE_RUNNING;
                 self->block_kind = BLOCK_KIND_NONE;
                 self->wait_pid = 0;
