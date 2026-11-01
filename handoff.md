@@ -5,421 +5,509 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-31.  **`v0.6.18` is released.**  Work is
-pre-`v0.6.19`.  The first backgrounded-exec failure is fixed
-(`68185de` on `b5c5075`): the already-mounted fast path in
-`mount_volume` did not invalidate the shared window, and the next
-`dir_find`'s `move_window` was a no-op when `dp->sect ==
-fs->winsect`, reading another process's sector as the root's
-dirents.  The fix is `fs->wflag = 0; fs->winsect = (LBA_t)0 - 1;`
-at the fast-path return, the same pair `check_fs` uses.  Gate on
-`68185de`: `canary --full` 28/28 and `test.sh` 57/57, both green,
-from `/` on a freshly built image.  Read "The concurrency
-contract" in `docs/contract.md` before touching shared state, then
-"Where we are".
+**Last updated:** 2026-11-01 (late session). **`v0.6.18` is released.**
+Work is pre-`v0.6.19`. Baseline is `d1ae213`
+(`tag: 20261031-ctrlz-owner-fix`), working tree clean, build green
+(`MAKE_EXIT=0`). **`dev` local is 68 commits ahead of `origin/dev`
+(`799e98f`, `v0.6.18`) and has NOT been pushed.** `origin/dev` must
+not be force-pushed without first reading those 68 commits; they are
+intentional work, not accidental divergence.
 
-**THE BUG THAT WAS FIXED, in one place.**  `FATFS` is one global
-(`FatFs[vol]`).  `fs->win` and `fs->winsect` are a **volume-global**
-one-sector cache shared by every process on the volume.
-`move_window(fs, sect)` returns immediately when
-`sect == fs->winsect`, trusting that `fs->win` already holds that
-sector.  `mount_volume`'s already-mounted fast path
-(`fs->fs_type != 0`, drive present) returned `FR_OK` **without
-touching `winsect` or `win`**, so the first `f_open` after a
-process switch trusted a window another process had left on a
-different sector.  The first `f_open("bin/busybox")` returned
-`FR_NO_PATH` because `dir_find`'s `move_window(root_sector)` was a
-no-op against the wrong window.  The fix is the pair `check_fs`
-already uses at every sector load:
+**Baseline builds. Baseline is NOT "green" as a test run.**
+`canary --full` on `d1ae213` crashes with a `#PF` on a live user page
+(see below). The old handoff's claim that `d1ae213` is green is
+**false**; it was never re-run on a clean checkout in the previous
+session, only assumed.
 
-    fs->wflag = 0; fs->winsect = (LBA_t)0 - 1;
+---
 
-applied at the fast-path return, so the caller's next `move_window`
-always reads.
+## THE PRIMARY OPEN BUG: `#PF` on a live user page (fork/exec context)
 
-**The first attempt (`b5c5075`) copied only `winsect = -1`, not
-`wflag = 0`.**  With `wflag` still set, the next write that reached
-`sync_window` before a `move_window` re-read flushed the window to
-sector `-1`, which wraps below the FAT partition.  The ATA driver
-refused it (`ATA: refuse write below LBA 2048 on master (requested
-LBA 2047)`), the failed write left FatFs corrupted, and `test.sh`
-failed from `split` onward with `f_open(...) -> 1` (`FR_DISK_ERR`).
-`split` is the first applet that writes files; `canary --full`
-passed because none of its rows write below the partition.  The
-correction (`68185de`) sets `wflag = 0` before `winsect = -1`, and
-`test.sh` is 57/57.
+`canary --full` crashes, sometimes with `^Z`/`fg`, sometimes with a
+plain `canary` (no `--full`, no `^Z` at all). The crash is
+**independent of Ctrl-Z**. Ctrl-Z just widens the window and changes
+the probability of hitting it, because it inserts scheduler activity
+between the fork/exec cycles that trigger it.
 
-**The one open bug, and the first test of the next session:**
+### Symptom (verbatim from a run on `d1ae213`, no `^Z`)
 
-**`kill` on a `RUNNING` background job hangs the OS.**  Killing a
-`STOPPED` background job is clean.  Same build, same applets, same
-job table; the only variable is the target's state when the signal
-lands.  `kill` on a background job did work once, after `fg`/`^Z`
-cycles, so the hang is either state-dependent or intermittent.  It
-is **not** closed.  The standing repro is `[2]+ Running sleep 300`,
-`kill %2` -> hang.
+    === PAGE FAULT (#PF) ===
+      CR2 (Bad Address) : 0x0000000000413937
+      Faulting RIP      : 0x0000000000413937
+      Raw Error Code    : 0x0000000000000014
+      CS                : 0x0000000000000033
+      RSP               : 0x00000080000FBF00
+      CR3               : 0x000000000033B000
+      Walk indices: pml4=0 pdpt=0 pd=2 pt=19
+      pde               : 0x000000000033F027   (present, user, writable)
+      pte               : 0x0000000000000000   (NOT PRESENT)
 
-**Not yet run:** `sleep 300 &`, `fg`, `^C` -- does killing a
-**foreground** `RUNNING` process hang?  If yes, the bug is
-"terminate from `RUNNING`."  If no, it is "terminate a `RUNNING`
-background process whose parent is in `wait4`."  Those need
-different fixes.  **Blocked on the serial console's unmapped
-`^C`**: host `intr = ^C` eats it before the guest sees it.  Run the
-test on the framebuffer/PS/2 console, or from a **second serial
-connection** (`ps` for the pid, `kill -TERM <pid>`), and state
-which launcher and which console were used.
+    Segfault
 
-**Baseline on `HEAD`:** `canary --full` 28/28 and `test.sh` 57/57
-green on `68185de`.  The backgrounded-exec acceptance passed:
-`sleep 5 &` as the first command, multiple backgrounded execs in
-one shell, `ls` after -- no `f_open(bin/busybox) -> 5`, root
-intact, `jobs` works.  `dev` is ahead of `origin/dev` by 64
-commits (nothing pushed).  **Tree: `68185de` on `bda5e40` on
-`b5c5075` on `89c7f3f` on `4594038` on `950d4f0` on `23252d2` on
-`a1f4eed` on `783b684` on `701dcc1`.**
+- **`CR2 == RIP`** — instruction fetch fault.
+- **`CS = 0x33`** — user mode. The process resumed cleanly; this is
+  not a resume-path fault.
+- **`PTE = 0` with `PDE` present** — the mapping was **explicitly
+  zeroed**. `vmm_unmap_page_in_cr3` or `vmm_unmap_page` ran on a VA
+  that the process still has PTE-backed code at.
+- **`CR2` is in canary's own `.text`** (`0x40xxxx`–`0x41xxxx`). Not a
+  shared library, not the child's code. Canary's own code page.
+- **`CR3 = 0x33B000`** — canary's own CR3 (the parent, not a child).
+- Page is one of several: `0x413962` (tag run), `0x413937` (tag run,
+  different byte offset), `0x40F6E3` (dev run), `0x40C0B8` (dev run).
+  Different pages. Not one fixed unmapped VA.
 
-**THE RELEASE TAGS.**  `v0.6.16` (the VFS), `v0.6.17` (FAT
-`st_ino`, `tar`, `chmod`/`chown`), and `v0.6.18` (signals slices
-1-5) are the release record; their annotations carry the
-per-release summary.  The `20261030-*` and `20261031-mount-fastpath*`
-scratch tags are the current restore points; the release procedure
-draws the `v0.6.19` summary from them before dropping them.
+### Related observations in the same crash family
 
-**WHERE WE ARE.**  `v0.6.15` through `v0.6.18` are released.  Work
-is pre-`v0.6.19`.  The working tree is `dev`, clean.  Job control
-on the framebuffer/PS/2 console works end to end: Ctrl-Z raises
-SIGTSTP to the foreground pgrp; `wait4(WUNTRACED)` reports
-`[1]+ Stopped`; `jobs` lists it; `fg` resumes it for both a
-`console_read` job (`cat`) and a `nanosleep` job (`sleep 300`).
-`bg` works.  Shebang / `/bin/sh` is done (`0d93f8c` + `62ee388`).
-The `wait4` stopped-child window is closed (`a1f4eed`).  The
-first-backgrounded-exec failure is closed (`68185de`).
+- **One run produced `#GP` instead of `#PF`**: `RIP = 0x448021`
+  (musl region), error code 0, frame otherwise identical. Different
+  fault class, same underlying unmap.
+- **One run produced a `.resume_rsp_zero` halt**: `Z` + `ffffffff80285120`
+  on serial. That is the `context_switch.asm` sentinel firing —
+  `next->rsp == 0` on a scheduled process. It did NOT happen on the
+  `d1ae213` baseline; it happened on a tree with the scheduler
+  `rsp == 0` guards added. **The guards turn the `#PF` into a `Z`
+  halt.** Same root cause, different observed halt shape.
+- **The crash is not deterministic**: two identical runs of the same
+  binary (same boot image, same `^Z` timing at 3 tests) both passed
+  28/28. A third run with a fresh boot crashed with no `^Z` at all.
 
-**NOT DONE, live:**
+### What we established today (do not re-derive)
 
-- **`kill` on a `RUNNING` background job hangs.**  Above.  The
-  foreground `^C` test is blocked on the serial console; run it on
-  the framebuffer/PS/2 console or from a second serial.
-- `process_stop_and_yield`'s `while (STOPPED) process_yield()` loop
-  has not been exercised with **no runnable peer**.
-- A `SWITCH-REFUSE: next pid=8 name=busybox rsp outside stack ->
-  idle` was observed once, after `fg` cycles, and not since.  Same
-  family as the `kill`-RUNNING hang; `scheduler.c:1252` is the site
-  and the `context_switch.asm` `0x110` consume is the mechanism.
-  **Do not patch `process_stop_and_yield`'s trailing yield
-  speculatively.**
-- `kill(pid <= 0)` group semantics: `kill(-pgid, sig)` works;
-  `kill(0, sig)` still returns `-EINVAL`.
-- Ctrl-C on the serial console is not mapped to SIGINT (host
-  `intr = ^C` eats it).
+- **`exec_churn` passes 24 rounds of fork/execve/wait4, all children
+  exit 0.** Plain fork/exec is not the trigger by itself. The crash
+  requires a *sequence* of fork/exec cycles, not one.
+- **`^Z` is not required.** A plain `canary` (no `--full`, no `^Z`)
+  crashed once on the same `#PF`. Therefore Ctrl-Z is a red herring
+  that widens the window; it is not the bug.
+- **The "working tag" `20261031-ctrlz-owner-fix` (`d1ae213`) is not
+  working.** A clean copy of the repo, `git clean -xdf`, fresh
+  `third_party/musl-install`, `MAKE_EXIT=0`, and `canary --full`
+  crashes on the `#PF` with or without `^Z`. The handoff from
+  2026-10-31 was wrong about this. Do not assume `d1ae213` passes
+  canary.
+- **`f91d31a` does not fix it either.** Same crashes, plus the `Z`
+  halt (because of the `rsp == 0` guards).
+- **`sys_munmap` has an unconditional `pmm_free_page(phys)` bug.**
+  It frees frames it does not own (any `phys` present at `va` in
+  `self->cr3`, not just those in `self->elf_page_list`). That is a
+  real bug; it is saved at
+  `~/donix-20261101-sys_munmap-owned-check.patch` (41 lines) and is
+  NOT applied to the tree. It did not fix the `#PF` when applied, but
+  it is correct-to-have and should be applied as an independent
+  commit with its own gate pass, not bundled with the `#PF` fix.
+- **`sys_fork`'s `EAGER_COPY_REGION` is correct in shape** — it
+  allocates new frames, memcpy's, remaps child PTE, and adds to
+  `child->elf_page_list`. Not sharing parent frames (as `fork` might
+  be naively assumed to).
+- **`vmm_clone_page_table`** deep-copies the low half; shares the high
+  half (kernel mappings). Correct shape.
+- **`process_create` sets `child->elf_page_list = NULL`** (line 136).
+  Child does not inherit parent's `elf_page_list`.
+- **`exec_free_and_unmap_user_pages(pcb)`** walks `[0x400000, 0x600000)`
+  (ELF), stack, brk, mmap regions; for each VA with a present PTE,
+  unmaps it **only if `phys` is in `pcb->elf_page_list`**; then frees
+  every `phys` in `elf_page_list`. This is the correct shape — it
+  should not free a frame the process does not own.
+- **`process_stop` / `process_continue` do not touch `cr3`.** The stop
+  path is not corrupting the address space.
+- **`context_switch.asm` loads `cr3` from `next->cr3`** at the resume
+  site. Nothing in scheduler/signal code touches `cr3`.
+- **The pipe read/write block paths use `process_yield`** (the fixed
+  shape), not `sti; hlt`. The pipe comments explicitly warn that
+  `sti; hlt` is broken on these paths. `sys_poll` still uses
+  `sti; hlt`; that is a known-fragile area but not the current crash.
+- **A `race_probe` dump from a crashed run showed `pid=4 wake_tries=28
+  wake_ok=0`, `refuse_by_reason: r3=32`.** That was during a `^Z`/`fg`
+  run; the wake refusals are consistent with canary being STOPPED or
+  in WAITPID (not PIPE_READ) at the time of the writes. **Not the
+  `#PF` bug**, but worth noting as a separate scheduling oddity.
 
-**REFUTED SHAPES (do not retry):**
+### Where the bug must be (the remaining candidates)
 
-1. `cli`-depth lock around the ATA transfer.  Crashed on boot.
-2. `f_sync` on inherited `FIL`s.
-3. `f_opendir("/tmp")` + `f_opendir("/")` warm-up.
-4. `user_syscall_clear_file_table(self)` alone.
-5. Removing `strip_dot_prefix(exec_path)` -- a real latent bug, but
-   not the `&` bug.  One-line cleanup for a later commit.
-6. `f_mount(NULL)` + `f_mount(fs)` in `sys_execve`.
-7. `f_read`/`f_write` `winsect = -1`.
-8. `move_window` in `dir_sdi` and `dir_next` tails.  Broke boot.
-9. `sys_fork` giving a `FILE_KIND_DIR` child its own `DIR`
-   (`bc7bef1`, reverted `950d4f0`).  Produced `/root` and
-   `ls: .: No such file`, worse than the original.
-10. `follow_path` reading the window for `dp->sect` before the
-    sub-directory descent (`4594038`, reverted `89c7f3f`).  No
-    change to the failure; aimed one level too deep.
-11. Invalidating `winsect` alone at the mount fast-path return,
-    without `wflag = 0` (`b5c5075`, corrected by `68185de`).
-    `sync_window` flushed the window to sector `-1`; ATA refused;
-    FatFs corrupted from `split` onward.
+The `#PF` is: **a live user page, in a process that is running, gets
+its PTE zeroed.** That can only happen via `vmm_unmap_page_in_cr3` or
+`vmm_unmap_page` called on the process's own CR3 with a VA the process
+still uses. The callers are:
 
-**RULED OUT, do not re-investigate** (theories refuted by
-transcripts, not code changes):
+- `sys_munmap` — runs on `self`, unmaps any VA in the process's
+  address space. Unconditional `pmm_free_page(phys)` is a known bug
+  (patched in the saved file). **But: does canary call `munmap` on
+  its own `.text` region (`0x40xxxx`)?** musl's `free()` calls
+  `munmap` for large allocations. If canary has a heap that got
+  mmap'd at `0x8010xxxx` and freed, that's `0x8010`, not `0x40xxxx`.
+  This is a possible path but not the obvious one.
+- `exec_free_and_unmap_user_pages` — runs on `pcb` at exec. It only
+  unmaps VAs in `pcb`'s own regions if `phys` is in `pcb`'s
+  `elf_page_list`. **If `pcb->cr3` is not the running process's CR3
+  (i.e. the wrong PCB was passed to `exec_free_and_unmap_user_pages`)**,
+  it unmaps the wrong process's pages. **Check whether
+  `sys_execve`'s `exec_free_and_unmap_user_pages(self)` can be reached
+  with `self` being the wrong process after a fork/exec chain.**
 
-- Disk corruption: the `hdd-single.img` recipe `rm -f`s and
-  rebuilds the image every build; a transcript showed root intact
-  after the same failure.
-- Cold FAT cache: two backgrounded execs in one shell, the second
-  succeeding after the first failed.
-- `sys_*` mutex / cross-process race: the same two-in-a-row
-  transcript; the failure reproduces single-threaded.
-- CPU / mode / launcher: the QEMU line was identical on failing
-  and succeeding runs.
+The **first thing the next session must do** is not to re-read the
+code: it's to **get the gdb stack of the faulting process at the
+moment of the `#PF`**. Three ways:
 
-**WHERE WE ARE, the rest:** no real `mount(2)`; file-backed `mmap`;
-`link(2)`/`mknod(2)`; `chmod`/`chown` accept and drop; SSE state is
-not saved (item 5); no privilege model (item 6).
+1. `./run` with the gdb stub (already on `:1234`), boot, run
+   `canary --full` (no `^Z`), wait for the `#PF`, then at the fault
+   dump's `[16]` (faulting RIP) on serial, use gdb:
 
-**NEXT.**
+       gdb -q -ex 'target remote :1234' \
+           -ex 'info registers rip rsp cr3 cr2' \
+           -ex 'x/40gx $rsp' \
+           -ex 'x/20i $rip' \
+           -ex 'detach' -ex 'quit'
 
-1. **Test `sleep 300 &`, `fg`, `^C`** -- does a foreground `RUNNING`
-   kill hang?  On the framebuffer/PS/2 console, or from a second
-   serial (`ps`, `kill -TERM <pid>`).  State the launcher and the
-   console.
-2. **Fix the `kill`-RUNNING hang** -- start from the repro, read
-   `sys_kill`'s TERMINATE branch and `process_exit`, and evaluate
-   the park-then-kill shape against the foreground-`^C` result.
-3. The no-peer stop soak; the interpreter-argv proof.
-4. SSE (item 5).  5. Privilege model (item 6).  6. busybox batch 2.
-7. PIPE7E soak at 100 Hz.  8. `run`'s `stty susp undef` restore.
+2. Or set a breakpoint on the fault handler:
+   `break *<fault_handler_symbol>` and inspect `current_process` /
+   `pcb->cr3` / `pcb->elf_page_list` / `pcb->state` at the fault.
+3. Or add a one-line `serial_print` in `exec_free_and_unmap_user_pages`
+   printing `pcb->pid` and the VA being unmapped, and in `sys_munmap`
+   printing `self->pid` and the VA. If either fires with a `va` in
+   `0x40xxxx`, the caller is confirmed.
 
-### Working style -- how this project gets changed
+**Do not** re-attempt the following — they were all tried and all
+refuted (details in REFUTED SHAPES below):
 
-Read this before proposing any command block.
+- `context_switch.asm` frame-consume removal (reverted; no effect)
+- `rsp == 0` guards in scheduler/process/pipe (reverted; no effect,
+  and turn `#PF` into a `Z` halt)
+- top-of-tick `signal_deliver_frame_iretq` for SIGINT (added, then
+  reverted; no effect on `#PF`)
+- `sys_munmap` owned-check (saved as patch, applied, **did not fix
+  `#PF`**)
 
-**One change at a time.** A "change" is a commit, verified before
-the next one starts.  **Verify by RUNNING, not by committing.** A
-build can pass and the test still be the wrong test.
+---
 
-**A handoff claim is not evidence.** This session's fix was found
-by re-running the repro from the committed tree and reading
-`mount_volume`/`check_fs` from the bytes.  Every prior theory
-(disk corruption, cold cache, `DIR` sharing, `follow_path`,
-`sys_*` mutex) was refuted by a transcript.  **Re-run every named
-repro on a fresh boot before acting on its diagnosis.**
+## THE OTHER OPEN BUG: `^C` -> the console dies after `/ #`
 
-**A command block is one paste -- write it to a file first.** `cat >
-/tmp/x.sh <<'SCRIPT_EOF'` and run it as a **separate** paste.  Never
-paste a multi-line block with a trailing backslash into an
-interactive shell; it kills the terminal.
+**Unchanged since 2026-10-31.** The `^C` work was not part of today's
+investigation. The `^C` bug and its WIP patch are unchanged from the
+previous handoff. **This section is verbatim from the old handoff,
+with the timestamp updated.**
 
-**Python edits with `count != 1` abort checks.** `set -e` at the
-top.  Count in Python, not `grep`.  Anchor from the file's current
-bytes (`cat -A`), including CRLF (`\r\n`) where the file has it,
-and open `rb`/`wb` so line endings are preserved.
+`^C` is **not fixed**. Everything tried is in
+`/tmp/donix-ctrlc-wip-20261031-1330.patch` (94 lines) and
+`/tmp/donix-ctrlc-wip-status.txt`. The tree is reverted to `d1ae213`
+so the OS boots; `^C` does nothing on the committed tree.
 
-**A build can pass and the test still be the wrong test.** Run the
-feature from a non-root cwd as well as `/`.  Run it the way a user
-would reach it.
+### What we PROVED on 2026-10-31 (do not re-derive)
 
-**Ask for source you do not have.** Before patching a file not seen
-this session, ask for it.
+- **`^C` -> SIGINT delivery WORKS.** The foreground child dies in every
+  variant tried.
+- **The console dies AFTER the shell prints `/ #`** — keyboard dead —
+  in every delivery variant (sys_kill in IRQ1, sys_kill in timer,
+  pure sig_pending bit-set).
+- **`^Z` on a foreground child WORKS**, and `^Z` also calls
+  `sys_kill(-fg,20)` from `irq1_handler`. So "IRQ handler + switch"
+  is **not** the trigger.
+- The one consistent difference: **`^C` TERMINATES the child**
+  (`signal_terminate_current` -> `process_exit`); **`^Z` STOPS it**.
+  The console death **correlates with a child `process_exit` /
+  termination via a signal**.
 
-**The build is TWO steps.** `make -C 04_kernel_64bit
-FAT_CONFIG=single`; `make -C 05_boot_kernel64 hdd-single.img`.
-Verify the mtime chain `source` < `ff.o` (if FatFs changed) <
-`kernel.elf` < `kernel.bin` < `hdd-single.img`.  A patch with no
-new string has only the mtime check; say so in the commit message.
+### Next action for `^C` (unchanged from 2026-10-31)
 
-**A write-path change needs a write test.** `b5c5075` invalidated
-`winsect` without `wflag = 0`; `canary --full` (read-only and
-small writes) stayed green, and `test.sh`'s `split` (the first
-applet that writes files) found the regression.  Any change to
-`move_window`/`sync_window`/`f_open` must run `test.sh`, not just
-`canary --full`, and the `ATA: refuse write` line is the tell.
+**gdb at the `^C` lockup.** At the hang, run:
 
-**`EXTRA_CFLAGS` is NOT forwarded.** `SW2_TRACE` is a `#define` in
-`scheduler.c`.
+    gdb -q -ex 'target remote :1234' \
+        -ex 'info registers rip rsp cs cr3' \
+        -ex 'x/40gx $rsp' -ex 'detach' -ex 'quit'
 
-**`nm` output moves between builds.** Re-run `nm`.  `pcb_pool`
-stride `0x840`; `_Static_assert` pins offsets through `user_rsp`
-(0x610); `PROC_STATE_STOPPED == 6`.  `kernel.elf` has no `-g`.
+Read the kernel stack. The answer ("CPU is in `process_exit`" vs "in
+a fault" vs "idle / `sys_poll` `hlt`") dictates the fix. Do not
+re-attack `irq1_handler`'s delivery path; the suspect is child
+`process_exit` interacting with the console wake.
 
-**A commit message is not a diff and not a test.** `git show
-<sha> --stat` is the check; do not write "verified" for something
-the transcript does not show.
+**Possible relationship to `#PF`:** if the `#PF` bug (VMM teardown
+during fork/exec) also affects the child-terminate path (which uses
+VMM teardown), the `^C` console death may be a downstream symptom of
+the same root cause. **Do not assume this.** Chase `#PF` first, and
+re-test `^C` on the fixed tree; if `^C` is fixed as a side effect,
+great; if not, its gdb investigation stands as its own bug.
 
-**Test notes.** `pidof <applet>` finds nothing (every applet's
-`comm` is `busybox`); use `ps` and the `STAT` column (`T` is
-stopped). `/proc/<pid>/` exists only for live pids.
+---
 
-**Test harness.** `./run` (no arg) is `clean-nofreeze`: full `make
-clean`, fresh `kernel.bin`, fresh `hdd-single.img` every time,
-`-enable-kvm -cpu host -display sdl`, no freeze.  The Makefile run
-targets (`run-single`, `runkernel64-single`, `run-headless`, ...)
-use `-cpu max` + TCG, a **different CPU**; a bug report must state
-which launcher was used.  `./run` writes `capture.txt` every run
-and **overwrites it** -- copy it aside after any failure.  The
-shell's default cwd is `/root` (prompt `~`); `pwd` confirms it; the
-`root/sleep` PATH candidate is correct for cwd `/root`, not a bug.
+## Working style -- how this project gets changed (READ THIS)
 
-**Do not run `git reset --hard` without stashing.  Do not edit
-`third_party/`.  Do not commit `kmain.c`'s `pit_init` knob.  Do not
-call a race closed on one clean run.**
+**One change at a time.** A "change" is a commit, verified by
+**RUNNING** before the next starts. A build passing is not a test
+passing.
+
+**This session's hard lesson (2026-11-01):** we stacked five unproven
+theories on one tree (context_switch, scheduler guards, top-of-tick
+signals, `sys_munmap` owned-check, plus assorted diagnostic edits) and
+none of them fixed the `#PF`. **Every one had to be reverted.** The
+correct sequence was: (1) save state, (2) gdb at the crash, (3) read
+the stack, (4) one fix. We did not do (2) and spent the session
+guessing.
+
+**A handoff claim is not evidence.** The old handoff said `d1ae213`
+was green; it is not. **Re-run every repro on a fresh boot and read
+the bytes before acting.** Today's clean-checkout tag test is the
+model: fresh `cp -a`, `git clean -xdf`, fresh `musl-install`,
+`MAKE_EXIT=0`, run. If it crashes, the "baseline is green" claim is
+false and the handoff is wrong.
+
+**Ask for source you do not have** before patching a file not seen
+this session.
+
+**A command block is one paste -- write it to a file first.**
+`cat > /tmp/x.sh <<'SCRIPT_EOF' ... SCRIPT_EOF` then run it as a
+**separate** paste. Never paste a multi-line block with trailing
+backslashes into an interactive shell.
+
+**Python edits with `count != 1` abort checks.** `set -e` at top.
+Count in Python, not `grep`. Anchor from the file's current bytes
+(`cat -A`), open `rb`/`wb` to preserve line endings. If an anchor
+aborts, **ask for the current bytes** -- do not guess a second anchor.
+
+**The build is TWO steps:**
+`make -C 04_kernel_64bit FAT_CONFIG=single`;
+`make -C 05_boot_kernel64 hdd-single.img`.
+Verify the mtime chain `source` < `.o` < `kernel.elf` < `kernel.bin` <
+`hdd-single.img`.
+
+**Test harness.** `./run` (no arg) = clean build + fresh
+`hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
+gdb stub on `:1234`, `capture.txt` written (overwritten each run --
+**copy it aside after any failure**). The Makefile run targets use
+`-cpu max` + TCG (a different CPU) -- state which launcher was used.
+Default cwd `/root` (prompt `~`).
+
+**In-guest gate:** `cd /`, then `canary --full` (28/28) and
+`/root/scripts/test.sh` (57/57).
+
+**Do not** `git reset --hard` without stashing; **do not** edit
+`third_party/`; **do not** commit `kmain.c`'s `pit_init` knob; **do not**
+call a race closed on one clean run.
+
+**Do not** assume a commit fixed something because its message says
+it did. `f91d31a` claims to fix canary/pipe7e/ctrl-Z; it does not.
+Test every commit before trusting its message.
+
+**Do not push `dev` without a full read of the 68 unpushed commits.**
+`origin/dev` is at `799e98f` (`v0.6.18`). Local `dev` is 68 ahead.
+That is intentional work, not accidental divergence. Force-pushing
+would destroy it.
 
 ---
 
 ## Releases
 
-**Before a release:** the scratch `2026MMDD-*` tags are annotated
-and are the source for the version summary.  **Write the summary
-from them BEFORE dropping them.**  The release tag and the merge
-commit are local objects; once they exist, the scratch tags may be
-dropped.
+**`v0.6.15` through `v0.6.18` are released.**
+`origin/dev` = `799e98f` = `v0.6.18`. Local `dev` = `d1ae213` = 68
+commits ahead (unpushed).
 
-**The release procedure** (on `dev`, pre-release):
+**Scratch tags present, not on `dev`:**
+- `fixA-stable` = `2c0df3b` (sys_poll revert; STOP/CONT self-pick)
+- `20261101-stable-scheduler-fixes` = `f91d31a` (scheduler guards;
+  turns `#PF` into `Z` halt; not a fix)
 
-1. **Patch the docs first.**  Update this file's release paragraph
-   and (optionally) `docs/version-history.md`.  Commit.
-2. **Bump the version string in `kmain.c` manually** (the banner).
-   Commit.
-3. **Tag** `vX.Y.Z` annotated, on `dev`, summary from the scratch
-   tags' annotations and `vPREV..HEAD`:
+Both are preserved as tags; they can be cherry-picked or merged later
+if the scheduler work is independently valuable, but they are **not**
+on `dev` because they don't fix the `#PF`.
 
-       git tag -a vX.Y.Z -m "<version summary>"
+**Release procedure (on `dev`, pre-release):** (1) patch docs + this
+file, commit; (2) bump the version string in `kmain.c`, commit;
+(3) `git tag -a vX.Y.Z -m "<summary>"`; (4) drop scratch tags;
+(5) `git push origin dev` then `git push origin vX.Y.Z` (by name --
+never `--tags`); (6) `git checkout main && git merge --no-ff dev &&
+git push origin main && git checkout dev`.
 
-4. **Drop the scratch tags locally** (the tag and summary now
-   exist):
-
-       for t in $(git tag --list '2026*'); do git tag -d "$t"; done
-
-5. **Push `dev`, then the tag:**
-
-       git push origin dev
-       git push origin vX.Y.Z
-
-6. **Merge to `main` with `--no-ff`** (keeps the merge point in
-   `main`'s history), push, return to `dev`:
-
-       git checkout main
-       git merge --no-ff dev -m "<version summary>"
-       git push origin main
-       git checkout dev
-
-Do not use `git push --tags` -- it would push the scratch tags.
-Push `vX.Y.Z` by name.
-
-**Current release state.**  **`v0.6.18` is released.**  Work is
-now pre-**`v0.6.19`**.  The release tags `v0.6.15` through
-`v0.6.18` carry their summaries; the scratch tags they were drawn
-from have been dropped.  The two live bugs recorded in the prior
-handoff are now one: the backgrounded-exec failure is fixed
-(`68185de`), and the `kill`-RUNNING hang is the remaining open bug.
+**Current release state:** `v0.6.18` released; work pre-`v0.6.19`;
+`dev` is 68 commits ahead of `origin/dev` (unpushed). No new release
+until the `#PF` is fixed.
 
 ---
 
 ## What donix is
 
-A fork of dons-os.  Goal: a Unix-like OS that runs static
-musl-linked binaries on the Linux x86_64 ABI, natively.  Newlib
-is gone.  Userland is a tracked source tree at `userland/musl/`.
-Phase B (busybox) is well underway: the shell is interactive,
-pipelines and redirection work, job control works on the
-framebuffer/PS/2 console, and shebang / `/bin/sh` is in.  The
-applet set includes `bc`, `dc`, `diff`, `du`, `awk` in addition
-to the file/text applets.
-
-Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
-Concurrency rules: `docs/contract.md`.
+A fork of dons-os. Goal: a Unix-like OS that runs static musl-linked
+binaries on the Linux x86_64 ABI, natively. Newlib is gone. Userland
+is `userland/musl/`. Phase B (busybox) well underway: interactive
+shell, pipelines, redirection, job control on the framebuffer/PS-2
+console, shebang / `/bin/sh` in; applets include `bc`, `dc`, `diff`,
+`du`, `awk`. Full strategy `docs/strategy.md`; direction `ROADMAP.md`;
+concurrency rules `docs/contract.md`.
 
 ---
 
 ## Where we are
 
-### Current baseline
+### Baseline (committed, `d1ae213`, tree clean, builds green)
 
-- `test.sh` 57/57; `canary --full` 28/28; pipe7e clean at 100 kHz
-  and on a >3.5-hour 100 Hz soak.  The gate ran on `68185de`,
-  from `/` on a freshly built image.
-- Busybox batch 1 (prompt, readlink, `ls` features,
-  human-readable, long options) and five applets (`bc`, `dc`,
-  `diff`, `du`, `awk`) enabled and verified by running them.
-  Batch 2 is open (see NEXT).
-- Signals slices 1-5 complete and verified.  `tkill` (200) in;
-  `CONFIG_KILL=y`; `SIG_IGN` fixed and proven.
-- Job control works end to end on the framebuffer/PS/2 console:
-  Ctrl-Z raises SIGTSTP to the foreground pgrp, `wait4(WUNTRACED)`
-  reports `[1]+ Stopped`, `jobs` lists it, `fg` resumes it for both
-  `console_read` and `nanosleep` jobs.  `bg` works.
-- `docs/contract.md` is the durable concurrency rule; read it
-  before any shared-state change.
+- `make clean && make` → `MAKE_EXIT=0`
+- **`canary --full` is NOT green.** It crashes with `#PF` on a live
+  user page, independent of `^Z`. See "THE PRIMARY OPEN BUG" above.
+- `^Z` on a foreground child → `[1]+ Stopped`; `jobs` lists it; `fg`
+  resumes. Works.
+- `^C` → does nothing (original behavior). Unchanged from 2026-10-31.
+- `exec_churn` → 24 rounds pass. This is the one clean baseline probe.
 
-### Next -- the highest-value work
+### State on disk / tree
 
-1. **`kill` on a `RUNNING` background job hangs.**  The standing
-   repro and the disambiguating foreground-`^C` test are above.
-  This is the more serious open bug.
-2. **The no-peer stop soak.**  `process_stop_and_yield`'s
-   `while (STOPPED) process_yield()` loop has not been exercised
-   with no runnable peer.
-3. **The interpreter-argv proof.**  The optional interpreter
-   argument reaching the interpreter as a real argv is not
-   proven; `-x` is ash-ignorable and the earlier transcripts were
-   the fallback path.  A test with an interpreter that can observe
-   argv is the way to prove it.
-4. **SSE** (item 5): save/restore XMM on context switch and the
-   interrupt path, then remove the userland `-mno-sse*` flags.
-5. **Privilege model** (item 6).
-6. busybox batch 2; `test.sh`'s md5.
-7. **PIPE7E soak** at 100 Hz.
-8. **`run`'s `stty susp undef` restore** -- save with `stty -g`
-   before QEMU and restore with `stty "$old"` after it exits (not
-   a bare `stty susp ^Z`, which assumes the original value).
+- Kernel sources `04_kernel_64bit/`. `04_kernel_64bit/fatfs/ff.c` is
+  **tracked**, built by the cross-GCC, not `third_party/`.
+- `third_party/` is **gitignored** -- do not commit edits to it.
+  `third_party/busybox/` has `busybox` (stripped) and
+  `busybox_unstripped` + `.map` if a userspace symbol is ever needed.
+  **`third_party/musl-install/` is gitignored and is needed for the
+  build.** If it's missing after a `git clean -xdf`, copy it back from
+  a working tree, or rebuild it with `toolchain/install_musl.sh`.
+- After a fresh image: `/bin/busybox` and `/bin/sh` are staged; run
+  `/bin/busybox --install -s /bin` (absolute path) to get applet
+  symlinks. Manual step, not part of the build.
+- `capture.txt` is gitignored, overwritten each `./run` -- copy aside
+  after any failure.
+- Saved artifacts from this session:
+  - `~/donix-20261101-sys_munmap-owned-check.patch` — 41-line
+    `sys_munmap` fix. Correct-to-have, does not fix `#PF`. Apply as
+    its own commit with its own gate pass.
+  - `~/donix-20261101-sys_munmap-owned-check.patch` is the **only**
+    file left from today's edits. Everything else was reverted.
+  - No `context_switch.asm` revert, no scheduler guards, no
+    top-of-tick signal delivery — those were all reverted. Do not
+    reapply them without a gdb-driven reason.
 
-### Refuted -- do NOT re-walk
+### Committed this session
 
-The numbered `REFUTED SHAPES` above are the full list.  In
-addition, the following theories were refuted by transcripts this
-session and are **not** shapes (nobody committed them):
+**Nothing.** All edits were either saved as a patch (the `sys_munmap`
+one), tried and reverted, or tried and abandoned. `dev` is at
+`d1ae213`, unchanged from the start of the session. That is
+deliberate: nothing was fixed, so nothing was committed.
 
-- Disk corruption across reboots.
-- A cold FAT cache as the first-call failure.
-- A `sys_*` mutex / cross-process race.
-- CPU / mode / launcher as the failing variable.
+### Open issues (top)
+
+1. **`#PF` on a live user page in fork/exec context** (above). Next:
+   gdb at the `#PF`, read the stack, then one fix. Do NOT re-derive
+   the fork/exec shapes in "REFUTED SHAPES".
+2. **`^C` -> console dies after `/ #`** (above). Next: gdb at the
+   `^C` lockup; suspect child `process_exit`, not the keymap.
+3. `sys_munmap` unconditional `pmm_free_page` bug — saved as a patch,
+   apply as an independent commit.
+4. `open-issues.md` item 5: SSE state not saved.
+5. `open-issues.md` item 6: no privilege model.
+6. `process_dump_all` `DETACHED` state may mask a stranded process.
+7. `kill(pid <= 0)` group semantics: `kill(-pgid, sig)` works;
+   `kill(0, sig)` returns `-EINVAL`.
+8. Ctrl-C on the serial console is not mapped to SIGINT (host
+   `intr = ^C` eats it; and the framebuffer `^C` is bug 2 above).
+
+Plus: busybox batch 2; PIPE7E soak at 100 Hz; `run`'s `stty susp undef`
+restore (`stty -g` save / `stty "$old"` restore); interpreter-argv
+proof.
+
+### REFUTED SHAPES (do not retry)
+
+1. `cli`-depth lock around the ATA transfer -- crashed on boot.
+2. `f_sync` on inherited `FIL`s.
+3. `f_opendir("/tmp")` + `f_opendir("/")` warm-up.
+4. `user_syscall_clear_file_table(self)` alone.
+5. Removing `strip_dot_prefix(exec_path)` -- real latent bug, not the
+   `&` bug; one-line cleanup for later.
+6. `f_mount(NULL)` + `f_mount(fs)` in `sys_execve`.
+7. `f_read`/`f_write` `winsect = -1`.
+8. `move_window` in `dir_sdi`/`dir_next` tails -- broke boot.
+9. `sys_fork` giving a `FILE_KIND_DIR` child its own `DIR`
+   (`bc7bef1`, reverted `950d4f0`).
+10. `follow_path` reading the window for `dp->sect` before the
+    sub-directory descent (`4594038`, reverted `89c7f3f`).
+11. Invalidating `winsect` alone at the mount fast-path return, without
+    `wflag = 0` (`b5c5075`, corrected `68185de`).
+
+**`^C`, refuted on 2026-10-31 (all in the WIP patch, none closed it):**
+
+12. `sys_kill(-fg,2)` in `irq1_handler` -> console dies after `/ #`.
+13. `sys_kill(-fg,2)` in `timer_preempt_handler` -> console dies.
+14. Pure `sig_pending` bit-set from the timer (no `sys_kill`) ->
+    console dies.
+15. Deferring the raise to `syscall_dispatch` -- never ran (the shell
+    parks in `sys_poll` `hlt`, no syscall).
+16. Orphan reparent to the shell / to pid 1 / to pid 1 + terminate,
+    and skip-`current_process` in the reparent loop -- each changed
+    *where* it hung, none fixed it.
+17. Double-EOI removal, 8042 drain at the top of the handler, and
+    `sys_poll` park via `process_yield` -- none fixed `^C`; the
+    `process_yield` park also lost the wake.
+
+**`#PF`, refuted on 2026-11-01 (all reverted; none fixed `#PF`):**
+
+18. Removing the `.resume_rsp_zero` frame-consume in
+    `context_switch.asm` (`mov qword [r12+0x110], 0` after `mov rsp,
+    [r12+0x110]`). Did not fix `#PF`. **Not restored — the `Z` halt
+    was observed on `f91d31a` with the frame-consume in place; the
+    frame-consume is not what zeroes canary's code PTE.**
+19. Removing the `rsp == 0` guards in `process.c` (`process_wake_all_blocked`,
+    `process_wake_parent_if_waiting`), `scheduler.c`
+    (`scheduler_ready_queue_add`), and `user_syscall.c`
+    (`pipe_wake_waiter`). Did not fix `#PF`; turned the `.resume_rsp_zero`
+    sentinel into a live halt. **Do not remove these guards without
+    a gdb-driven reason** — they protect against dispatching a
+    frame-less process.
+20. Adding top-of-tick `signal_deliver_frame_iretq(current, stack_pointer)`
+    to `timer_preempt_handler` for SIGINT/SIGTERM/SIGKILL/SIGHUP.
+    Did not fix `#PF`. **Not related to the crash.** (The change was
+    architecturally defensible but empirically neutral, and it is not
+    the bug.)
+21. `sys_munmap` owned-check (only `pmm_free_page` if the frame is in
+    `self->elf_page_list`). **Applied, built, ran, still crashed with
+    `#PF`.** Saved as `~/donix-20261101-sys_munmap-owned-check.patch`.
+    Correct-to-have; apply separately. **Did not fix `#PF`.**
+
+**`^Z`-specific refuted on 2026-11-01:**
+
+22. Treating `^Z` as the trigger. **Refuted by Run 3**: a plain
+    `canary` (no `--full`, no `^Z`) crashed with `#PF` on the same
+    class of VA. `^Z` is a race-window widener, not the trigger.
 
 ---
 
-## Open issues (top 6)
+## NEXT (in order)
 
-1. **`kill` on a `RUNNING` background job hangs.**  See "The one
-   open bug" above and NEXT item 1.
-2. **`open-issues.md` item 5: SSE state is not saved.**
-3. **`open-issues.md` item 6: no privilege model.**
-4. **`process_dump_all`'s `DETACHED` state** -- may mask a
-   stranded process bug.
-5. **`kill(pid <= 0)` group semantics** -- `kill(-pgid, sig)`
-   works; `kill(0, sig)` returns `-EINVAL`.
-6. **Ctrl-C on the serial console is not mapped to SIGINT.**
+1. **gdb at the `#PF`** on `d1ae213` (baseline, no `^Z`). Run
+   `canary --full` (no `^Z`) with gdb stub on `:1234`; when the `#PF`
+   frame dump appears on serial, attach:
 
-Plus: busybox batch 2, PIPE7E soak, `run`'s `stty` restore, and
-the interpreter-argv proof.
+       gdb -q -ex 'target remote :1234' \
+           -ex 'info registers rip rsp cr3 cr2' \
+           -ex 'x/40gx $rsp' \
+           -ex 'x/20i $rip' \
+           -ex 'detach' -ex 'quit'
 
----
+   And separately, at the fault handler breakpoint:
 
-## State on disk
+       break *<fault_handler_symbol>
+       (or) break *<isr14_common> — whichever symbol the linker map names
 
-Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored
-and is overwritten every `./run` -- **copy it aside after any
-failure.**  `04_kernel_64bit/fatfs/ff.c` is **tracked**, built
-directly by the Makefile with the cross-GCC; it is **not**
-`third_party/`, and a clone gets it.  The `ff16.zip` archive is
-tracked but nothing references or unzips it.
+   Inspect `current_process->pid`, `current_process->cr3`,
+   `current_process->state`, `current_process->elf_page_list`,
+   `current_process->elf_num_pages`. **Read the bytes first. No patch
+   until the stack says what function is on it.**
 
-**After a fresh image, one manual step:** the image stages
-`/bin/busybox` and `/bin/sh` (a second copy of busybox).  To get
-the applet symlinks, boot and run `/bin/busybox --install -s /bin`.
-The absolute path is required: busybox reads `/proc/self/exe` to
-find itself, donix has no `/proc/self/exe`, and it falls back to
-`argv[0]` -- which must start with `/`.  This is a manual step,
-not part of the build; automating it is a Makefile/boot change and
-is not done.
+2. If the fault is in `sys_munmap` or `exec_free_and_unmap_user_pages`,
+   add a `serial_print` at the top of each that prints `self->pid` and
+   the `va` being unmapped, run `canary --full`, and check whether
+   `va` in `0x40xxxx` is being unmapped for a process that still owns
+   the page.
 
-`v0.6.15` through `v0.6.18` are the release record.  The
-`20261030-*` and `20261031-mount-fastpath*` scratch tags are the
-current restore points; there is no single tag as a release, and
-nothing is pushed until `v0.6.19` is complete and verified.  The
-next release procedure draws the release summary from these tags
-before dropping them.
+3. If the fault is elsewhere (idle, scheduler, signal), the stack
+   will say which. **One fix, one commit, one verification.**
+
+4. **After `#PF` is fixed**, re-test `^C` on the fixed tree before
+   re-opening the `^C` WIP. If `^C` is fixed as a side effect (VMM
+   teardown was the mechanism), note it; if not, `^C`'s own gdb
+   investigation stands.
+
+5. **After both are fixed**, apply the `sys_munmap` owned-check patch
+   as its own commit with its own gate pass.
+
+6. Then: SSE (item 5), privilege model (item 6), busybox batch 2,
+   PIPE7E soak, `run`'s `stty` restore, interpreter-argv proof.
 
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last release.  The first backgrounded-exec
-failure is fixed (`68185de` on `b5c5075`): `mount_volume`'s
-already-mounted fast path now does `fs->wflag = 0; fs->winsect =
-(LBA_t)0 - 1;`, the same pair `check_fs` uses, so the next
-`move_window` reads instead of trusting a window another process
-left.**  `FATFS` is one global; `fs->win` and `fs->winsect` are
-shared across processes.  The first attempt (`b5c5075`) copied
-only `winsect = -1`; the missing `wflag = 0` let `sync_window`
-flush to sector `-1`, ATA refused the write, and `test.sh` failed
-from `split` onward -- found by `test.sh`, fixed by `68185de`,
-`canary --full` 28/28 and `test.sh` 57/57 green.  Backgrounded-exec
-acceptance passed: `sleep 5 &` first, multiple backgrounded
-execs, `ls` after, root intact.  **The `kill`-RUNNING hang is the
-one open bug and the next session's first test, blocked on the
-serial console's unmapped `^C`.**  Read `docs/contract.md` and
-"NEXT" before any code.
+**`v0.6.18` is the last release. `dev` is at `d1ae213` (`20261031-ctrlz-owner-fix`), tree clean, builds green — but `canary --full` crashes with a `#PF` on a live user page, independent of `^Z`, in a fork/exec context. This is the primary open bug. The `^C` bug is unchanged from 2026-10-31. The 2026-10-31 handoff's "baseline is green" claim is false; `d1ae213` crashes and does not pass `canary --full`. The next session must start with gdb at the `#PF`, not with more code reading — five wrong hypotheses were tried on 2026-11-01, all reverted, all refuted. The `sys_munmap` owned-check patch is saved and correct-to-have but does not fix the `#PF`. The scheduler work in `2c0df3b` and `f91d31a` is preserved as tags, not on `dev`, because it does not fix the `#PF` and turns it into a `Z` halt when applied.**
