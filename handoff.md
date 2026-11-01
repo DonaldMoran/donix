@@ -21,164 +21,199 @@ session, only assumed.
 
 ---
 
-## THE PRIMARY OPEN BUG: `#PF` on a live user page (fork/exec context)
+## THE PRIMARY OPEN BUG: `#PF` on a live user page after `^Z`/`fg`
 
-`canary --full` crashes, sometimes with `^Z`/`fg`, sometimes with a
-plain `canary` (no `--full`, no `^Z` at all). The crash is
-**independent of Ctrl-Z**. Ctrl-Z just widens the window and changes
-the probability of hitting it, because it inserts scheduler activity
-between the fork/exec cycles that trigger it.
+`canary --full` **passes 28/28 without `^Z`** on a clean `d1ae213` tree.
+The crash requires at least one `^Z`/`fg` cycle. When it fires, it
+kills canary (or a `busybox` test child) with a `#PF` on a page of the
+process's own `.text`, and the PTE at the faulting VA is 0.
 
-### Symptom (verbatim from a run on `d1ae213`, no `^Z`)
+### Symptom (verbatim from `d1ae213` + handoff commit, one `^Z` then `fg`)
 
     === PAGE FAULT (#PF) ===
-      CR2 (Bad Address) : 0x0000000000413937
-      Faulting RIP      : 0x0000000000413937
+      CR2 (Bad Address) : 0x0000000000400C07
+      Faulting RIP      : 0x0000000000400C07
       Raw Error Code    : 0x0000000000000014
       CS                : 0x0000000000000033
-      RSP               : 0x00000080000FBF00
-      CR3               : 0x000000000033B000
-      Walk indices: pml4=0 pdpt=0 pd=2 pt=19
-      pde               : 0x000000000033F027   (present, user, writable)
+      RSP               : 0x00000080000FBD08
+      CR3               : 0x0000000000347000     <- child CR3 or canary's
+      Walk indices: pml4=0 pdpt=0 pd=2 pt=12
+      pde               : 0x000000000034B027   (present)
       pte               : 0x0000000000000000   (NOT PRESENT)
 
-    Segfault
+- **CR2 = RIP** — instruction fetch.
+- **CS = 0x33** — user mode, so the process was running normally.
+- **PTE = 0 with PDE present** — an explicit unmap of a live code page.
+- **CR3 varies** (`0x33B000` = canary, `0x347000` = a child). The
+  faulting VA varies (`0x413962`, `0x40C0B8`, `0x400C07`, …) but is
+  always inside the process's own `.text` (`0x40xxxx`–`0x41xxxx`).
+- **PDE at fault time gives the PT phys** (`0x33F000` for the
+  `pt[19]` walk, `0x347B000` for `pt[12]`).
 
-- **`CR2 == RIP`** — instruction fetch fault.
-- **`CS = 0x33`** — user mode. The process resumed cleanly; this is
-  not a resume-path fault.
-- **`PTE = 0` with `PDE` present** — the mapping was **explicitly
-  zeroed**. `vmm_unmap_page_in_cr3` or `vmm_unmap_page` ran on a VA
-  that the process still has PTE-backed code at.
-- **`CR2` is in canary's own `.text`** (`0x40xxxx`–`0x41xxxx`). Not a
-  shared library, not the child's code. Canary's own code page.
-- **`CR3 = 0x33B000`** — canary's own CR3 (the parent, not a child).
-- Page is one of several: `0x413962` (tag run), `0x413937` (tag run,
-  different byte offset), `0x40F6E3` (dev run), `0x40C0B8` (dev run).
-  Different pages. Not one fixed unmapped VA.
+### Second, separate fault seen in the same run
 
-### Related observations in the same crash family
+Later in the same `canary --full` sequence, `sigsuspend_probe` faults
+with:
 
-- **One run produced `#GP` instead of `#PF`**: `RIP = 0x448021`
-  (musl region), error code 0, frame otherwise identical. Different
-  fault class, same underlying unmap.
-- **One run produced a `.resume_rsp_zero` halt**: `Z` + `ffffffff80285120`
-  on serial. That is the `context_switch.asm` sentinel firing —
-  `next->rsp == 0` on a scheduled process. It did NOT happen on the
-  `d1ae213` baseline; it happened on a tree with the scheduler
-  `rsp == 0` guards added. **The guards turn the `#PF` into a `Z`
-  halt.** Same root cause, different observed halt shape.
-- **The crash is not deterministic**: two identical runs of the same
-  binary (same boot image, same `^Z` timing at 3 tests) both passed
-  28/28. A third run with a fresh boot crashed with no `^Z` at all.
+    CR2 = 0x000000000000003D
+    RIP = 0x00000000004051F8
+    pte = 0x0000000000000003   (PRESENT, phys 0x00000000)
+    CR3 = 0x0000000000347000
 
-### What we established today (do not re-derive)
+`CR2 = 0x3D` is a small integer — a **NULL pointer plus offset**, not
+a user VA. The PTE is present but points at phys page 0. This is a
+**distinct bug** in `sigsuspend_probe` / `sys_rt_sigsuspend`'s ABI,
+unrelated to the `.text` PTE zeroing. Do not conflate the two when
+triaging.
 
-- **`exec_churn` passes 24 rounds of fork/execve/wait4, all children
-  exit 0.** Plain fork/exec is not the trigger by itself. The crash
-  requires a *sequence* of fork/exec cycles, not one.
-- **`^Z` is not required.** A plain `canary` (no `--full`, no `^Z`)
-  crashed once on the same `#PF`. Therefore Ctrl-Z is a red herring
-  that widens the window; it is not the bug.
-- **The "working tag" `20261031-ctrlz-owner-fix` (`d1ae213`) is not
-  working.** A clean copy of the repo, `git clean -xdf`, fresh
-  `third_party/musl-install`, `MAKE_EXIT=0`, and `canary --full`
-  crashes on the `#PF` with or without `^Z`. The handoff from
-  2026-10-31 was wrong about this. Do not assume `d1ae213` passes
-  canary.
-- **`f91d31a` does not fix it either.** Same crashes, plus the `Z`
-  halt (because of the `rsp == 0` guards).
-- **`sys_munmap` has an unconditional `pmm_free_page(phys)` bug.**
-  It frees frames it does not own (any `phys` present at `va` in
-  `self->cr3`, not just those in `self->elf_page_list`). That is a
-  real bug; it is saved at
-  `~/donix-20261101-sys_munmap-owned-check.patch` (41 lines) and is
-  NOT applied to the tree. It did not fix the `#PF` when applied, but
-  it is correct-to-have and should be applied as an independent
-  commit with its own gate pass, not bundled with the `#PF` fix.
-- **`sys_fork`'s `EAGER_COPY_REGION` is correct in shape** — it
-  allocates new frames, memcpy's, remaps child PTE, and adds to
-  `child->elf_page_list`. Not sharing parent frames (as `fork` might
-  be naively assumed to).
-- **`vmm_clone_page_table`** deep-copies the low half; shares the high
-  half (kernel mappings). Correct shape.
-- **`process_create` sets `child->elf_page_list = NULL`** (line 136).
-  Child does not inherit parent's `elf_page_list`.
-- **`exec_free_and_unmap_user_pages(pcb)`** walks `[0x400000, 0x600000)`
-  (ELF), stack, brk, mmap regions; for each VA with a present PTE,
-  unmaps it **only if `phys` is in `pcb->elf_page_list`**; then frees
-  every `phys` in `elf_page_list`. This is the correct shape — it
-  should not free a frame the process does not own.
-- **`process_stop` / `process_continue` do not touch `cr3`.** The stop
-  path is not corrupting the address space.
-- **`context_switch.asm` loads `cr3` from `next->cr3`** at the resume
-  site. Nothing in scheduler/signal code touches `cr3`.
-- **The pipe read/write block paths use `process_yield`** (the fixed
-  shape), not `sti; hlt`. The pipe comments explicitly warn that
-  `sti; hlt` is broken on these paths. `sys_poll` still uses
-  `sti; hlt`; that is a known-fragile area but not the current crash.
-- **A `race_probe` dump from a crashed run showed `pid=4 wake_tries=28
-  wake_ok=0`, `refuse_by_reason: r3=32`.** That was during a `^Z`/`fg`
-  run; the wake refusals are consistent with canary being STOPPED or
-  in WAITPID (not PIPE_READ) at the time of the writes. **Not the
-  `#PF` bug**, but worth noting as a separate scheduling oddity.
+### What we PROVED on 2026-11-01 (do not re-derive)
 
-### Where the bug must be (the remaining candidates)
+1. **`canary --full` passes 28/28 without `^Z`** on a clean
+   `d1ae213` + handoff commit tree, no instrumentation. Verified
+   once, cleanly, by hand.
 
-The `#PF` is: **a live user page, in a process that is running, gets
-its PTE zeroed.** That can only happen via `vmm_unmap_page_in_cr3` or
-`vmm_unmap_page` called on the process's own CR3 with a VA the process
-still uses. The callers are:
+2. **`process_reclaim` is NOT the caller.** A guard was added to
+   `process_reclaim` refusing to reclaim any PCB that is
+   `current_process` or whose `state` is not `ZOMBIE`/`TERMINATED`.
+   The guard did **not** fire, and the crash still happened. So
+   `process_reclaim(canary)` is not the mechanism.
 
-- `sys_munmap` — runs on `self`, unmaps any VA in the process's
-  address space. Unconditional `pmm_free_page(phys)` is a known bug
-  (patched in the saved file). **But: does canary call `munmap` on
-  its own `.text` region (`0x40xxxx`)?** musl's `free()` calls
-  `munmap` for large allocations. If canary has a heap that got
-  mmap'd at `0x8010xxxx` and freed, that's `0x8010`, not `0x40xxxx`.
-  This is a possible path but not the obvious one.
-- `exec_free_and_unmap_user_pages` — runs on `pcb` at exec. It only
-  unmaps VAs in `pcb`'s own regions if `phys` is in `pcb`'s
-  `elf_page_list`. **If `pcb->cr3` is not the running process's CR3
-  (i.e. the wrong PCB was passed to `exec_free_and_unmap_user_pages`)**,
-  it unmaps the wrong process's pages. **Check whether
-  `sys_execve`'s `exec_free_and_unmap_user_pages(self)` can be reached
-  with `self` being the wrong process after a fork/exec chain.**
+3. **`elf_page_list` does not contain page-table pages.** Every one
+   of the six `elf_add_page_to_pcb` callers (`elf.c:190`,
+   `user_syscall.c:5419, 7581, 9733, 11299`, `process.c:401`) passes
+   a `phys` returned by `pmm_alloc_page_for_elf()`, i.e. a **leaf**
+   page. `sys_brk` and `sys_mmap` follow the correct pattern:
+   `phys = pmm_alloc_page_for_elf(); vmm_map_page_in_cr3(..., phys,
+   ...); elf_add_page_to_pcb(self, phys);`. The `vmm_map_page_in_cr3`
+   page-table pages are never returned to the caller. So
+   `exec_free_and_unmap_user_pages` and `process_cleanup_elf_pages`
+   **cannot** free the faulting PT page via `elf_page_list`.
 
-The **first thing the next session must do** is not to re-read the
-code: it's to **get the gdb stack of the faulting process at the
-moment of the `#PF`**. Three ways:
+4. **`vmm_unmap_page_in_cr3` is not called on canary's `.text`.** A
+   gdb breakpoint on `vmm_unmap_page_in_cr3` during a `canary --full`
+   `^Z`/`fg` run logged only VAs in the child's stack
+   (`0x80000f6000`–`0x80000ff000`) and mmap region
+   (`0x8010001000`, `0x8010002000`), with `cr3 = 0x347000`. **No
+   `0x413xxx` or `0x40cxxx` VA was ever passed.** The crash is not
+   caused by an explicit unmap call.
 
-1. `./run` with the gdb stub (already on `:1234`), boot, run
-   `canary --full` (no `^Z`), wait for the `#PF`, then at the fault
-   dump's `[16]` (faulting RIP) on serial, use gdb:
+5. **`pmm_free_page(0x33F000)` fired exactly once** in an
+   instrumented run: from `process_reclaim(canary)` via
+   `process_free_clone`. In the plain (uninstrumented) run, the crash
+   happens with **no `pmm_free_page(0x33F000)` at all** (the guard
+   didn't fire and no `[FREE-33Fxxx]` line was logged because the
+   plain run has no such instrumentation).
 
-       gdb -q -ex 'target remote :1234' \
-           -ex 'info registers rip rsp cr3 cr2' \
-           -ex 'x/40gx $rsp' \
-           -ex 'x/20i $rip' \
-           -ex 'detach' -ex 'quit'
+6. **`exec_churn` passes 24 rounds of fork/execve/wait4** — plain
+   fork/exec is not the trigger.
 
-2. Or set a breakpoint on the fault handler:
-   `break *<fault_handler_symbol>` and inspect `current_process` /
-   `pcb->cr3` / `pcb->elf_page_list` / `pcb->state` at the fault.
-3. Or add a one-line `serial_print` in `exec_free_and_unmap_user_pages`
-   printing `pcb->pid` and the VA being unmapped, and in `sys_munmap`
-   printing `self->pid` and the VA. If either fires with a `va` in
-   `0x40xxxx`, the caller is confirmed.
+7. **`gdb` masks the crash.** With gdb attached, the guest is slowed
+   enough that `^Z`/`fg` never triggers the fault, even with the
+   exact repro. **Do not rely on gdb for this bug** — it changes the
+   timing that makes the bug visible.
 
-**Do not** re-attempt the following — they were all tried and all
-refuted (details in REFUTED SHAPES below):
+8. **`^Z` loses pipe wakeups on canary.** From a race_probe dump:
+   `pid=4 wake_tries=28 wake_ok=0 refuse=r3=32`. Canary is blocked
+   in `BLOCK_KIND_PIPE_READ` while stopped, and 28 pipe-write wakes
+   are refused because `waiter->state != PROC_STATE_BLOCKED` (it is
+   `STOPPED`). Canary re-checks the pipe on `fg` and reads the
+   pending data, so this is a **latency bug, not a data-loss bug** —
+   but it is real and separate from the `.text` PTE fault.
 
-- `context_switch.asm` frame-consume removal (reverted; no effect)
-- `rsp == 0` guards in scheduler/process/pipe (reverted; no effect,
-  and turn `#PF` into a `Z` halt)
-- top-of-tick `signal_deliver_frame_iretq` for SIGINT (added, then
-  reverted; no effect on `#PF`)
-- `sys_munmap` owned-check (saved as patch, applied, **did not fix
-  `#PF`**)
+### The remaining hypothesis: `pmm_bitmap` corruption
 
----
+The fault-page PT (`0x33F000` for the `pt[19]` walk) is **canary's
+own PT** for the `0x40F000`–`0x40FFFF` range. Its PTEs are
+individual pages of canary's `.text`. For `pt[19]` (or `pt[12]`) to
+be zero, one of two things happened:
+
+- **The whole PT page was `memset` to zero** by
+  `vmm_clone_page_table` (`vmm.c:329`) or `vmm_map_page_in_cr3`
+  (`vmm.c:164`, `vmm.c:463`), then refilled with a *different*
+  process's PTEs. Canary's PD entry still points at `0x33F000`, but
+  `pt[19]` is now whatever the new owner wrote there — probably 0.
+
+- **A single PTE at `pt[19]` was zeroed directly** by
+  `vmm_unmap_page_in_cr3` or `vmm_unmap_page` — **ruled out** by
+  fact #4 above.
+
+The remaining path is the first: **`pmm_alloc_page_for_tables`
+returned `0x33F000` as a new PT page**, even though canary's PD
+still referenced it. That can only happen if `bitmap_test(0x33F)`
+returned 0 inside `pmm_scan_zone`.
+
+The bitmap for page `0x33F` is byte `0x67F`, bit 7 of
+`pmm_bitmap`. **For that bit to be 0, `pmm_bitmap[0x67F]` must have
+been written with bit 7 clear.** The only legitimate writers are
+`bitmap_set`, `bitmap_clear`, and `pmm_init`, all in `pmm.c`. None
+of them should touch `0x67F` for a page that is not explicitly being
+allocated or freed.
+
+**The hypothesis:** a stray write (buffer overflow, wild pointer,
+stack overflow from a user-triggered syscall) writes a 0 bit into
+`pmm_bitmap[0x67F]`. Then `pmm_scan_zone` sees `0x33F000` as free,
+`pmm_alloc_page_for_tables` returns it for a new PT, and
+`vmm_map_page_in_cr3`/`vmm_clone_page_table` `memset`s it to zero.
+Canary's `.text` PTEs are wiped. Canary executes `.text` and faults.
+
+### Next instrumentation (fresh session, do this FIRST)
+
+Add to `pmm.c`:
+
+1. In `bitmap_clear(uint64_t page)`: if `page == 0x33F`, print
+   `[BITMAP_CLEAR_33F] caller=0x...` with `__builtin_return_address(0)`.
+2. In `bitmap_set(uint64_t page)`: if `page == 0x33F`, print
+   `[BITMAP_SET_33F] caller=0x...`.
+3. In `pmm_alloc_page`, when a page is returned for
+   `PAGE_PAGE_TABLE`, print `phys` if `phys == 0x33F000`. Also print
+   if `phys == 0x340000` (the adjacent `pt`-range page) as a
+   cross-check.
+
+Then run `canary --full` with `^Z`/`fg` (no gdb — gdb masks it) and
+look at the serial log.
+
+- If `[BITMAP_CLEAR_33F]` fires → the caller of `bitmap_clear(0x33F)`
+  is the bug. The address names the function.
+- If only `[BITMAP_SET_33F]` fires → page `0x33F` was set (allocated)
+  while already canary's PT; the caller that re-set it is the bug.
+- If `[PAGE_TABLE_33F000]` fires but neither bitmap call does → the
+  bitmap was corrupted silently (stray write) and we need to find
+  the writer.
+- If none fire → the mechanism is even more subtle. Look at
+  `pmm_scan_zone` and whether the page-index arithmetic could alias.
+
+**No patch until one of these prints.** The bitmap corruption is the
+only remaining candidate, and the instrumentation is what confirms or
+refutes it.
+
+### What NOT to retry
+
+- **Do not** re-add a `process_reclaim` guard (tried, didn't fire).
+- **Do not** re-add top-of-tick `signal_deliver_frame_iretq` (tried,
+  neutral).
+- **Do not** re-add the `rsp == 0` guards in `scheduler.c` /
+  `process.c` / `user_syscall.c` (tried, turned the fault into a `Z`
+  halt and made it harder to diagnose).
+- **Do not** re-add the `sys_munmap` owned-check (tried, did not fix).
+- **Do not** use gdb for this bug (masks the timing).
+- **Do not** assume `^Z` is optional. The 2026-10-31 handoff's
+  "Run 3 crashed without `^Z`" was one data point; today's clean
+  run passed 28/28 without `^Z` on the exact same tree.
+
+### Files to check in the fresh session
+
+- `pmm.c`: `bitmap_clear`, `bitmap_set`, `pmm_alloc_page_for_tables`,
+  `pmm_scan_zone`, `pmm_page_info` bookkeeping.
+- `vmm.c`: `vmm_clone_page_table` (`memset` at `vmm.c:329`),
+  `vmm_map_page_in_cr3` (`memset` at `vmm.c:164`, `vmm.c:463`).
+- `process.c`: `process_create`, `process_free_clone`,
+  `process_cleanup_elf_pages`, `process_reclaim`.
+- `elf.c`: `elf_add_page_to_pcb` (defensive check: reject if `phys`
+  is inside the page-table range or a known PT).
+
+The `.bak-before-*` files from 2026-11-01 are all reverted. The tree
+at `23826a8` (== `d1ae213` + this handoff) is the clean starting
+point.
 
 ## THE OTHER OPEN BUG: `^C` -> the console dies after `/ #`
 
