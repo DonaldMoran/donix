@@ -6199,7 +6199,32 @@ long sys_wait4(long pid, int* user_status, int options) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)ECHILD;
 
-    uint64_t target = (pid <= 0) ? (uint64_t)-1 : (uint64_t)pid;
+    /*
+     * Linux wait4 pid argument forms:
+     *   pid  >  0  wait for that pid
+     *   pid ==  0  wait for any child in the caller's pgroup
+     *   pid == -1  wait for any child
+     *   pid <  -1  wait for any child in process group -pid
+     * The old code collapsed every pid <= 0 to "any child",
+     * which is wrong for the group forms: busybox ash's job
+     * control waits on the pipeline's pgroup, not on one pid,
+     * and a wait4(-pgid) treated as wait4(-1) leaves the
+     * group's zombies un-reaped and the parent blocked.
+     */
+    enum { WAIT_ANY = 0, WAIT_PID = 1, WAIT_PGRP = 2 } wait_mode;
+    uint64_t wait_val = 0;
+    if (pid > 0) {
+        wait_mode = WAIT_PID;
+        wait_val  = (uint64_t)pid;
+    } else if (pid == 0) {
+        wait_mode = WAIT_PGRP;
+        wait_val  = self->pgrp;
+    } else if (pid == -1) {
+        wait_mode = WAIT_ANY;
+    } else {
+        wait_mode = WAIT_PGRP;
+        wait_val  = (uint64_t)(-pid);
+    }
 
     for (;;) {
         pcb_t* zombie  = NULL;
@@ -6227,7 +6252,8 @@ long sys_wait4(long pid, int* user_status, int options) {
             pcb_t* c = process_get_pcb(i);
             if (!c) continue;
             if (c->parent_pid != self->pid) continue;
-            if (target != (uint64_t)-1 && c->pid != target) continue;
+            if (wait_mode == WAIT_PID && c->pid != wait_val) continue;
+            if (wait_mode == WAIT_PGRP && c->pgrp != wait_val) continue;
 
             if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) {
                 zombie = c;
@@ -6294,6 +6320,15 @@ long sys_wait4(long pid, int* user_status, int options) {
                 status = (zombie->exit_status & 0xff) << 8;
             }
 
+            /*
+             * Do NOT restore fg here.  This path runs on every
+             * reap; a multi-child job like canary --full would
+             * have fg reset to the shell's pgrp after the first
+             * child, and the remaining children would be
+             * unreachable by ^C.  fg is restored by process_exit's
+             * console_fg_pgrp_reclaim_if, which now only resets
+             * when the pgrp has no live member left.
+             */
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
@@ -6333,15 +6368,37 @@ long sys_wait4(long pid, int* user_status, int options) {
         __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
-        self->wait_pid = target;
+        self->wait_pid = (wait_mode == WAIT_PID) ? wait_val
+                                                    : (uint64_t)-1;
+        /*
+         * Foreground handoff.  Busybox ash in this tree calls
+         * setpgid(child, 0) for a command -- moving it to its own
+         * pgrp -- but does not reliably call tcsetpgrp, so
+         * g_console_fg_pgrp stayed the shell's own pgrp and a ^C
+         * targeted the shell's group, not the child's.  The CRP
+         * trace showed it: fg=3 (shell), canary in pgrp 4, ^C
+         * signalled nothing the child would see.  Fix: when the
+         * shell blocks in wait4 for a specific pid whose pgrp is
+         * different, that pgrp is the foreground.
+         */
+        if (wait_mode == WAIT_PID) {
+            pcb_t* _child = process_find_by_pid(wait_val);
+            extern uint64_t console_owner_pgrp_get(void);
+            extern void     console_fg_pgrp_set(uint64_t pgrp);
+            if (_child && _child->pgrp != self->pgrp &&
+                _child->pgrp != console_owner_pgrp_get()) {
+                console_fg_pgrp_set(_child->pgrp);
+            }
+        }
         RACE_P1_BLOCK(self->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAIT4_BLOCK);
-        RACE_P11_BLOCK(self->pid, target);
+        RACE_P11_BLOCK(self->pid,
+                         (wait_mode == WAIT_PID) ? wait_val : 0);
 
         #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
-        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print_dec((wait_mode == WAIT_PID) ? wait_val : 0);
         serial_print(" blocking\n");
         #endif
         
@@ -6364,7 +6421,8 @@ long sys_wait4(long pid, int* user_status, int options) {
                 pcb_t* c = process_get_pcb(i);
                 if (!c) continue;
                 if (c->parent_pid != self->pid) continue;
-                if (target != (uint64_t)-1 && c->pid != target) continue;
+                if (wait_mode == WAIT_PID && c->pid != wait_val) continue;
+                if (wait_mode == WAIT_PGRP && c->pgrp != wait_val) continue;
                 if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) { late_zombie = c; break; }
                 /*
                  * A stopped child, same window as the zombie above:
@@ -6436,7 +6494,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
-        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print_dec((wait_mode == WAIT_PID) ? wait_val : 0);
         serial_print(" yielding state=");
         serial_print_dec((uint64_t)self->state);
         serial_print("\n");
@@ -6582,6 +6640,37 @@ static long console_read(void* buf, size_t count) {
             }
         }
 
+        {
+            /*
+             * Only the console foreground process group may block
+             * on read(0).  A stale reader from a previous foreground
+             * group (a child that ^C did not kill because it was in
+             * a different pgrp) blocks here too, and then two
+             * processes are blocked on BLOCK_KIND_NONE and the
+             * next keystroke wakes whichever the timer picks
+             * first -- the wedge.  Refuse with -EIO so the stale
+             * reader returns, the shell reads, and the console
+             * stays live.
+             *
+             * console_fg_pgrp_get() is 0 before any tcgetpgrp; in
+             * that window (boot) we permit the block, which is the
+             * pre-existing behavior.
+             */
+            uint64_t _fg = console_fg_pgrp_get();
+            uint64_t _owner = console_owner_pgrp_get();
+            /*
+             * Permitted readers: the fg pgrp, or the owner
+             * (the boot shell).  The owner is always allowed to
+             * read -- the console is its tty, and after a ^C the
+             * fg pgrp is the killed child's group until
+             * tcsetpgrp runs.  Only a *third* pgrp is refused:
+             * that is the stale reader case the pool walk found.
+             */
+            if (_fg != 0 && self->pgrp != _fg && self->pgrp != _owner) {
+                __asm__ volatile("sti");
+                return -(long)EIO_;
+            }
+        }
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_NONE;
         __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
@@ -8787,6 +8876,27 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                         __asm__ volatile("hlt");
                         continue;
                     }
+                    /*
+                     * Signals slice 6: a pending, unblocked signal
+                     * interrupts the poll.  The shell parks here
+                     * waiting for keyboard input, and a ^C must
+                     * return -EINTR so the line editor can reset
+                     * without waiting for a newline.  Without this
+                     * check the shell only wakes on the next
+                     * keystroke, which is why '^C then Enter' was
+                     * required.  Same shape as console_read's
+                     * EINTR check: the sys_kill / console raise
+                     * set sig_pending and marked us READY; take
+                     * -EINTR now rather than block on a poll that
+                     * the signal is going to interrupt.
+                     */
+                    if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                        scheduler_ready_queue_remove(self);
+                        self->state      = PROC_STATE_RUNNING;
+                        self->block_kind = BLOCK_KIND_NONE;
+                        __asm__ volatile("sti");
+                        return -(long)4;   /* -EINTR */
+                    }
                     self->state = PROC_STATE_BLOCKED;
                     self->block_kind = BLOCK_KIND_NONE;
             /* PROBE (session 61): save the live caller-saved
@@ -8804,8 +8914,9 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
             __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
 
 
-                    __asm__ volatile("sti");
-                    __asm__ volatile("hlt");
+                    process_yield();
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
                     /* Woken by irq1_handler ->
                      * process_wake_all_blocked, which sets
                      * state = READY and re-adds us to the
@@ -8974,6 +9085,16 @@ long sys_getpgrp(void) {
     return sys_getpgid_impl(0);
 }
 
+/*
+ * Deferred setpgid: busybox ash calls setpgid(child_pid, pgid)
+ * before the child is scheduled.  process_find_by_pid returns
+ * NULL then, and the child keeps the inherited pgrp.  A ^C to
+ * the pipeline's group then misses it.  Record the request
+ * here and apply it in sys_fork after process_create.
+ */
+struct deferred_setpgid { long pid; long pgid; };
+static struct deferred_setpgid g_defer_pgid[16];
+
 long sys_setpgid(long pid, long pgid) {
     pcb_t* target;
     if (pid == 0) {
@@ -8982,14 +9103,53 @@ long sys_setpgid(long pid, long pgid) {
     } else {
         target = process_find_by_pid((uint64_t)pid);
     }
-    if (!target) return -(long)ESRCH_;
+    if (!target) {
+        /* Defer: the child may not be created yet. */
+        for (int _i = 0; _i < 16; _i++) {
+            if (g_defer_pgid[_i].pid == 0 || g_defer_pgid[_i].pid == pid) {
+                g_defer_pgid[_i].pid  = pid;
+                g_defer_pgid[_i].pgid = (pgid == 0) ? pid : pgid;
+                return 0;
+            }
+        }
+        return -(long)ESRCH_;
+    }
     if (pid == 1) return -(long)EPERM_;
     if (pgid == 0) pgid = pid;
 
     uint64_t saved_flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    uint64_t _was_child = (target != process_get_current()) ? 1 : 0;
     target->pgrp = (uint64_t)pgid;
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    /*
+     * Foreground handoff.  busybox ash in this tree setpgid's a
+     * child into a new pgrp but does not call tcsetpgrp, so
+     * g_console_fg_pgrp stayed the shell's own group and every ^C
+     * missed the child (CRP trace: shell pgrp 3 blocked in wait4,
+     * canary pgrp 4 running, ^C target pgrp=3).  On Unix tcsetpgrp
+     * would have run at this point; do it in the kernel.
+     */
+    {
+        extern uint64_t console_owner_pgrp_get(void);
+        extern void     console_fg_pgrp_set(uint64_t pgrp);
+        uint64_t _owner = console_owner_pgrp_get();
+        /*
+         * Fire regardless of who called setpgid.  Busybox ash's
+         * child path is setpgid(0, 0) from the child itself; with
+         * the earlier _was_child gate that was false (target ==
+         * current), and the handoff never ran.  The trace showed
+         * the canary in pgrp 4 with g_console_fg_pgrp still 3.
+         * Unconditional is safe: the shell's own setpgid(0, 0)
+         * either sets fg to itself (pgid == owner once owner is
+         * latched) or runs before owner is latched; either way the
+         * prompt stays a no-op because console_raise_pending skips
+         * the owner pid.
+         */
+        if ((uint64_t)pgid != 0 && (uint64_t)pgid != _owner) {
+            console_fg_pgrp_set((uint64_t)pgid);
+        }
+    }
     return 0;
 }
 
@@ -9398,6 +9558,13 @@ static uint64_t g_console_fg_pgrp = 0;
  * guard wrong.
  */
 static uint64_t g_console_owner_pgrp = 0;
+/* The shell's pid, latched at the same moment as the owner pgrp.
+ * console_raise_pending skips this pid when delivering ^C, so
+ * the shell never signals itself.  The prior test skipped only
+ * pid 1; on a boot where the shell is not pid 1, the shell was a
+ * ^C target and took SIGINT at the next safe point -- the canary
+ * dying to its own ^C was the observable. */
+static uint64_t g_console_owner_pid = 0;
 
 /*
  * Read the console foreground pgrp for the keyboard IRQ.
@@ -9426,6 +9593,51 @@ uint64_t console_owner_pgrp_get(void) {
     v = g_console_owner_pgrp;
     __asm__ volatile("sti");
     return v;
+}
+
+/* The shell's pid (latched with the owner pgrp).  Read by
+ * console_raise_pending to skip the shell when delivering ^C. */
+uint64_t console_owner_pid_get(void) {
+    uint64_t v;
+    __asm__ volatile("cli");
+    v = g_console_owner_pid;
+    __asm__ volatile("sti");
+    return v;
+}
+
+/* Write the console foreground pgrp.  Used by sys_wait4's
+ * foreground handoff: when the shell blocks waiting on a child
+ * in its own pgrp, that pgrp becomes the foreground, and when
+ * the child is reaped the shell's pgrp does again.  cli is
+ * held because g_console_fg_pgrp is shared with the keyboard
+ * IRQ (contract rule 1). */
+void console_fg_pgrp_set(uint64_t pgrp) {
+    __asm__ volatile("cli");
+    g_console_fg_pgrp = pgrp;
+    __asm__ volatile("sti");
+}
+
+/* Called from process_exit: if the exiting process was in the
+ * console foreground pgrp, put the owner back to the fg.  Console
+ * fg pgrp is shared state; cli protects it (contract rule 1). */
+void console_fg_pgrp_reclaim_if(uint64_t pgrp) {
+    extern int process_pgrp_has_child(uint64_t pgrp);
+    __asm__ volatile("cli");
+    /*
+     * Reclaim fg to the owner only when the exiting process was
+     * in the current fg pgrp AND no other live process remains
+     * in that pgrp.  A multi-child job (canary --full) keeps the
+     * pgrp as fg across every child exit until the last one; if
+     * this reset fired on each exit, fg would revert to the shell
+     * after the first child and later children would be
+     * unreachable by ^C.
+     */
+    if (pgrp != 0 && pgrp == g_console_fg_pgrp) {
+        if (!process_pgrp_has_child(pgrp)) {
+            g_console_fg_pgrp = g_console_owner_pgrp;
+        }
+    }
+    __asm__ volatile("sti");
 }
 
 static int fd_is_console(int fd) {
@@ -9504,14 +9716,32 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
              */
             uint32_t fg;
             __asm__ volatile("cli");
+            /*
+             * Do NOT latch g_console_owner_pgrp/g_console_fg_pgrp
+             * from the first caller.  The first caller of
+             * tcgetpgrp is not necessarily the shell -- on the
+             * boot that produced this CRP trace it was pid 2, a
+             * wait4-blocked child, and the latch then set
+             * g_console_fg_pgrp = g_console_owner_pgrp = 2, so
+             * every later ^C targeted pgrp 2 (which held only the
+             * wait4-blocked parent) and never the actual
+             * foreground child (pid 6, pgrp 4).  The shell (pid 3,
+             * pgrp 3) then saw tcgetpgrp(0)=2 != getpgrp()=3,
+             * assumed it was NOT foreground, and never called
+             * tcsetpgrp for its children, so fg never advanced.
+             *
+             * The pre-existing behavior for an unset fg was to
+             * return the caller's own pgrp.  Keep that, but do
+             * not persist it: the owner is latched at the first
+             * tcsetpgrp (see TIOCSPGRP) instead, where the caller
+             * is necessarily the shell.
+             */
             if (g_console_fg_pgrp == 0) {
                 pcb_t* self = process_get_current();
-                if (self) {
-                    g_console_fg_pgrp    = self->pgrp;
-                    g_console_owner_pgrp = self->pgrp;   /* set once */
-                }
+                fg = self ? (uint32_t)self->pgrp : 0;
+            } else {
+                fg = (uint32_t)g_console_fg_pgrp;
             }
-            fg = (uint32_t)g_console_fg_pgrp;
             __asm__ volatile("sti");
             /*
              * The wire type is pid_t (4 bytes).  musl's tcgetpgrp
@@ -9543,6 +9773,13 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
                 return -(long)EFAULT_;
             }
             __asm__ volatile("cli");
+            if (g_console_owner_pgrp == 0) {
+                pcb_t* self = process_get_current();
+                if (self) {
+                    g_console_owner_pgrp = self->pgrp;
+                    g_console_owner_pid  = self->pid;
+                }
+            }
             g_console_fg_pgrp = (uint64_t)fg32;
             __asm__ volatile("sti");
             return 0;
@@ -11473,6 +11710,25 @@ long sys_fork(void) {
      */
     child->brk_virt = parent->brk_virt;
 
+    /* POSIX: a fork child inherits the parent's process group (only a
+     * session leader gets a new one).  Without this, every forked child
+     * stayed in its own group (process_create sets pgrp = pid), so a ^C
+     * or ^Z to the shell's foreground group never reached the pipeline
+     * children: the pool walk showed four zombies with pgrp == pid, and
+     * the ^C print fg=<shell group> matched none of them.  The wait4
+     * parent then blocked forever and the console stalled. */
+    child->pgrp = parent->pgrp;
+    /* Apply a deferred setpgid the parent issued before we
+     * created this child.  See sys_setpgid. */
+    extern struct deferred_setpgid g_defer_pgid[16];
+    for (int _i = 0; _i < 16; _i++) {
+        if (g_defer_pgid[_i].pid == (long)child->pid) {
+            child->pgrp = (uint64_t)g_defer_pgid[_i].pgid;
+            g_defer_pgid[_i].pid = 0;
+            g_defer_pgid[_i].pgid = 0;
+            break;
+        }
+    }
     child->parent_pid = parent->pid;
     child->state = PROC_STATE_READY;
     scheduler_ready_queue_add(child);
@@ -11568,6 +11824,7 @@ uint64_t syscall_dispatch(uint64_t num,
 
     uint64_t result = 0;
     switch (num) {
+        { extern void console_raise_pending(void); console_raise_pending(); }
 
         /* --- Linux x86_64 numbers, strictly ascending --- */
         case SYS_READ:            result = (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2); break;

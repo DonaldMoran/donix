@@ -576,6 +576,23 @@ void __attribute__((noreturn)) process_exit(void) {
 
     exiting->state = PROC_STATE_TERMINATED;
     scheduler_ready_queue_remove(exiting);
+    {
+        extern void console_fg_pgrp_reclaim_if(uint64_t pgrp);
+        console_fg_pgrp_reclaim_if(exiting->pgrp);
+    }
+    /*
+     * If this process was the console foreground pgrp, hand the
+     * console back to the owner (the boot shell).  Without this a
+     * ^C that kills the fg child leaves g_console_fg_pgrp naming
+     * a dead group, and the shell's next read(0) is refused by
+     * console_read's fg check -- the console is stuck.  Owner
+     * reclaim mirrors what the shell's tcsetpgrp would do; we do
+     * it here because the shell is not yet running.
+     */
+    {
+        extern void console_fg_pgrp_reclaim_if(uint64_t pgrp);
+        console_fg_pgrp_reclaim_if(exiting->pgrp);
+    }
 
     if (process_get_current() == exiting) {
         process_set_current(NULL);

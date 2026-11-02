@@ -729,6 +729,28 @@ void process_wake_all_blocked(void) {
 }
 
 /*
+ * Return 1 if any live process in pgrp is not the shell
+ * (pid 1) and not the idle (pid 1).  Used by the ^C raise to
+ * decide whether there is a foreground child to interrupt.
+ * 'Shell' is identified by pid 1 -- the boot shell's pid in
+ * this tree.  If the boot shell is not pid 1, the test still
+ * holds: fg will typically have been set by tcsetpgrp to a
+ * child group, and any non-pid-1 member counts as a child.
+ */
+int process_pgrp_has_child(uint64_t pgrp) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcb_t* p = &pcb_pool[i];
+        if (p->state == PROC_STATE_UNUSED) continue;
+        if (p->state == PROC_STATE_ZOMBIE) continue;
+        if (p->state == PROC_STATE_TERMINATED) continue;
+        if (p->pgrp != pgrp) continue;
+        if (p->pid == 1) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Wake the parent of `child` if it is blocked in waitpid on this
  * child, or on any child (wait_pid == (uint64_t)-1).
  *
