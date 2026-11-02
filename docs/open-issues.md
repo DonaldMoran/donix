@@ -1,7 +1,8 @@
 # Open issues
 
-**Last updated: 2026-10-30** (third session; HEAD on `dev` at
-`701dcc1`).  This file lists **only open issues**.  Closed items
+**Last updated: 2026-11-02 (evening)** (HEAD on `dev` at
+`162a1d3` before the handoff/open-issues close-pair commit).
+This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
 defect, a missing feature, or an unverified claim about the tree.
@@ -150,6 +151,25 @@ call it closed on one clean run: it is a standing question about
 the pipe wake counts, separate from signals.  If it reproduces
 as a hang, the ring's `P13` events are the place to read.
 
+**The TCG scheduler fault (`./run tcg`, 2026-11-02).**  Open,
+separate.  Under TCG (not KVM), a `sh` child resumed with
+`rsp=0` and a bad cr3, faulted at `RIP=0x451CC3` on
+`CR2=0xFFFFFFFFFFFFFFF8` (`error 0x6`, write, user,
+not-present), with a recursive PML4 walk not present
+(`pml4=511 pdpt=511 pd=511 pt=511`, `pdpte=0`).  The
+scheduler's `SWITCH-REFUSE: next pid=46 name=sh rsp outside
+stack -> idle` fired *after* the bad dispatch -- the frame was
+already broken when dispatched.  `sha256sum ABC` failed
+(`got: []`) in the same run, likely the same process dying.
+
+This is **distinct** from the canary `.text` PTE zeroing (which
+is KVM-timing, `error 0x14`, `pte=0`, a 4 KB PT) and from the
+pipe7e `#GP` (which was `error 0x4640` at `context_switch_resume`'s
+`iretq`, a bad GDT segment selector `0x8C8`, closed by
+`0196d66`/`162a1d3`).  It is a context-switch / cr3 bug under
+TCG.  Needs its own session: move the `SWITCH-REFUSE` guard
+before dispatch; find who zeroes `rsp`.
+
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
 closed.  The `20261003-vmm-map-diag` instrumentation (the three
@@ -180,6 +200,24 @@ address, which is the 7b/7e signature.  The boot's capture
 contained exactly one `#PF`; the nine signal probes were clean.
 The kernel killed the faulting busybox and returned to the
 fallback `musl_sh` prompt; the system survived.
+
+> **2026-11-02 evening cross-reference.**  The canary `.text` `#PF`
+> that was tracked in `handoff.md` (not in this file) faulted at
+> `RIP=CR2=0x413966` before 2026-11-02, and at `0x450630` on an
+> unlucky post-`7cb26fb` run -- `error 0x14` (present, user, fetch),
+> `pte=0`, canary's own cr3.  The `0x413962` `#PF` described in the
+> preceding paragraph is on the *same page* as the `0x413966`
+> canary fault (offset 4 bytes).  Different `error` code (`0x5`
+> read vs `0x14` fetch) and different process (`echo hi | wc` vs
+> `canary --full`), so they are not proven to be the same fault --
+> but they are close enough to flag.  The canary `.text` `#PF` did
+> not reproduce after the 2026-11-02 IF fix (`162a1d3`) and is
+> closed pending the VA-gated probe (Session 2, the `v0.6.19`
+> release gate).  If that probe is silent across all boots AND
+> this `0x413962` `#PF` also fails to reproduce on the same boots,
+> that is evidence they share a root cause.  If the canary probe
+> is silent but this `#PF` recurs, they are separate and this
+> entry stays.  **Do not merge them without that evidence.**
 
 Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
 boot all completed cleanly; a probe-then-5000 run on a later
