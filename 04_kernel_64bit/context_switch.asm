@@ -3,6 +3,7 @@ default rel
 
 section .text
 global context_switch
+extern g_ticks
 
 ; Correct pcb_t offsets (from process.h). These MUST match the C struct
 ; layout exactly. Any change to pcb_t that shifts a field used here must
@@ -421,6 +422,251 @@ context_switch_resume:
     mov al, '='
     out dx, al
     EMIT_HEX rbx
+    mov al, 0x0A
+    out dx, al
+    ; --- EXTENDED-C-DUMP: the 15 GPR slots of the frame at rsp ---
+    mov al, 0x0A
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x30
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x00]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x08]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x32
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x10]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x33
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x18]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x34
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x20]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x35
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x28]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x36
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x30]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x37
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x38]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x38
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x40]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x39
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x48]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, 0x30
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x50]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x58]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, 0x32
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x60]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, 0x33
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x68]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x47
+    out dx, al
+    mov al, 0x31
+    out dx, al
+    mov al, 0x34
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [rsp + 0x70]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    ; --- EXTENDED-C-DUMP: PCB fields from r12 = next ---
+    mov al, 0x0A
+    out dx, al
+    mov al, 0x4b
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [r12 + 0x158]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x55
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [r12 + 0x610]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x56
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [r12 + 0x030]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x4b
+    out dx, al
+    mov al, 0x56
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [r12 + 0x048]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x4b
+    out dx, al
+    mov al, 0x54
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rbx, [r12 + 0x050]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    mov al, 0x54
+    out dx, al
+    mov al, 0x6b
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rax, g_ticks
+    mov rbx, [rax]
+    EMIT_HEX rbx
+    mov al, ' '
+    out dx, al
+    ; --- EXTENDED-C-DUMP: next->name (up to 32 bytes) ---
+    mov al, 0x0A
+    out dx, al
+    mov al, 'N'
+    out dx, al
+    mov al, 'M'
+    out dx, al
+    mov al, '='
+    out dx, al
+    mov rcx, 0
+.c_dump_name_loop:
+    cmp rcx, 32
+    jae .c_dump_name_done
+    mov al, [r12 + rcx + 0x008]
+    test al, al
+    jz .c_dump_name_done
+    out dx, al
+    inc rcx
+    jmp .c_dump_name_loop
+.c_dump_name_done:
+    mov al, 0x0A
+    out dx, al
     mov al, 0x0A
     out dx, al
     hlt
