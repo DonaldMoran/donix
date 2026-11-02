@@ -588,11 +588,18 @@ void __attribute__((noreturn)) process_exit(void) {
      * console_read's fg check -- the console is stuck.  Owner
      * reclaim mirrors what the shell's tcsetpgrp would do; we do
      * it here because the shell is not yet running.
+     *
+     * NOTE: reclaim_if ends in sti by design (it is called from
+     * sys_wait4 and the scheduler paths with IF already 1).  It
+     * used to be called here twice; the second call was a
+     * duplicate introduced by 7cb26fb.  Removed.  The IF
+     * discipline inside process_exit (which holds cli from its
+     * top) is handled by converting reclaim_if to the
+     * pushfq/popfq idiom in the next commit; until then this
+     * call leaves IF=1 for the rest of process_exit, which is
+     * the pipe7e #GP.  Do NOT re-order: the duplicate removal
+     * must land first so the IF fix is tested in isolation.
      */
-    {
-        extern void console_fg_pgrp_reclaim_if(uint64_t pgrp);
-        console_fg_pgrp_reclaim_if(exiting->pgrp);
-    }
 
     if (process_get_current() == exiting) {
         process_set_current(NULL);
