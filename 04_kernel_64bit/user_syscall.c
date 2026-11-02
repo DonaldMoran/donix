@@ -9577,10 +9577,11 @@ static uint64_t g_console_owner_pid = 0;
  * yet"; the caller must not signal group 0.
  */
 uint64_t console_fg_pgrp_get(void) {
+    uint64_t saved_flags;
     uint64_t v;
-    __asm__ volatile("cli");
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
     v = g_console_fg_pgrp;
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return v;
 }
 
@@ -9588,20 +9589,22 @@ uint64_t console_fg_pgrp_get(void) {
  * suppress a stop that would deadlock the console.  Under cli like
  * its sibling. */
 uint64_t console_owner_pgrp_get(void) {
+    uint64_t saved_flags;
     uint64_t v;
-    __asm__ volatile("cli");
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
     v = g_console_owner_pgrp;
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return v;
 }
 
 /* The shell's pid (latched with the owner pgrp).  Read by
  * console_raise_pending to skip the shell when delivering ^C. */
 uint64_t console_owner_pid_get(void) {
+    uint64_t saved_flags;
     uint64_t v;
-    __asm__ volatile("cli");
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
     v = g_console_owner_pid;
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return v;
 }
 
@@ -9612,9 +9615,10 @@ uint64_t console_owner_pid_get(void) {
  * held because g_console_fg_pgrp is shared with the keyboard
  * IRQ (contract rule 1). */
 void console_fg_pgrp_set(uint64_t pgrp) {
-    __asm__ volatile("cli");
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
     g_console_fg_pgrp = pgrp;
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
 /* Called from process_exit: if the exiting process was in the
@@ -9622,7 +9626,8 @@ void console_fg_pgrp_set(uint64_t pgrp) {
  * fg pgrp is shared state; cli protects it (contract rule 1). */
 void console_fg_pgrp_reclaim_if(uint64_t pgrp) {
     extern int process_pgrp_has_child(uint64_t pgrp);
-    __asm__ volatile("cli");
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
     /*
      * Reclaim fg to the owner only when the exiting process was
      * in the current fg pgrp AND no other live process remains
@@ -9637,7 +9642,7 @@ void console_fg_pgrp_reclaim_if(uint64_t pgrp) {
             g_console_fg_pgrp = g_console_owner_pgrp;
         }
     }
-    __asm__ volatile("sti");
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
 static int fd_is_console(int fd) {
