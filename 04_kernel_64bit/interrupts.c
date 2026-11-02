@@ -40,6 +40,15 @@ extern volatile uint64_t g_arch_prctl_addr[32];
  * Ctrl-Z.  Leave 0 in any committed tree; flip to 1 only to
  * capture a run. */
 #define TRACE_CTRLZ 0
+/* ^C / console-signal trace.  The CRP dump in console_raise_pending
+ * and the CTRLC-IRQ line in irq1_handler are success-path
+ * diagnostics: they fire on every ^C on a healthy system and scroll
+ * the prompt away.  Failure-path signal is the delivery itself, not
+ * these lines.  Leave 0 in any committed tree; flip to 1 to capture
+ * a run. */
+#ifndef TRACE_CTRLC
+#define TRACE_CTRLC 0
+#endif
 #define KBD_STATUS 0x64
 
 /* Deferred console signal (^C): irq1_handler records the target group and
@@ -54,6 +63,7 @@ void console_raise_pending(void) {
     g_console_sig_pgrp = 0; g_console_sig_no = 0;
     if (pgrp > 1 && sig > 0) {
         extern uint64_t console_owner_pid_get(void);
+#if TRACE_CTRLC
         serial_lock();
         serial_print("CRP: target pgrp="); serial_print_dec((uint64_t)pgrp);
         serial_print(" sig="); serial_print_dec((uint64_t)sig);
@@ -72,6 +82,7 @@ void console_raise_pending(void) {
             serial_print("\n");
         }
         serial_unlock();
+#endif
         /* Pure pending-bit set: NO sys_kill here.  sys_kill can terminate
          * and context-switch, which is fatal in an IRQ handler (proven:
          * it kills IRQ1/the timer).  Each target takes the signal at its
@@ -1152,11 +1163,13 @@ void irq1_handler(void) {
     if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2E) {
         outb(PIC1_CMD, (PIC_EOI | 1));
         long fg    = (long)console_fg_pgrp_get();
+#if TRACE_CTRLC
         long owner = (long)console_owner_pgrp_get();
         serial_lock();
         serial_print("CTRLC-IRQ fg="); serial_print_dec((uint64_t)(fg<0?0:fg));
         serial_print(" owner="); serial_print_dec((uint64_t)(owner<0?0:owner));
         serial_print("\n"); serial_unlock();
+#endif
         /*
          * Deliver ^C to the foreground pgrp when it contains at
          * least one process other than the shell / idle.  The

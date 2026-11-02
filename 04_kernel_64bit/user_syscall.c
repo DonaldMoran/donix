@@ -8231,6 +8231,10 @@ long sys_pause(void) {
  * it gets a clean answer.
  */
 long sys_rt_sigsuspend(const void* user_mask, size_t size) {
+    /* rt_sigsuspend(2) takes size_t for the sigset size; this
+     * implementation does not use it (the mask is a fixed
+     * kernel-sized set).  Keep the parameter for the ABI. */
+    (void)size;
     /*
      * Linux x86_64 rt_sigsuspend(2) -- syscall 130.
      *
@@ -9133,7 +9137,6 @@ long sys_setpgid(long pid, long pgid) {
 
     uint64_t saved_flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
-    uint64_t _was_child = (target != process_get_current()) ? 1 : 0;
     target->pgrp = (uint64_t)pgid;
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     /*
