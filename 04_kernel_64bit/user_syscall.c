@@ -5338,9 +5338,9 @@ static void exec_free_and_unmap_user_pages(pcb_t* pcb) {
              va < regions[r].end;
              va += 0x1000) {
 
-            uint64_t phys = vmm_get_phys_from_cr3(pcb->cr3, va);
-            if (!phys) continue;
-            phys &= ~0xFFFULL;
+            uint64_t* pte = vmm_pte_ptr_in_cr3(pcb->cr3, va);
+            if (!pte || !(*pte & PT_PRESENT)) continue;
+            uint64_t phys = pte_phys(*pte) & ~0xFFFULL;
 
             int owned = 0;
             for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
@@ -5348,7 +5348,21 @@ static void exec_free_and_unmap_user_pages(pcb_t* pcb) {
             }
             if (!owned) continue;
 
-            vmm_unmap_page_in_cr3(pcb->cr3, va);
+            /* One walk done; clear and flush inline (same
+             * active_cr3 guard vmm_unmap_page_in_cr3 uses).
+             * The owned scan and the invlpg are preserved:
+             * the owned scan because brk/mmap pages are not on
+             * elf_page_list, the invlpg because exec does not
+             * write %cr3 itself (the next context switch does),
+             * so the old CR3 TLB is still live until then. */
+            *pte = 0;
+            {
+                uint64_t active_cr3;
+                asm volatile("mov %%cr3, %0" : "=r"(active_cr3));
+                if ((active_cr3 & ~0xFFFULL) == (pcb->cr3 & ~0xFFFULL)) {
+                    asm volatile("invlpg (%0)" : : "r"(va) : "memory");
+                }
+            }
         }
     }
 

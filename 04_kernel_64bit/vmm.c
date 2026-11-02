@@ -647,3 +647,34 @@ void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt) {
         asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
     }
 }
+
+/*
+ * Walk cr3 to the PTE for virt and return a pointer to it, or
+ * NULL if the PML4/PDPT/PD/PT or the PTE is not present.
+ *
+ * One walk.  The caller decides what to do with the PTE (read it,
+ * test it, clear it) and whether to invlpg.
+ * exec_free_and_unmap_user_pages uses this to replace its two-walk
+ *   vmm_get_phys_from_cr3(cr3, va) + vmm_unmap_page_in_cr3(cr3, va)
+ * with one walk per mapped page on every exec.
+ *
+ * Does NOT invlpg.  Does NOT clear.  Returns NULL for a 2 MB huge
+ * page at the PD level, because the only caller walks 4 KB user
+ * regions that are never backed by a huge page at the PD level.
+ */
+uint64_t* vmm_pte_ptr_in_cr3(uint64_t cr3, uint64_t virt) {
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(cr3);
+    uint32_t pml4_idx = (virt >> 39) & 0x1FF;
+    uint32_t pdpt_idx = (virt >> 30) & 0x1FF;
+    uint32_t pd_idx   = (virt >> 21) & 0x1FF;
+    uint32_t pt_idx   = (virt >> 12) & 0x1FF;
+
+    if (!(pml4[pml4_idx] & PT_PRESENT)) return NULL;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pte_phys(pml4[pml4_idx]));
+    if (!(pdpt[pdpt_idx] & PT_PRESENT)) return NULL;
+    uint64_t* pd = (uint64_t*)phys_to_virt(pte_phys(pdpt[pdpt_idx]));
+    if (!(pd[pd_idx] & PT_PRESENT)) return NULL;
+    if (pd[pd_idx] & PT_HUGE) return NULL;
+    uint64_t* pt = (uint64_t*)phys_to_virt(pte_phys(pd[pd_idx]));
+    return &pt[pt_idx];
+}
