@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-11-02 (evening)** (HEAD on `dev` at
-`162a1d3` before the handoff/open-issues close-pair commit).
+**Last updated: 2026-11-02 (late)** (HEAD on `dev` at `873be27`,
+tag `reset-baseline-873be27`).
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -151,25 +151,6 @@ call it closed on one clean run: it is a standing question about
 the pipe wake counts, separate from signals.  If it reproduces
 as a hang, the ring's `P13` events are the place to read.
 
-**The TCG scheduler fault (`./run tcg`, 2026-11-02).**  Open,
-separate.  Under TCG (not KVM), a `sh` child resumed with
-`rsp=0` and a bad cr3, faulted at `RIP=0x451CC3` on
-`CR2=0xFFFFFFFFFFFFFFF8` (`error 0x6`, write, user,
-not-present), with a recursive PML4 walk not present
-(`pml4=511 pdpt=511 pd=511 pt=511`, `pdpte=0`).  The
-scheduler's `SWITCH-REFUSE: next pid=46 name=sh rsp outside
-stack -> idle` fired *after* the bad dispatch -- the frame was
-already broken when dispatched.  `sha256sum ABC` failed
-(`got: []`) in the same run, likely the same process dying.
-
-This is **distinct** from the canary `.text` PTE zeroing (which
-is KVM-timing, `error 0x14`, `pte=0`, a 4 KB PT) and from the
-pipe7e `#GP` (which was `error 0x4640` at `context_switch_resume`'s
-`iretq`, a bad GDT segment selector `0x8C8`, closed by
-`0196d66`/`162a1d3`).  It is a context-switch / cr3 bug under
-TCG.  Needs its own session: move the `SWITCH-REFUSE` guard
-before dispatch; find who zeroes `rsp`.
-
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
 closed.  The `20261003-vmm-map-diag` instrumentation (the three
@@ -211,13 +192,11 @@ fallback `musl_sh` prompt; the system survived.
 > read vs `0x14` fetch) and different process (`echo hi | wc` vs
 > `canary --full`), so they are not proven to be the same fault --
 > but they are close enough to flag.  The canary `.text` `#PF` did
-> not reproduce after the 2026-11-02 IF fix (`162a1d3`) and is
-> closed pending the VA-gated probe (Session 2, the `v0.6.19`
-> release gate).  If that probe is silent across all boots AND
-> this `0x413962` `#PF` also fails to reproduce on the same boots,
-> that is evidence they share a root cause.  If the canary probe
-> is silent but this `#PF` recurs, they are separate and this
-> entry stays.  **Do not merge them without that evidence.**
+> not reproduce after the 2026-11-02 IF fix (`162a1d3`).  The
+> VA-gated probe that was to close it was in the discarded stash
+> and was dropped on 2026-11-02; it is not in the tree.  If this
+> `0x413962` `#PF` recurs, read it on its own.  **Do not merge
+> them without evidence.**
 
 Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
 boot all completed cleanly; a probe-then-5000 run on a later
@@ -323,49 +302,3 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 - `process_dump_all`'s `DETACHED` state: a process READY with
   `prev == NULL && next == NULL` is labeled DETACHED, which may
   mask a stranded-process bug.
-
----
-
-## Test-design notes
-
-> **This section does not belong in this file.**  It should move
-> to `handoff.md`'s canary section in the next documentation
-> round.  It is here because it was here.
-
-- **The old `musl_sh` ash-only caveats are gone.**  Redirection
-  and pipeline tests are valid from `donix>` as well as ash.
-- **Framebuffer / `vi` tests are one-offs, not canary rows.**
-  `vi` mutates the disk and takes over the screen.
-- **Pipe regression suite is not a canary.**  `pipe_step1` …
-  `pipe_step3b` fork and take seconds.
-- **`at_step2` is not a canary either.**  It mutates the disk.
-  `at_step1` is read-only.
-- **`readlink_errno` is read-only and fast**, run by hand.
-- **`proc_status` and `proc_fd` are read-only and fast**, run by
-  hand.
-- **`proc_dir`, `proc_stat`, `proc_walk`, `proc_walk_fds`,
-  `mmap_stress`, and `exec_churn`** are run by hand.
-  `exec_churn` needs its helper staged as
-  `/usr/bin/CHURN_HELPER`, and is the test that exercises
-  `process_free_clone` on the process-exit path.
-- **`test.sh`** is the ~58-row harness at `/root/scripts/test.sh`.
-  Run it by hand when changing the applet config or the
-  pipe/wait paths.
-- **`mmap_nx`** proves `sys_mmap`'s `PT_NX` gate is enforced.
-  Run it when changing `sys_mmap`, the `PROT_*` handling, or the
-  leaf-PTE construction.
-- **`sigsegv_probe`** installs a `SIGSEGV` handler, faults, and
-  edits `ucontext.gregs[16]` so `rt_sigreturn` resumes past the
-  fault.  It is the acceptance check for slice 4.
-- **`sigterm_ignore`** installs `SIG_IGN` for SIGTERM, raises
-  SIGTERM, and prints whether it survived.  It is the acceptance
-  check for the `SIG_IGN` disposition (`20261023-sigign`).
-- **`nanosleep_intr_probe`** blocks in `nanosleep`, has a peer
-  signal it, and asserts `got=1` and `rc=-1/errno=EINTR`.  It
-  is the acceptance check for `nanosleep` interruption and the
-  `-EINTR` return on a blocking syscall.
-- **`at_step1` sections**, as of session 41: sections 1–7
-  `resolve_at`; 8–9 `faccessat`; 11 `utimensat`.  (There is no
-  section 10.)
-- **The canary is now `canary`, a program.**  `canary` (read-only)
-  and `canary --full` (also the mutating rows).  15/15 and 28/28.
