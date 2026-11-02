@@ -5,147 +5,144 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-01 (late session). **`v0.6.18` is released.**
-Work is pre-`v0.6.19`. Baseline is `80d272b`; the tree currently has
-five commits on top of it (see "Releases" for the real ahead-count).
+**Last updated:** 2026-11-02. **`v0.6.18` is released.** Work is
+pre-`v0.6.19`. Baseline is `80d272b`; `dev` is now well past it (run
+`git rev-list --count origin/dev..dev` for the real ahead-count).
 Working tree clean, build green (`MAKE_EXIT=0`). **`origin/dev` is at
 `799e98f` (`v0.6.18`) and has NOT been pushed to.** `origin/dev` must
 not be force-pushed without first reading every unpushed `dev` commit;
 they are intentional work, not accidental divergence.
 
-**The `#PF` is UNSOLVED.** See "THE `#PF`: VA-stable, PT-phys-unstable"
-below. The fault is stable by VA (`RIP=CR2=0x413966`, `pt=19`, `pte=0`)
-but the `.text` PT's *physical* address varies by boot, so every
-physical-address probe this session (gated on `0x33F000`) was boot-
-dependent and has been reverted. The next probe is VA-based: gate on
-`virt in [0x413000, 0x414000)`, not on `phys == 0x33F000`.
+**`^C`, `^Z`/`fg`, and the `busybox sh` nesting are FIXED** (2026-11-02,
+commit `7cb26fb`). The fix is the 2026-10-31 `^C` WIP, which the old
+handoff reported as "lost from `/tmp`" -- **it was not lost; it was
+uncommitted in `~/code/saved`.** Recovered, applied cleanly on top of the
+three correctness fixes, committed, and verified:
+- `^C` SIGINT reaches the foreground pgrp without killing IRQ1; the
+  console survives and the prompt returns.
+- `^Z`/`fg` works across many cycles; `jobs` lists the stopped child.
+- `exit` from busybox to the Donix shell, then `busybox sh` again,
+  returns the ash prompt (`sys_execve: f_open(usr/bin/BUSYBOX) -> 4`
+  on the first PATH attempt, then the fallback to `/bin/busybox`
+  succeeds).
 
-**`canary --full` can pass 28/28.** Observed once this session in the
-terminal (28 passed, 0 failed, including the mutating rows). The serial
-was overwritten by a later KVM run, so no file artifact was kept, but the
-pass was real. **The `#PF` is an intermittent race, not a deterministic
-failure** -- the code paths are correct, and a lucky run passes cleanly.
-The three fixes landed this session are correct and independent; the
-`#PF` remains open.
-
-**Baseline builds. Baseline is NOT reliably "green" as a test run.**
-`canary --full` on `80d272b` crashes with the `#PF` described below on
-unlucky runs, after at least one `^Z`/`fg` cycle; a lucky run passes
-28/28 (observed this session). The old handoff's blanket "baseline is
-green" claim was false as a general statement -- re-test every repro on
-a fresh boot and read the bytes before acting.
+**The `#PF` is REDUCED but NOT CLOSED.** Before `7cb26fb`, one `^Z`/`fg`
+cycle reliably faulted `canary --full` at `0x413966` (`pt=19`, `pte=0`).
+After `7cb26fb`, a full `canary --full` with **5** `^Z`/`fg` cycles
+reaches **28/28**, and `ps` shows a correct process table. But an
+**unlucky run still faults**, at a **different `.text` slot**:
+`RIP=CR2=0x450630`, `pt=80`, `error 0x14`, `pte=0`, canary's cr3. So
+the job-control state machine was **a contributing cause**, not the only
+one. The fault class is "a present `.text` PTE is zeroed under some
+timing." **The VA-based probe is still the next step, generalized to
+any `.text` PTE that gets zeroed** -- see "THE `#PF`" below.
 
 ---
 
-## THE `#PF`: VA-stable, PT-phys-unstable, **UNSOLVED**
+## THE `#PF`: intermittent `.text` PTE zeroing, **still open**
 
-**Symptom (stable across every boot this session):**
+**Two observed instances, same class, different slot:**
 
+    # old (before 7cb26fb, first ^Z/fg reliably):
     === PAGE FAULT (#PF) ===
-      CR2 / Faulting RIP : 0x413966
-      Raw Error Code     : 0x14    (present, user, instruction fetch)
-      CR3                : canary's cr3
-      Walk               : pd=2 pt=19
-      pde                : 0x...0027 (4 KB PT, present/RW/user)
-      pte                : 0
+      CR2 / RIP : 0x413966   error 0x14 (present, user, fetch)  pt=19  pte=0
 
-Canary's `.text` PTE for `0x413000`'s page is **zero**, canary fetches
-it, faults. **Stable by VA in every run this session.**
+    # new (after 7cb26fb, unlucky run):
+    === PAGE FAULT (#PF) ===
+      CR2 / RIP : 0x450630   error 0x14 (present, user, fetch)  pt=80  pte=0
 
-**The critical finding: the PT's *physical* address is not stable across
-boots.** In most runs canary's `.text` PT landed at `0x33F000`; in one run
-it landed at `0x340000` (whole hierarchy shifted one page: `cr3=0x33C000`,
-`pml4e=0x33D027`, `pdpte=0x33E027`, `pde=0x340027`). **Every diagnostic
-probe this session gated on the literal `0x33F000`, so every "probe is
-silent" conclusion is valid only for the boots where the PT happened to
-land there.** Those probes have been **reverted**; the conclusions below
-are marked accordingly.
+Both are canary's own cr3, both are a `present` 4 KB PT (`pde=0x…027`),
+both have the faulting slot `pte=0`. `0x413966` is in `.text`; `0x450630`
+is also in `.text` (the ELF image is `0x400000`–`0x600000`). **The
+faulting VA is stable per instance but the specific PT slot varies**,
+and the `.text` PT's *physical* address also varies by boot (see
+"physical-address probes" below).
 
-**Ruled out (for the boots where the PT was `0x33F000`):**
-- Bitmap corruption (`bitmap_set`/`clear` of `0x33F` fired only at
-  clone-alloc and reclaim, both consistent).
-- `memset(phys_to_virt(0x33F000), ...)` in `vmm.c` -- silent.
-- `elf.c` copy/BSS writes to `0x33F000` -- silent.
-- Zombie dispatch -- fixed (`scheduler_ready_queue_next`), fault unchanged.
-- `sys_munmap` from canary -- the `UNMAP_33F` on `0x33F000` was
-  `exec_free_and_unmap_user_pages`, legitimate exec teardown.
+**What 7cb26fb changed:** the fault went from "fires on the first
+`^Z`/`fg`" to "fires occasionally, at a moving `.text` slot." That is a
+real improvement in behavior, and it names the job-control state machine
+(pgrp inheritance, `wait4` pgroup semantics, console-fg handoff) as **a**
+cause. It is not the whole cause.
 
-**Not ruled out -- and the next probe must be VA-based, not phys-based:**
+**Ruled out this session (for the boots where the probes fired):**
+- Bitmap corruption of the specific page under test.
+- `memset(phys_to_virt(<pt>), …)` in `vmm.c` (gated on the literal
+  physical page -- silent).
+- `elf.c` copy/BSS writes to that page -- silent.
+- Zombie dispatch -- fixed separately (`b931603`), fault unchanged by
+  that fix alone.
+- `sys_munmap` from canary -- the gated `vmm_unmap_page_in_cr3` events
+  on the ELF range were `exec_free_and_unmap_user_pages`, legitimate
+  exec teardown.
 
-The zeroing (or flag-change) write to `pt[19]` of canary's `.text` PT, by
-**virtual address**. Gate in **`vmm_unmap_page_in_cr3`** and
-**`vmm_map_page_in_cr3`'s else-branch write** on
-**`virt in [0x413000, 0x414000)`** (and the clone's `new_pt[m] = src_pt[m]`
-loop on `virt == 0x413000`'s slot), printing `virt`, `cr3`, `pt_idx`,
-`old`, `new`. **Do NOT gate on `phys == 0x33F000`.** This catches the
-write regardless of where the PT lives this boot.
+**The next probe -- VA-based, generalized to any `.text` slot:**
 
-**Secondary tool:** gdb hardware watchpoint on the **virtual** PTE -- but
-the PT phys must be read from the fault dump's `pde` first (it is
-`0x33F027` or `0x340027` depending on the boot), so the watchpoint
-address is `HHDM_START | (pde & ~0xFFF) + 19*8`. Arm it after the fault
-dump prints, then re-run.
+Gate on the **virtual address**, not the physical page. In
+`vmm_unmap_page_in_cr3` and `vmm_map_page_in_cr3`'s `else`-branch write
+(and the clone's `new_pt[m] = src_pt[m]` loop for the matching slot),
+print whenever the write **clears the present bit of a PTE whose `va`
+is in `[0x400000, 0x600000)`** (the ELF image range). Print `va`, `cr3`,
+`pt_idx`, `old`, `new`. **This catches the zeroing regardless of which
+`.text` slot and which physical PT page the boot happens to use.** The
+two known faulting VAs (`0x413966`, `0x450630`) are both in that range,
+so gating on "any `.text` PTE becoming non-present" is the right
+generalization.
 
-**A second, distinct fault class:** the `mmap`-window write.
-`CR2=0x8010000000`, `cr3=0x347000` (a child), `error=0x6` (write, user,
-not-present), `pt[0]=0` after `pde=0x352027`. Reproduces deterministically
-under **TCG** (`./run tcg`); the `.text` `#PF` above is a **KVM**-timing
-race that TCG avoids. These are two bugs, not one.
+Also record **`interrupts_enabled` (RFLAGS.IF)** and **`g_ticks`** at
+each such write. If a write to a live `.text` PTE lands with IF=1 in a
+function whose caller assumed `cli`, that is the `cli`/`sti`-class
+explanation, and the fix is a `cli` at the right boundary -- a
+different probe shape from the VA gate, and the one never run this
+session.
 
-**What was tried and reverted (do not reapply):** every physical-address
-gate (`[BITMAP_*_33F]`, `[FREECLONE]`, `[FREE_TARGET]`, `[UNMAP_33F]`,
-`[MAP33F]`, `[MEMSET_33F]`, `[ELF_WRITE_33F]`, `[EXIT]`). They are
-boot-dependent. The `sys_munmap` ELF-range guard is **kept** -- it is a
-range check, not a phys check.
+**Secondary tool:** gdb hardware watchpoint on the **virtual** PTE. The
+PT phys must be read from the fault dump's `pde` first (it changes by
+boot), then the watchpoint is `HHDM_START | (pde & ~0xFFF) + pt_idx*8`.
+Arm after the fault dump prints, re-run.
 
-**The three fixes landed this session are independent of both faults and
-stay.**
+**What was tried and reverted (do not reapply):** every
+physical-address gate (`[BITMAP_*_33F]`, `[FREECLONE]`, `[FREE_TARGET]`,
+`[UNMAP_33F]`, `[MAP33F]`, `[MEMSET_33F]`, `[ELF_WRITE_33F]`,
+`[EXIT]`). They are boot-dependent. The `sys_munmap` ELF-range guard is
+**kept** -- it is a range check, not a phys check.
+
+**The correctness fixes from `b931603` (`pmm_alloc_page` type check,
+`scheduler_ready_queue_next` zombie/terminated/unused skip,
+`sys_munmap` ELF-range guard) and the job-control WIP from `7cb26fb`
+are all in and stay.** They are independent of the remaining `.text`
+zeroing.
+
+**Note on `pmm_alloc_page`'s type check:** the `PMM: bitmap desync!`
+print fires only when the bitmap and `pmm_page_info[page].type`
+disagree. That is a general "metadata desync" signal, not a
+`0x33F000`-specific gate -- keep it. If it fires, that is a distinct
+bug from the `.text` PTE zeroing.
 
 ---
 
-## THE OTHER OPEN BUG: `^C` -> the console dies after `/ #`
+## Fixed this session (do not re-investigate)
 
-**Unchanged since 2026-10-31.** The `^C` work was not part of today's
-investigation. **This section is verbatim from the old handoff, with the
-timestamp updated.**
+**`^C` -> the console no longer dies after `/ #`.** Fixed by `7cb26fb`.
+The WIP was written 2026-10-31, never committed, and recovered from
+`~/code/saved` (see "The `~/code/saved` lesson" below). What it does:
+deferred `^C` signal via `console_raise_pending` (never `sys_kill` inside
+IRQ1), pgrp inheritance in `sys_fork`, `wait4` pid/pgrp/wait-any forms,
+`console_read` foreground check, `sys_poll` EINTR, deferred `setpgid`,
+`console_fg_pgrp_set`/`_reclaim_if`, `tcgetpgrp`/`tcsetpgrp` latching,
+and an IRQ1 unmask safety net in the timer. The old "`^C` is not fixed"
+section is **obsolete** -- replaced by this paragraph.
 
-`^C` is **not fixed**. The WIP patch and status file from 2026-10-31 are
-in `/tmp` and were lost when the box was cleaned; the tree is reverted
-so the OS boots; `^C` does nothing on the committed tree.
+**`^Z`/`fg` on a foreground child works across many cycles.** `jobs`
+lists the stopped child; `fg` resumes. Fixed/robust by the same WIP.
 
-### What we PROVED on 2026-10-31 (do not re-derive)
-
-- **`^C` -> SIGINT delivery WORKS.** The foreground child dies in every
-  variant tried.
-- **The console dies AFTER the shell prints `/ #`** -- keyboard dead --
-  in every delivery variant (sys_kill in IRQ1, sys_kill in timer,
-  pure sig_pending bit-set).
-- **`^Z` on a foreground child WORKS**, and `^Z` also calls
-  `sys_kill(-fg,20)` from `irq1_handler`. So "IRQ handler + switch"
-  is **not** the trigger.
-- The one consistent difference: **`^C` TERMINATES the child**
-  (`signal_terminate_current` -> `process_exit`); **`^Z` STOPS it**.
-  The console death **correlates with a child `process_exit` /
-  termination via a signal**.
-
-### Next action for `^C` (unchanged from 2026-10-31)
-
-**gdb at the `^C` lockup.** At the hang, run:
-
-    gdb -q -ex 'target remote :1234' \
-        -ex 'info registers rip rsp cs cr3' \
-        -ex 'x/40gx $rsp' -ex 'detach' -ex 'quit'
-
-Read the kernel stack. The answer ("CPU is in `process_exit`" vs "in
-a fault" vs "idle / `sys_poll` `hlt`") dictates the fix. Do not
-re-attack `irq1_handler`'s delivery path; the suspect is child
-`process_exit` interacting with the console wake.
-
-**Possible relationship to `#PF`:** the `#PF` (VA-stable write to
-canary's `.text` PT) could also affect the child-terminate path (VMM
-teardown). **Do not assume this.** Chase the `#PF` first, and
-re-test `^C` on the fixed tree; if `^C` is fixed as a side effect,
-great; if not, its gdb investigation stands as its own bug.
+**`busybox sh` nesting works.** `exit` from busybox returns to the Donix
+shell; `busybox sh` from the Donix prompt returns the ash banner and
+prompt. On the first PATH attempt, `sys_execve: f_open(usr/bin/BUSYBOX)
+-> 4` is printed (FatFs `FR_NO_FILE`); the fallback to `/bin/busybox`
+(which is staged) then succeeds. **The image does NOT have
+`/usr/bin/busybox`** -- only `/bin/busybox` and `/bin/sh`. If the
+fallback ever stops working, that is the `^C`/job-control state again,
+not a missing file.
 
 ---
 
@@ -155,23 +152,32 @@ great; if not, its gdb investigation stands as its own bug.
 **RUNNING** before the next starts. A build passing is not a test
 passing.
 
-**This session's hard lessons (2026-11-01):**
+**This session's hard lessons (2026-11-01 .. 02):**
 
-- **Stacked probes broke the boot.** Six probes on one tree made
-  `musl_sh` fault at `0x400047` (`CR2=0`, `pte=0x3`). Sequence should
-  have been: (1) save state, (2) **gdb hardware watchpoint**, (3) read
-  the backtrace, (4) one fix.
+- **Stacked probes break the boot.** Six probes on one tree made
+  `musl_sh` fault at `0x400047`. Sequence should be: (1) save state,
+  (2) **gdb hardware watchpoint**, (3) read the backtrace, (4) one fix.
 - **Physical-address gates are boot-dependent.** A dozen probes gated
-  on `0x33F000` were silent on the boot where the PT landed at
-  `0x340000`. **Gate on the invariant (VA, pid, state), not on the
-  address that happens to hold today.**
-- **`canary --full` can pass.** One run reached 28/28. The `#PF` is
-  a race; one clean run does not mean the bug is fixed and one crash
-  does not mean the code is wrong.
+  on `0x33F000` were silent on the boot where the `.text` PT landed at
+  `0x340000`. **Gate on the invariant (VA, pid, state, pgrp), not on
+  the address that happens to hold today.**
+- **`canary --full` can pass.** 28/28 has now been observed across
+  multiple runs, including one with 5 `^Z`/`fg` cycles and a correct
+  `ps` table. The `.text` `#PF` is intermittent.
+- **THE `~/code/saved` LESSON (the big one).** A comparison tree is
+  not necessarily the commit it claims to be. `~/code/saved` was
+  "`d1ae213`" by `git log`, but had **five uncommitted files** -- the
+  entire 2026-10-31 `^C` WIP. Every "it works at `d1ae213` but not at
+  `HEAD`" comparison was `d1ae213+WIP` vs `HEAD`, i.e. **WIP vs no-WIP**,
+  not baseline vs regression. The fix took two sessions to find because
+  nobody ran `git status` on the comparison tree. **Rule: before
+  calling anything a regression, `git status` BOTH trees. If the
+  "known-good" tree is dirty, `git diff` it first.**
 
 **A handoff claim is not evidence.** The old handoff said `d1ae213` was
-green; it was not. **Re-run every repro on a fresh boot and read the
-bytes before acting.**
+green; it was not. The old handoff said the `^C` WIP was "lost from
+`/tmp`"; it was not -- it was uncommitted in `~/code/saved`. **Re-run
+every repro on a fresh boot and read the bytes before acting.**
 
 **Ask for source you do not have** before patching a file not seen this
 session.
@@ -190,17 +196,20 @@ aborts, **ask for the current bytes** -- do not guess a second anchor.
 `make -C 04_kernel_64bit FAT_CONFIG=single`;
 `make -C 05_boot_kernel64 hdd-single.img`.
 Verify the mtime chain `source` < `.o` < `kernel.elf` < `kernel.bin` <
-`hdd-single.img`.
+`hdd-single.img`. **After a session of probe edits and reverts, run a
+full `make clean` before the next behavioral test** -- per-file `rm` is
+not enough when multiple files were patched.
 
 **Test harness.** `./run` (no arg) = clean build + fresh
 `hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
 gdb stub on `:1234`, `capture.txt` written (overwritten each run --
-**copy it aside after any failure**). `./run debug` adds `-S` (frozen
-at reset). **`./run tcg` / `./run tcg-debug`** = the same flow in TCG
-(`-cpu max`, no `-enable-kvm`): use TCG for the `mmap`-window fault,
-KVM for the canary `.text` race. The Makefile run targets also use
-`-cpu max` + TCG -- **state which launcher was used.** Default cwd
-`/root` (prompt `~`).
+**copy it aside after any failure or pass you want to keep**).
+`./run debug` adds `-S` (frozen at reset). **`./run tcg` /
+`./run tcg-debug`** = the same flow in TCG (`-cpu max`, no
+`-enable-kvm`): use TCG for the `mmap`-window fault (`CR2=0x8010000000`,
+`cr3=0x347000`, `pt[0]=0`, `error=0x6`), KVM for the canary `.text`
+`#PF`. The Makefile run targets also use `-cpu max` + TCG -- **state
+which launcher was used.** Default cwd `/root` (prompt `~`).
 
 **In-guest gate:** `cd /`, then `canary --full` (28/28) and
 `/root/scripts/test.sh` (57/57). **Use multiple `^Z`/`fg` cycles.**
@@ -222,7 +231,7 @@ the unpushed work.
 **gdb hardware watchpoint is safe for this bug.** The handoff's
 "do not use gdb" applies to **timing-sensitive repro** (gdb-at-fault
 masks the race). A **write watchpoint** on the physical page does not
-mask it; it caught the writer in one run.
+mask it; it caught writers in single runs.
 
 ---
 
@@ -250,7 +259,10 @@ never `--tags`); (6) `git checkout main && git merge --no-ff dev &&
 git push origin main && git checkout dev`.
 
 **Current release state:** `v0.6.18` released; work pre-`v0.6.19`.
-No new release until the `#PF` is fixed.
+No new release until the `.text` `#PF` is closed. The `^C`/`^Z`/nesting
+fixes (`7cb26fb`) are a strong candidate for `v0.6.19` **once the
+intermittent `.text` `#PF` is also addressed or explicitly accepted as
+a known open bug in the release notes**.
 
 ---
 
@@ -268,17 +280,21 @@ concurrency rules `docs/contract.md`.
 
 ## Where we are
 
-### Baseline (committed, `80d272b` plus this session's five commits, tree clean, builds green)
+### Baseline (committed, `80d272b` plus this session's commits, tree clean, builds green)
 
 - `make clean && make` -> `MAKE_EXIT=0`
-- **`canary --full` is not reliably green.** It faults intermittently
-  with the `#PF` described above after at least one `^Z`/`fg` cycle;
-  a lucky run passes 28/28 (observed this session). **The writer of
-  the `pt[19]` zeroing is not yet named** (see the `#PF` section:
-  VA-based probe is next).
+- **`canary --full` is green on lucky runs and faults on unlucky
+  ones.** 28/28 has been observed across multiple runs, including one
+  with 5 `^Z`/`fg` cycles and a correct `ps` table. The intermittent
+  fault is the `.text` `#PF` at a moving slot (`0x413966`/`pt=19`
+  before `7cb26fb`; `0x450630`/`pt=80` after).
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
-  resumes. Works.
-- `^C` -> does nothing (original behavior). Unchanged from 2026-10-31.
+  resumes. Works across many cycles.
+- `^C` -> SIGINT reaches the foreground pgrp; the console survives and
+  the prompt returns. **Fixed 2026-11-02** (`7cb26fb`).
+- `busybox sh` nesting -> works. `exit` returns to Donix shell;
+  `busybox sh` returns the ash prompt. **Fixed 2026-11-02**
+  (`7cb26fb`).
 - `exec_churn` -> 24 rounds pass.
 
 ### State on disk / tree
@@ -295,11 +311,10 @@ concurrency rules `docs/contract.md`.
   `/bin/busybox --install -s /bin` (absolute path) to get applet
   symlinks. Manual step, not part of the build.
 - `capture.txt` is gitignored, overwritten each `./run` -- copy aside
-  after any failure or pass you want to keep. **The 28/28 pass this
-  session was not preserved**: a later KVM run overwrote the file.
-  `capture-canary-28-28.txt` was a mis-named copy of that later run and
-  was deleted.
-- `~/donix-20261101-canary-probes.patch` -- the old probe stack from
-  earlier in the session. **Do not apply it as a stack**; it broke the
-  boot. Individual probes can be cherry-picked and applied one at a time
-  with a boot check between each, per the working-style rule.
+  after any failure or pass you want to keep.
+- **`~/code/saved` is the old `d1ae213` copy WITH THE 2026-10-31 `^C`
+  WIP uncommitted.** The WIP has been recovered and committed as
+  `7cb26fb`; `~/code/saved` can now be treated as stale. **Do not
+  compare against it again without `git status` first.**
+- `~/donix-20261101-canary-probes.patch` -- the old physical-address
+  probe stack. **Do not apply it as a stack**; it broke the boot.
