@@ -3,6 +3,7 @@
 #include "include/vga.h"
 #include "include/serial.h"
 #include "include/fb.h"
+#include "libc.h"
 
 /* ------------------------------------------------------------------ */
 /* Tunables                                                            */
@@ -519,7 +520,7 @@ static void vga_scroll(void) {
     const int cols = con_cols();
     const int rows = con_rows();
 
-    /* Shift the shadow up one row, then repaint the whole grid. */
+    /* Shift the shadow up one row. */
     for (int row = 0; row < rows - 1; row++) {
         for (int col = 0; col < cols; col++) {
             shadow_set(row, col, shadow_get(row + 1, col));
@@ -528,9 +529,38 @@ static void vga_scroll(void) {
     for (int col = 0; col < cols; col++) {
         shadow_set(rows - 1, col, blank_cell());
     }
-    for (int row = 0; row < rows; row++) {
+
+    /* VGA: scroll via framebuffer row blit.
+     *
+     * The old body repainted every cell (cols x rows paint_cell
+     * calls, each an 18-row fb_putchar glyph render -- ~4284
+     * glyphs and ~2.3 MB of framebuffer stores per scroll at
+     * 102x42).  Instead: move the framebuffer up by one glyph
+     * row with memmove (one linear copy; the destination is
+     * below the source, so memmove is correct), then paint only
+     * the new last row (cols glyphs).  ~42x less glyph work.
+     *
+     * Works only when the framebuffer is available.  The VGA
+     * text fallback (fb->available == 0) keeps the old full
+     * repaint path below, because the fallback writes cells,
+     * not pixels, and there is no framebuffer row to move. */
+    const fb_info_t* fb = fb_get_info();
+    if (fb->available) {
+        const size_t row_bytes = (size_t)18 * (size_t)fb->pitch;
+        const size_t shift = (size_t)(rows - 1) * row_bytes;
+        if (shift > 0) {
+            memmove(fb->base, fb->base + row_bytes, shift);
+        }
+        /* New last row: cols glyphs. */
         for (int col = 0; col < cols; col++) {
-            paint_cell(row, col, shadow_get(row, col));
+            paint_cell(rows - 1, col, shadow_get(rows - 1, col));
+        }
+    } else {
+        /* VGA text fallback: the shadow IS the screen; repaint it. */
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                paint_cell(row, col, shadow_get(row, col));
+            }
         }
     }
 
