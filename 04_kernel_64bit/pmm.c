@@ -520,9 +520,24 @@ uint64_t pmm_alloc_page(page_type_t type) {
             goto done;
         }
 
-        uint64_t page = pmm_scan_zone(pmm_next_high_page,
-                                      pmm_high_start_page, pmm_high_end_page,
-                                      0, 0);
+        uint64_t page = 0;
+        while (1) {
+            page = pmm_scan_zone(pmm_next_high_page,
+                                 pmm_high_start_page, pmm_high_end_page,
+                                 0, 0);
+            if (page == 0) break;
+            if (pmm_page_info[page].type == PAGE_FREE) break;
+            
+            /* Defensive check: bitmap says free, but bookkeeping says in-use. Skip it. */
+            serial_lock();
+            serial_print("PMM: bitmap desync! Page 0x");
+            serial_print_hex(page * PAGE_SIZE);
+            serial_print(" type=");
+            serial_print_hex((uint64_t)pmm_page_info[page].type);
+            serial_print(" -- skipping.\n");
+            serial_unlock();
+            pmm_next_high_page = (page > pmm_high_start_page) ? (page - 1) : pmm_high_start_page;
+        }
         if (page != 0) {
             bitmap_set(page);
             pmm_free_pages--;
@@ -589,9 +604,24 @@ uint64_t pmm_alloc_page(page_type_t type) {
             min_page = 0x200;
         }
 
-        uint64_t page = pmm_scan_zone(pmm_next_low_page,
-                                      pmm_low_start_page, pmm_low_end_page,
-                                      1, min_page);
+        uint64_t page = 0;
+        while (1) {
+            page = pmm_scan_zone(pmm_next_low_page,
+                                 pmm_low_start_page, pmm_low_end_page,
+                                 1, min_page);
+            if (page == 0) break;
+            if (pmm_page_info[page].type == PAGE_FREE) break;
+            
+            /* Defensive check: bitmap says free, but bookkeeping says in-use. Skip it. */
+            serial_lock();
+            serial_print("PMM: bitmap desync! Page 0x");
+            serial_print_hex(page * PAGE_SIZE);
+            serial_print(" type=");
+            serial_print_hex((uint64_t)pmm_page_info[page].type);
+            serial_print(" -- skipping.\n");
+            serial_unlock();
+            pmm_next_low_page = (page < pmm_low_end_page) ? (page + 1) : pmm_low_end_page;
+        }
         if (page != 0) {
             bitmap_set(page);
             pmm_free_pages--;

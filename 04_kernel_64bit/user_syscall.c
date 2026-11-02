@@ -9796,6 +9796,20 @@ long sys_munmap(void* addr, size_t length) {
     uint64_t end   = ((uint64_t)addr + length + 0xFFFULL) & ~0xFFFULL;
     if (end <= start) return 0;
 
+    /*
+     * Refuse to unmap the kernel-loaded ELF image.
+     *
+     * A process must not munmap its own .text and then execute it.
+     * That is the [UNMAP_33F] -> #PF shape: sys_munmap zeroes the
+     * PTE, and the next fetch at that VA faults with pte=0. The
+     * region is documented as the ELF image at line 5311:
+     *   [0x400000, 0x600000)  2 MB
+     * Return -EINVAL, the errno a bogus munmap gets on Linux.
+     */
+    if (start < 0x0000000000600000ULL && end > 0x0000000000400000ULL) {
+        return -(long)EINVAL_;
+    }
+
     for (uint64_t va = start; va < end; va += 0x1000) {
         uint64_t phys = vmm_get_phys_from_cr3(self->cr3, va);
         if (!phys) continue;      /* hole: Linux tolerates it */

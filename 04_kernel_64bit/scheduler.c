@@ -424,8 +424,17 @@ pcb_t* scheduler_ready_queue_next(void) {
      * falls back to idle.  Skipping current_process is correct --
      * you never switch to the process already on the CPU.
      */
+    /* Never dispatch a non-runnable PCB.  RUNNING is the
+     * already-existing skip (see the long comment above).
+     * ZOMBIE/TERMINATED/UNUSED are added here: a ZOMBIE that
+     * was on the queue got popped, resumed from a stale frame,
+     * and executed its (freed) .text -- the 0x413966 #PF.  A
+     * zombie is never dispatchable, from any caller. */
     while (ready_queue_head &&
-           ready_queue_head->state == PROC_STATE_RUNNING) {
+           (ready_queue_head->state == PROC_STATE_RUNNING ||
+            ready_queue_head->state == PROC_STATE_ZOMBIE ||
+            ready_queue_head->state == PROC_STATE_TERMINATED ||
+            ready_queue_head->state == PROC_STATE_UNUSED)) {
         pcb_t* skip = ready_queue_head;
         ready_queue_head = skip->next;
         if (ready_queue_head) {
