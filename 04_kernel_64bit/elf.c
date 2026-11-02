@@ -188,56 +188,45 @@ uint64_t elf_load_into_process(pcb_t* pcb, const void* elf_data) {
             }
             ensure_hhdm_mapped(phys);
             elf_add_page_to_pcb(pcb, phys);
-        }
 
-        const uint8_t* src = (const uint8_t*)elf_data + offset;
-        if (filesz > 0) {
-            uint64_t copied = 0;
-            while (copied < filesz) {
-                uint64_t cur_virt = vaddr + copied;
-                uint64_t phys = vmm_get_phys_from_cr3(pcb->cr3, cur_virt);
-                if (phys == 0) {
-                    serial_print("ELF: COPY-FAIL phys=0 at vaddr=");
-                    serial_print_hex(cur_virt);
-                    serial_print("\n");
-                    return 0;
-                }
-                uint64_t page_off = cur_virt & 0xFFF;
-                size_t chunk = filesz - copied;
-                size_t page_rem = 4096 - page_off;
-                if (chunk > page_rem) chunk = page_rem;
+            /* ELF: fused map/copy/zero.  phys is in hand; do the
+             * filesz copy and the memsz zero for this page now,
+             * instead of re-walking the page table per page in
+             * follow-up loops.  Same bytes, same boundaries. */
+            {
                 uint8_t* dest = (uint8_t*)(HHDM_START + phys);
-                for (size_t j = 0; j < chunk; j++) {
-                    dest[j] = src[copied + j];
+
+                /* Copy the filesz bytes that fall in this page. */
+                {
+                    uint64_t seg_filesz_end = vaddr + filesz;
+                    uint64_t copy_lo = (virt > vaddr) ? virt : vaddr;
+                    uint64_t page_hi = virt + 4096;
+                    uint64_t copy_hi = (page_hi < seg_filesz_end) ? page_hi : seg_filesz_end;
+                    if (copy_lo < copy_hi) {
+                        const uint8_t* src = (const uint8_t*)elf_data + offset;
+                        uint64_t src_off = copy_lo - vaddr;
+                        size_t n = (size_t)(copy_hi - copy_lo);
+                        uint8_t* dst = dest + (copy_lo - virt);
+                        for (size_t j = 0; j < n; j++) dst[j] = src[src_off + j];
+                    }
                 }
-                copied += chunk;
+
+                /* Zero the memsz tail that falls in this page. */
+                if (memsz > filesz) {
+                    uint64_t seg_zero_start = vaddr + filesz;
+                    uint64_t seg_zero_end   = vaddr + memsz;
+                    uint64_t z_lo = (virt > seg_zero_start) ? virt : seg_zero_start;
+                    uint64_t page_hi = virt + 4096;
+                    uint64_t z_hi = (page_hi < seg_zero_end) ? page_hi : seg_zero_end;
+                    if (z_lo < z_hi) {
+                        size_t n = (size_t)(z_hi - z_lo);
+                        uint8_t* dst = dest + (z_lo - virt);
+                        for (size_t j = 0; j < n; j++) dst[j] = 0;
+                    }
+                }
             }
         }
 
-        if (memsz > filesz) {
-            uint64_t bss_start = vaddr + filesz;
-            uint64_t bss_bytes = memsz - filesz;
-            uint64_t zeroed = 0;
-            while (zeroed < bss_bytes) {
-                uint64_t cur_virt = bss_start + zeroed;
-                uint64_t phys = vmm_get_phys_from_cr3(pcb->cr3, cur_virt);
-                if (phys == 0) {
-                    serial_print("ELF: BSS-FAIL phys=0 at vaddr=");
-                    serial_print_hex(cur_virt);
-                    serial_print("\n");
-                    return 0;
-                }
-                uint64_t page_off = cur_virt & 0xFFF;
-                size_t chunk = bss_bytes - zeroed;
-                size_t page_rem = 4096 - page_off;
-                if (chunk > page_rem) chunk = page_rem;
-                uint8_t* dest = (uint8_t*)(HHDM_START + phys);
-                for (size_t j = 0; j < chunk; j++) {
-                    dest[j] = 0;
-                }
-                zeroed += chunk;
-            }
-        }
     }
 
     return ehdr->e_entry;
