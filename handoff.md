@@ -12,10 +12,12 @@ green (`MAKE_EXIT=0`). **`dev` local is 69 commits ahead of `origin/dev`
 not be force-pushed without first reading those 69 commits; they are
 intentional work, not accidental divergence.
 
-**The writer of the `#PF` is FOUND.** See "THE `#PF` BUG: WRITER FOUND"
-below. The bug is a PMM bitmap corruption: `pmm_alloc_page_for_tables`
-returned `0x33F000` (canary's live `.text` PT) to `vmm_clone_page_table`
-during a `sys_fork`, and the `memset` zeroed canary's `pt[19]`.
+**The `#PF` is UNSOLVED.** See "THE `#PF`: VA-stable, PT-phys-unstable"
+below. The fault is stable by VA (`RIP=CR2=0x413966`, `pt=19`, `pte=0`)
+but the `.text` PT's *physical* address varies by boot, so every
+physical-address probe this session (gated on `0x33F000`) was boot-
+dependent and has been reverted. The next probe is VA-based: gate on
+`virt in [0x413000, 0x414000)`, not on `phys == 0x33F000`.
 
 **Baseline builds. Baseline is NOT "green" as a test run.**
 `canary --full` on `80d272b` crashes with the `#PF` described below,
@@ -25,125 +27,63 @@ false.
 
 ---
 
-## THE `#PF` BUG: WRITER FOUND
+## THE `#PF`: VA-stable, PT-phys-unstable, **UNSOLVED**
 
-### The watchpoint result (verbatim)
+**Symptom (stable across every boot this session):**
 
-    Hardware watchpoint 1: *(unsigned long long *)(0xFFFF80000033F000 + 19*8)
-    Old value = <unreadable>
-    New value = 132862015
-    0xffffffff80105876 in vmm_clone_page_table+534
-    RIP: 0xffffffff80105876  <vmm_clone_page_table+534>
-    CR3: 0x32f000
-    Backtrace:
-    #0  vmm_clone_page_table+534
-    #1  process_create
-    #2  sys_fork
-    #3  syscall_dispatch
-    #4  user_syscall_entry
+    === PAGE FAULT (#PF) ===
+      CR2 / Faulting RIP : 0x413966
+      Raw Error Code     : 0x14    (present, user, instruction fetch)
+      CR3                : canary's cr3
+      Walk               : pd=2 pt=19
+      pde                : 0x...0027 (4 KB PT, present/RW/user)
+      pte                : 0
 
-### What it means
+Canary's `.text` PTE for `0x413000`'s page is **zero**, canary fetches
+it, faults. **Stable by VA in every run this session.**
 
-`sys_fork` -> `process_create` -> `vmm_clone_page_table` wrote `pt[19]`
-of **physical page `0x33F000`** -- canary's live `.text` PT -- while
-running in the **parent's** cr3 (`0x32F000`). The write is a
-`memset(new_pt, 0, PAGE_SIZE)` (or the copy that follows it) inside
-`vmm_clone_page_table`'s deep-copy of the low half.
+**The critical finding: the PT's *physical* address is not stable across
+boots.** In most runs canary's `.text` PT landed at `0x33F000`; in one run
+it landed at `0x340000` (whole hierarchy shifted one page: `cr3=0x33C000`,
+`pml4e=0x33D027`, `pdpte=0x33E027`, `pde=0x340027`). **Every diagnostic
+probe this session gated on the literal `0x33F000`, so every "probe is
+silent" conclusion is valid only for the boots where the PT happened to
+land there.** Those probes have been **reverted**; the conclusions below
+are marked accordingly.
 
-`vmm_clone_page_table` allocates a **new** PT with
-`pmm_alloc_page_for_tables()`, memsets it to zero, and copies the
-parent's leaf PTEs into it. If `pmm_alloc_page_for_tables()` returns
-**`0x33F000`** -- a page that is still a live PT in canary's address
-space -- the `memset` zeroes canary's `pt[19]`, and canary's next
-instruction fetch at `0x413966` (or whichever VA is on that page) faults
-with `pte = 0`.
+**Ruled out (for the boots where the PT was `0x33F000`):**
+- Bitmap corruption (`bitmap_set`/`clear` of `0x33F` fired only at
+  clone-alloc and reclaim, both consistent).
+- `memset(phys_to_virt(0x33F000), ...)` in `vmm.c` -- silent.
+- `elf.c` copy/BSS writes to `0x33F000` -- silent.
+- Zombie dispatch -- fixed (`scheduler_ready_queue_next`), fault unchanged.
+- `sys_munmap` from canary -- the `UNMAP_33F` on `0x33F000` was
+  `exec_free_and_unmap_user_pages`, legitimate exec teardown.
 
-**This is the original "pmm_bitmap corruption" hypothesis, proven.**
-`pmm_bitmap[0x67F]` bit 7 (page `0x33F`) was **clear** when
-`pmm_alloc_page_for_tables` ran, even though canary's PD still pointed
-at `0x33F000`. The PMM handed the page out as free; the clone zeroed it.
+**Not ruled out -- and the next probe must be VA-based, not phys-based:**
 
-### Why earlier probes missed it
+The zeroing (or flag-change) write to `pt[19]` of canary's `.text` PT, by
+**virtual address**. Gate in **`vmm_unmap_page_in_cr3`** and
+**`vmm_map_page_in_cr3`'s else-branch write** on
+**`virt in [0x413000, 0x414000)`** (and the clone's `new_pt[m] = src_pt[m]`
+loop on `virt == 0x413000`'s slot), printing `virt`, `cr3`, `pt_idx`,
+`old`, `new`. **Do NOT gate on `phys == 0x33F000`.** This catches the
+write regardless of where the PT lives this boot.
 
-- `[PT_ALLOC_33F]` (in `pmm_alloc_page`, gated on `result == 0x33F000`)
-  was **stripped** before the `sys_fork`/`sys_clone` path ran on the
-  base tree. It should have caught it; it was not in the image.
-- The tick canary (`[PT-CANARY]`) checks on every tick. The write
-  happens inside `vmm_clone_page_table`, which runs with **interrupts
-  off** (from `sys_fork`'s `cli`). No tick can fire between the
-  `memset` and the copy, so the tick canary could not see it.
-- The write-protect PDE probe did not fire because it watched for
-  **kernel writes to the PT page through the HHDM alias**, and the
-  clone's write is through `HHDM_START + new_pt_phys` -- but the
-  write-protect block was removed before the clone path ran, and the
-  probe was never live during a fork that hit `0x33F000`.
-- The gdb hardware watchpoint was the tool that caught it, because it
-  watches the **physical page** and does not need a tick or a probe
-  in the kernel.
+**Secondary tool:** gdb hardware watchpoint on the **virtual** PTE -- but
+the PT phys must be read from the fault dump's `pde` first (it is
+`0x33F027` or `0x340027` depending on the boot), so the watchpoint
+address is `HHDM_START | (pde & ~0xFFF) + 19*8`. Arm it after the fault
+dump prints, then re-run.
 
-### The root cause is still open
+**What was tried and reverted (do not reapply):** every physical-address
+gate (`[BITMAP_*_33F]`, `[FREECLONE]`, `[FREE_TARGET]`, `[UNMAP_33F]`,
+`[MAP33F]`, `[MEMSET_33F]`, `[ELF_WRITE_33F]`, `[EXIT]`). They are
+boot-dependent. The `sys_munmap` ELF-range guard is **kept** -- it is a
+range check, not a phys check.
 
-**Who cleared `pmm_bitmap[0x67F]` bit 7?** The clone is the **victim**,
-not the cause. The PMM handed out a live PT because the bitmap said the
-page was free. The bitmap was corrupted by some **earlier** stray write
-or a missing `bitmap_set` on an allocation that did not record the page
-as used. The fix is to find **who clears the bit**, not to patch
-`vmm_clone_page_table`.
-
-**The next probe is the handoff's original one, never run:**
-`bitmap_clear(page)` / `bitmap_set(page)` in `pmm.c`, gated on
-`page == 0x33F`, printing the caller's return address. Run it with
-**several `^Z`/`fg` cycles** on the base tree. The first
-`[BITMAP_CLEAR_33F]` before a fork names the clearing code.
-
-Do **not** patch `vmm_clone_page_table` or `process_create` before the
-bitmap-clear probe names the real culprit. The clone is a victim.
-
-### What NOT to retry
-
-- Do **not** re-add the `process_reclaim` guard (tried, did not fire).
-- Do **not** re-add top-of-tick `signal_deliver_frame_iretq` (tried, neutral).
-- Do **not** re-add the `rsp == 0` guards in `scheduler.c` /
-  `process.c` / `user_syscall.c` (tried, turned the fault into a `Z`
-  halt).
-- Do **not** re-add the `sys_munmap` owned-check (tried, did not fix).
-- Do **not** use gdb for **timing-sensitive repro** (masks the race).
-  The **hardware watchpoint** is a different intervention and **did
-  catch it** -- the masking risk did not materialize.
-- Do **not** assume `^Z` is optional. Every reproduction this session
-  required at least one `^Z`/`fg` cycle.
-- Do **not** re-stack the probe stack from
-  `~/donix-20261101-canary-probes.patch` all at once. It **broke the
-  boot** (`musl_sh` faulted at `0x400047`, `CR2=0`, `pte=0x3`). Apply
-  one probe at a time, boot-check each, per the "one change at a time"
-  rule.
-
-### Files to check in the fresh session
-
-- `pmm.c`: `bitmap_clear`, `bitmap_set`, `pmm_alloc_page_for_tables`,
-  `pmm_scan_zone`, `pmm_page_info` bookkeeping. **Start here.**
-- `vmm.c`: `vmm_clone_page_table` (`memset` at `vmm.c:329`),
-  `vmm_map_page_in_cr3` (`memset` at `vmm.c:164`, `vmm.c:463`).
-- `process.c`: `process_create`, `process_free_clone`,
-  `process_cleanup_elf_pages`, `process_reclaim`.
-- `elf.c`: `elf_add_page_to_pcb` (defensive check: reject if `phys` is
-  inside a known PT range).
-
-### The probe to add first
-
-In `pmm.c`, in `bitmap_clear(uint64_t page)`:
-
-    if (page == 0x33F) {
-        serial_lock();
-        serial_print("[BITMAP_CLEAR_33F] caller=0x");
-        serial_print_hex((uint64_t)__builtin_return_address(0));
-        serial_print("\n");
-        serial_unlock();
-    }
-
-and the same in `bitmap_set`. Run `canary --full` with several `^Z`/`fg`
-cycles, **no gdb**, and read the serial log. The first
-`[BITMAP_CLEAR_33F]` before a fork names the clearing function.
+**The three fixes landed this session are independent of the `#PF` and
+stay.**
 
 ---
 
@@ -187,9 +127,9 @@ a fault" vs "idle / `sys_poll` `hlt`") dictates the fix. Do not
 re-attack `irq1_handler`'s delivery path; the suspect is child
 `process_exit` interacting with the console wake.
 
-**Possible relationship to `#PF`:** the bitmap corruption that causes
-the `#PF` could also affect the child-terminate path (VMM teardown).
-**Do not assume this.** Chase the bitmap corruption first, and
+**Possible relationship to `#PF`:** the `#PF` (VA-stable write to
+canary's `.text` PT) could also affect the child-terminate path (VMM
+teardown). **Do not assume this.** Chase the `#PF` first, and
 re-test `^C` on the fixed tree; if `^C` is fixed as a side effect,
 great; if not, its gdb investigation stands as its own bug.
 
@@ -311,7 +251,8 @@ concurrency rules `docs/contract.md`.
 - `make clean && make` -> `MAKE_EXIT=0`
 - **`canary --full` is NOT green.** It crashes with the `#PF`
   described above after at least one `^Z`/`fg` cycle. The writer is
-  found; the root cause (PMM bitmap corruption) is not yet fixed.
+  found; the writer of the `pt[19]` zeroing is not yet named (see
+  the `#PF` section: VA-based probe is next).
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
   resumes. Works.
 - `^C` -> does nothing (original behavior). Unchanged from 2026-10-31.
