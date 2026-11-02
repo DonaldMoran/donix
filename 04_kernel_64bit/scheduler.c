@@ -1286,18 +1286,39 @@ void scheduler_switch_to(pcb_t* next) {
         serial_print_dec(next->pid);
         serial_print(" name=");
         serial_print(next->name);
-        serial_print(" rsp outside stack -> idle\n");
+        serial_print(" rsp outside stack -> restore prev\n");
         serial_unlock();
-        pcb_t* _idle2 = process_find_by_pid(1);
-        if (_idle2 && _idle2 != current_process) {
-            current_process = _idle2;
-            process_set_current(_idle2);
-            _idle2->state = PROC_STATE_RUNNING;
-            next = _idle2;
-        } else {
-            __asm__ volatile("sti");
-            return;
-        }
+        /*
+         * A true refuse: restore current_process to prev and
+         * return to the caller.  process_yield is written to
+         * handle a return from scheduler_switch_to (it
+         * re-promotes current_process from READY to RUNNING and
+         * sti's).  The previous shape substituted idle and fell
+         * through to context_switch, which does not return, so
+         * process_yield's tail never ran and prev stayed on the
+         * ready queue with a context_switch-shaped resume frame.
+         * The timer's dispatch path resumes next->rsp through
+         * irq0_stub's pop, which expects an irq0_stub interrupt
+         * frame; a context_switch switch frame in that slot
+         * iretqs a non-canonical RIP/RSP and takes #GP error 0
+         * (the 2026-11-02 fault at irq0_stub's iretq).
+         * Restore and return; no context_switch.
+         *
+         * NOTE: the sibling refuse below (next->rsp == 0) still
+         * has the fall-to-idle shape and its comment says the
+         * callers do not handle a return.  That comment predates
+         * process_yield's current tail, which does.  Not changed
+         * in this commit; one change at a time.
+         *
+         * process_exit's refuse (the other " rsp outside stack"
+         * string, ~line 850) is a different check: it switches
+         * with context_switch_no_save and halts the exiting
+         * process.  Not touched here.
+         */
+        current_process = prev;
+        process_set_current(prev);
+        __asm__ volatile("sti");
+        return;
     }
 
     /*
