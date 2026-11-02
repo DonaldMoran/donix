@@ -79,15 +79,22 @@ zeroes `rsp`). This is a context-switch / cr3 bug under TCG,
 `error 0x14`, `pte=0`, 4 KB PT) and the pipe7e `#GP` (`error
 0x4640`, `iretq`, bad segment selector).
 
-**THE RELEASE TAGS.** `v0.6.15` through `v0.6.18` are the release
-record; their annotations carry the per-release summary. All
-scratch `2026MMDD-*` tags from `v0.6.18`'s work have been dropped.
-`origin/dev` = `799e98f` = `v0.6.18`; `dev` is ahead of it by the
-unpushed work since that tag (see "THE GITHUB PUSH POLICY" below).
-`fixA-stable` = `2c0df3b` and `20261101-stable-scheduler-fixes` =
-`f91d31a` are **not on `dev`** -- they are preserved as tags because
-the scheduler guards might be independently valuable, but they do
-not fix the canary `.text` `#PF` and were not merged.
+**THE RELEASE TAGS.** `v0.6.15` through `v0.6.18` are the released
+release record; their annotations carry the per-release summary.
+**The scratch `2026MMDD-*` tags are PRESERVED until the user
+decides to push to GitHub.** They are the source material for the
+release summary: read each tag's annotation and
+`git log <prev-tag>..<this-tag>` to see what that slice
+accomplished. **Do NOT drop a scratch tag before the summary is
+written and reviewed by the user.** Run
+`git tag --list '2026*' | wc -l` for the current count; do not
+hardcode it. `origin/dev` = `799e98f` = `v0.6.18`; `dev` is
+ahead of it by the unpushed work since that tag (see "THE
+GITHUB PUSH POLICY" below). `fixA-stable` = `2c0df3b` and
+`20261101-stable-scheduler-fixes` = `f91d31a` are **not on
+`dev`** -- they are preserved as tags because the scheduler
+guards might be independently valuable, but they do not fix the
+canary `.text` `#PF` and were not merged.
 
 **WHAT IS NOT DONE.** No privilege model (item 9); SSE state is not
 saved (item 10); SIGCHLD-interrupts-a-blocked-`wait4` was done
@@ -404,10 +411,13 @@ every repro on a fresh boot and read the bytes before acting.**
 ## Releases
 
 **Before a release:** the scratch `2026MMDD-*` tags are annotated
-and are the source for the version summary. **Write the summary
-from them BEFORE dropping them.** The release tag and the merge
-commit are local objects; once they exist, the scratch tags may be
-dropped.
+and are the source for the version summary. **The scratch tags
+are PRESERVED until the user decides to push to GitHub, and
+are dropped ONLY after the summary is written and reviewed by
+the user.** A session does NOT drop them on its own initiative,
+even when the release tag and merge commit exist locally. The
+drop is step 4 of the release procedure below, and it is taken
+by the user, at release time, after reviewing the summary.
 
 **The release procedure** (on `dev`, pre-release):
 
