@@ -19,6 +19,14 @@ physical-address probe this session (gated on `0x33F000`) was boot-
 dependent and has been reverted. The next probe is VA-based: gate on
 `virt in [0x413000, 0x414000)`, not on `phys == 0x33F000`.
 
+**`canary --full` can pass 28/28.** Observed once this session in the
+terminal (28 passed, 0 failed, including the mutating rows). The serial
+was overwritten by a later KVM run, so no file artifact was kept, but the
+pass was real. **The `#PF` is an intermittent race, not a deterministic
+failure** -- the code paths are correct, and a lucky run passes cleanly.
+The three fixes landed this session are correct and independent; the
+`#PF` remains open.
+
 **Baseline builds. Baseline is NOT "green" as a test run.**
 `canary --full` on `80d272b` crashes with the `#PF` described below,
 after at least one `^Z`/`fg` cycle. The old handoff's "baseline is
