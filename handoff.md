@@ -6,11 +6,12 @@ Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
 **Last updated:** 2026-11-01 (late session). **`v0.6.18` is released.**
-Work is pre-`v0.6.19`. Baseline is `80d272b`, working tree clean, build
-green (`MAKE_EXIT=0`). **`dev` local is 69 commits ahead of `origin/dev`
-(`799e98f`, `v0.6.18`) and has NOT been pushed.** `origin/dev` must
-not be force-pushed without first reading those 69 commits; they are
-intentional work, not accidental divergence.
+Work is pre-`v0.6.19`. Baseline is `80d272b`; the tree currently has
+five commits on top of it (see "Releases" for the real ahead-count).
+Working tree clean, build green (`MAKE_EXIT=0`). **`origin/dev` is at
+`799e98f` (`v0.6.18`) and has NOT been pushed to.** `origin/dev` must
+not be force-pushed without first reading every unpushed `dev` commit;
+they are intentional work, not accidental divergence.
 
 **The `#PF` is UNSOLVED.** See "THE `#PF`: VA-stable, PT-phys-unstable"
 below. The fault is stable by VA (`RIP=CR2=0x413966`, `pt=19`, `pte=0`)
@@ -27,11 +28,12 @@ failure** -- the code paths are correct, and a lucky run passes cleanly.
 The three fixes landed this session are correct and independent; the
 `#PF` remains open.
 
-**Baseline builds. Baseline is NOT "green" as a test run.**
-`canary --full` on `80d272b` crashes with the `#PF` described below,
-after at least one `^Z`/`fg` cycle. The old handoff's "baseline is
-green" claim was false; it was re-tested this session and confirmed
-false.
+**Baseline builds. Baseline is NOT reliably "green" as a test run.**
+`canary --full` on `80d272b` crashes with the `#PF` described below on
+unlucky runs, after at least one `^Z`/`fg` cycle; a lucky run passes
+28/28 (observed this session). The old handoff's blanket "baseline is
+green" claim was false as a general statement -- re-test every repro on
+a fresh boot and read the bytes before acting.
 
 ---
 
@@ -84,13 +86,19 @@ the PT phys must be read from the fault dump's `pde` first (it is
 address is `HHDM_START | (pde & ~0xFFF) + 19*8`. Arm it after the fault
 dump prints, then re-run.
 
+**A second, distinct fault class:** the `mmap`-window write.
+`CR2=0x8010000000`, `cr3=0x347000` (a child), `error=0x6` (write, user,
+not-present), `pt[0]=0` after `pde=0x352027`. Reproduces deterministically
+under **TCG** (`./run tcg`); the `.text` `#PF` above is a **KVM**-timing
+race that TCG avoids. These are two bugs, not one.
+
 **What was tried and reverted (do not reapply):** every physical-address
 gate (`[BITMAP_*_33F]`, `[FREECLONE]`, `[FREE_TARGET]`, `[UNMAP_33F]`,
 `[MAP33F]`, `[MEMSET_33F]`, `[ELF_WRITE_33F]`, `[EXIT]`). They are
 boot-dependent. The `sys_munmap` ELF-range guard is **kept** -- it is a
 range check, not a phys check.
 
-**The three fixes landed this session are independent of the `#PF` and
+**The three fixes landed this session are independent of both faults and
 stay.**
 
 ---
@@ -98,14 +106,12 @@ stay.**
 ## THE OTHER OPEN BUG: `^C` -> the console dies after `/ #`
 
 **Unchanged since 2026-10-31.** The `^C` work was not part of today's
-investigation. The `^C` bug and its WIP patch are unchanged from the
-previous handoff. **This section is verbatim from the old handoff,
-with the timestamp updated.**
+investigation. **This section is verbatim from the old handoff, with the
+timestamp updated.**
 
-`^C` is **not fixed**. Everything tried is in
-`/tmp/donix-ctrlc-wip-20261031-1330.patch` (94 lines) and
-`/tmp/donix-ctrlc-wip-status.txt`. The tree is reverted to `80d272b` so
-the OS boots; `^C` does nothing on the committed tree.
+`^C` is **not fixed**. The WIP patch and status file from 2026-10-31 are
+in `/tmp` and were lost when the box was cleaned; the tree is reverted
+so the OS boots; `^C` does nothing on the committed tree.
 
 ### What we PROVED on 2026-10-31 (do not re-derive)
 
@@ -149,15 +155,22 @@ great; if not, its gdb investigation stands as its own bug.
 **RUNNING** before the next starts. A build passing is not a test
 passing.
 
-**This session's hard lesson (2026-11-01):** we stacked six probes on
-one tree and **broke the boot** (`musl_sh` faulted at `0x400047`,
-`CR2=0`, `pte=0x3`). Every probe had to be stashed. The correct
-sequence was: (1) save state, (2) **gdb hardware watchpoint**, (3) read
-the backtrace, (4) one fix. We did not do (2) until the end, and the
-watchpoint gave the answer in one run.
+**This session's hard lessons (2026-11-01):**
+
+- **Stacked probes broke the boot.** Six probes on one tree made
+  `musl_sh` fault at `0x400047` (`CR2=0`, `pte=0x3`). Sequence should
+  have been: (1) save state, (2) **gdb hardware watchpoint**, (3) read
+  the backtrace, (4) one fix.
+- **Physical-address gates are boot-dependent.** A dozen probes gated
+  on `0x33F000` were silent on the boot where the PT landed at
+  `0x340000`. **Gate on the invariant (VA, pid, state), not on the
+  address that happens to hold today.**
+- **`canary --full` can pass.** One run reached 28/28. The `#PF` is
+  a race; one clean run does not mean the bug is fixed and one crash
+  does not mean the code is wrong.
 
 **A handoff claim is not evidence.** The old handoff said `d1ae213` was
-green; it is not. **Re-run every repro on a fresh boot and read the
+green; it was not. **Re-run every repro on a fresh boot and read the
 bytes before acting.**
 
 **Ask for source you do not have** before patching a file not seen this
@@ -183,9 +196,11 @@ Verify the mtime chain `source` < `.o` < `kernel.elf` < `kernel.bin` <
 `hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
 gdb stub on `:1234`, `capture.txt` written (overwritten each run --
 **copy it aside after any failure**). `./run debug` adds `-S` (frozen
-at reset). The Makefile run targets use `-cpu max` + TCG (a different
-CPU) -- state which launcher was used. Default cwd `/root` (prompt
-`~`).
+at reset). **`./run tcg` / `./run tcg-debug`** = the same flow in TCG
+(`-cpu max`, no `-enable-kvm`): use TCG for the `mmap`-window fault,
+KVM for the canary `.text` race. The Makefile run targets also use
+`-cpu max` + TCG -- **state which launcher was used.** Default cwd
+`/root` (prompt `~`).
 
 **In-guest gate:** `cd /`, then `canary --full` (28/28) and
 `/root/scripts/test.sh` (57/57). **Use multiple `^Z`/`fg` cycles.**
@@ -199,24 +214,24 @@ call a race closed on one clean run.
 it did. `f91d31a` claims to fix canary/pipe7e/ctrl-Z; it does not.
 Test every commit before trusting its message.
 
-**Do not push `dev` without a full read of the 69 unpushed commits.**
-`origin/dev` is at `799e98f` (`v0.6.18`). Local `dev` is 69 ahead.
-That is intentional work, not accidental divergence. Force-pushing
-would destroy it.
+**Do not push `dev` without a full read of every unpushed commit.**
+Run `git log --oneline origin/dev..dev | wc -l` for the current count.
+`origin/dev` is at `799e98f` (`v0.6.18`). Force-pushing would destroy
+the unpushed work.
 
 **gdb hardware watchpoint is safe for this bug.** The handoff's
 "do not use gdb" applies to **timing-sensitive repro** (gdb-at-fault
 masks the race). A **write watchpoint** on the physical page does not
-mask it; it caught the writer in one run. Use it again for the
-`^C` bug if the bitmap fix does not fix `^C` as a side effect.
+mask it; it caught the writer in one run.
 
 ---
 
 ## Releases
 
 **`v0.6.15` through `v0.6.18` are released.**
-`origin/dev` = `799e98f` = `v0.6.18`. Local `dev` = `80d272b` = 69
-commits ahead (unpushed).
+`origin/dev` = `799e98f` = `v0.6.18`. Run
+`git rev-list --count origin/dev..dev` for the current ahead-count on
+`dev`; **do not hardcode the number here.**
 
 **Scratch tags present, not on `dev`:**
 - `fixA-stable` = `2c0df3b` (sys_poll revert; STOP/CONT self-pick)
@@ -234,9 +249,8 @@ file, commit; (2) bump the version string in `kmain.c`, commit;
 never `--tags`); (6) `git checkout main && git merge --no-ff dev &&
 git push origin main && git checkout dev`.
 
-**Current release state:** `v0.6.18` released; work pre-`v0.6.19`;
-`dev` is 69 commits ahead of `origin/dev` (unpushed). No new release
-until the `#PF` is fixed.
+**Current release state:** `v0.6.18` released; work pre-`v0.6.19`.
+No new release until the `#PF` is fixed.
 
 ---
 
@@ -254,13 +268,14 @@ concurrency rules `docs/contract.md`.
 
 ## Where we are
 
-### Baseline (committed, `80d272b`, tree clean, builds green)
+### Baseline (committed, `80d272b` plus this session's five commits, tree clean, builds green)
 
 - `make clean && make` -> `MAKE_EXIT=0`
-- **`canary --full` is NOT green.** It crashes with the `#PF`
-  described above after at least one `^Z`/`fg` cycle. The writer is
-  found; the writer of the `pt[19]` zeroing is not yet named (see
-  the `#PF` section: VA-based probe is next).
+- **`canary --full` is not reliably green.** It faults intermittently
+  with the `#PF` described above after at least one `^Z`/`fg` cycle;
+  a lucky run passes 28/28 (observed this session). **The writer of
+  the `pt[19]` zeroing is not yet named** (see the `#PF` section:
+  VA-based probe is next).
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
   resumes. Works.
 - `^C` -> does nothing (original behavior). Unchanged from 2026-10-31.
@@ -280,6 +295,11 @@ concurrency rules `docs/contract.md`.
   `/bin/busybox --install -s /bin` (absolute path) to get applet
   symlinks. Manual step, not part of the build.
 - `capture.txt` is gitignored, overwritten each `./run` -- copy aside
-  after any failure.
-- Saved artifacts from this session:
-  - `~/donix-20261101-canary-probes.patch` --
+  after any failure or pass you want to keep. **The 28/28 pass this
+  session was not preserved**: a later KVM run overwrote the file.
+  `capture-canary-28-28.txt` was a mis-named copy of that later run and
+  was deleted.
+- `~/donix-20261101-canary-probes.patch` -- the old probe stack from
+  earlier in the session. **Do not apply it as a stack**; it broke the
+  boot. Individual probes can be cherry-picked and applied one at a time
+  with a boot check between each, per the working-style rule.
