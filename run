@@ -44,7 +44,7 @@ CAPTURE=capture.txt
 # diagnosis.
 DEFAULT_MODE=clean-nofreeze
 
-MODES=(clean-nofreeze nofreeze sdl gtk headless debug monitor int verbose clean-sdl clean-headless)
+MODES=(clean-nofreeze nofreeze sdl gtk headless debug monitor int verbose clean-sdl clean-headless tcg tcg-debug)
 
 # ---- build + stage ---------------------------------------------------
 build() {
@@ -78,9 +78,27 @@ qemu_base_nofreeze() {
         -serial stdio -s -monitor none
 }
 
+# TCG (software emulation) bases: -cpu max instead of -enable-kvm.
+qemu_base_tcg() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -cpu max \
+        -serial stdio -s -monitor none \
+        -no-reboot -no-shutdown
+}
+
+qemu_base_tcg_nofreeze() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -cpu max \
+        -serial stdio -s -monitor none
+}
+
 mode_qemu() {
     local base; base=$(qemu_base)
     local nf;   nf=$(qemu_base_nofreeze)
+    local tbase; tbase=$(qemu_base_tcg)
+    local tnf;   tnf=$(qemu_base_tcg_nofreeze)
     case "$1" in
         clean-nofreeze) echo "$nf -display sdl" ;;
         nofreeze)       echo "$nf -display sdl" ;;
@@ -93,6 +111,8 @@ mode_qemu() {
         verbose)        echo "$base -display none -d guest_errors,int,cpu_reset" ;;
         clean-sdl)      echo "$base -display sdl" ;;
         clean-headless) echo "$base -display none" ;;
+        tcg)            echo "$tnf -display sdl" ;;
+        tcg-debug)      echo "$tbase -display sdl -S" ;;
         *) return 1 ;;
     esac
 }
@@ -110,6 +130,8 @@ mode_desc() {
         verbose)        echo "no display, full log           -d guest_errors,int,cpu_reset" ;;
         clean-sdl)      echo "make clean + SDL               fault freezes" ;;
         clean-headless) echo "make clean + no display        fault freezes" ;;
+        tcg)            echo "TCG (-cpu max), SDL, no freeze  fault reboots (no KVM)" ;;
+        tcg-debug)      echo "TCG (-cpu max), SDL, gdb -S    fault freezes (no KVM)" ;;
     esac
 }
 
