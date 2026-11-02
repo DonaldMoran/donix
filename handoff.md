@@ -288,6 +288,19 @@ concurrency rules `docs/contract.md`.
   with 5 `^Z`/`fg` cycles and a correct `ps` table. The intermittent
   fault is the `.text` `#PF` at a moving slot (`0x413966`/`pt=19`
   before `7cb26fb`; `0x450630`/`pt=80` after).
+- **A separate TCG-only scheduler fault (`./run tcg`), 2026-11-02:**
+  a `sh` child resumed with `rsp=0` and a bad cr3, faulted at
+  `RIP=0x451CC3` on `CR2=0xFFFFFFFFFFFFFFF8` (`error 0x6`, write,
+  user, not-present), with a recursive PML4 walk not present
+  (`pml4=511 pdpt=511 pd=511 pt=511`, `pdpte=0`). The scheduler's
+  `SWITCH-REFUSE: next pid=46 name=sh rsp outside stack -> idle`
+  fired *after* the bad dispatch -- the frame was already broken
+  when dispatched. This is a context-switch / cr3 bug under TCG,
+  **distinct** from the `.text` PTE zeroing (which is KVM-timing,
+  `error 0x14`, `pte=0`, a 4 KB PT). `sha256sum ABC` failed
+  (`got: []`) in the same run, likely the same process dying.
+  **Not fixed; needs its own investigation** (move the
+  `SWITCH-REFUSE` guard before dispatch; find who zeroes `rsp`).
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
   resumes. Works across many cycles.
 - `^C` -> SIGINT reaches the foreground pgrp; the console survives and
