@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-11-02 (late)** (HEAD on `dev` at `873be27`,
-tag `reset-baseline-873be27`).
+**Last updated: 2026-11-02 (very late)** (HEAD on `dev` at
+`e52bd2f`).
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -39,6 +39,22 @@ privilege model lands.  That session adds `setuid`/`seteuid`
 and then changes these five to return the unprivileged default
 (1000) with root as an escalation.
 
+**Status note (2026-11-02).**  Nothing currently fails because
+this is not implemented, and there is no user-facing feature it
+unlocks: every binary on the image is built here, there is no
+network service, no multi-user login, and no applet in `test.sh`
+behaves differently as non-root.  The cost of implementing it is
+real -- every filesystem syscall grows a permission check, the
+five identity syscalls flip from 0 to 1000 together (changing
+`tar -x`, `ps`, and `whoami` output), `chmod`/`chown` become
+real (which needs a FAT mode store or a side-channel), and the
+setuid marker is security-relevant in a way item 8's symlink
+marker is not.  **Before starting item 9, ask what it unlocks
+that will be used soon.**  If the answer is "nothing in the near
+term," item 10 or a visible-payoff item from the un-numbered
+list (real FatFs timestamps, `gettimeofday`/`time`) is a better
+use of the session.
+
 **10.  `CR4.OSFXSR` is set, but the kernel saves no SSE state.**
 Userland compiled by `toolchain/musl-gcc.sh` can emit SSE; the
 kernel is built with `-mno-sse -mno-sse2 -mno-avx -mno-mmx` and
@@ -59,6 +75,27 @@ switch and on the interrupt path, then to remove the
 No test currently fails because of this; the corruption is
 latent, and the surface is *any* 64-bit computation that gcc
 chooses to vectorize.
+
+**The fix has two separable halves and they should be two
+commits.**  (a) Kernel save/restore: `fxsave`/`fxrstor` (or
+`xsave`/`xrstor`) in `context_switch.asm`'s save and resume
+sides, and in the interrupt path (`interrupts.c`'s timer and ISR
+entry/exit).  The save region is 512 bytes (or 576 with AVX);
+it must be 16-byte aligned, so it is a `kmalloc`'d buffer per
+PCB or an `__attribute__((aligned(16)))` field in `pcb_t`.
+`CR0.MP` and `CR0.NE` should be set; `CR4.OSXSAVE` may need
+setting if `xsave` is chosen.  (b) Userland flag removal: drop
+`-mno-sse -mno-sse2 -mno-avx -mno-mmx` from
+`userland/musl/Makefile`'s `CFLAGS`.  **Do not drop the
+kernel's `-mno-sse*` flags in the same commit** -- kernel SSE
+and userland SSE are two separate decisions, and the kernel is
+written expecting no XMM state to survive across calls.
+
+The test: a program that writes `%xmm0`, forks a child that does
+not touch `%xmm0`, and has the child verify its value survived a
+tick (and the reverse: parent clobbers `%xmm0`, child still sees
+its own value).  One new applet, or an extension of an existing
+one.
 
 ## Un-numbered open items
 

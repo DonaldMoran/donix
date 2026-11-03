@@ -5,63 +5,73 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-02 (late, after the ATA rep-pio fix).
-**`v0.6.18` is released.** Work is pre-`v0.6.19`.
-`dev` = `6df4fef` (clean, ahead of `origin/dev` by 93).
+**Last updated:** 2026-11-02 (very late, after the fork `rep movsb`
+commit). **`v0.6.18` is released.** Work is pre-`v0.6.19`.
+`dev` = `e52bd2f` (clean, ahead of `origin/dev` by 97).
 `origin/dev` = `799e98f` = `v0.6.18`. Working tree clean.
 No stashes. Build green. `canary --full` 28/28 and `test.sh`
-57/57 at `6df4fef` (run as the gate for the ATA commit).
-Four new scratch tags: `20261102-ata-rep-pio`,
-`20261102-console-cursor-defer`, `20261102-exec-churn-ns-timing`,
-`20261102-console-timer`.
+57/57 at `78216bc` (the gate for the fork commit). Five scratch
+tags: `20261102-ata-rep-pio`, `20261102-console-cursor-defer`,
+`20261102-exec-churn-ns-timing`, `20261102-console-timer`,
+`20261102-fork-rep-movsb`.
 
 **WHERE WE ARE.** The 2026-11-02 session closed the `exec_churn`
-performance issue. The cause was **not** the console, **not** the
-scheduler, and **not** the VGA cursor; it was the child's
-`execve` reading `CHURN_HELPER` from the ATA disk, where
-`ata_read_chunk` moved each 16-bit word with a separate `inw`.
-On KVM each `inw` is one `KVM_EXIT_IO`, so a 512-byte sector
-cost 256 VM-Exits; ~25 sectors per `execve`, 24 rounds, ~154,000
-exits per `exec_churn`. Fixed with `rep insw`/`rep outsw`
-(one exit per sector). `exec_churn` under KVM dropped from
-`total 4,000,000 us, max round 160,000 us` to
-`total 360,000 us, max round 30,000 us`; the KVM-vs-TCG gap
-narrowed from ~20x to ~1.8x. Console cursor CRTC writes were
-also cut from 4 per character to 4 per write chunk
-(`20261102-console-cursor-defer`), independent of the ATA fix.
+performance issue (ATA PIO data port, fixed by `rep insw`/`rep
+outsw`) **and** the `sys_fork` eager-copy issue (byte loop
+replaced by `rep movsb`). The fork change is behaviorally clean:
+`canary --full` 28/28, `test.sh` 57/57, `exec_churn` 24/24. It is
+**not** measurable by the current test suite -- see the Refuted
+section on `exec_churn`'s tick floor. `sys_fork`'s
+`EAGER_COPY_REGION` is now `rep movsb` at both surviving call
+sites in the linked kernel (`f3 a4` in the disassembly).
 
-**NEXT -- top 3.**
-1. **`sys_fork`'s `EAGER_COPY_REGION` uses a byte loop.** Same
-   shape as the ATA bug, smaller:
-   `for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i];`
-   inside `sys_fork` in `user_syscall.c`. ~400 present pages per
-   fork at ~8 K cycles/page is 1-3 ms per fork. It does not show
-   at `exec_churn`'s scale (fork floor is the 10 ms clock
-   granularity) but any test that forks hundreds of times will
-   see it. `rep movsb` is the fix; verify with a fork-heavy test
-   under KVM and a `perf kvm stat` before/after.
-2. **`docs/open-issues.md` item 9 -- the privilege model.**
-   uid/gid are 0 for every process; no per-process uid/euid
-   split, no setuid, no `chown`. Unchanged from the previous
-   handoff. The item lists the shape: `setuid`/`seteuid`
-   (105/117), a setuid-root marker on a FAT-hostile filesystem
-   (magic-marker, same shape as item 8), a `sudoers` equivalent,
-   then 102/104/107/108/115 return 1000 with root as an
-   escalation.
-3. **`docs/open-issues.md` item 10 -- SSE save/restore.**
+**NEXT -- top 2.**
+1. **`docs/open-issues.md` item 10 -- SSE save/restore.**
    `CR4.OSFXSR` is set but the kernel saves no SSE state;
    userland is pinned to `-mno-sse*` as a stopgap. The fix is
    `fxsave`/`fxrstor`/`xsave` in `context_switch.asm` and the
    interrupt path, then remove the `-mno-sse*` flags from the
-   userland build.
+   userland build. One commit, one test. The risky part is
+   alignment of the save region and any latent SSE use in the
+   kernel once `-mno-sse` is dropped from kernel CFLAGS (do not
+   drop the kernel's flags in the same commit as the userland
+   flags -- kernel SSE and userland SSE are two separate
+   decisions).
+2. **`docs/open-issues.md` item 9 -- the privilege model.**
+   uid/gid are 0 for every process; no per-process uid/euid
+   split, no setuid, no `chown`. The item lists the shape:
+   `setuid`/`seteuid` (105/117), a setuid-root marker on a
+   FAT-hostile filesystem (magic-marker, same shape as item 8),
+   a `sudoers` equivalent, then 102/104/107/108/115 return 1000
+   with root as an escalation.
+
+   **NOTE FOR THE NEXT SESSION BEFORE STARTING ITEM 2.** Item 9
+   is the second-biggest numbered item, not a thing donix needs
+   right now. There is no current user-facing feature it
+   unlocks: every binary on the image is built here, there is no
+   network service, no multi-user login, and no applet in
+   `test.sh` that behaves differently as non-root. The cost is
+   real -- every filesystem syscall grows a permission check,
+   the five identity syscalls flip from 0 to 1000 together (and
+   `tar -x`/`ps`/`whoami` output changes with them), `chmod`/
+   `chown` become real (which means FAT needs a mode store or a
+   side-channel), and the setuid marker is security-relevant in
+   a way item 8's symlink marker is not. **Before starting item
+   9, ask what it unlocks that will be used soon.** If the
+   answer is "nothing in the near term," pick one of the
+   visible-payoff items instead: real FatFs timestamps,
+   `gettimeofday` (96) / `time` (201), or SSE (item 10). Item 9
+   is a multi-session project and is correctly deferred until
+   there is a reason for it.
 
 **THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** Unchanged from
 the previous handoff. The C is `context_switch_resume`'s
-unknown-CS branch. One clean `canary --full` at `873be27` does
-not close it; the `canary --full` at `6df4fef` that gated the
-ATA commit is a second clean run, which is evidence, not a
-close. No C work is planned until the top 3 are addressed. The
-refuted paths below are still refuted.
+unknown-CS branch. Two clean `canary --full` runs (at `873be27`
+and `6df4fef`) plus the `canary --full` at `78216bc` are three
+clean runs, which is evidence, not a close. The `78216bc` run is
+the gate for the fork commit, not a C investigation. No C work
+is planned until the top 2 are addressed. The refuted paths
+below are still refuted.
 
 ---
 
@@ -83,7 +93,11 @@ with `cd ... || exit 1` into an interactive shell** -- the `exit`
 closes the terminal. Write to `/tmp/<name>.sh` with
 `cat > ... <<'SCRIPT_EOF'`, then run it as a **separate** paste.
 Never paste a multi-line block with trailing backslashes into an
-interactive shell.
+interactive shell. **`cd "$HOME/..."` or a literal path in the
+script, never `cd "$(dirname "$0")"` when the script is pasted --
+`$0` is the interactive shell, and the `cd` fails.** A `set -e`
+at the top of the *script* is fine; a `set -e` pasted into the
+interactive shell is a terminal-killer.
 
 **Never put a destructive git command inside a block that also
 runs diagnostics.** A `git checkout -- <file>` or `git restore`
@@ -122,6 +136,14 @@ a STALE `kernel.bin`. Always run both, and verify the mtime chain
 `make clean` before the next behavioral test** -- per-file `rm`
 is not enough when multiple files were patched.
 
+**The patch-script write changes the mode of the file it writes.**
+A Python `open(..., "wb")` or `os.replace` drops the `+x` bit
+that the file had. `78216bc`'s follow-up `ea4dc2e` restored
+`user_syscall.c` from 100644 to 100755 for exactly this reason.
+If a patched file was executable, `chmod +x` it back, or commit
+the mode change as its own explicit commit -- do not leave a
+mode change hidden inside a content commit.
+
 **`nm` output moves between builds.** Re-run `nm` before using
 any address.
 
@@ -132,7 +154,7 @@ success-or-transient-path; they are gated. The refuse lines
 (`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`, `EXIT-REFUSE`)
 and the `C` report are failure-path (kept).
 
-**Test harness.** `./run` (no arg) = clean build + fresh
+**Test harness.** `./run` (no arg) = clean rebuild + fresh
 `hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
 gdb stub on `:1234`, `capture.txt` written (overwritten each run --
 **copy it aside after any failure or pass you want to keep**).
@@ -157,6 +179,16 @@ does not mean "port I/O is slow"; it means "the guest is doing
 port I/O on a hot path."** The 2026-11-02 session spent hours
 chasing that to the console before finding the ATA data port.
 Read the guest source before reading the exit reason.
+
+**On Fedora 44, `perf kvm stat record` aborts with `double free
+or corruption (!prev)` in cleanup, after writing `perf.data.guest`.**
+The capture is complete and `perf kvm stat report` on it works.
+The abort is in `kvm_events_record()` (it `strdup`s `rec_argv`
+entries and frees them after `parse_options()` reorders `argv`),
+not in the guest and not in the kernel. Do not chase it as a
+donix issue. If `report` also aborts on the same host, use
+`sudo perf kvm stat live` as the workaround. The `perf.data*`
+files are now in `.gitignore` (`e52bd2f`).
 
 **GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
 `-g`). Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028,
@@ -259,12 +291,13 @@ Concurrency rules: `docs/contract.md`. Open issues:
 
 ### Current baseline
 
-- `test.sh` **57/57** at `6df4fef` (2026-11-02 late, gate for the
-  ATA commit).
-- `canary --full` **28/28** at `6df4fef` (same run). The full 28-row
+- `test.sh` **57/57** at `78216bc` (2026-11-02 very late, gate for
+  the fork commit).
+- `canary --full` **28/28** at `78216bc` (same run). The full 28-row
   sequence, no skips.
-- `exec_churn` 24 rounds pass at `6df4fef`; `total` 360,000 us,
-  `max round` 30,000 us under KVM (down from 4,000,000 / 160,000).
+- `exec_churn` 24 rounds pass at `78216bc`; every round reports
+  `fork 0` (tick-quantized). See the Refuted section -- this is
+  not a measurement of the fork copy.
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it;
   `fg` resumes.
 - `^C` -> SIGINT reaches the foreground pgrp; the console survives
@@ -274,9 +307,11 @@ Concurrency rules: `docs/contract.md`. Open issues:
 
 ### Next -- the highest-value work
 
-1. `sys_fork`'s `EAGER_COPY_REGION` byte loop -> `rep movsb`.
-2. `docs/open-issues.md` item 9 -- the privilege model.
-3. `docs/open-issues.md` item 10 -- SSE save/restore.
+1. `docs/open-issues.md` item 10 -- SSE save/restore.
+2. `docs/open-issues.md` item 9 -- the privilege model, **with the
+   note above**: no current user-facing payoff; ask what it unlocks
+   before starting it. Real FatFs timestamps, `gettimeofday`/
+   `time`, or SSE may be a better use of the next session.
 
 ### Refuted -- do NOT re-walk
 
@@ -310,6 +345,24 @@ revival of these.
   fixed by `rep insw`/`rep outsw`.
 - **`ata_poll_drq` spinning.** Instrumented 2026-11-02:
   2,113 calls, 128 total spins. Not the cost.
+- **`exec_churn` can measure the `sys_fork` eager-copy cost.**
+  Refuted 2026-11-02, same session as the fork `rep movsb` commit
+  (`78216bc`). `exec_churn`'s floor is the 10 ms PIT tick; every
+  round reports `fork 0` **before and after** the fix. The byte
+  loop was ~1-3 ms per fork (below one tick), and so is the
+  `rep movsb` -- the two are indistinguishable to `exec_churn`.
+  The round totals vary between boots (`360,000 us` in the
+  handoff's baseline vs `440,000 us` at `78216bc`) because they
+  are dominated by how many rounds happened to land on 1 vs 2
+  ticks, not by the fork copy. **A sub-tick fork benchmark is
+  what the next session needs if this is ever to be measured.**
+  Do not re-walk `exec_churn` as evidence for or against a fork
+  change.
+- **The `perf kvm stat record` `double free` is a donix issue.**
+  Refuted 2026-11-02. It is a Fedora 44 `perf` bug in
+  `kvm_events_record()`'s cleanup (see "Test harness" above). The
+  capture writes and the report reads correctly. Do not chase it
+  in the kernel.
 
 ### Open issues
 
@@ -357,23 +410,33 @@ the discarded guards, they are not in the tree -- read
 `git log --all --oneline` for `efc8e08` and the session log, but
 treat them as **refuted** per the section above.
 
-**The 2026-11-02 performance commits** (four, on top of
-`873be27`-derived `dev`):
-- `905bc70` `20261102-ata-rep-pio` -- the fix.
+**The 2026-11-02 performance and correctness commits** (six, on
+top of `f902af6`):
+- `78216bc` `20261102-fork-rep-movsb` -- fork `EAGER_COPY_REGION`
+  `rep movsb`. **The item 1 commit.**
+- `ea4dc2e` -- `user_syscall.c` mode restore (100644 -> 100755,
+  dropped by `78216bc`'s Python write).
+- `e52bd2f` -- gitignore `perf.data*`.
+- `905bc70` `20261102-ata-rep-pio` -- the ATA fix.
 - `fdbcbc7` `20261102-console-cursor-defer` -- independent
   improvement.
 - `5db42f2` `20261102-exec-churn-ns-timing` -- test-only.
 - `6df4fef` `20261102-console-timer` -- test-only.
 
+(`f902af6` is `20261102-handoff-rewrite`; the six above are the
+work on top of it.)
+
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last release.** The tree is at `6df4fef`, clean,
-no stashes, ahead of `origin/dev` by 93; the `exec_churn`
+**`v0.6.18` is the last release.** The tree is at `e52bd2f`, clean,
+no stashes, ahead of `origin/dev` by 97. The `exec_churn`
 performance issue is closed (ATA PIO data port, fixed by `rep
-insw`/`rep outsw`). The C is open (two clean `canary --full`
-runs, which is evidence, not a close). NEXT is the top 3:
-`sys_fork` `rep movsb`, item 9 (privilege model), item 10 (SSE
-save/restore). Read `docs/contract.md` and this file's NEXT
-before any code.
+insw`/`rep outsw`), and the `sys_fork` eager-copy issue is closed
+(byte loop -> `rep movsb`, `78216bc`, tagged
+`20261102-fork-rep-movsb`). The C is open (three clean
+`canary --full` runs, which is evidence, not a close). NEXT is
+item 10 (SSE save/restore) and item 9 (privilege model, with the
+"is this worth a session" note above). Read `docs/contract.md`
+and this file's NEXT before any code.
