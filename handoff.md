@@ -5,27 +5,56 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-02 (very late, after the fork `rep movsb`
-commit). **`v0.6.18` is released.** Work is pre-`v0.6.19`.
-`dev` = `e52bd2f` (clean, ahead of `origin/dev` by 97).
-`origin/dev` = `799e98f` = `v0.6.18`. Working tree clean.
-No stashes. Build green. `canary --full` 28/28 and `test.sh`
-57/57 at `78216bc` (the gate for the fork commit). Five scratch
-tags: `20261102-ata-rep-pio`, `20261102-console-cursor-defer`,
-`20261102-exec-churn-ns-timing`, `20261102-console-timer`,
-`20261102-fork-rep-movsb`.
+**Last updated:** 2026-11-03, documentation pass for `v0.6.19`.
+**`v0.6.18` is the last pushed release; nothing was pushed.** `dev` =
+`d69c2ab` plus the uncommitted docs edits (ahead of `origin/dev` by
+100 before the edits). `origin/dev` = `799e98f` = `v0.6.18`. No
+stashes. Build green. `canary --full` 28/28 and `test.sh` 57/57 at
+`d69c2ab` (clean rebuild, no probes). Two scratch tags from the
+2026-11-03 tar session: `20261103-tar-dirflush` (`a0664a8`) and
+`20261103-tar-padding` (`d69c2ab`).
 
-**WHERE WE ARE.** The 2026-11-02 session closed the `exec_churn`
-performance issue (ATA PIO data port, fixed by `rep insw`/`rep
-outsw`) **and** the `sys_fork` eager-copy issue (byte loop
-replaced by `rep movsb`). The fork change is behaviorally clean:
-`canary --full` 28/28, `test.sh` 57/57, `exec_churn` 24/24. It is
-**not** measurable by the current test suite -- see the Refuted
-section on `exec_churn`'s tick floor. `sys_fork`'s
-`EAGER_COPY_REGION` is now `rep movsb` at both surviving call
-sites in the linked kernel (`f3 a4` in the disassembly).
+**WHERE WE ARE.** The 2026-11-03 session fixed **busybox `tar`**.
+It was two bugs, both in vendored FatFs, both the same class: **state
+staged in `fs->win` is not flushed before something else moves the
+window.** `move_window()` is a no-op when `fs->winsect` already
+equals the requested sector even if `fs->win` holds something else.
 
-**NEXT -- top 2.**
+1. **`a0664a8` (`20261103-tar-dirflush`)** -- `f_open`: `dir_register`
+   stages the new directory entry into `fs->win` via `dj.dir` but
+   does not flush it. A later `f_open`/`f_read`/`f_write` on the same
+   volume calls `move_window`, reloads `fs->win`, and the staged name
+   is discarded; the close-time `sync_window` then writes the **old**
+   sector back over the entry. Fix: `sync_window(fs)` right after
+   `dir_register` succeeds in `f_open`, while `dj.dir` is valid.
+2. **`d69c2ab` (`20261103-tar-padding`)** -- `f_write`: the
+   cluster-boundary code above the **direct-write branch** sets the
+   new FAT link in `fs->win` (`wflag=1`), but the direct branch
+   writes data sectors from the caller's buffer and `continue`s
+   without flushing. A later `create_chain`'s `move_window` is a
+   no-op if `winsect` already equals the FAT sector, the chain read
+   is stale, `create_chain` returns 1, `ABORT(FR_INT_ERR)` sets
+   `FIL.err=2` -- **sticky** -- and every later `f_write` fails. That
+   made tar's end-of-archive padding write return short:
+   `write error: I/O error` on create, `short read` on list/extract.
+   Fix: `sync_window(fs)` before the direct `disk_write`.
+
+Both verified on a clean rebuild: `canary --full` 28/28,
+`test.sh` 57/57, full `tar -cvf` / `-tvf` / `-xvf` round trip
+**silent with `rc=0`** and matching contents (3072-byte archive for
+two small members; 2048 for one), and the six-line redirect/tar
+matrix green. **Directory members work too:** `tar -cvf dir.tar
+a.txt b.txt src` (with `src/c.txt`) creates a 4608-byte archive
+listing `src/` as `drwxr-xr-x`, and `tar -xvf` recreates the tree
+with matching contents and `rc=0`. One cosmetic warning remains on
+extract -- see NEXT item 4.
+
+The prior session (2026-11-02) closed the `exec_churn`
+performance issue (ATA PIO data port, `rep insw`/`rep outsw`) and
+the `sys_fork` eager-copy issue (byte loop -> `rep movsb`); see
+the 2026-11-02 commits list under "State on disk".
+
+**NEXT -- highest-value work.**
 1. **`docs/open-issues.md` item 10 -- SSE save/restore.**
    `CR4.OSFXSR` is set but the kernel saves no SSE state;
    userland is pinned to `-mno-sse*` as a stopgap. The fix is
@@ -63,15 +92,32 @@ sites in the linked kernel (`f3 a4` in the disassembly).
    `gettimeofday` (96) / `time` (201), or SSE (item 10). Item 9
    is a multi-session project and is correctly deferred until
    there is a reason for it.
+3. **`umask` is unimplemented (syscall 95).** `mkdir -p` fails
+   with `Unknown syscall: 95` and then mis-creates; `mkdir`
+   without `-p` works. Small, self-contained, and it unblocks
+   `mkdir -p` for scripts. Candidate for a short session.
+4. **`mkdir` on an existing directory returns `EPERM` instead of
+   `EEXIST`.** Symptom: `tar -xvf` of an archive with a directory
+   member prints `tar: can't create directory 'src': Operation
+   not permitted`, even though the directory is created and the
+   tree extracts correctly (`rc=0`, contents match). Cause:
+   busybox `tar` does `mkdir`, then treats `EEXIST` as "already
+   there, fine" but warns on any other errno; the kernel's
+   `sys_mkdir` returns `-EPERM` for an existing directory.
+   Correct POSIX: `-EEXIST` when the target exists and is a
+   directory, `-ENOTDIR` when it exists as a file. Small; read
+   `sys_mkdir` before patching (not read this session). Pair it
+   with `umask` -- both are small syscall-completion fixes, both
+   unblock script-level behavior, neither touches FatFs.
 
-**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** Unchanged from
-the previous handoff. The C is `context_switch_resume`'s
-unknown-CS branch. Two clean `canary --full` runs (at `873be27`
-and `6df4fef`) plus the `canary --full` at `78216bc` are three
-clean runs, which is evidence, not a close. The `78216bc` run is
-the gate for the fork commit, not a C investigation. No C work
-is planned until the top 2 are addressed. The refuted paths
-below are still refuted.
+**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** The C is
+`context_switch_resume`'s unknown-CS branch. Not observed since the
+2026-11-02 disk-path fixes (`905bc70` ATA rep-pio, `a0664a8` /
+`d69c2ab` FatFs window flush). Three clean `canary --full` runs
+before that (`873be27`, `6df4fef`, `78216bc`), and none since. That
+is evidence, not a close -- no mechanism was ever named, and the
+fault is intermittent. No C work is planned. The refuted paths below
+are still refuted.
 
 ---
 
@@ -265,10 +311,12 @@ ready and verified.** `origin/dev` is not force-pushed; every
 unpushed `dev` commit is intentional work. Run
 `git log --oneline origin/dev..dev | wc -l` for the current count.
 
-**Current release state.** **`v0.6.18` is released.** Work is now
-pre-**`v0.6.19`**. There is no release gate recorded for
-`v0.6.19`. If a gate is wanted for `v0.6.19`, it is set in this
-file before the release session, not during it.
+**Current release state.** **`v0.6.18` is the last pushed release.**
+This session is the `v0.6.19` documentation pass; the banner bump
+and tag happen only when the user says so, and **nothing is pushed
+until the user says so.** The scratch tags are preserved. Do not
+push, tag a release, or drop the scratch tags on the session's own
+initiative.
 
 ---
 
@@ -278,8 +326,11 @@ A fork of dons-os. Goal: a Unix-like OS that runs static
 musl-linked binaries on the Linux x86_64 ABI, natively. Newlib is
 gone. Userland is a tracked source tree at `userland/musl/`. Phase B
 (busybox) is well underway: the shell is interactive, pipelines and
-redirection work, and the applet set now includes `bc`, `dc`, `diff`,
-`du`, `awk` in addition to the file/text applets.
+redirection work, job control works (`^C`, `^Z`, `jobs`, `fg`), and
+the applet set now includes `bc`, `dc`, `diff`, `du`, `awk` in
+addition to the file/text applets. **`tar` now creates, lists and
+extracts correct, well-formed archives, including directory
+members** (`a0664a8` + `d69c2ab`).
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -303,7 +354,8 @@ Concurrency rules: `docs/contract.md`. Open issues:
 - `^C` -> SIGINT reaches the foreground pgrp; the console survives
   and the prompt returns.
 - `busybox sh` nesting -> works.
-- The C is open; see "THE C HALT" above.
+- The C is not observed since the 2026-11-02 disk-path fixes; still
+  open -- evidence, not a close. See "THE C HALT" above.
 
 ### Next -- the highest-value work
 
@@ -397,7 +449,10 @@ start with `/`. This is a manual step, not part of the build.
 build.** If it's missing after a `git clean -xdf`, copy it back from
 a working tree, or rebuild it with `toolchain/install_musl.sh`.
 `04_kernel_64bit/fatfs/ff.c` is **tracked** (not `third_party/`),
-built by the cross-GCC.
+built by the cross-GCC, and now contains **two** `sync_window` fixes
+(`a0664a8` in `f_open`, `d69c2ab` in `f_write`). Any further edit
+there must re-run the full gate (`canary --full` + `test.sh` + the
+tar round trip + the redirect/tar matrix), not just a build.
 
 **`~/code/saved`** -- not a baseline. Run
 `git -C ~/code/saved status --short` before any comparison; treat
@@ -430,13 +485,21 @@ work on top of it.)
 
 ## One-line summary
 
-**`v0.6.18` is the last release.** The tree is at `e52bd2f`, clean,
-no stashes, ahead of `origin/dev` by 97. The `exec_churn`
-performance issue is closed (ATA PIO data port, fixed by `rep
-insw`/`rep outsw`), and the `sys_fork` eager-copy issue is closed
-(byte loop -> `rep movsb`, `78216bc`, tagged
-`20261102-fork-rep-movsb`). The C is open (three clean
-`canary --full` runs, which is evidence, not a close). NEXT is
-item 10 (SSE save/restore) and item 9 (privilege model, with the
-"is this worth a session" note above). Read `docs/contract.md`
-and this file's NEXT before any code.
+**`v0.6.18` is the last pushed release; nothing is pushed.** The
+tree is at `d69c2ab` plus the uncommitted docs edits, no stashes,
+ahead of `origin/dev` by 100 before the edits. The **busybox `tar`
+bug is fixed in two parts**: `a0664a8` (`f_open` flushes the
+staged directory entry after `dir_register`) and `d69c2ab`
+(`f_write` flushes the FAT window before a direct data write).
+Both are stale-`fs->win` bugs. `canary --full` 28/28, `test.sh`
+57/57, a full `tar` create/list/extract round trip (regular files
+**and directory members**) silent with `rc=0` and matching
+contents, and the six-line redirect/tar matrix are green on a
+clean rebuild with the probes reverted. **This session is the
+`v0.6.19` documentation pass; the bump and tag happen when the
+user says so, and nothing is pushed until the user says so.**
+NEXT, if the user wants OS work, is item 10 (SSE), item 9
+(privilege model, with the "is this worth a session" note), or the
+two small syscall-completion fixes (`umask` 95, `mkdir`/`EEXIST`);
+otherwise treat any user-reported bug as a new task. Read
+`docs/contract.md` and this file's NEXT before any code.
