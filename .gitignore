@@ -62,3 +62,6 @@ third_party/
 .backup-*
 run.bak.*
 .fat_config_*
+
+# perf kvm artifacts (regenerated each capture)
+perf.data*
