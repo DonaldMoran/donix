@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-11-02 (very late)** (HEAD on `dev` at
-`e52bd2f`).
+**Last updated: 2026-11-03 (v0.6.19 documentation pass)** (HEAD on
+`dev` at `d69c2ab` plus the docs commits).
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -97,6 +97,11 @@ tick (and the reverse: parent clobbers `%xmm0`, child still sees
 its own value).  One new applet, or an extension of an existing
 one.
 
+The 2026-11-02/03 hot paths (`78216bc` fork rep movsb, `905bc70` ATA
+rep-pio, `d69c2ab` `f_write`) are more vectorizable than what came
+before, so the latent surface is larger than when this item was filed.
+That raises priority; it does not change the fix.
+
 ## Un-numbered open items
 
 **`chmod`/`chown` accept and drop, and their applets are not
@@ -116,16 +121,44 @@ FatFs's `f_chmod` would be a real but two-state mode change, and
 a separate, larger decision.
 
 **`tar` is enabled, and link restoration is verified.**  The
-v0.6.16 note that called its creation path a busybox applet
-issue was **wrong**: busybox's self-archive check compares the
-archive's `(st_dev, st_ino)` against each member's, and every
-FAT file reported `Inode: 0`, so every member matched and was
-skipped.  `76d66db` gives FAT a real `st_ino` from `(sclust,
-objsize)`; `tar -cf`/`-tf`/`-xf` now work, and `tar -tvf`
-records a symlink as `lrwxrwxrwx ... -> target`.  One limit
+v0.6.16 note named a real symptom but the wrong cause.  busybox's
+self-archive check compares the archive's `(st_dev, st_ino)` against
+each member's, and every FAT file reported `Inode: 0`, so every
+member matched and was skipped; `76d66db` gives FAT a real `st_ino`
+from `(sclust, objsize)`.  That was **necessary but not sufficient**:
+the archive was still lost on create and short on list/extract
+because of two vendored-FatFs bugs of the same class -- **state
+staged in `fs->win` is not flushed before something else moves the
+window.**  `a0664a8` flushes the staged directory entry after
+`dir_register` in `f_open`; `d69c2ab` flushes the FAT link before a
+direct data write in `f_write`.  With both, `tar -cvf`/`-tvf`/`-xvf`
+round-trip silently with `rc=0`, including directory members
+(`src/` lists as `drwxr-xr-x`), and `tar -tvf` records a symlink as
+`lrwxrwxrwx ... -> target`.  One limit
 remains: two empty files with the same name in different
 directories collide in `st_ino`, because `FILINFO` carries no
 parent -- see `fat_ino`.
+
+**`umask` (95) is unimplemented.**  `mkdir -p` calls it first and
+fails with `Unknown syscall: 95`, then mis-creates the tree; `mkdir`
+without `-p` works.  The fix is a real `sys_umask`: store a
+per-process mask (a `pcb_t` field, appended so the `_Static_assert`
+offsets do not move) and return the previous one; the FAT/`S_IFDIR`
+mode synthesis in `stat` already reports the standard `0755`, so the
+mask only needs to be stored for a caller that reads it back.  Small,
+self-contained, and it unblocks `mkdir -p` for scripts.  Read
+`sys_umask`/`sys_mkdir` before patching.
+
+**`sys_mkdir` returns `-EPERM` for an existing directory; it should
+be `-EEXIST`.**  busybox `tar` does `mkdir`, treats `EEXIST` as
+"already there, fine," and warns on any other errno, so `tar -xvf` of
+an archive with a directory member prints `tar: can't create
+directory 'src': Operation not permitted` even though the directory
+is created and the tree extracts correctly (`rc=0`, contents match).
+Correct POSIX: `-EEXIST` when the target exists and is a directory,
+`-ENOTDIR` when it exists as a file.  Cosmetic today; pair it with
+`umask` -- both are small syscall-completion fixes, neither touches
+FatFs.  Read `sys_mkdir` before patching.
 
 **`tkill` (200) is implemented as `kill(tid, sig)`.**  Not an
 open issue; noted so it is not re-added.  busybox's `kill`
@@ -235,6 +268,10 @@ fallback `musl_sh` prompt; the system survived.
 > `0x413962` `#PF` recurs, read it on its own.  **Do not merge
 > them without evidence.**
 
+Status (2026-11-03): not observed since the 2026-11-02 disk-path
+fixes (`905bc70`, `a0664a8`, `d69c2ab`).  Not closed -- the
+mechanism was never named; recurrence should be read on its own.
+
 Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
 boot all completed cleanly; a probe-then-5000 run on a later
 boot reached 5000.  So the loop is not the cause and 5000 is not
@@ -245,7 +282,13 @@ closed on one clean run.  It is the same family as the
 next session that touches the VFS, fork, or exec paths should
 read this first.
 
-**Disassembly of the current build (2026-10-18).**  `third_party/busybox/busybox` is non-PIE (`Type: EXEC`, load base `0x400000`); `0x42F1A7` is inside the executable PT_LOAD but is **not an instruction boundary** -- it falls inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.  Starting a disassembly at `0x42F1A7` yields a spurious `movabs`, which is the tell.  The nearest real instructions that can raise a user `#GP(0)` are `0x42F1A3` (`mov 0xa0(%r12),%rdi`, a non-canonical `%r12`) and `0x42F1AB` (`cmpb $0x0,0x1(%rbp)`, a non-canonical `%rbp` set by `xchg %rax,%rbp` at `0x42F197` from a returned pointer).  No SSE/XMM instruction appears in the window, so 7b is **not** a face of item 10.  The recorded address is therefore either a fault/operand address, a transcription slip, or from an older build.  Suspected (not proven) to be a downstream symptom of a pre-v0.6.13 corruption race (heap cycle / pipe wake / `C`); unobserved since those closed.  The standing test is a 100 Hz soak (PIPE7E-ALL-PASS, 250000 iterations @ 100 Hz over >3.5 hours, 2026-10-18); if it recurs, inspect `%r12`/`%rbp` at `0x42F1A3`/`0x42F1AB` and trace the corruption upstream of `find`.
+**Disassembly note.**  `0x42F1A7` is inside an instruction, not at
+one; the nearest real instructions that can raise a user `#GP(0)` are
+`0x42F1A3` (non-canonical `%r12`) and `0x42F1AB` (non-canonical
+`%rbp`).  Not SSE (no XMM in the window).  Suspected (not proven)
+downstream of a pre-`v0.6.13` corruption race; unobserved since those
+closed.  Standing test: the 100 Hz soak.  If it recurs, inspect
+`%r12`/`%rbp` at those two addresses.
 
 **Item 7e — ash's stale `jmp_buf`.**  The kernel-side faces of
 7e are closed (the pipe-wake face by `c3e5c97`; the
@@ -308,17 +351,10 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 
 ---
 
-## Also open
+## Also open -- small defects and missing features
 
 - `kill(0, sig)` ("my group") still returns `-EINVAL`.
-  `kill(-pgid, sig)` works (`9b1a4ed`).  Retired from item 13.
-- `setpgid`/`setsid`-as-pgrp: verify whether a process can join
-  or create a process group beyond `TIOCSPGRP`'s foreground
-  assignment.  Retired from item 13; state unverified.
-- The optional shebang interpreter argument reaching the
-  interpreter as a real argv is unproven.  A test with an
-  interpreter that can observe argv is the proof.  Retired from
-  item 14.
+  `kill(-pgid, sig)` works (`9b1a4ed`).
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are
   latent collisions.
 - Real FatFs timestamp storage: the three timestamp syscalls
@@ -334,8 +370,41 @@ or walk `elf_page_list` and unmap by VA from the list itself.
   writer (see `pipe_t`'s comment in `user_syscall.c` — a second
   blocked reader on the same pipe end has nowhere to record
   itself and will only wake on a keyboard IRQ).
+- A nonexistent pid stats as a directory: `stat("/proc/999999/")`
+  reports `S_IFDIR` rather than `ENOENT`.  `ps` only stats pids
+  `readdir` gave it, so no consumer is affected.  Worth one line
+  when `/proc` is next touched.
+- `ls` long options are unavailable in the pinned BusyBox 1.36.1
+  (`--color`, `--help`, `--full-time`): the applet registers no
+  long-option table in this snapshot.  `third_party/` is read-only;
+  use short options (`-l`, `-F`, `-R`, `-h`).  Not a kernel bug, a
+  source-version limit.
+- `exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window
+  (`user_syscall.c:4358` lists `[0x8000200000, 0x8000300000)`), but
+  `sys_brk` has no upper bound and `sys_fork`'s copy uses the real
+  `parent->brk_virt`.  A parent whose `brk_virt` grew past the
+  window forks a child with pages the exec cleanup will neither
+  unmap nor free.  Leak, not corruption; extend the cleanup row to
+  the live bound, or unmap by VA from `elf_page_list`.
+
+## Also open -- verify
+
+- `setpgid`/`setsid`-as-pgrp: can a process join or create a
+  process group beyond `TIOCSPGRP`'s foreground assignment?
+  State unverified.
+- The optional shebang interpreter argument reaching the
+  interpreter as a real argv is unproven.  A test with an
+  interpreter that can observe argv is the proof.
+
+## Also open -- hazards (read before touching)
+
 - `put_file_slot`'s pipe wake is coupled to `sys_close`'s wake
   (read the `put_file_slot` comment before touching either).
 - `process_dump_all`'s `DETACHED` state: a process READY with
   `prev == NULL && next == NULL` is labeled DETACHED, which may
   mask a stranded-process bug.
+- The `g_syscall_stack_top - 120` frame base is coupled to the
+  stub's push sequence in `user_syscall_entry.asm`; a push added,
+  removed, or reordered means `kf[]` must be re-derived and
+  `signal_deliver_frame` + `sys_rt_sigreturn` updated in the same
+  commit.
