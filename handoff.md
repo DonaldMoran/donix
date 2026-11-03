@@ -5,14 +5,13 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-03, documentation pass for `v0.6.19`.
-**`v0.6.18` is the last pushed release; nothing was pushed.** `dev` =
-`d69c2ab` plus the uncommitted docs edits (ahead of `origin/dev` by
-100 before the edits). `origin/dev` = `799e98f` = `v0.6.18`. No
-stashes. Build green. `canary --full` 28/28 and `test.sh` 57/57 at
-`d69c2ab` (clean rebuild, no probes). Two scratch tags from the
-2026-11-03 tar session: `20261103-tar-dirflush` (`a0664a8`) and
-`20261103-tar-padding` (`d69c2ab`).
+**Last updated:** 2026-11-03, after the `v0.6.19` release.
+**`v0.6.19` is the last pushed release.** `dev` = `ba56b3d`;
+`origin/dev` = `ba56b3d`. `main` = `7e4748b` (the `--no-ff` merge of
+`v0.6.19`). Clean tree, no stashes, ahead 0. Build green. Gate at
+`ba56b3d` (clean rebuild, no probes): boot banner `donix v0.6.19`,
+`canary --full` 28/28, `test.sh` 57/57. The scratch `2026*` tags are
+dropped (the release summary is the `v0.6.19` tag annotation).
 
 **WHERE WE ARE.** The 2026-11-03 session fixed **busybox `tar`**.
 It was two bugs, both in vendored FatFs, both the same class: **state
@@ -311,12 +310,12 @@ ready and verified.** `origin/dev` is not force-pushed; every
 unpushed `dev` commit is intentional work. Run
 `git log --oneline origin/dev..dev | wc -l` for the current count.
 
-**Current release state.** **`v0.6.18` is the last pushed release.**
-This session is the `v0.6.19` documentation pass; the banner bump
-and tag happen only when the user says so, and **nothing is pushed
-until the user says so.** The scratch tags are preserved. Do not
-push, tag a release, or drop the scratch tags on the session's own
-initiative.
+**Current release state.** **`v0.6.19` is the last pushed release.**
+`dev` = `ba56b3d` and `main` = `7e4748b`, both pushed; `v0.6.19` is
+annotated on `ba56b3d`; the scratch `2026*` tags are dropped. Work is
+now pre-`v0.6.20`. There is no release gate recorded for `v0.6.20`;
+if a gate is wanted it is set in this file before that release
+session, not during it.
 
 ---
 
@@ -481,25 +480,33 @@ top of `f902af6`):
 (`f902af6` is `20261102-handoff-rewrite`; the six above are the
 work on top of it.)
 
+**The 2026-11-03 documentation and release commits** (on top of
+`a0664a8` / `d69c2ab`):
+- `c0126d4` -- docs: handoff live-state for the v0.6.19 docs pass.
+- `28272f9` -- docs: open-issues full pass for v0.6.19.
+- `b0e9cce` -- docs: README signals/job control, tar cause, jobctl
+  syscalls.
+- `9a36e76` -- docs: ROADMAP future-work pass for v0.6.19.
+- `ef090f4` -- docs: gotchas -- two method lessons from v0.6.19 prep.
+- `ba56b3d` -- bump: version banner to v0.6.19. **Tagged `v0.6.19`.**
+
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last pushed release; nothing is pushed.** The
-tree is at `d69c2ab` plus the uncommitted docs edits, no stashes,
-ahead of `origin/dev` by 100 before the edits. The **busybox `tar`
-bug is fixed in two parts**: `a0664a8` (`f_open` flushes the
-staged directory entry after `dir_register`) and `d69c2ab`
-(`f_write` flushes the FAT window before a direct data write).
-Both are stale-`fs->win` bugs. `canary --full` 28/28, `test.sh`
-57/57, a full `tar` create/list/extract round trip (regular files
-**and directory members**) silent with `rc=0` and matching
-contents, and the six-line redirect/tar matrix are green on a
-clean rebuild with the probes reverted. **This session is the
-`v0.6.19` documentation pass; the bump and tag happen when the
-user says so, and nothing is pushed until the user says so.**
-NEXT, if the user wants OS work, is item 10 (SSE), item 9
-(privilege model, with the "is this worth a session" note), or the
-two small syscall-completion fixes (`umask` 95, `mkdir`/`EEXIST`);
-otherwise treat any user-reported bug as a new task. Read
-`docs/contract.md` and this file's NEXT before any code.
+**`v0.6.19` is released and pushed.** The tree is at `ba56b3d` on
+`dev`, `7e4748b` on `main` (the `--no-ff` merge), clean, no stashes,
+ahead 0. The **busybox `tar` bug is fixed in two parts**: `a0664a8`
+(`f_open` flushes the staged directory entry after `dir_register`)
+and `d69c2ab` (`f_write` flushes the FAT window before a direct data
+write), both stale-`fs->win` bugs. **Job control works end to end**
+(`^C`, `^Z`, `jobs`, `fg`, `bg`), and **shebang** and **signals
+slice 6** ship. Gate at `ba56b3d`: boot banner `donix v0.6.19`,
+`canary --full` 28/28, `test.sh` 57/57, a live `^Z` mid-`test.sh`
+that `jobs` listed and `fg` resumed, the six-line redirect/tar
+matrix green, and the file and directory `tar` round trips silent
+with `rc=0` and matching contents. NEXT, if the user wants OS work,
+is item 10 (SSE), item 9 (privilege model, with the "is this worth a
+session" note), or the two small syscall-completion fixes (`umask`
+95, `mkdir`/`EEXIST`); otherwise treat any user-reported bug as a new
+task. Read `docs/contract.md` and this file's NEXT before any code.
