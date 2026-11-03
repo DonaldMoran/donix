@@ -5,40 +5,49 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-02 (late). **`v0.6.18` is released.**
-Work is pre-`v0.6.19`. `dev` = `873be27` (tag
-`reset-baseline-873be27`). `origin/dev` = `799e98f` = `v0.6.18`;
-run `git rev-list --count origin/dev..dev` for the real ahead-count
-on `dev`. Working tree clean. No stashes. Build green, canary
-`28 passed, 0 failed`.
+**Last updated:** 2026-11-02 (late, after the ATA rep-pio fix).
+**`v0.6.18` is released.** Work is pre-`v0.6.19`.
+`dev` = `6df4fef` (clean, ahead of `origin/dev` by 93).
+`origin/dev` = `799e98f` = `v0.6.18`. Working tree clean.
+No stashes. Build green. `canary --full` 28/28 and `test.sh`
+57/57 at `6df4fef` (run as the gate for the ATA commit).
+Four new scratch tags: `20261102-ata-rep-pio`,
+`20261102-console-cursor-defer`, `20261102-exec-churn-ns-timing`,
+`20261102-console-timer`.
 
-**WHERE WE ARE.** The 2026-11-02 session ended with a reset. The
-C-halt investigation and the four scheduler guards that had been
-layered on trying to fix it were discarded; the tree is at
-`873be27` (`context_switch: extend the C dump with the frame GPRs
-and PCB fields`), which is the extended-C-dump baseline, with tag
-`reset-baseline-873be27` marking it. Both stashes from that
-session were dropped. The C is **open** (see below). Work now
-moves to the top 3 in "NEXT."
+**WHERE WE ARE.** The 2026-11-02 session closed the `exec_churn`
+performance issue. The cause was **not** the console, **not** the
+scheduler, and **not** the VGA cursor; it was the child's
+`execve` reading `CHURN_HELPER` from the ATA disk, where
+`ata_read_chunk` moved each 16-bit word with a separate `inw`.
+On KVM each `inw` is one `KVM_EXIT_IO`, so a 512-byte sector
+cost 256 VM-Exits; ~25 sectors per `execve`, 24 rounds, ~154,000
+exits per `exec_churn`. Fixed with `rep insw`/`rep outsw`
+(one exit per sector). `exec_churn` under KVM dropped from
+`total 4,000,000 us, max round 160,000 us` to
+`total 360,000 us, max round 30,000 us`; the KVM-vs-TCG gap
+narrowed from ~20x to ~1.8x. Console cursor CRTC writes were
+also cut from 4 per character to 4 per write chunk
+(`20261102-console-cursor-defer`), independent of the ATA fix.
 
 **NEXT -- top 3.**
-1. **`exec_churn` performance: the `prnt`/`total` variance.**
-   Rounds print `prnt 0` on most iterations and `prnt 70-140` on
-   some, with `total` swinging 30-170 ms between otherwise
-   identical rounds (seen on the `873be27` run). Split the slow
-   rounds: `fork`, `execve`, `wait4`, or the printf path; and
-   check whether the variance tracks `process_free_clone` on the
-   exit path (`exec_churn` is the test that exercises it -- see
-   `docs/open-issues.md`'s test-notes history). Do not guess at a
-   scroll cause; the `873be27` run reproduced the bimodality with
-   the row blit already in.
+1. **`sys_fork`'s `EAGER_COPY_REGION` uses a byte loop.** Same
+   shape as the ATA bug, smaller:
+   `for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i];`
+   inside `sys_fork` in `user_syscall.c`. ~400 present pages per
+   fork at ~8 K cycles/page is 1-3 ms per fork. It does not show
+   at `exec_churn`'s scale (fork floor is the 10 ms clock
+   granularity) but any test that forks hundreds of times will
+   see it. `rep movsb` is the fix; verify with a fork-heavy test
+   under KVM and a `perf kvm stat` before/after.
 2. **`docs/open-issues.md` item 9 -- the privilege model.**
    uid/gid are 0 for every process; no per-process uid/euid
-   split, no setuid, no `chown`. The item lists the shape:
-   `setuid`/`seteuid` (105/117), a setuid-root marker on a
-   FAT-hostile filesystem (magic-marker, same shape as item 8), a
-   `sudoers` equivalent, then 102/104/107/108/115 return 1000 with
-   root as an escalation.
+   split, no setuid, no `chown`. Unchanged from the previous
+   handoff. The item lists the shape: `setuid`/`seteuid`
+   (105/117), a setuid-root marker on a FAT-hostile filesystem
+   (magic-marker, same shape as item 8), a `sudoers` equivalent,
+   then 102/104/107/108/115 return 1000 with root as an
+   escalation.
 3. **`docs/open-issues.md` item 10 -- SSE save/restore.**
    `CR4.OSFXSR` is set but the kernel saves no SSE state;
    userland is pinned to `-mno-sse*` as a stopgap. The fix is
@@ -46,25 +55,13 @@ moves to the top 3 in "NEXT."
    interrupt path, then remove the `-mno-sse*` flags from the
    userland build.
 
-**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** The C is
-`context_switch_resume`'s unknown-CS branch: the frame at
-`next->rsp` has a CS slot that is neither `0x18` nor `0x33`. It
-was last characterized at `dev = efc8e08` with four uncommitted
-scheduler guards; that commit and those guards were discarded on
-2026-11-02, the tree was reset to `873be27`, and both stashes
-were dropped. `efc8e08` is no longer on `dev` (it survives as a
-commit object). The extended C dump in the tree is `873be27`'s.
-**One `canary --full` at `873be27` passed 28/28** -- per this
-file's own rule, that does not close the C; it is one run. No C
-work is planned until the top 3 are addressed. The investigation's
-discarded paths are listed under "Refuted -- do NOT re-walk"
-below; do not re-derive them from scratch without new evidence.
-
-**THE CANARY ROW COUNT.** `canary --full` at `873be27` printed
-the full 28-row sequence and `28 passed, 0 failed`, ending at the
-`/ #` prompt. The 28 rows include the 15 read-only rows and the
-13 mutating rows. `exec_churn` was **not** part of that run; its
-bimodality data is from the earlier `873be27` run.
+**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** Unchanged from
+the previous handoff. The C is `context_switch_resume`'s
+unknown-CS branch. One clean `canary --full` at `873be27` does
+not close it; the `canary --full` at `6df4fef` that gated the
+ATA commit is a second clean run, which is evidence, not a
+close. No C work is planned until the top 3 are addressed. The
+refuted paths below are still refuted.
 
 ---
 
@@ -91,11 +88,8 @@ interactive shell.
 **Never put a destructive git command inside a block that also
 runs diagnostics.** A `git checkout -- <file>` or `git restore`
 in a block whose other lines are `git status`/`git log`/`grep` is
-a trap: it discards working-tree work while the operator is
-reading diagnostics. If a revert is wanted, name it on its own
-line, say what it discards, and run it as its own paste. (The
-2026-11-02 session lost the four scheduler guards to exactly this
-shape.)
+a trap. If a revert is wanted, name it on its own line, say what
+it discards, and run it as its own paste.
 
 **Python edits with `count != 1` abort checks are the preferred
 edit style.** **`set -e` at the top.** **Idempotent edit scripts.**
@@ -153,8 +147,19 @@ gdb stub on `:1234`, `capture.txt` written (overwritten each run --
 One is not always enough to reach an intermittent fault; several
 reliably do.
 
-**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT `-g`).
-Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028,
+**`perf kvm stat` is the way to count VM-Exits.** `sudo dnf
+install -y perf` on the Fedora host. Two terminals: guest runs
+the test; host runs `sudo perf kvm stat record -a sleep 15`, then
+`sudo perf kvm stat report` (`q` to quit the pager), then
+`rm -f perf.data.guest`. The report names `io`, `npf`,
+`interrupt`, `vintr`, `idle-halt`. **An `io`-dominated report
+does not mean "port I/O is slow"; it means "the guest is doing
+port I/O on a hot path."** The 2026-11-02 session spent hours
+chasing that to the console before finding the ATA data port.
+Read the guest source before reading the exit reason.
+
+**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
+`-g`). Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028,
 `cr3` 0x030, `entry_point` 0x038, `kernel_stack_virt` 0x048,
 `kernel_stack_top` 0x050, `rsp` 0x110, `rip` 0x118, `next` 0x120,
 `prev` 0x128, `block_kind` 0x158. `sizeof(pcb_t)` = 0x618.
@@ -189,10 +194,7 @@ bytes before acting.**
 and are the source for the version summary. **The scratch tags
 are PRESERVED until the user decides to push to GitHub, and
 are dropped ONLY after the summary is written and reviewed by
-the user.** A session does NOT drop them on its own initiative,
-even when the release tag and merge commit exist locally. The
-drop is step 4 of the release procedure below, and it is taken
-by the user, at release time, after reviewing the summary.
+the user.** A session does NOT drop them on its own initiative.
 
 **The release procedure** (on `dev`, pre-release):
 
@@ -233,10 +235,8 @@ unpushed `dev` commit is intentional work. Run
 
 **Current release state.** **`v0.6.18` is released.** Work is now
 pre-**`v0.6.19`**. There is no release gate recorded for
-`v0.6.19`; the previous gate (the canary `.text` `#PF` probe)
-was tied to a tree that has since been reset. If a gate is wanted
-for `v0.6.19`, it is set in this file before the release session,
-not during it.
+`v0.6.19`. If a gate is wanted for `v0.6.19`, it is set in this
+file before the release session, not during it.
 
 ---
 
@@ -259,12 +259,12 @@ Concurrency rules: `docs/contract.md`. Open issues:
 
 ### Current baseline
 
-- `test.sh` 57/57 (last run before the reset; re-run on a fresh
-  boot before relying on it after any scheduler change).
-- `canary --full` **28/28** at `873be27` (2026-11-02 late). The
-  full 28-row sequence, no skips.
-- `exec_churn` 24 rounds pass (from the same `873be27` run); the
-  `prnt`/`total` variance is the top NEXT item.
+- `test.sh` **57/57** at `6df4fef` (2026-11-02 late, gate for the
+  ATA commit).
+- `canary --full` **28/28** at `6df4fef` (same run). The full 28-row
+  sequence, no skips.
+- `exec_churn` 24 rounds pass at `6df4fef`; `total` 360,000 us,
+  `max round` 30,000 us under KVM (down from 4,000,000 / 160,000).
 - `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it;
   `fg` resumes.
 - `^C` -> SIGINT reaches the foreground pgrp; the console survives
@@ -274,19 +274,19 @@ Concurrency rules: `docs/contract.md`. Open issues:
 
 ### Next -- the highest-value work
 
-1. `exec_churn` performance: the `prnt`/`total` variance.
+1. `sys_fork`'s `EAGER_COPY_REGION` byte loop -> `rep movsb`.
 2. `docs/open-issues.md` item 9 -- the privilege model.
 3. `docs/open-issues.md` item 10 -- SSE save/restore.
 
 ### Refuted -- do NOT re-walk
 
-These were discarded with the 2026-11-02 reset. They are listed so
-a future session does not spend the same cycles. If any turns out
+These were discarded in earlier sessions. They are listed so a
+future session does not spend the same cycles. If any turns out
 to be a different root cause, that is a **new** hypothesis, not a
 revival of these.
 
 - **The `efc8e08` rsp/irq0_rsp split, and `frame_kind`.** Discarded
-  with the reset; not on `dev`. The C was not prevented by it.
+  with the 2026-11-02 reset; not on `dev`.
 - **The four uncommitted scheduler guards** (`process_yield`
   FRAME_IRQ0 skip, `scheduler_ready_queue_add` non-PCB guard,
   `scheduler_switch_to` non-PCB guard, `scheduler_switch_to`
@@ -295,16 +295,21 @@ revival of these.
   with the reset and the stash drop.
 - **The canary `.text` `#PF` probe stack** (`[PT-CANARY]`,
   `[PT-WP]`, `[PHDR]`/`[EHDR]`, `[UNMAP_IN_CR3]`, `[FREE_CLONE]`,
-  `[PCLAIM]`). It was in `stash@{1}` and was dropped. The probe
-  arm was gated on canary `pid == 4`, which did not match the
-  first user process at `873be27` (pid 2); it was a non-test on
-  that boot. Not revived.
+  `[PCLAIM]`). Dropped with `stash@{1}`.
 - **The physical-address gates on `.text` PTE zeroing.** Boot
-  dependent; do not reapply without new evidence. Gate on the
-  invariant (VA, pid, state, pgrp), not on the address that
-  happens to hold today.
+  dependent; do not reapply without new evidence.
 - **The `f91d31a` "scheduler guards fix canary/pipe7e/ctrl-Z"
   claim.** Disproved by running.
+- **`exec_churn`'s KVM slowness is the console / the serial poll
+  loop / the VGA cursor CRTC writes.** Refuted 2026-11-02: the
+  serial `inb` poll was commented out and `prnt` was unchanged;
+  `console_timer` measured the console at microseconds in the
+  same boot that ran `exec_churn` at 4 s; the VGA cursor patch
+  (later committed as `20261102-console-cursor-defer`) also did
+  not move `prnt`. The cost was the ATA data port in `ata.c`,
+  fixed by `rep insw`/`rep outsw`.
+- **`ata_poll_drq` spinning.** Instrumented 2026-11-02:
+  2,113 calls, 128 total spins. Not the cost.
 
 ### Open issues
 
@@ -352,14 +357,23 @@ the discarded guards, they are not in the tree -- read
 `git log --all --oneline` for `efc8e08` and the session log, but
 treat them as **refuted** per the section above.
 
+**The 2026-11-02 performance commits** (four, on top of
+`873be27`-derived `dev`):
+- `905bc70` `20261102-ata-rep-pio` -- the fix.
+- `fdbcbc7` `20261102-console-cursor-defer` -- independent
+  improvement.
+- `5db42f2` `20261102-exec-churn-ns-timing` -- test-only.
+- `6df4fef` `20261102-console-timer` -- test-only.
+
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last release.** The tree is at `873be27`
-(`reset-baseline-873be27`), clean, no stashes; the C-halt
-investigation and its guards were discarded in the 2026-11-02
-reset and the C is open with one clean `canary --full` (28/28)
-recorded. NEXT is the top 3: `exec_churn` performance, item 9
-(privilege model), item 10 (SSE save/restore). Read
-`docs/contract.md` and this file's NEXT before any code.
+**`v0.6.18` is the last release.** The tree is at `6df4fef`, clean,
+no stashes, ahead of `origin/dev` by 93; the `exec_churn`
+performance issue is closed (ATA PIO data port, fixed by `rep
+insw`/`rep outsw`). The C is open (two clean `canary --full`
+runs, which is evidence, not a close). NEXT is the top 3:
+`sys_fork` `rep movsb`, item 9 (privilege model), item 10 (SSE
+save/restore). Read `docs/contract.md` and this file's NEXT
+before any code.
