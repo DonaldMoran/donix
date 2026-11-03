@@ -6535,6 +6535,7 @@ long sys_wait4(long pid, int* user_status, int options) {
  * lost-wakeup).  A change to those lines is a different commit
  * with its own soak, not a side effect of sharing the code.
  */
+
 static long console_write(const void* buf, size_t count) {
     size_t remaining = count;
     const uint8_t* user_ptr = (const uint8_t*)buf;
@@ -6543,10 +6544,8 @@ static long console_write(const void* buf, size_t count) {
         if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
             return -(long)EFAULT_;
         }
-        for (size_t i = 0; i < chunk; i++) {
-            char c = g_write_bounce[i];
-            serial_putc(c); vga_putc(c);
-        }
+        serial_write((const char*)g_write_bounce, chunk);
+        vga_write((const char*)g_write_bounce, chunk);
         user_ptr += chunk; remaining -= chunk;
     }
     return (long)count;

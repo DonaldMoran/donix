@@ -148,6 +148,7 @@ static int cursor_visible = 1;
  * blink; raise toward 75 for a slower, lazier one.
  */
 static int cursor_drawn   = 0;    /* cursor currently painted on fb? */
+static int cursor_hw_dirty = 0;
 static uint32_t cursor_blink_ticks = 0;   /* counts PIT ticks */
 
 /*
@@ -744,12 +745,12 @@ static void vga_putc_raw(char c) {
             vga_scroll();
             cursor_row = rows - 1;
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\r') {
         cursor_col = 0;
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\b') {
@@ -757,14 +758,14 @@ static void vga_putc_raw(char c) {
             cursor_col--;
             con_put_cell(cursor_row, cursor_col, ' ', cursor_attr);
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\t') {
         int next = (cursor_col + 8) & ~7;
         if (next > cols - 1) next = cols - 1;
         cursor_col = next;
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == 0x07) {
@@ -781,7 +782,7 @@ static void vga_putc_raw(char c) {
                 cursor_row = rows - 1;
             }
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
     }
 }
 
@@ -1156,6 +1157,7 @@ void vga_hide_cursor(void) {
 void vga_putc(char c) {
     serial_lock();
     vga_putc_unlocked(c);
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 
@@ -1164,6 +1166,7 @@ void vga_write(const char* data, size_t count) {
     for (size_t i = 0; i < count; i++) {
         vga_putc_unlocked(data[i]);
     }
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 
@@ -1172,6 +1175,7 @@ void vga_print(const char *s) {
     while (*s) {
         vga_putc_unlocked(*s++);
     }
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 
