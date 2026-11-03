@@ -11555,7 +11555,11 @@ long sys_fork(void) {
                     (const uint8_t*)(HHDM_START + _parent_phys);         \
                 uint8_t* _dst =                                          \
                     (uint8_t*)(HHDM_START + _new_phys);                  \
-                for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i]; \
+                __asm__ volatile(                                        \
+                    "rep movsb"                                         \
+                    : "+D"(_dst), "+S"(_src)                          \
+                    : "c"((uint64_t)4096)                              \
+                    : "memory");                                        \
                                                                          \
                 uint64_t _map_flags = PT_PRESENT | PT_WRITE | PT_USER;   \
                 if (vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,    \
