@@ -3839,6 +3839,14 @@ FRESULT f_open (
 					res = enq_share() ? dir_register(&dj) : FR_TOO_MANY_OPEN_FILES;
 #else
 					res = dir_register(&dj);
+					/* Flush the staged dir entry while dj.dir is valid.
+					 * dj.dir points into fs->win; any later f_open/f_read/
+					 * f_write on this volume reloads fs->win and discards
+					 * the staged name, so the close-time sync_window would
+					 * flush the old bytes back over it. */
+					if (res == FR_OK) {
+						res = sync_window(fs);
+					}
 #endif
 				}
 				mode |= FA_CREATE_ALWAYS;		/* File is created */
