@@ -4169,6 +4169,14 @@ FRESULT f_write (
 				if (csect + cc > fs->csize) {	/* Clip at cluster boundary */
 					cc = fs->csize - csect;
 				}
+				/* Flush the FAT window before the direct data write.  The
+				 * cluster-boundary code above wrote the new FAT link into
+				 * fs->win (wflag=1); the direct write below does not touch
+				 * that window, and a later create_chain's move_window is a
+				 * no-op when fs->winsect already equals the FAT sector even
+				 * if fs->win holds a data sector, so create_chain can read
+				 * a stale link and return 1 (ABORT FR_INT_ERR). */
+				if (sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);
 				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) ABORT(fs, FR_DISK_ERR);
 #if FF_FS_MINIMIZE <= 2
 #if FF_FS_TINY
