@@ -182,6 +182,7 @@ static char g_write_bounce[WRITE_CHUNK];
 #define ENAMETOOLONG_ 36
 
 #define DEBUG_GETCWD 0
+#define DEBUG_SIGDELIVER 0
 /* ============================================================
  * DEBUG INSTRUMENTATION
  *
@@ -1172,6 +1173,7 @@ static size_t proc_build_stat(uint64_t pid, char* out, size_t cap) {
             case PROC_STATE_READY:   sc = 'R'; break;
             case PROC_STATE_BLOCKED: sc = 'S'; break;
             case PROC_STATE_ZOMBIE:  sc = 'Z'; break;
+            case PROC_STATE_STOPPED: sc = 'T'; break;
             default:                 sc = 'S'; break;
         }
         if (o + 1 < cap) out[o++] = sc;
@@ -3388,6 +3390,33 @@ static long dev_open(const char* in_path, const char* local_path,
         file_slot_t* dslot = NULL;
         int dfd = alloc_file_slot(&dslot);
         if (dfd == -1) return -(long)EIO_;
+        /*
+         * The console and tty rows are TTY slots, not generic
+         * character devices.  Every consumer that answers "is this
+         * fd a tty?" -- fd_is_console (ioctl TCGETS/TIOCGPGRP),
+         * sys_read's fd-0 guard, sys_write's fd-1/2 guard -- tests
+         * FILE_KIND_CONSOLE, matching the sentinels alloc_console_slot
+         * installs on fds 0/1/2.  An opened /dev/tty must be the same
+         * kind, or busybox ash's tcgetpgrp(fd 10) is refused with
+         * -ENOTTY and it prints "can't access tty; job control
+         * turned off".
+         *
+         * Major 5 is the tty major (console 5,1; tty 5,0).  The
+         * other devices (null/zero/urandom, major 1) keep
+         * FILE_KIND_DEV with obj = d, which is what their read/
+         * write dispatch in sys_read/sys_write expects.
+         */
+        if (d->major == 5) {
+            dslot->kind     = FILE_KIND_CONSOLE;
+            dslot->obj      = NULL;
+            dslot->refcount = 1;
+            dslot->dir_path = NULL;
+            FDTRACE({ serial_print("open  tty -> fd=");
+                      serial_print_dec((uint64_t)dfd);
+                      serial_print(" dev=");
+                      serial_print(d->name); });
+            return dfd;
+        }
         dslot->kind = FILE_KIND_DEV;
         dslot->obj  = (void*)d;
         FDTRACE({ serial_print("open  dev -> fd=");
@@ -5309,9 +5338,9 @@ static void exec_free_and_unmap_user_pages(pcb_t* pcb) {
              va < regions[r].end;
              va += 0x1000) {
 
-            uint64_t phys = vmm_get_phys_from_cr3(pcb->cr3, va);
-            if (!phys) continue;
-            phys &= ~0xFFFULL;
+            uint64_t* pte = vmm_pte_ptr_in_cr3(pcb->cr3, va);
+            if (!pte || !(*pte & PT_PRESENT)) continue;
+            uint64_t phys = pte_phys(*pte) & ~0xFFFULL;
 
             int owned = 0;
             for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
@@ -5319,7 +5348,21 @@ static void exec_free_and_unmap_user_pages(pcb_t* pcb) {
             }
             if (!owned) continue;
 
-            vmm_unmap_page_in_cr3(pcb->cr3, va);
+            /* One walk done; clear and flush inline (same
+             * active_cr3 guard vmm_unmap_page_in_cr3 uses).
+             * The owned scan and the invlpg are preserved:
+             * the owned scan because brk/mmap pages are not on
+             * elf_page_list, the invlpg because exec does not
+             * write %cr3 itself (the next context switch does),
+             * so the old CR3 TLB is still live until then. */
+            *pte = 0;
+            {
+                uint64_t active_cr3;
+                asm volatile("mov %%cr3, %0" : "=r"(active_cr3));
+                if ((active_cr3 & ~0xFFFULL) == (pcb->cr3 & ~0xFFFULL)) {
+                    asm volatile("invlpg (%0)" : : "r"(va) : "memory");
+                }
+            }
         }
     }
 
@@ -5532,7 +5575,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (fr != FR_OK) {
         #if TRACE_EXECVE_ERR
         serial_print("sys_execve: f_open(");
-        serial_print(path);
+        serial_print(exec_path);
         serial_print(") -> ");
         serial_print_dec(fr);
         serial_print("\n");
@@ -5568,6 +5611,90 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
      * when execve returns ENOEXEC; on EIO it prints "I/O error"
      * and gives up.
      */
+    /*
+     * ---- 1b. Shebang (#!) handling. ----
+     *
+     * A file that starts "#!" is a script: re-exec the
+     * interpreter named on the first line, with argv
+     *   [interp, optional_arg?, script_path, user_argv[1..]]
+     * exactly as execve(2) specifies.
+     *
+     * The script_path passed to the interpreter is the caller's
+     * raw `path`, not section 1's exec_path.  exec_path is already
+     * resolved against the caller's cwd and dot-prefix-stripped for
+     * FatFs, so it is cwd-RELATIVE.  The interpreter inherits that
+     * same cwd, and its own sys_execve resolves the argument against
+     * it again -- so a cwd-relative exec_path doubles the prefix.
+     * The 2026-10-30 test showed it: from /root, "./don.sh" became
+     * exec_path "root/don.sh", the interpreter re-resolved that
+     * against /root to "root/root/don.sh", and ash reported
+     * "can't open 'root/don.sh'".  The caller's raw path "./don.sh"
+     * resolves correctly the second time, because the cwd is the
+     * same one it resolved against the first time.
+     *
+     * Depth guard: a script whose interpreter is itself a script
+     * would recurse without bound.  self->shebang_depth is
+     * incremented across the recursive call and refused at >= 1.
+     * ELOOP is not defined in this tree, so the refusal is
+     * -ENOEXEC -- the same errno a shell keys its fallback on.
+     *
+     * The interpreter line is parsed from the bytes already in
+     * ehdr (the first f_read above).  A line longer than the
+     * 64-byte header window is treated as ENOEXEC, not guessed.
+     */
+    if (got >= 2 && ehdr.e_ident[0] == '#' && ehdr.e_ident[1] == '!') {
+        if (self->shebang_depth >= 1) {
+            serial_print("sys_execve: shebang depth\n");
+            f_close(&file);
+            __asm__ volatile("sti");
+            return -(long)ENOEXEC;
+        }
+        char interp[64];
+        char optarg[64];
+        int  have_opt = 0;
+        int  ip = 0, op = 0;
+        int  i = 2;
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               (ehdr.e_ident[i] == ' ' || ehdr.e_ident[i] == '\t')) i++;
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               ehdr.e_ident[i] != '\n' && ehdr.e_ident[i] != ' ' &&
+               ehdr.e_ident[i] != '\t' && ip < (int)sizeof(interp) - 1) {
+            interp[ip++] = (char)ehdr.e_ident[i++];
+        }
+        interp[ip] = '\0';
+        while (i < (int)sizeof(ehdr.e_ident) &&
+               (ehdr.e_ident[i] == ' ' || ehdr.e_ident[i] == '\t')) i++;
+        if (i < (int)sizeof(ehdr.e_ident) && ehdr.e_ident[i] != '\n') {
+            have_opt = 1;
+            while (i < (int)sizeof(ehdr.e_ident) && ehdr.e_ident[i] != '\n' &&
+                   ehdr.e_ident[i] != ' ' && ehdr.e_ident[i] != '\t' &&
+                   op < (int)sizeof(optarg) - 1) {
+                optarg[op++] = (char)ehdr.e_ident[i++];
+            }
+            optarg[op] = '\0';
+        }
+        f_close(&file);
+        if (ip == 0) {
+            serial_print("sys_execve: empty shebang interp\n");
+            __asm__ volatile("sti");
+            return -(long)ENOEXEC;
+        }
+        int argc_in = 0;
+        while (user_argv && user_argv[argc_in] && argc_in < 250) argc_in++;
+        char *new_argv[254];
+        int na = 0;
+        new_argv[na++] = interp;
+        if (have_opt) new_argv[na++] = optarg;
+        new_argv[na++] = path;
+        for (int k = 1; k < argc_in; k++) new_argv[na++] = user_argv[k];
+        new_argv[na] = 0;
+        self->shebang_depth++;
+        long rc = sys_execve(interp, new_argv, user_envp);
+        self->shebang_depth--;
+        __asm__ volatile("sti");
+        return rc;
+    }
+
     if (got < 4 ||
         ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
@@ -5790,6 +5917,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->brk_virt        = 0;
 
     uint64_t entry = elf_load_into_process(self, elf_buf);
+    self->shebang_depth = 0;  /* a real ELF resets the guard */
     kfree(elf_buf);
     if (entry == 0) {
         #if TRACE_EXECVE_ERR
@@ -6008,6 +6136,23 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
 
+    /* POSIX exec: caught signal dispositions reset to SIG_DFL,
+     * SIG_IGN is preserved, the blocked mask is preserved, and
+     * pending is cleared.  Without this a forked-then-exec'd
+     * process carries a handler address from its pre-exec image;
+     * delivery jumps to a page the new image does not map
+     * (0x41E1A1 #PF, 2026-10-29).  The fork-side inheritance
+     * (c7a7962) and this exec-side reset are one change: either
+     * alone is a bug. */
+    for (int _si = 1; _si < 64; _si++) {
+        if (self->signal_handler[_si] != 1) {   /* keep SIG_IGN */
+            self->signal_handler[_si]  = 0;      /* SIG_DFL */
+            self->signal_restorer[_si] = 0;
+        }
+    }
+    self->sig_pending       = 0;
+    self->in_signal_handler = 0;
+
     {
         int i = 0;
         while (proc_name[i] && i < PROC_NAME_LEN - 1) {
@@ -6068,11 +6213,37 @@ long sys_wait4(long pid, int* user_status, int options) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)ECHILD;
 
-    uint64_t target = (pid <= 0) ? (uint64_t)-1 : (uint64_t)pid;
+    /*
+     * Linux wait4 pid argument forms:
+     *   pid  >  0  wait for that pid
+     *   pid ==  0  wait for any child in the caller's pgroup
+     *   pid == -1  wait for any child
+     *   pid <  -1  wait for any child in process group -pid
+     * The old code collapsed every pid <= 0 to "any child",
+     * which is wrong for the group forms: busybox ash's job
+     * control waits on the pipeline's pgroup, not on one pid,
+     * and a wait4(-pgid) treated as wait4(-1) leaves the
+     * group's zombies un-reaped and the parent blocked.
+     */
+    enum { WAIT_ANY = 0, WAIT_PID = 1, WAIT_PGRP = 2 } wait_mode;
+    uint64_t wait_val = 0;
+    if (pid > 0) {
+        wait_mode = WAIT_PID;
+        wait_val  = (uint64_t)pid;
+    } else if (pid == 0) {
+        wait_mode = WAIT_PGRP;
+        wait_val  = self->pgrp;
+    } else if (pid == -1) {
+        wait_mode = WAIT_ANY;
+    } else {
+        wait_mode = WAIT_PGRP;
+        wait_val  = (uint64_t)(-pid);
+    }
 
     for (;;) {
-        pcb_t* zombie = NULL;
-        pcb_t* live   = NULL;
+        pcb_t* zombie  = NULL;
+        pcb_t* stopped = NULL;
+        pcb_t* live    = NULL;
 
         /*
          * Walk the PCB pool by INDEX, not by pid.
@@ -6095,15 +6266,49 @@ long sys_wait4(long pid, int* user_status, int options) {
             pcb_t* c = process_get_pcb(i);
             if (!c) continue;
             if (c->parent_pid != self->pid) continue;
-            if (target != (uint64_t)-1 && c->pid != target) continue;
+            if (wait_mode == WAIT_PID && c->pid != wait_val) continue;
+            if (wait_mode == WAIT_PGRP && c->pgrp != wait_val) continue;
 
-            if (c->state == PROC_STATE_ZOMBIE) {
+            if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) {
                 zombie = c;
+                break;
+            }
+            /*
+             * A stopped child is reportable only with WUNTRACED, and
+             * only once per stop (stop_reported).  Without WUNTRACED
+             * a shell that did not ask for stops keeps waiting, which
+             * is the pre-WUNTRACED behavior.
+             */
+            if ((options & WUNTRACED) &&
+                c->state == PROC_STATE_STOPPED &&
+                c->stop_reported == 0) {
+                stopped = c;
                 break;
             }
             if (c->state != PROC_STATE_UNUSED) {
                 live = c;
             }
+        }
+
+        if (stopped) {
+            /*
+             * A stopped child, WUNTRACED.  The status is Linux's
+             * stopped encoding: WIFSTOPPED(status) is true when the
+             * low byte is 0x7f, and WSTOPSIG(status) is the signal
+             * in the next byte.  Do NOT reclaim: a stopped child is
+             * alive, and its parent will see it again on exit or a
+             * later stop.
+             */
+            long spid = (long)stopped->pid;
+            int  sstatus = ((int)stopped->stop_signal << 8) | 0x7f;
+            stopped->stop_reported = 1;
+            if (user_status) {
+                if (safe_copy_to_user(user_status, &sstatus,
+                                      sizeof(sstatus)) != 0) {
+                    return -(long)EFAULT_;
+                }
+            }
+            return spid;
         }
 
         if (zombie) {
@@ -6129,6 +6334,15 @@ long sys_wait4(long pid, int* user_status, int options) {
                 status = (zombie->exit_status & 0xff) << 8;
             }
 
+            /*
+             * Do NOT restore fg here.  This path runs on every
+             * reap; a multi-child job like canary --full would
+             * have fg reset to the shell's pgrp after the first
+             * child, and the remaining children would be
+             * unreachable by ^C.  fg is restored by process_exit's
+             * console_fg_pgrp_reclaim_if, which now only resets
+             * when the pgrp has no live member left.
+             */
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
@@ -6168,15 +6382,37 @@ long sys_wait4(long pid, int* user_status, int options) {
         __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_WAITPID;
-        self->wait_pid = target;
+        self->wait_pid = (wait_mode == WAIT_PID) ? wait_val
+                                                    : (uint64_t)-1;
+        /*
+         * Foreground handoff.  Busybox ash in this tree calls
+         * setpgid(child, 0) for a command -- moving it to its own
+         * pgrp -- but does not reliably call tcsetpgrp, so
+         * g_console_fg_pgrp stayed the shell's own pgrp and a ^C
+         * targeted the shell's group, not the child's.  The CRP
+         * trace showed it: fg=3 (shell), canary in pgrp 4, ^C
+         * signalled nothing the child would see.  Fix: when the
+         * shell blocks in wait4 for a specific pid whose pgrp is
+         * different, that pgrp is the foreground.
+         */
+        if (wait_mode == WAIT_PID) {
+            pcb_t* _child = process_find_by_pid(wait_val);
+            extern uint64_t console_owner_pgrp_get(void);
+            extern void     console_fg_pgrp_set(uint64_t pgrp);
+            if (_child && _child->pgrp != self->pgrp &&
+                _child->pgrp != console_owner_pgrp_get()) {
+                console_fg_pgrp_set(_child->pgrp);
+            }
+        }
         RACE_P1_BLOCK(self->pid, BLOCK_KIND_WAITPID, RACE_SITE_WAIT4_BLOCK);
-        RACE_P11_BLOCK(self->pid, target);
+        RACE_P11_BLOCK(self->pid,
+                         (wait_mode == WAIT_PID) ? wait_val : 0);
 
         #if TRACE_WAIT
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
-        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print_dec((wait_mode == WAIT_PID) ? wait_val : 0);
         serial_print(" blocking\n");
         #endif
         
@@ -6194,20 +6430,76 @@ long sys_wait4(long pid, int* user_status, int options) {
          */
         {
             pcb_t* late_zombie = NULL;
+            pcb_t* late_stopped = NULL;
             for (int i = 0; i < MAX_PROCESSES; i++) {
                 pcb_t* c = process_get_pcb(i);
                 if (!c) continue;
                 if (c->parent_pid != self->pid) continue;
-                if (target != (uint64_t)-1 && c->pid != target) continue;
-                if (c->state == PROC_STATE_ZOMBIE) { late_zombie = c; break; }
+                if (wait_mode == WAIT_PID && c->pid != wait_val) continue;
+                if (wait_mode == WAIT_PGRP && c->pgrp != wait_val) continue;
+                if (c->state == PROC_STATE_ZOMBIE || c->state == PROC_STATE_TERMINATED) { late_zombie = c; break; }
+                /*
+                 * A stopped child, same window as the zombie above:
+                 * the first scan ran while the child was live, the
+                 * parent was still RUNNING when process_stop_and_yield
+                 * called process_wake_parent_if_waiting, and the wake
+                 * missed.  Un-block and loop so the first scan's
+                 * WUNTRACED branch reports the stop.  The WUNTRACED
+                 * guard must match the first scan's, or a wait4
+                 * without WUNTRACED would un-block on a stopped child
+                 * that the first scan will not report, and spin.
+                 * Do not reclaim: a stopped child is alive.
+                 */
+                if ((options & WUNTRACED) &&
+                    c->state == PROC_STATE_STOPPED &&
+                    c->stop_reported == 0) {
+                    late_stopped = c;
+                    break;
+                }
             }
-            if (late_zombie) {
+            if (late_zombie || late_stopped) {
                 self->state = PROC_STATE_RUNNING;
                 self->block_kind = BLOCK_KIND_NONE;
                 self->wait_pid = 0;
                 __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
                 continue;
             }
+        }
+
+        /*
+         * Signals slice 6: a pending, unblocked signal interrupts
+         * the wait.  The wake that brought us here came from
+         * sys_kill, which sets sig_pending and marks us READY (and
+         * adds us to the ready queue) under cli -- so we are on the
+         * queue as we run this.  The late re-scan above gives a
+         * reap priority: a zombie that is ready wins over EINTR,
+         * which is the Unix ordering.  With no zombie and a
+         * deliverable signal pending, return -EINTR (4).
+         *
+         * scheduler_ready_queue_remove(self) before the return is
+         * the same pattern as scheduler_switch_to's tail: the
+         * process is running, so it must not remain on the ready
+         * queue in RUNNING state (the stranded-RUNNING shape the
+         * YIELD-TO-IDLE dump showed).  _remove is idempotent; if
+         * the sys_kill wake did not reach us (it ran before we
+         * re-blocked), there is nothing to remove.
+         *
+         * STEP-A delivery then runs on the way out of
+         * syscall_dispatch: the handler runs, and -EINTR is
+         * preserved in ucontext.gregs[RAX] for rt_sigreturn.
+         *
+         * No handler + no restorer means the bit stays set and no
+         * handler runs; that is a probe-installation bug (musl
+         * always sets SA_RESTORER), not a kernel bug, and the
+         * syscall's -EINTR is still correct.
+         */
+        if ((self->sig_pending & ~self->sig_blocked) != 0) {
+            scheduler_ready_queue_remove(self);
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            self->wait_pid   = 0;
+            __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+            return -(long)4;   /* -EINTR */
         }
         /* End of the critical section.  The state is BLOCKED and the
          * waker has not run; restore interrupts before yielding. */
@@ -6216,7 +6508,7 @@ long sys_wait4(long pid, int* user_status, int options) {
         serial_print("WW: wait4 self=");
         serial_print_dec(self->pid);
         serial_print(" target=");
-        serial_print_dec(target == (uint64_t)-1 ? 0 : target);
+        serial_print_dec((wait_mode == WAIT_PID) ? wait_val : 0);
         serial_print(" yielding state=");
         serial_print_dec((uint64_t)self->state);
         serial_print("\n");
@@ -6243,6 +6535,7 @@ long sys_wait4(long pid, int* user_status, int options) {
  * lost-wakeup).  A change to those lines is a different commit
  * with its own soak, not a side effect of sharing the code.
  */
+
 static long console_write(const void* buf, size_t count) {
     size_t remaining = count;
     const uint8_t* user_ptr = (const uint8_t*)buf;
@@ -6251,14 +6544,21 @@ static long console_write(const void* buf, size_t count) {
         if (safe_copy_from_user(g_write_bounce, user_ptr, chunk) != 0) {
             return -(long)EFAULT_;
         }
-        for (size_t i = 0; i < chunk; i++) {
-            char c = g_write_bounce[i];
-            serial_putc(c); vga_putc(c);
-        }
+        serial_write((const char*)g_write_bounce, chunk);
+        vga_write((const char*)g_write_bounce, chunk);
         user_ptr += chunk; remaining -= chunk;
     }
     return (long)count;
 }
+
+/*
+ * console_read: signal-aware EINTR.
+ *
+ * signal_default_action is defined below, after the delivery
+ * helpers; console_read needs it here to stop on a default-action
+ * signal instead of returning -EINTR (see the block in the body).
+ */
+static long signal_default_action(pcb_t* self, int sig);
 
 static long console_read(void* buf, size_t count) {
     pcb_t* self = process_get_current();
@@ -6272,6 +6572,118 @@ static long console_read(void* buf, size_t count) {
             break;
         }
         if (self->pid == 1) { __asm__ volatile("sti"); __asm__ volatile("hlt"); continue; }
+
+        /*
+         * Signals item 2: a pending, unblocked signal interrupts
+         * the console read.  Same shape as the pipe read/write
+         * EINTR checks: the wake that brought us here came from
+         * sys_kill, which sets sig_pending and marks us READY
+         * (and adds us to the ready queue) under cli.  Return
+         * -EINTR (4) before blocking, so a signal that arrived
+         * between the kbd check and this point is not lost.
+         *
+         * scheduler_ready_queue_remove(self) is the same
+         * pattern as sys_wait4's -EINTR path: the process is
+         * running, so it must not remain on the queue in
+         * RUNNING state.  _remove is idempotent; if the
+         * sys_kill wake did not reach us (it ran before we
+         * re-blocked), there is nothing to remove.
+         */
+        /*
+         * Signal-aware EINTR.
+         *
+         * A pending, unblocked signal here means the raise happened
+         * while this process was blocked on the console.  What to do
+         * with it depends on its disposition:
+         *
+         *   caught (signal_handler[sig] != 0): interrupt the read
+         *   and return -EINTR.  The handler runs at the syscall-
+         *   return delivery point, and the application decides what
+         *   a read that was cut short means.  This is Unix, and it is
+         *   what the pipe read/write and sys_wait4 already do.
+         *
+         *   default action (signal_handler[sig] == 0): do NOT return
+         *   -EINTR.  A default-action SIGTSTP/SIGSTOP is a stop, not
+         *   an interrupted read; returning -EINTR lets the
+         *   application retry read(2) and lose the stop entirely.
+         *   busybox cat is exactly that application: it treats
+         *   EINTR as "try again" and re-blocks.  The 2026-10-30
+         *   serial Ctrl-Z test showed it -- cat echoed the next
+         *   keystroke after the -EINTR, sig_deliver stayed 0, and
+         *   the process never stopped.
+         *
+         *   So for a default-action signal, deliver it HERE, at this
+         *   safe point: clear the bit and call signal_default_action,
+         *   which stops the process (process_stop_and_yield) or
+         *   terminates it.  The process is RUNNING at this instant
+         *   (we are in its context), so the stop is taken now, not
+         *   deferred -- process_stop_and_yield sets in_stop_safe_point
+         *   around the call, which is what tells process_stop to take
+         *   the write rather than set stop_pending.
+         *
+         *   If the default action is IGNORE (SIGCHLD, SIGURG, ...),
+         *   signal_default_action returns 0 and the loop continues;
+         *   the read was not interrupted and should not be.
+         */
+        {
+            uint64_t del = self->sig_pending & ~self->sig_blocked;
+            if (del != 0) {
+                int n = 0;
+                while (n < 64 && !(del & (1ULL << n))) n++;
+                if (n < 64 && self->signal_handler[n] != 0) {
+                    /* caught: Unix -EINTR; delivery runs on the way out */
+                    scheduler_ready_queue_remove(self);
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    __asm__ volatile("sti");
+                    return -(long)4;   /* -EINTR */
+                }
+                if (n < 64) {
+                    /* default action: deliver now, at this safe point */
+                    self->sig_pending &= ~(1ULL << n);
+                    __asm__ volatile("sti");
+                    signal_default_action(self, n);
+                    /* IGNORE returns; loop and keep reading.  A stop
+                     * parks the process until SIGCONT, and resumes
+                     * here; a terminate does not return. */
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
+                    continue;
+                }
+            }
+        }
+
+        {
+            /*
+             * Only the console foreground process group may block
+             * on read(0).  A stale reader from a previous foreground
+             * group (a child that ^C did not kill because it was in
+             * a different pgrp) blocks here too, and then two
+             * processes are blocked on BLOCK_KIND_NONE and the
+             * next keystroke wakes whichever the timer picks
+             * first -- the wedge.  Refuse with -EIO so the stale
+             * reader returns, the shell reads, and the console
+             * stays live.
+             *
+             * console_fg_pgrp_get() is 0 before any tcgetpgrp; in
+             * that window (boot) we permit the block, which is the
+             * pre-existing behavior.
+             */
+            uint64_t _fg = console_fg_pgrp_get();
+            uint64_t _owner = console_owner_pgrp_get();
+            /*
+             * Permitted readers: the fg pgrp, or the owner
+             * (the boot shell).  The owner is always allowed to
+             * read -- the console is its tty, and after a ^C the
+             * fg pgrp is the killed child's group until
+             * tcsetpgrp runs.  Only a *third* pgrp is refused:
+             * that is the stale reader case the pool walk found.
+             */
+            if (_fg != 0 && self->pgrp != _fg && self->pgrp != _owner) {
+                __asm__ volatile("sti");
+                return -(long)EIO_;
+            }
+        }
         self->state = PROC_STATE_BLOCKED;
         self->block_kind = BLOCK_KIND_NONE;
         __asm__ volatile("movq %%rax, %0" : "=m"(self->rax) :: "memory");
@@ -6283,7 +6695,37 @@ static long console_read(void* buf, size_t count) {
         __asm__ volatile("movq %%r9,  %0" : "=m"(self->r9)  :: "memory");
         __asm__ volatile("movq %%r10, %0" : "=m"(self->r10) :: "memory");
         __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
-        __asm__ volatile("sti"); __asm__ volatile("hlt");
+
+        /*
+         * Block via process_yield, not sti; hlt.  sti; hlt
+         * leaves self->rsp at its LAST SAVE -- the frame from
+         * the previous context_switch -- which the stack has
+         * since moved past.  When the timer (or a peer) wakes
+         * us, the scheduler resumes from that stale frame and
+         * halts.  The GPR slots saved above do not help: the
+         * resume needs a 20-slot frame at self->rsp, and
+         * sti; hlt builds none.  This is the same fix the pipe
+         * read/write block paths already carry; console_read
+         * was the outlier.
+         *
+         * process_yield does the right thing: it marks us
+         * BLOCKED (already done above), calls
+         * scheduler_switch_to, and context_switch builds a
+         * proper 20-slot resume frame and stores its base in
+         * self->rsp.  The timer's process_wake_all_blocked
+         * does NOT filter on block_kind (it guards pid 1,
+         * ZOMBIE/TERMINATED, and double-add only), so a
+         * BLOCK_KIND_NONE reader is still woken every 10 ms
+         * to re-check the keyboard and the pending mask.
+         */
+        process_yield();
+            /* Resumed.  Reset state so the requeue guards (which test
+             * state == RUNNING) see us correctly, matching the pipe
+             * read block.  Then loop and re-check. */
+            self->state      = PROC_STATE_RUNNING;
+            self->block_kind = BLOCK_KIND_NONE;
+            /* Loop; the EINTR check at the top of the loop catches a
+             * signal that arrived while we were parked. */
     }
     return (long)bytes_read;
 }
@@ -6423,6 +6865,27 @@ long sys_write(int fd, const void* buf, size_t count) {
             if (!self) {
                 __asm__ volatile("sti");
                 return -(long)EAGAIN_;
+            }
+
+            /*
+             * Signals slice 6: a pending, unblocked signal interrupts
+             * the write.  The wake that brought us here came from
+             * sys_kill, which sets sig_pending and marks us READY
+             * under cli.  The EPIPE and free_space checks above
+             * give a reader's disappearance or a freeing of space
+             * priority over EINTR, which is the Unix ordering.
+             * With the pipe still full, return -EINTR (4).
+             *
+             * scheduler_ready_queue_remove(self) is the same
+             * pattern as sys_read and sys_wait4: the process is
+             * running, so it must not remain on the queue.
+             */
+            if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                scheduler_ready_queue_remove(self);
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return -(long)4;   /* -EINTR */
             }
 
             /*
@@ -6990,6 +7453,29 @@ long sys_read(int fd, void* buf, size_t count) {
                 self->block_kind = BLOCK_KIND_NONE;
                 __asm__ volatile("sti");
                 return 0;
+            }
+
+            /*
+             * Signals slice 6: a pending, unblocked signal interrupts
+             * the read.  The wake that brought us here came from
+             * sys_kill, which sets sig_pending and marks us READY
+             * under cli.  The writers_open re-check above gives a
+             * closed pipe priority (returning 0 for EOF wins over
+             * EINTR, which is the Unix ordering).  With the pipe
+             * still open and no data, return -EINTR (4).
+             *
+             * scheduler_ready_queue_remove(self) is the same
+             * pattern as sys_wait4's -EINTR path: the process is
+             * running, so it must not remain on the queue in
+             * RUNNING state.  The sys_kill wake added us to the
+             * queue; if it did not reach us, _remove is a no-op.
+             */
+            if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                scheduler_ready_queue_remove(self);
+                self->state      = PROC_STATE_RUNNING;
+                self->block_kind = BLOCK_KIND_NONE;
+                __asm__ volatile("sti");
+                return -(long)4;   /* -EINTR */
             }
 
             /* PROBE (session 61): save the live caller-saved
@@ -7681,6 +8167,127 @@ long sys_sysinfo(void* user_info) {
     return 0;
 }
 
+/*
+ * Linux x86_64 pause(2) -- syscall 34.
+ *
+ * Suspend the calling thread until a signal whose action is to
+ * execute a handler or terminate the process is delivered.
+ * Signals that are blocked, ignored (SIG_IGN), or whose default
+ * action is ignore do NOT wake pause.
+ *
+ * The implementation is a block loop: set state = BLOCKED with
+ * block_kind = BLOCK_KIND_PAUSE, yield, and check sig_pending
+ * on wake.  sys_kill's wake path sees us BLOCKED and marks us
+ * READY, so we are woken.  The timer's process_wake_all_blocked
+ * skips us because block_kind != NONE, so we do not spin.
+ */
+long sys_pause(void) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    for (;;) {
+        /*
+         * If a deliverable signal is already pending, return
+         * -EINTR immediately.  This covers the case where the
+         * signal arrived between the caller's last syscall and
+         * this one.
+         */
+        if ((self->sig_pending & ~self->sig_blocked) != 0) {
+            return -(long)4;   /* -EINTR */
+        }
+
+        uint64_t saved_flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+        self->state      = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_PAUSE;
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+
+        process_yield();
+
+        /*
+         * Resumed.  Check the pending mask again.  If a signal
+         * was delivered while we were blocked, return -EINTR.
+         * If the wake was spurious (e.g. a SIGKILL that set
+         * pending but also terminated us, we would not be here),
+         * loop and block again.
+         */
+        self->state      = PROC_STATE_RUNNING;
+        self->block_kind = BLOCK_KIND_NONE;
+    }
+}
+
+/*
+ * Linux x86_64 rt_sigsuspend(2) -- syscall 130.
+ *
+ * Atomically replace the signal mask with the one in user_mask,
+ * block until a signal outside that mask is delivered, then
+ * restore the old mask.  This is the primitive that a race-free
+ * "wait for a signal" loop is built on.
+ *
+ * Not implemented yet.  The mask swap and restore are simple;
+ * the wake path and the -EINTR delivery need the same check as
+ * sys_pause.  For now, return -ENOSYS so a caller that probes
+ * it gets a clean answer.
+ */
+long sys_rt_sigsuspend(const void* user_mask, size_t size) {
+    /* rt_sigsuspend(2) takes size_t for the sigset size; this
+     * implementation does not use it (the mask is a fixed
+     * kernel-sized set).  Keep the parameter for the ABI. */
+    (void)size;
+    /*
+     * Linux x86_64 rt_sigsuspend(2) -- syscall 130.
+     *
+     * Atomically replace sig_blocked with the mask at user_mask,
+     * block until a signal outside that mask is delivered (and
+     * caught or terminates), then restore the old mask and
+     * return -EINTR.
+     *
+     * The whole point of this syscall is that the mask swap and
+     * the wait are ONE critical section: a signal that arrives
+     * after the swap but before the yield is caught, and a
+     * signal that arrived before the swap is also caught (the
+     * loop checks the pending mask after the swap).  A caller
+     * that does sigprocmask(UNBLOCK) then pause() has a window
+     * between the two calls where the signal can arrive while
+     * still blocked.
+     *
+     * The restore MUST happen before the -EINTR return: STEP-A
+     * delivery runs on the way out of syscall_dispatch and reads
+     * sig_blocked to build uc_sigmask.  If we did not restore
+     * first, the handler would run with the new (temporary) mask.
+     */
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (!user_mask) return -(long)EFAULT_;
+
+    uint64_t newmask = 0;
+    if (safe_copy_from_user(&newmask, user_mask, sizeof(newmask)) != 0) {
+        return -(long)EFAULT_;
+    }
+
+    uint64_t saved = self->sig_blocked;
+
+    for (;;) {
+        uint64_t sf;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(sf));
+        self->sig_blocked = newmask;
+        uint64_t deliverable = self->sig_pending & ~self->sig_blocked;
+        if (deliverable != 0) {
+            self->sig_blocked = saved;
+            __asm__ volatile("pushq %0; popfq" :: "r"(sf));
+            return -(long)4;   /* -EINTR */
+        }
+        self->state      = PROC_STATE_BLOCKED;
+        self->block_kind = BLOCK_KIND_PAUSE;
+        __asm__ volatile("pushq %0; popfq" :: "r"(sf));
+
+        process_yield();
+
+        self->state      = PROC_STATE_RUNNING;
+        self->block_kind = BLOCK_KIND_NONE;
+    }
+}
+
 long sys_nanosleep(const void* user_req, void* user_rem) {
     (void)user_rem;   /* never written; see the header comment */
 
@@ -7706,12 +8313,63 @@ long sys_nanosleep(const void* user_req, void* user_rem) {
 
     if (ticks == 0) return 0;
 
-    uint64_t deadline = g_ticks + ticks;
-    while (g_ticks < deadline) {
-        __asm__ volatile("sti");
-        __asm__ volatile("hlt");
-    }
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
 
+    /* A signal already deliverable: don't sleep at all. */
+    if ((self->sig_pending & ~self->sig_blocked) != 0)
+        return -(long)4;   /* -EINTR */
+
+    uint64_t deadline = g_ticks + ticks;
+
+    /* Block instead of spinning: park BLOCKED with a wake_tick the
+     * timer checks.  process_yield's refuse guards now leave a
+     * BLOCKED caller BLOCKED (scheduler fix), so this parks
+     * correctly.  The timer wakes us at the deadline; a signal
+     * (kill) sets sig_pending and wakes us early. */
+    self->block_kind = BLOCK_KIND_NANOSLEEP;
+    self->wake_tick  = deadline;
+    self->state      = PROC_STATE_BLOCKED;
+    __asm__ volatile("sti");
+    process_yield();
+
+    /* Woken (deadline, signal, or a stop/continue).  Clear the
+     * park state, then decide whether the sleep is actually done. */
+    self->wake_tick  = 0;
+    self->block_kind = BLOCK_KIND_NONE;
+    self->state      = PROC_STATE_RUNNING;
+
+    if ((self->sig_pending & ~self->sig_blocked) != 0)
+        return -(long)4;   /* -EINTR: a caught signal interrupted the sleep */
+
+    /*
+     * The yield can return before the deadline without a signal:
+     * a SIGTSTP stops the process, process_continue clears
+     * block_kind and requeues it on SIGCONT, and the resumed
+     * process lands here with the deadline still in the future.
+     * Returning 0 told userland the sleep had completed -- `sleep
+     * 1000` stopped, `fg`'d, and exited immediately (2026-10-30).
+     *
+     * Re-enter the wait for the remaining time, the same shape
+     * console_read uses: loop back into process_yield until the
+     * deadline has passed.  A deadline that elapsed while stopped
+     * falls straight through with return 0, which is correct --
+     * the sleep's time has passed.  No change to process_stop or
+     * process_continue is needed; block_kind and wake_tick are
+     * re-armed here.
+     */
+    while (g_ticks < deadline) {
+        self->block_kind = BLOCK_KIND_NANOSLEEP;
+        self->wake_tick  = deadline;
+        self->state      = PROC_STATE_BLOCKED;
+        __asm__ volatile("sti");
+        process_yield();
+        self->wake_tick  = 0;
+        self->block_kind = BLOCK_KIND_NONE;
+        self->state      = PROC_STATE_RUNNING;
+        if ((self->sig_pending & ~self->sig_blocked) != 0)
+            return -(long)4;   /* -EINTR on a later signal */
+    }
     return 0;
 }
 
@@ -8235,6 +8893,27 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
                         __asm__ volatile("hlt");
                         continue;
                     }
+                    /*
+                     * Signals slice 6: a pending, unblocked signal
+                     * interrupts the poll.  The shell parks here
+                     * waiting for keyboard input, and a ^C must
+                     * return -EINTR so the line editor can reset
+                     * without waiting for a newline.  Without this
+                     * check the shell only wakes on the next
+                     * keystroke, which is why '^C then Enter' was
+                     * required.  Same shape as console_read's
+                     * EINTR check: the sys_kill / console raise
+                     * set sig_pending and marked us READY; take
+                     * -EINTR now rather than block on a poll that
+                     * the signal is going to interrupt.
+                     */
+                    if ((self->sig_pending & ~self->sig_blocked) != 0) {
+                        scheduler_ready_queue_remove(self);
+                        self->state      = PROC_STATE_RUNNING;
+                        self->block_kind = BLOCK_KIND_NONE;
+                        __asm__ volatile("sti");
+                        return -(long)4;   /* -EINTR */
+                    }
                     self->state = PROC_STATE_BLOCKED;
                     self->block_kind = BLOCK_KIND_NONE;
             /* PROBE (session 61): save the live caller-saved
@@ -8252,8 +8931,9 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
             __asm__ volatile("movq %%r11, %0" : "=m"(self->r11) :: "memory");
 
 
-                    __asm__ volatile("sti");
-                    __asm__ volatile("hlt");
+                    process_yield();
+                    self->state      = PROC_STATE_RUNNING;
+                    self->block_kind = BLOCK_KIND_NONE;
                     /* Woken by irq1_handler ->
                      * process_wake_all_blocked, which sets
                      * state = READY and re-adds us to the
@@ -8379,16 +9059,132 @@ static void signal_kill_other(pcb_t* target, int sig) {
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
 }
 
-long sys_kill(long pid, int sig) {
-    if (sig < 0 || sig > 63) return -(long)EINVAL_;
-    if (pid <= 0) return -(long)EINVAL_;   /* no process groups */
-    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
-
-    pcb_t* target = process_find_by_pid((uint64_t)pid);
+/*
+ * Process group syscalls -- setpgid(109), getpgrp(111), getpgid(121).
+ *
+ * `pgrp` is a pcb_t field (see the pcb_t comment in process.h): it
+ * defaults to the process's own pid at create and is cleared on
+ * destroy.  busybox ash calls getpgid(0) at startup; before these
+ * existed the dispatch `default:` returned -ENOSYS and ash looped
+ * on "Unknown syscall: 121" without ever printing a prompt.
+ *
+ * CONCURRENCY.  `pgrp` is shared state (docs/contract.md rule 1):
+ * the tty-side Ctrl-Z raise (a later commit) reads it from the
+ * keyboard IRQ path, so sys_setpgid's write is under cli and its
+ * target-lookup check is in the same critical section.  sys_getpgid
+ * reads under cli so it observes exactly what setpgid wrote.
+ *
+ * There are no process groups in sys_kill yet: kill(-pgid, sig)
+ * still returns -EINVAL.  That is a separate change; these three
+ * only make the group id itself readable and writable.
+ */
+static long sys_getpgid_impl(long pid) {
+    pcb_t* target;
+    if (pid == 0) {
+        target = process_get_current();
+    } else {
+        target = process_find_by_pid((uint64_t)pid);
+    }
     if (!target) return -(long)ESRCH_;
 
-    if (sig == 0) return 0;   /* existence check: no bit set */
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    uint64_t pgrp = target->pgrp;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return (long)pgrp;
+}
 
+long sys_getpgid(long pid) {
+    return sys_getpgid_impl(pid);
+}
+
+long sys_getpgrp(void) {
+    return sys_getpgid_impl(0);
+}
+
+/*
+ * Deferred setpgid: busybox ash calls setpgid(child_pid, pgid)
+ * before the child is scheduled.  process_find_by_pid returns
+ * NULL then, and the child keeps the inherited pgrp.  A ^C to
+ * the pipeline's group then misses it.  Record the request
+ * here and apply it in sys_fork after process_create.
+ */
+struct deferred_setpgid { long pid; long pgid; };
+static struct deferred_setpgid g_defer_pgid[16];
+
+long sys_setpgid(long pid, long pgid) {
+    pcb_t* target;
+    if (pid == 0) {
+        target = process_get_current();
+        pid = (long)target->pid;
+    } else {
+        target = process_find_by_pid((uint64_t)pid);
+    }
+    if (!target) {
+        /* Defer: the child may not be created yet. */
+        for (int _i = 0; _i < 16; _i++) {
+            if (g_defer_pgid[_i].pid == 0 || g_defer_pgid[_i].pid == pid) {
+                g_defer_pgid[_i].pid  = pid;
+                g_defer_pgid[_i].pgid = (pgid == 0) ? pid : pgid;
+                return 0;
+            }
+        }
+        return -(long)ESRCH_;
+    }
+    if (pid == 1) return -(long)EPERM_;
+    if (pgid == 0) pgid = pid;
+
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    target->pgrp = (uint64_t)pgid;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    /*
+     * Foreground handoff.  busybox ash in this tree setpgid's a
+     * child into a new pgrp but does not call tcsetpgrp, so
+     * g_console_fg_pgrp stayed the shell's own group and every ^C
+     * missed the child (CRP trace: shell pgrp 3 blocked in wait4,
+     * canary pgrp 4 running, ^C target pgrp=3).  On Unix tcsetpgrp
+     * would have run at this point; do it in the kernel.
+     */
+    {
+        extern uint64_t console_owner_pgrp_get(void);
+        extern void     console_fg_pgrp_set(uint64_t pgrp);
+        uint64_t _owner = console_owner_pgrp_get();
+        /*
+         * Fire regardless of who called setpgid.  Busybox ash's
+         * child path is setpgid(0, 0) from the child itself; with
+         * the earlier _was_child gate that was false (target ==
+         * current), and the handoff never ran.  The trace showed
+         * the canary in pgrp 4 with g_console_fg_pgrp still 3.
+         * Unconditional is safe: the shell's own setpgid(0, 0)
+         * either sets fg to itself (pgid == owner once owner is
+         * latched) or runs before owner is latched; either way the
+         * prompt stays a no-op because console_raise_pending skips
+         * the owner pid.
+         */
+        if ((uint64_t)pgid != 0 && (uint64_t)pgid != _owner) {
+            console_fg_pgrp_set((uint64_t)pgid);
+        }
+    }
+    return 0;
+}
+
+/*
+ * kill_one -- deliver one signal to one already-resolved process.
+ *
+ * This is sys_kill's single-target body, factored out so the
+ * process-group loop (sys_kill's pid < 0 branch) calls the SAME
+ * raise the single-pid path does.  A second copy of the SIGKILL /
+ * SIGCONT / generic-set-and-wake logic would drift from this one,
+ * and a shell's kill(-pgid, sig) must not disagree with
+ * kill(pid, sig) about SIGKILL, pid 1, or the blocked-and-
+ * unblocked wake.
+ *
+ * `target` is non-NULL and not pid 1 (callers check).  `sig` is
+ * in [1,63]; sig == 0 is the existence check, handled by the
+ * caller, and is not passed here.
+ */
+static long kill_one(pcb_t* target, int sig) {
     /*
      * Slice 5: SIGKILL acts at the raise, not at a deliver point.
      * It cannot be caught, blocked, or ignored, so a target in a
@@ -8404,6 +9200,45 @@ long sys_kill(long pid, int sig) {
         }
         signal_kill_other(target, 9);
         return 0;
+    }
+
+    /*
+     * SIGCONT acts at the raise when the target is STOPPED.  A
+     * stopped process has no deliver point: it is not running, so
+     * its syscall_dispatch tail never runs, so the generic pending-
+     * bit path below can never be observed.  SIGCONT's whole purpose
+     * is to requeue a stopped process, so the requeue happens here,
+     * at the raise, through process_continue (which holds cli and
+     * calls scheduler_ready_queue_add).
+     *
+     * This is the same shape as the SIGKILL special case above:
+     * an action that must land on a target that is not deliverable.
+     *
+     * If the target is not STOPPED, fall through to the generic
+     * pending-bit path.  When the target next delivers, case 18
+     * calls process_continue, which clears stop_pending (POSIX:
+     * SIGCONT between a SIGSTOP and the safe point cancels the
+     * stop) and is a no-op for a RUNNING/READY process.
+     */
+    if (sig == 18) {   /* SIGCONT */
+        if (target->state == PROC_STATE_STOPPED) {
+            g_sig_raise_count++;
+            /*
+             * 04b: set the pending bit so the resumed child's next
+             * delivery point runs a SIGCONT handler if one is
+             * installed.  process_continue requeues the child; the
+             * bit is delivered at the child's next syscall return
+             * or tick iretq, where a non-zero signal_handler[18]
+             * enters the handler (the SIGSTOP_PEER_PROBE child's
+             * on_cont, which _exit(0)s).  Without the bit the
+             * child resumes without a delivery point and never
+             * exits -- the SIGSTOP_PEER_PROBE FAIL with T_seen=1.
+             */
+            target->sig_pending |= (1ULL << 18);
+            process_continue(target);
+            return 0;
+        }
+        /* else: fall through to the generic path. */
     }
 
     uint64_t bit = 1ULL << (uint64_t)sig;
@@ -8423,6 +9258,77 @@ long sys_kill(long pid, int sig) {
 
     __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
     return 0;
+}
+
+long sys_kill(long pid, int sig) {
+    if (sig < 0 || sig > 63) return -(long)EINVAL_;
+
+    if (sig == 0) {
+        /*
+         * Existence check.  For a pid it is "does the pid name a
+         * live process"; for a group it is "does any process
+         * belong to it".  Both are answered without a raise.
+         */
+        if (pid > 0) {
+            if (pid == 1) return -(long)EPERM_;
+            return process_find_by_pid((uint64_t)pid) ? 0
+                                                      : -(long)ESRCH_;
+        }
+        if (pid == 0) return -(long)EINVAL_;   /* no "my group" yet */
+        {
+            long pg = -pid;
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                pcb_t* c = process_get_pcb(i);
+                if (!c || c->pid == 1) continue;
+                if (c->pgrp == (uint64_t)pg) return 0;
+            }
+            return -(long)ESRCH_;
+        }
+    }
+
+    if (pid == 1) return -(long)EPERM_;    /* init/idle: refuse */
+
+    if (pid > 0) {
+        pcb_t* target = process_find_by_pid((uint64_t)pid);
+        if (!target) return -(long)ESRCH_;
+        return kill_one(target, sig);
+    }
+
+    if (pid == 0) return -(long)EINVAL_;   /* no "my group" yet */
+
+    /*
+     * pid < 0: signal every process in process group -pid.
+     *
+     * This is the Unix kill(-pgid, sig) form, and it is what the
+     * tty-side Ctrl-Z uses: irq1_handler resolves the console
+     * foreground pgrp (g_console_fg_pgrp, set by TIOCSPGRP) and
+     * calls sys_kill(-fg, SIGTSTP).  Before this branch existed,
+     * kill(-pgid) was -EINVAL and the tty had no way to name the
+     * group it means to stop.
+     *
+     * pid 1 is excluded: it is never on the ready queue and
+     * sys_kill refuses it as a single target; the group form must
+     * not sneak past that.  The walk is MAX_PROCESSES entries and
+     * each kill_one does its own cli around the raise, so a tick
+     * between members is safe: the group is stopped one member at
+     * a time, and each stop is a complete raise.
+     *
+     * Returns 0 if at least one member matched, -ESRCH otherwise,
+     * matching Linux (kill to a group with no members is ESRCH).
+     */
+    {
+        long pg = -pid;
+        int matched = 0;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            pcb_t* c = process_get_pcb(i);
+            if (!c) continue;
+            if (c->pid == 1) continue;
+            if (c->pgrp != (uint64_t)pg) continue;
+            matched = 1;
+            kill_one(c, sig);
+        }
+        return matched ? 0 : -(long)ESRCH_;
+    }
 }
 
 /*
@@ -8535,6 +9441,8 @@ long sys_tkill(long tid, int sig) {
 #define TCSETSF_ 0x5404
 #define TIOCGWINSZ_ 0x5413
 #define TIOCSWINSZ_ 0x5414
+#define TIOCGPGRP_  0x540F
+#define TIOCSPGRP_  0x5410
 
 /* termios flag bits (musl bits/termios.h, x86_64). */
 #define T_ICRNL  0x0100   /* c_iflag: map CR to NL on input       */
@@ -8647,6 +9555,112 @@ static void fill_kernel_winsize(kernel_winsize_t* ws) {
  * A NULL slot (fd not open) and a non-console slot both yield
  * -ENOTTY, which is what isatty() reports as "not a tty".
  */
+/*
+ * The console's foreground process group (tcgetpgrp/tcsetpgrp).
+ * One tty today, so one static.  Written by TIOCSPGRP under cli,
+ * read by TIOCGPGRP under cli, and (in a later commit) read by the
+ * Ctrl-Z raise on the keyboard path.  This is shared state: keep
+ * every access under cli.
+ */
+static uint64_t g_console_fg_pgrp = 0;
+/*
+ * The console's OWNER pgrp: the pgrp of the first process to
+ * call tcgetpgrp (the boot shell).  Set once at the lazy latch
+ * and NEVER changed by TIOCSPGRP.  This is what separates
+ * "^Z at the shell's prompt" (owner == fg -> suppress) from
+ * "^Z on a foreground child" (fg == child's pgrp != owner ->
+ * raise).  g_console_fg_pgrp alone cannot: it equals the current
+ * process's pgrp in BOTH cases, which is what made the first
+ * guard wrong.
+ */
+static uint64_t g_console_owner_pgrp = 0;
+/* The shell's pid, latched at the same moment as the owner pgrp.
+ * console_raise_pending skips this pid when delivering ^C, so
+ * the shell never signals itself.  The prior test skipped only
+ * pid 1; on a boot where the shell is not pid 1, the shell was a
+ * ^C target and took SIGINT at the next safe point -- the canary
+ * dying to its own ^C was the observable. */
+static uint64_t g_console_owner_pid = 0;
+
+/*
+ * Read the console foreground pgrp for the keyboard IRQ.
+ *
+ * g_console_fg_pgrp is private to this file (TIOCGPGRP/TIOCSPGRP
+ * write and read it), but irq1_handler in interrupts.c needs it to
+ * decide who receives a Ctrl-Z.  This is the one exported reader,
+ * and it reads under cli like TIOCGPGRP does, so the IRQ observes
+ * exactly what TIOCSPGRP wrote.  0 means "no foreground group set
+ * yet"; the caller must not signal group 0.
+ */
+uint64_t console_fg_pgrp_get(void) {
+    uint64_t saved_flags;
+    uint64_t v;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    v = g_console_fg_pgrp;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return v;
+}
+
+/* The owner pgrp (the boot shell's).  Read by the ^Z raise paths to
+ * suppress a stop that would deadlock the console.  Under cli like
+ * its sibling. */
+uint64_t console_owner_pgrp_get(void) {
+    uint64_t saved_flags;
+    uint64_t v;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    v = g_console_owner_pgrp;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return v;
+}
+
+/* The shell's pid (latched with the owner pgrp).  Read by
+ * console_raise_pending to skip the shell when delivering ^C. */
+uint64_t console_owner_pid_get(void) {
+    uint64_t saved_flags;
+    uint64_t v;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    v = g_console_owner_pid;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+    return v;
+}
+
+/* Write the console foreground pgrp.  Used by sys_wait4's
+ * foreground handoff: when the shell blocks waiting on a child
+ * in its own pgrp, that pgrp becomes the foreground, and when
+ * the child is reaped the shell's pgrp does again.  cli is
+ * held because g_console_fg_pgrp is shared with the keyboard
+ * IRQ (contract rule 1). */
+void console_fg_pgrp_set(uint64_t pgrp) {
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    g_console_fg_pgrp = pgrp;
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+}
+
+/* Called from process_exit: if the exiting process was in the
+ * console foreground pgrp, put the owner back to the fg.  Console
+ * fg pgrp is shared state; cli protects it (contract rule 1). */
+void console_fg_pgrp_reclaim_if(uint64_t pgrp) {
+    extern int process_pgrp_has_child(uint64_t pgrp);
+    uint64_t saved_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags));
+    /*
+     * Reclaim fg to the owner only when the exiting process was
+     * in the current fg pgrp AND no other live process remains
+     * in that pgrp.  A multi-child job (canary --full) keeps the
+     * pgrp as fg across every child exit until the last one; if
+     * this reset fired on each exit, fg would revert to the shell
+     * after the first child and later children would be
+     * unreachable by ^C.
+     */
+    if (pgrp != 0 && pgrp == g_console_fg_pgrp) {
+        if (!process_pgrp_has_child(pgrp)) {
+            g_console_fg_pgrp = g_console_owner_pgrp;
+        }
+    }
+    __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags));
+}
+
 static int fd_is_console(int fd) {
     file_slot_t* slot = get_file_slot_any(fd);
     return slot && slot->kind == FILE_KIND_CONSOLE;
@@ -8690,6 +9704,105 @@ long sys_ioctl(int fd, unsigned long request, void* argp) {
             if (safe_copy_to_user(argp, &ws, sizeof(ws)) != 0) {
                 return -(long)EFAULT_;
             }
+            return 0;
+        }
+        case TIOCGPGRP_: {
+            /*
+             * tcgetpgrp().  busybox ash calls this to learn the
+             * terminal's foreground process group; -ENOTTY here is
+             * what makes it print "can't access tty; job control
+             * turned off".  Answer for the console only, matching
+             * TCGETS.  A foreground pgrp of 0 means "none set",
+             * which is a valid answer (ash then makes itself the
+             * foreground group via TIOCSPGRP).
+             */
+            if (!fd_is_console(fd)) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            /*
+             * tcgetpgrp(0) is compared against getpgid(0) by
+             * busybox's startup (0x4205db).  Until a TIOCSPGRP
+             * names a foreground group, answer with the caller's
+             * own pgrp and remember it: the first process to ask
+             * is the terminal's foreground group, which is what a
+             * boot shell is before it calls tcsetpgrp.  Returning
+             * 0 here made tcgetpgrp(0) != getpgid(0) forever and
+             * the shell retried without ever reaching a prompt.
+             *
+             * The check (== 0) and the lazy set are one cli
+             * region (contract rule 1: shared state).
+             */
+            uint32_t fg;
+            __asm__ volatile("cli");
+            /*
+             * Do NOT latch g_console_owner_pgrp/g_console_fg_pgrp
+             * from the first caller.  The first caller of
+             * tcgetpgrp is not necessarily the shell -- on the
+             * boot that produced this CRP trace it was pid 2, a
+             * wait4-blocked child, and the latch then set
+             * g_console_fg_pgrp = g_console_owner_pgrp = 2, so
+             * every later ^C targeted pgrp 2 (which held only the
+             * wait4-blocked parent) and never the actual
+             * foreground child (pid 6, pgrp 4).  The shell (pid 3,
+             * pgrp 3) then saw tcgetpgrp(0)=2 != getpgrp()=3,
+             * assumed it was NOT foreground, and never called
+             * tcsetpgrp for its children, so fg never advanced.
+             *
+             * The pre-existing behavior for an unset fg was to
+             * return the caller's own pgrp.  Keep that, but do
+             * not persist it: the owner is latched at the first
+             * tcsetpgrp (see TIOCSPGRP) instead, where the caller
+             * is necessarily the shell.
+             */
+            if (g_console_fg_pgrp == 0) {
+                pcb_t* self = process_get_current();
+                fg = self ? (uint32_t)self->pgrp : 0;
+            } else {
+                fg = (uint32_t)g_console_fg_pgrp;
+            }
+            __asm__ volatile("sti");
+            /*
+             * The wire type is pid_t (4 bytes).  musl's tcgetpgrp
+             * reads into a 4-byte stack slot; writing 8 would stomp
+             * the word after it.
+             */
+            if (safe_copy_to_user(argp, &fg, sizeof(fg)) != 0) {
+                return -(long)EFAULT_;
+            }
+            return 0;
+        }
+        case TIOCSPGRP_: {
+            /*
+             * tcsetpgrp().  Record the foreground pgrp.  This is
+             * shared state: the Ctrl-Z raise (a later commit) reads
+             * it from the keyboard IRQ path, so the write is under
+             * cli.  No queue or state change -- the process stays
+             * RUNNING and no dispatch follows (contract rules 1-5:
+             * no state write, no wake, no dispatch).
+             */
+            if (!fd_is_console(fd)) {
+                return -(long)ENOTTY;
+            }
+            if (!argp) {
+                return -(long)EFAULT_;
+            }
+            uint32_t fg32 = 0;
+            if (safe_copy_from_user(&fg32, argp, sizeof(fg32)) != 0) {
+                return -(long)EFAULT_;
+            }
+            __asm__ volatile("cli");
+            if (g_console_owner_pgrp == 0) {
+                pcb_t* self = process_get_current();
+                if (self) {
+                    g_console_owner_pgrp = self->pgrp;
+                    g_console_owner_pid  = self->pid;
+                }
+            }
+            g_console_fg_pgrp = (uint64_t)fg32;
+            __asm__ volatile("sti");
             return 0;
         }
         case TCSETS_:
@@ -8941,6 +10054,20 @@ long sys_munmap(void* addr, size_t length) {
     uint64_t end   = ((uint64_t)addr + length + 0xFFFULL) & ~0xFFFULL;
     if (end <= start) return 0;
 
+    /*
+     * Refuse to unmap the kernel-loaded ELF image.
+     *
+     * A process must not munmap its own .text and then execute it.
+     * That is the [UNMAP_33F] -> #PF shape: sys_munmap zeroes the
+     * PTE, and the next fetch at that VA faults with pte=0. The
+     * region is documented as the ELF image at line 5311:
+     *   [0x400000, 0x600000)  2 MB
+     * Return -EINVAL, the errno a bogus munmap gets on Linux.
+     */
+    if (start < 0x0000000000600000ULL && end > 0x0000000000400000ULL) {
+        return -(long)EINVAL_;
+    }
+
     for (uint64_t va = start; va < end; va += 0x1000) {
         uint64_t phys = vmm_get_phys_from_cr3(self->cr3, va);
         if (!phys) continue;      /* hole: Linux tolerates it */
@@ -9014,6 +10141,15 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
     if (signum < 1 || signum >= 64) return -(long)EINVAL_;
     pcb_t *self = process_get_current();
     if (!self) return -(long)EINVAL_;
+#if DEBUG_SIGDELIVER
+    serial_print("DBG-SIGACTION-ENTRY self->pid=");
+    serial_print_dec(self->pid);
+    serial_print(" signum=");
+    serial_print_dec((uint64_t)signum);
+    serial_print(" act=");
+    serial_print_hex((uint64_t)(uintptr_t)act);
+    serial_print("\n");
+#endif
 
     if (!act) return 0;
 
@@ -9057,6 +10193,17 @@ long sys_rt_sigaction(int signum, const void* act, void* oldact,
     uint64_t prev_r = self->signal_restorer[signum];
     self->signal_handler[signum]  = handler;
     self->signal_restorer[signum] = restorer;
+#if DEBUG_SIGDELIVER
+    serial_print("DBG-SIGACTION self->pid=");
+    serial_print_dec(self->pid);
+    serial_print(" signum=");
+    serial_print_dec((uint64_t)signum);
+    serial_print(" handler=");
+    serial_print_hex(handler);
+    serial_print(" stored=");
+    serial_print_hex(self->signal_handler[signum]);
+    serial_print("\n");
+#endif
     if (oldact) {
         uint64_t old[4];
         old[0] = prev_h;
@@ -9337,6 +10484,252 @@ void signal_terminate_current(int sig) {
 }
 
 /*
+ * process_stop / process_continue -- job control (open-issues item 13).
+ *
+ * Contract.md question 1 (safe point): a SIGSTOP delivered while the
+ * process is mid-syscall must not rewrite its state out from under
+ * the syscall's return path.  process_stop is called from two shapes:
+ *
+ *   - the raise path (a SIGSTOP raised by another process) -- self
+ *     is not current, or is current and RUNNING, so the write is
+ *     deferred: stop_pending is set, and the safe point takes the
+ *     stop on the next delivery.
+ *
+ *   - the safe point itself (process_stop_and_yield, called from
+ *     signal_default_action's SIGSTOP/SIGTSTP branch, reached only
+ *     from the syscall-return delivery) -- in_stop_safe_point is 1,
+ *     so the state change happens now, in the same critical section
+ *     as the dispatch decision.
+ *
+ * stop_pending is the deferred write.  The transition is READY or
+ * RUNNING -> STOPPED, never BLOCKED -> STOPPED: a BLOCKED process
+ * is not preempted to be stopped; it stops when it wakes and takes
+ * its own delivery.  (POSIX disagrees slightly, but that is the
+ * scope of 02b.)
+ *
+ * A second call while stop_pending is already set is a no-op; a
+ * call on a process that has already stopped is a no-op.
+ */
+void process_stop(pcb_t* self, int sig) {
+    if (!self) return;
+    uint64_t _sf;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+
+    if (self->state == PROC_STATE_STOPPED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+    if (self == process_get_current() &&
+        self->state == PROC_STATE_RUNNING &&
+        self->in_stop_safe_point == 0) {
+        /*
+         * Stop delivered on the running process, but the safe point
+         * has not yet been entered (mid-syscall or mid-fault).  Set
+         * the pending bit; the delivery point will call back into
+         * this function with in_stop_safe_point != 0.
+         */
+        self->stop_pending = 1;
+        self->stop_signal  = (uint8_t)sig;
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+
+    /* At the safe point: take the stop now.  Remove from the ready
+     * queue (idempotent), set STOPPED, and do NOT add it back.  The
+     * timer's process_wake_all_blocked only touches BLOCKED, so a
+     * STOPPED process will not be woken by the keyboard; the
+     * nanosleep deadline loop only touches BLOCK_KIND_NANOSLEEP,
+     * so it is not woken by a deadline; and process_yield's RUNNING
+     * refuse guard only runs for the current process.  Nothing
+     * requeues a STOPPED process except process_continue. */
+    scheduler_ready_queue_remove(self);
+    self->stop_signal   = (uint8_t)sig;
+    self->stop_reported = 0;
+    self->state        = PROC_STATE_STOPPED;
+    self->block_kind   = BLOCK_KIND_NONE;
+    self->stop_pending = 0;
+
+    /*
+     * Wake a parent blocked in wait4 for this child.
+     *
+     * process_exit wakes the parent when a child EXITS; a child
+     * that STOPS must wake it too, or a wait4(WUNTRACED) parent
+     * sleeps through the stop.  The 2026-10-30 test showed it: the
+     * shell (pid 3) called wait4 with opts=0x2, the scan ran while
+     * cat was still live (live=1), the shell blocked, and no second
+     * scan ever happened -- nothing woke it when cat stopped.
+     *
+     * The state and stop_reported writes above happen first, so a
+     * parent woken here re-scans and sees STOPPED with
+     * stop_reported == 0.  process_wake_parent_if_waiting is the
+     * same helper process_exit uses; it checks state == BLOCKED
+     * and block_kind == WAITPID under cli, which is exactly the
+     * parent we want.
+     */
+    process_wake_parent_if_waiting(self);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+}
+
+/*
+ * process_stop_and_yield -- the syscall-return safe-point wrapper.
+ *
+ * Called ONLY from signal_default_action's SIGSTOP/SIGTSTP branch,
+ * which is reached only from signal_deliver_frame's SIG_DFL branch,
+ * which is reached only from syscall_dispatch's delivery-on-the-way-
+ * out block.  That block runs with interrupts off (the syscall stub
+ * issued cli and has not sti'd), and signal_deliver_frame returns
+ * into syscall_dispatch, which returns result to the stub, which
+ * sysret's with %rax = result and RFLAGS = kf[7] -- the interrupted
+ * syscall's user RFLAGS, IF=1.  The user-visible shape is therefore
+ * "the syscall returned its value only after SIGCONT", which is
+ * Unix: a process stopped in a system call returns from it only
+ * once it is continued.
+ *
+ * The helper is what makes the stop take effect at the safe point.
+ * process_stop alone would see self == current && RUNNING &&
+ * in_stop_safe_point == 0 and re-set stop_pending -- the raise-path
+ * deferral -- which is exactly wrong here: this IS the safe point.
+ * Setting in_stop_safe_point around the call tells process_stop to
+ * take the write now.
+ *
+ * process_yield never returns until the scheduler dispatches this
+ * process again -- that is, until SIGCONT's process_continue has
+ * set it STOPPED->READY and requeued it.  When it returns, the
+ * stack above is intact: signal_default_action returns 0,
+ * signal_deliver_frame returns 0, syscall_dispatch returns result,
+ * the stub sysret's.  No sentinel return value is needed and
+ * syscall_dispatch's tail is unchanged.
+ *
+ * Not called from the timer's signal_deliver_frame_iretq yet: a
+ * process that is in user mode can receive SIGSTOP and is stopped
+ * at the tick's iretq delivery point, but that path yields from
+ * inside the timer handler, which is its own contract and is 02c.
+ * A process that is in user mode is reached by a SIGSTOP from
+ * another process; the STOPPED self-raise path goes through the
+ * syscall-return delivery above, so 02b covers what a probe can
+ * actually exercise today.
+ */
+static void process_stop_and_yield(pcb_t* self, int sig) {
+    if (!self) return;
+    self->in_stop_safe_point = 1;
+    process_stop(self, sig);
+    self->in_stop_safe_point = 0;
+    /*
+     * Refuse a spurious resume.  process_yield dispatches some other
+     * process and switches away; when it returns, this process is on
+     * the CPU again.  It must have been resumed by SIGCONT
+     * (process_continue, which sets state back to READY/RUNNING) for
+     * that to be legitimate.  If it is still STOPPED, the scheduler
+     * picked it without a continue -- the empty-queue self-pick, a
+     * tick, or a requeue guard that treats STOPPED as dispatchable --
+     * and letting it return into console_read resumes a stopped
+     * process.  The 2026-10-30 serial Ctrl-Z test showed exactly
+     * that: after the stop (state 6), process_yield returned with no
+     * further default_action, and the next six keystrokes echoed.
+     *
+     * So loop: yield again while still STOPPED.  process_yield does
+     * not return for a process with no runnable peer (it parks on
+     * idle), and process_continue is the only writer that clears
+     * STOPPED, so this terminates exactly when a real SIGCONT has
+     * run.  It does not bypass the dispatcher -- each iteration is a
+     * normal process_yield -- and it adds no state of its own.
+     */
+    while (self->state == PROC_STATE_STOPPED) {
+        process_yield();
+    }
+    /* Contract rule 1: process_stop already left the state change
+     * under cli; this yield is the dispatch decision itself.  If
+     * the scheduler refuses the yield (nothing runnable), the
+     * process stays STOPPED and the next process_continue -- or a
+     * keyboard IRQ's process_wake_all_blocked, which does not
+     * touch STOPPED -- is what requeues it.  process_yield handles
+     * the "idle is the only target" case by switching to idle,
+     * which is the correct park. */
+    process_yield();
+}
+
+/*
+ * process_try_stop_iretq -- timer-path stop delivery.
+ *
+ * A peer SIGSTOP/SIGTSTP raised on a process running in user mode
+ * never reaches the syscall-return delivery point (the process is
+ * not making a syscall).  The timer's dispatch (interrupts.c) is the
+ * delivery point that observes it.  Called from the tick for the
+ * process the tick is about to resume; returns 1 if it stopped the
+ * target, 0 if there was nothing to do.
+ *
+ * Clears every deliverable stop bit before stopping: a second
+ * SIGSTOP raised while the first is still pending is discarded
+ * (POSIX: SIGSTOP is not queued).  A SIGCONT that arrives between
+ * the raise and this call also cancels the stop (process_stop
+ * sets stop_pending on the deferred path, but here in_stop_safe_point
+ * is 1, so it takes the transition now).  That is the correct Unix
+ * shape: SIGCONT cancels a pending SIGSTOP.
+ *
+ * Called with interrupts off (the tick's cli); process_stop
+ * preserves that (its own cli/popfq are nested but harmless).  The
+ * caller (interrupts.c) must NOT resume the target after this
+ * returns 1 -- it must fall to idle and return idle->rsp.
+ */
+int process_try_stop_iretq(pcb_t* target) {
+    if (!target) return 0;
+    /* SIGSTOP (19) and SIGTSTP (20); SIGTTIN (21) / SIGTTOU (22)
+     * not implemented yet; join them here when the tty raises
+     * them. */
+    uint64_t stop_bits = (1ULL << 19) | (1ULL << 20);
+    uint64_t deliverable = target->sig_pending & ~target->sig_blocked & stop_bits;
+    if (deliverable == 0) return 0;
+
+    target->sig_pending &= ~deliverable;
+    {
+        int _bs = 0;
+        while (_bs < 64 && !(deliverable & (1ULL << _bs))) _bs++;
+        target->in_stop_safe_point = 1;
+        process_stop(target, _bs);
+        target->in_stop_safe_point = 0;
+    }
+    return 1;
+}
+
+/*
+ * process_continue -- SIGCONT handler helper.
+ *
+ * Clears a pending stop and, if the process is actually STOPPED,
+ * puts it back on the ready queue through the dispatcher.  Idempotent
+ * on a RUNNING/READY process: SIGCONT on a running process is a
+ * no-op (except clearing a pending stop, which is POSIX -- a SIGCONT
+ * that arrives between a SIGSTOP and the safe point cancels the
+ * stop).
+ *
+ * Contract rule 4: the requeue goes through scheduler_ready_queue_add
+ * (not the internal head/tail), so the dispatcher's guards see it.
+ * Contract rule 1: the state and the queue change are one cli
+ * section.
+ */
+void process_continue(pcb_t* self) {
+    if (!self) return;
+    uint64_t _sf;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(_sf));
+
+    /* SIGCONT before the safe point cancels a pending stop. */
+    self->stop_pending  = 0;
+    self->stop_signal   = 0;
+    self->stop_reported = 0;
+
+    if (self->state != PROC_STATE_STOPPED) {
+        __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+        return;
+    }
+
+    self->state      = PROC_STATE_READY;
+    self->block_kind = BLOCK_KIND_NONE;
+    scheduler_ready_queue_add(self);
+
+    __asm__ volatile("pushq %0; popfq" :: "r"(_sf));
+}
+
+/*
  * signal_default_action -- slice 5's default-action table.
  *
  * Called by the three deliver helpers when a pending signal has no
@@ -9365,7 +10758,13 @@ static long signal_default_action(pcb_t* self, int sig) {
         case 17:   /* SIGCHLD  */
         case 23:   /* SIGURG   */
         case 28:   /* SIGWINCH */
-        case 18:   /* SIGCONT  */
+            return 0;
+        case 18:   /* SIGCONT -- resume a stopped process */
+            process_continue(self);
+            return 0;
+        case 19:   /* SIGSTOP -- cannot be caught; stop now */
+        case 20:   /* SIGTSTP -- default is stop */
+            process_stop_and_yield(self, sig);
             return 0;
         default:
             (void)self;
@@ -9396,6 +10795,22 @@ long signal_deliver_frame(uint64_t syscall_result) {
     pcb_t* self = process_get_current();
     if (!self) return 0;
     if (self->in_signal_handler) return 0;
+#if DEBUG_SIGDELIVER
+    {
+        uint64_t _p = self->sig_pending & ~self->sig_blocked;
+        int _n = 0;
+        while (_n < 64 && !(_p & (1ULL << _n))) _n++;
+        serial_print("DBG-SIGDELIVER self->pid=");
+        serial_print_dec(self->pid);
+        serial_print(" n=");
+        serial_print_dec((uint64_t)_n);
+        serial_print(" handler=");
+        serial_print_hex(self->signal_handler[_n]);
+        serial_print(" pend=0x");
+        serial_print_hex(self->sig_pending);
+        serial_print("\n");
+    }
+#endif
 
     uint64_t pend = self->sig_pending & ~self->sig_blocked;
     if (pend == 0) return 0;
@@ -10140,7 +11555,11 @@ long sys_fork(void) {
                     (const uint8_t*)(HHDM_START + _parent_phys);         \
                 uint8_t* _dst =                                          \
                     (uint8_t*)(HHDM_START + _new_phys);                  \
-                for (uint64_t _i = 0; _i < 4096; _i++) _dst[_i] = _src[_i]; \
+                __asm__ volatile(                                        \
+                    "rep movsb"                                         \
+                    : "+D"(_dst), "+S"(_src)                          \
+                    : "c"((uint64_t)4096)                              \
+                    : "memory");                                        \
                                                                          \
                 uint64_t _map_flags = PT_PRESENT | PT_WRITE | PT_USER;   \
                 if (vmm_map_page_in_cr3(child->cr3, _virt, _new_phys,    \
@@ -10219,8 +11638,10 @@ long sys_fork(void) {
      */
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
-    for (int _i = 0; _i < 64; _i++)
+    for (int _i = 0; _i < 64; _i++) {
+        child->signal_handler[_i]  = parent->signal_handler[_i];
         child->signal_restorer[_i] = parent->signal_restorer[_i];
+    }
 
 
     /*
@@ -10314,6 +11735,25 @@ long sys_fork(void) {
      */
     child->brk_virt = parent->brk_virt;
 
+    /* POSIX: a fork child inherits the parent's process group (only a
+     * session leader gets a new one).  Without this, every forked child
+     * stayed in its own group (process_create sets pgrp = pid), so a ^C
+     * or ^Z to the shell's foreground group never reached the pipeline
+     * children: the pool walk showed four zombies with pgrp == pid, and
+     * the ^C print fg=<shell group> matched none of them.  The wait4
+     * parent then blocked forever and the console stalled. */
+    child->pgrp = parent->pgrp;
+    /* Apply a deferred setpgid the parent issued before we
+     * created this child.  See sys_setpgid. */
+    extern struct deferred_setpgid g_defer_pgid[16];
+    for (int _i = 0; _i < 16; _i++) {
+        if (g_defer_pgid[_i].pid == (long)child->pid) {
+            child->pgrp = (uint64_t)g_defer_pgid[_i].pgid;
+            g_defer_pgid[_i].pid = 0;
+            g_defer_pgid[_i].pgid = 0;
+            break;
+        }
+    }
     child->parent_pid = parent->pid;
     child->state = PROC_STATE_READY;
     scheduler_ready_queue_add(child);
@@ -10382,6 +11822,16 @@ static void kernel_do_reboot(void) {
 uint64_t syscall_dispatch(uint64_t num,
                           uint64_t arg0, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+#if DEBUG_SIGDELIVER
+    {
+        pcb_t* _d = process_get_current();
+        serial_print("DBG-SYSCALL pid=");
+        serial_print_dec(_d ? _d->pid : 0);
+        serial_print(" num=");
+        serial_print_dec(num);
+        serial_print("\n");
+    }
+#endif
     g_last_syscall_num = num;
     /* Record the calling process's %fs base at syscall entry.
      * Done here in C, not in the asm stub: the asm stub has no
@@ -10399,6 +11849,7 @@ uint64_t syscall_dispatch(uint64_t num,
 
     uint64_t result = 0;
     switch (num) {
+        { extern void console_raise_pending(void); console_raise_pending(); }
 
         /* --- Linux x86_64 numbers, strictly ascending --- */
         case SYS_READ:            result = (uint64_t)sys_read((int)arg0, (void*)arg1, (size_t)arg2); break;
@@ -10450,6 +11901,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_PIPE:            result = (uint64_t)sys_pipe((int*)arg0); break;
         case SYS_DUP:             result = (uint64_t)sys_dup((int)arg0); break;
         case SYS_DUP2:            result = (uint64_t)sys_dup2((int)arg0, (int)arg1); break;
+        case SYS_PAUSE:           result = (uint64_t)sys_pause(); break;
+        case SYS_RT_SIGSUSPEND:   result = (uint64_t)sys_rt_sigsuspend((const void*)arg0, (size_t)arg1); break;
         case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
         case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
         case SYS_FORK:            result = (uint64_t)sys_fork(); break;
@@ -10457,6 +11910,9 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
         case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
         case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
+        case SYS_SETPGID:         result = (uint64_t)sys_setpgid((long)arg0, (long)arg1); break;
+        case SYS_GETPGRP:         result = (uint64_t)sys_getpgrp(); break;
+        case SYS_GETPGID:         result = (uint64_t)sys_getpgid((long)arg0); break;
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;

@@ -1,10 +1,11 @@
 # Open issues
 
-**Last updated: 2026-10-23** (HEAD `20261023-sigign`).  This file
-lists **only open issues**.  Closed items are removed, not struck
-through; their history is in `git log` and `docs/session-log.md`.
-An item appears here only while it is a defect, a missing
-feature, or an unverified claim about the tree.
+**Last updated: 2026-11-03 (v0.6.19 documentation pass)** (HEAD on
+`dev` at `d69c2ab` plus the docs commits).
+This file lists **only open issues**.  Closed items
+are removed, not struck through; their history is in `git log` and
+`docs/session-log.md`.  An item appears here only while it is a
+defect, a missing feature, or an unverified claim about the tree.
 
 Read top to bottom.  The numbered items are the long-standing
 list; the un-numbered entries below them are smaller and were
@@ -38,6 +39,22 @@ privilege model lands.  That session adds `setuid`/`seteuid`
 and then changes these five to return the unprivileged default
 (1000) with root as an escalation.
 
+**Status note (2026-11-02).**  Nothing currently fails because
+this is not implemented, and there is no user-facing feature it
+unlocks: every binary on the image is built here, there is no
+network service, no multi-user login, and no applet in `test.sh`
+behaves differently as non-root.  The cost of implementing it is
+real -- every filesystem syscall grows a permission check, the
+five identity syscalls flip from 0 to 1000 together (changing
+`tar -x`, `ps`, and `whoami` output), `chmod`/`chown` become
+real (which needs a FAT mode store or a side-channel), and the
+setuid marker is security-relevant in a way item 8's symlink
+marker is not.  **Before starting item 9, ask what it unlocks
+that will be used soon.**  If the answer is "nothing in the near
+term," item 10 or a visible-payoff item from the un-numbered
+list (real FatFs timestamps, `gettimeofday`/`time`) is a better
+use of the session.
+
 **10.  `CR4.OSFXSR` is set, but the kernel saves no SSE state.**
 Userland compiled by `toolchain/musl-gcc.sh` can emit SSE; the
 kernel is built with `-mno-sse -mno-sse2 -mno-avx -mno-mmx` and
@@ -59,49 +76,31 @@ No test currently fails because of this; the corruption is
 latent, and the surface is *any* 64-bit computation that gcc
 chooses to vectorize.
 
-**13.  `CONFIG_ASH_JOB_CONTROL` gap.**  busybox ash's
-job-control code is gated behind `CONFIG_ASH_JOB_CONTROL`, which
-this build does not set.  When a child faults and `sys_wait4`
-returns a signal-kill status, ash's default message is printed,
-but the shell does not do job-control bookkeeping (no `[1]+
-Done` lines, no `fg`/`bg`, no `kill %1`).
+**The fix has two separable halves and they should be two
+commits.**  (a) Kernel save/restore: `fxsave`/`fxrstor` (or
+`xsave`/`xrstor`) in `context_switch.asm`'s save and resume
+sides, and in the interrupt path (`interrupts.c`'s timer and ISR
+entry/exit).  The save region is 512 bytes (or 576 with AVX);
+it must be 16-byte aligned, so it is a `kmalloc`'d buffer per
+PCB or an `__attribute__((aligned(16)))` field in `pcb_t`.
+`CR0.MP` and `CR0.NE` should be set; `CR4.OSXSAVE` may need
+setting if `xsave` is chosen.  (b) Userland flag removal: drop
+`-mno-sse -mno-sse2 -mno-avx -mno-mmx` from
+`userland/musl/Makefile`'s `CFLAGS`.  **Do not drop the
+kernel's `-mno-sse*` flags in the same commit** -- kernel SSE
+and userland SSE are two separate decisions, and the kernel is
+written expecting no XMM state to survive across calls.
 
-Signals are done (see handoff): raise, delivery at three points,
-dispositions including `SIG_IGN`, the default-action table, and
-`SIGCHLD` reaching `wait4` all work.  What is not built is the
-job-control surface *on top of* that machinery: there is no
-stopped process state (`signal_default_action` maps SIGSTOP and
-SIGTSTP to TERMINATE, the documented placeholder), no SIGCONT
-resume path, no process groups (`sys_kill` refuses `pid <= 0`),
-no controlling terminal, no `tcsetpgrp`/`setpgid`, and
-`CONFIG_ASH_JOB_CONTROL` is unset so ash has no job table.  Not
-small, but the hard half -- the signal substrate -- is in.
+The test: a program that writes `%xmm0`, forks a child that does
+not touch `%xmm0`, and has the child verify its value survived a
+tick (and the reverse: parent clobbers `%xmm0`, child still sees
+its own value).  One new applet, or an extension of an existing
+one.
 
-**14.  Shebang (`#!`) and `/bin/sh` are missing.**  `./script.sh`
-works only because busybox ash falls back on `ENOEXEC` and runs
-`sh script.sh`.  The kernel's `sys_execve` opens the file, checks
-for ELF magic, finds `#!`, prints `sys_execve: not an ELF file`,
-and returns `-ENOEXEC`; there is no shebang handling.
-**The image half is now done**: `/bin/sh` exists as a soft
-link to busybox (after the one-time
-`/bin/busybox --install -s /bin`; see handoff).  What remains
-is the kernel half -- `#!` parsing in `sys_execve`.
-
-Both must land together: `#!` parsing in `sys_execve` (read the
-first line, build argv `[interp, optional_arg, script, ...]`,
-recurse with a depth guard) **and** an interpreter on the image
-(a copy of busybox at `/bin/sh`, or a kernel alias — a decision,
-not a one-liner).  Fixing only the kernel gives `ENOENT` instead
-of `ENOEXEC`, still a fallback.  Fixing only `/bin/sh` does
-nothing, because the kernel never looks at the shebang.
-
-This is a **feature gap**, not a bug: `./test.sh` runs, and the
-printed line is the kernel correctly reporting that the script is
-not an ELF.  It becomes a defect when a script's interpreter is
-not a shell (e.g. `#!/usr/bin/python`), where there is no
-fallback.
-
----
+The 2026-11-02/03 hot paths (`78216bc` fork rep movsb, `905bc70` ATA
+rep-pio, `d69c2ab` `f_write`) are more vectorizable than what came
+before, so the latent surface is larger than when this item was filed.
+That raises priority; it does not change the fix.
 
 ## Un-numbered open items
 
@@ -122,16 +121,44 @@ FatFs's `f_chmod` would be a real but two-state mode change, and
 a separate, larger decision.
 
 **`tar` is enabled, and link restoration is verified.**  The
-v0.6.16 note that called its creation path a busybox applet
-issue was **wrong**: busybox's self-archive check compares the
-archive's `(st_dev, st_ino)` against each member's, and every
-FAT file reported `Inode: 0`, so every member matched and was
-skipped.  `76d66db` gives FAT a real `st_ino` from `(sclust,
-objsize)`; `tar -cf`/`-tf`/`-xf` now work, and `tar -tvf`
-records a symlink as `lrwxrwxrwx ... -> target`.  One limit
+v0.6.16 note named a real symptom but the wrong cause.  busybox's
+self-archive check compares the archive's `(st_dev, st_ino)` against
+each member's, and every FAT file reported `Inode: 0`, so every
+member matched and was skipped; `76d66db` gives FAT a real `st_ino`
+from `(sclust, objsize)`.  That was **necessary but not sufficient**:
+the archive was still lost on create and short on list/extract
+because of two vendored-FatFs bugs of the same class -- **state
+staged in `fs->win` is not flushed before something else moves the
+window.**  `a0664a8` flushes the staged directory entry after
+`dir_register` in `f_open`; `d69c2ab` flushes the FAT link before a
+direct data write in `f_write`.  With both, `tar -cvf`/`-tvf`/`-xvf`
+round-trip silently with `rc=0`, including directory members
+(`src/` lists as `drwxr-xr-x`), and `tar -tvf` records a symlink as
+`lrwxrwxrwx ... -> target`.  One limit
 remains: two empty files with the same name in different
 directories collide in `st_ino`, because `FILINFO` carries no
 parent -- see `fat_ino`.
+
+**`umask` (95) is unimplemented.**  `mkdir -p` calls it first and
+fails with `Unknown syscall: 95`, then mis-creates the tree; `mkdir`
+without `-p` works.  The fix is a real `sys_umask`: store a
+per-process mask (a `pcb_t` field, appended so the `_Static_assert`
+offsets do not move) and return the previous one; the FAT/`S_IFDIR`
+mode synthesis in `stat` already reports the standard `0755`, so the
+mask only needs to be stored for a caller that reads it back.  Small,
+self-contained, and it unblocks `mkdir -p` for scripts.  Read
+`sys_umask`/`sys_mkdir` before patching.
+
+**`sys_mkdir` returns `-EPERM` for an existing directory; it should
+be `-EEXIST`.**  busybox `tar` does `mkdir`, treats `EEXIST` as
+"already there, fine," and warns on any other errno, so `tar -xvf` of
+an archive with a directory member prints `tar: can't create
+directory 'src': Operation not permitted` even though the directory
+is created and the tree extracts correctly (`rc=0`, contents match).
+Correct POSIX: `-EEXIST` when the target exists and is a directory,
+`-ENOTDIR` when it exists as a file.  Cosmetic today; pair it with
+`umask` -- both are small syscall-completion fixes, neither touches
+FatFs.  Read `sys_mkdir` before patching.
 
 **`tkill` (200) is implemented as `kill(tid, sig)`.**  Not an
 open issue; noted so it is not re-added.  busybox's `kill`
@@ -225,6 +252,26 @@ contained exactly one `#PF`; the nine signal probes were clean.
 The kernel killed the faulting busybox and returned to the
 fallback `musl_sh` prompt; the system survived.
 
+> **2026-11-02 evening cross-reference.**  The canary `.text` `#PF`
+> that was tracked in `handoff.md` (not in this file) faulted at
+> `RIP=CR2=0x413966` before 2026-11-02, and at `0x450630` on an
+> unlucky post-`7cb26fb` run -- `error 0x14` (present, user, fetch),
+> `pte=0`, canary's own cr3.  The `0x413962` `#PF` described in the
+> preceding paragraph is on the *same page* as the `0x413966`
+> canary fault (offset 4 bytes).  Different `error` code (`0x5`
+> read vs `0x14` fetch) and different process (`echo hi | wc` vs
+> `canary --full`), so they are not proven to be the same fault --
+> but they are close enough to flag.  The canary `.text` `#PF` did
+> not reproduce after the 2026-11-02 IF fix (`162a1d3`).  The
+> VA-gated probe that was to close it was in the discarded stash
+> and was dropped on 2026-11-02; it is not in the tree.  If this
+> `0x413962` `#PF` recurs, read it on its own.  **Do not merge
+> them without evidence.**
+
+Status (2026-11-03): not observed since the 2026-11-02 disk-path
+fixes (`905bc70`, `a0664a8`, `d69c2ab`).  Not closed -- the
+mechanism was never named; recurrence should be read on its own.
+
 Not reproduced: 2, 10, 100, 500, and 2000 iterations in a fresh
 boot all completed cleanly; a probe-then-5000 run on a later
 boot reached 5000.  So the loop is not the cause and 5000 is not
@@ -235,7 +282,13 @@ closed on one clean run.  It is the same family as the
 next session that touches the VFS, fork, or exec paths should
 read this first.
 
-**Disassembly of the current build (2026-10-18).**  `third_party/busybox/busybox` is non-PIE (`Type: EXEC`, load base `0x400000`); `0x42F1A7` is inside the executable PT_LOAD but is **not an instruction boundary** -- it falls inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.  Starting a disassembly at `0x42F1A7` yields a spurious `movabs`, which is the tell.  The nearest real instructions that can raise a user `#GP(0)` are `0x42F1A3` (`mov 0xa0(%r12),%rdi`, a non-canonical `%r12`) and `0x42F1AB` (`cmpb $0x0,0x1(%rbp)`, a non-canonical `%rbp` set by `xchg %rax,%rbp` at `0x42F197` from a returned pointer).  No SSE/XMM instruction appears in the window, so 7b is **not** a face of item 10.  The recorded address is therefore either a fault/operand address, a transcription slip, or from an older build.  Suspected (not proven) to be a downstream symptom of a pre-v0.6.13 corruption race (heap cycle / pipe wake / `C`); unobserved since those closed.  The standing test is a 100 Hz soak (PIPE7E-ALL-PASS, 250000 iterations @ 100 Hz over >3.5 hours, 2026-10-18); if it recurs, inspect `%r12`/`%rbp` at `0x42F1A3`/`0x42F1AB` and trace the corruption upstream of `find`.
+**Disassembly note.**  `0x42F1A7` is inside an instruction, not at
+one; the nearest real instructions that can raise a user `#GP(0)` are
+`0x42F1A3` (non-canonical `%r12`) and `0x42F1AB` (non-canonical
+`%rbp`).  Not SSE (no XMM in the window).  Suspected (not proven)
+downstream of a pre-`v0.6.13` corruption race; unobserved since those
+closed.  Standing test: the 100 Hz soak.  If it recurs, inspect
+`%r12`/`%rbp` at those two addresses.
 
 **Item 7e — ash's stale `jmp_buf`.**  The kernel-side faces of
 7e are closed (the pipe-wake face by `c3e5c97`; the
@@ -298,8 +351,10 @@ or walk `elf_page_list` and unmap by VA from the list itself.
 
 ---
 
-## Also open
+## Also open -- small defects and missing features
 
+- `kill(0, sig)` ("my group") still returns `-EINVAL`.
+  `kill(-pgid, sig)` works (`9b1a4ed`).
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are
   latent collisions.
 - Real FatFs timestamp storage: the three timestamp syscalls
@@ -315,50 +370,41 @@ or walk `elf_page_list` and unmap by VA from the list itself.
   writer (see `pipe_t`'s comment in `user_syscall.c` — a second
   blocked reader on the same pipe end has nowhere to record
   itself and will only wake on a keyboard IRQ).
+- A nonexistent pid stats as a directory: `stat("/proc/999999/")`
+  reports `S_IFDIR` rather than `ENOENT`.  `ps` only stats pids
+  `readdir` gave it, so no consumer is affected.  Worth one line
+  when `/proc` is next touched.
+- `ls` long options are unavailable in the pinned BusyBox 1.36.1
+  (`--color`, `--help`, `--full-time`): the applet registers no
+  long-option table in this snapshot.  `third_party/` is read-only;
+  use short options (`-l`, `-F`, `-R`, `-h`).  Not a kernel bug, a
+  source-version limit.
+- `exec_free_and_unmap_user_pages` walks a fixed 1 MB brk window
+  (`user_syscall.c:4358` lists `[0x8000200000, 0x8000300000)`), but
+  `sys_brk` has no upper bound and `sys_fork`'s copy uses the real
+  `parent->brk_virt`.  A parent whose `brk_virt` grew past the
+  window forks a child with pages the exec cleanup will neither
+  unmap nor free.  Leak, not corruption; extend the cleanup row to
+  the live bound, or unmap by VA from `elf_page_list`.
+
+## Also open -- verify
+
+- `setpgid`/`setsid`-as-pgrp: can a process join or create a
+  process group beyond `TIOCSPGRP`'s foreground assignment?
+  State unverified.
+- The optional shebang interpreter argument reaching the
+  interpreter as a real argv is unproven.  A test with an
+  interpreter that can observe argv is the proof.
+
+## Also open -- hazards (read before touching)
+
 - `put_file_slot`'s pipe wake is coupled to `sys_close`'s wake
   (read the `put_file_slot` comment before touching either).
 - `process_dump_all`'s `DETACHED` state: a process READY with
   `prev == NULL && next == NULL` is labeled DETACHED, which may
   mask a stranded-process bug.
-
----
-
-## Test-design notes
-
-> **This section does not belong in this file.**  It should move
-> to `handoff.md`'s canary section in the next documentation
-> round.  It is here because it was here.
-
-- **The old `musl_sh` ash-only caveats are gone.**  Redirection
-  and pipeline tests are valid from `donix>` as well as ash.
-- **Framebuffer / `vi` tests are one-offs, not canary rows.**
-  `vi` mutates the disk and takes over the screen.
-- **Pipe regression suite is not a canary.**  `pipe_step1` …
-  `pipe_step3b` fork and take seconds.
-- **`at_step2` is not a canary either.**  It mutates the disk.
-  `at_step1` is read-only.
-- **`readlink_errno` is read-only and fast**, run by hand.
-- **`proc_status` and `proc_fd` are read-only and fast**, run by
-  hand.
-- **`proc_dir`, `proc_stat`, `proc_walk`, `proc_walk_fds`,
-  `mmap_stress`, and `exec_churn`** are run by hand.
-  `exec_churn` needs its helper staged as
-  `/usr/bin/CHURN_HELPER`, and is the test that exercises
-  `process_free_clone` on the process-exit path.
-- **`test.sh`** is the ~58-row harness at `/root/scripts/test.sh`.
-  Run it by hand when changing the applet config or the
-  pipe/wait paths.
-- **`mmap_nx`** proves `sys_mmap`'s `PT_NX` gate is enforced.
-  Run it when changing `sys_mmap`, the `PROT_*` handling, or the
-  leaf-PTE construction.
-- **`sigsegv_probe`** installs a `SIGSEGV` handler, faults, and
-  edits `ucontext.gregs[16]` so `rt_sigreturn` resumes past the
-  fault.  It is the acceptance check for slice 4.
-- **`sigterm_ignore`** installs `SIG_IGN` for SIGTERM, raises
-  SIGTERM, and prints whether it survived.  It is the acceptance
-  check for the `SIG_IGN` disposition (`20261023-sigign`).
-- **`at_step1` sections**, as of session 41: sections 1–7
-  `resolve_at`; 8–9 `faccessat`; 11 `utimensat`.  (There is no
-  section 10.)
-- **The canary is now `canary`, a program.**  `canary` (read-only)
-  and `canary --full` (also the mutating rows).  15/15 and 28/28.
+- The `g_syscall_stack_top - 120` frame base is coupled to the
+  stub's push sequence in `user_syscall_entry.asm`; a push added,
+  removed, or reordered means `kf[]` must be re-derived and
+  `signal_deliver_frame` + `sys_rt_sigreturn` updated in the same
+  commit.

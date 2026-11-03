@@ -69,6 +69,7 @@
  *  22  pipe              sys_pipe          (Step 1: non-blocking; see note)
  *  32  dup               sys_dup           (alias of fcntl F_DUPFD)
  *  33  dup2              sys_dup2
+ *  34  pause             sys_pause         (block until a deliverable signal)
  *  35  nanosleep         sys_nanosleep (g_ticks deadline loop; 10 ms granularity)
  *  39  getpid            sys_getpid
  *  57  fork              sys_fork
@@ -154,6 +155,8 @@
 #define SYS_BRK             12
 #define SYS_RT_SIGACTION    13
 #define SYS_RT_SIGPROCMASK  14
+#define SYS_PAUSE           34
+#define SYS_RT_SIGSUSPEND   130
 #define SYS_RT_SIGRETURN    15
 #define SYS_IOCTL           16
 #define SYS_READV           19
@@ -170,6 +173,9 @@
 #define SYS_WAIT4           61
 #define SYS_KILL            62
 #define SYS_UNAME           63
+#define SYS_SETPGID         109
+#define SYS_GETPGRP         111
+#define SYS_GETPGID         121
 #define SYS_FCNTL           72
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
@@ -255,6 +261,7 @@
  *          -1 on error
  */
 #define WNOHANG 1
+#define WUNTRACED 2   /* report a stopped child once */
 
 /* --- kernel-side handlers (called by the dispatcher) --- */
 long sys_write(int fd, const void* buf, size_t count);
@@ -281,6 +288,8 @@ long sys_close(int fd);
 long sys_dup(int fd);
 long sys_dup2(int oldfd, int newfd);
 long sys_nanosleep(const void* req, void* rem);
+long sys_pause(void);
+long sys_rt_sigsuspend(const void* user_mask, size_t size);
 long sys_unlink(const char* path);
 long sys_readlink(const char* path, char* buf, size_t bufsiz);
 long sys_rmdir(const char* path);

@@ -375,8 +375,12 @@ static int ata_read_chunk(uint8_t drive, uint32_t lba, uint8_t count, void* buf)
 #endif
             return rc;
         }
-        for (int i = 0; i < 256; i++) {
-            *p++ = inw(ATA_PRIMARY_DATA);
+        {
+            uint64_t _cnt = 256;
+            __asm__ volatile("cld; rep insw"
+                             : "+D"(p), "+c"(_cnt)
+                             : "d"((uint16_t)ATA_PRIMARY_DATA)
+                             : "memory");
         }
         ata_400ns_delay();
     }
@@ -412,8 +416,12 @@ static int ata_write_chunk(uint8_t drive, uint32_t lba, uint8_t count,
     for (uint32_t s = 0; s < sectors; s++) {
         rc = ata_poll_drq();
         if (rc != 0) return rc;
-        for (int i = 0; i < 256; i++) {
-            outw(ATA_PRIMARY_DATA, *p++);
+        {
+            uint64_t _cnt = 256;
+            __asm__ volatile("cld; rep outsw"
+                             : "+S"(p), "+c"(_cnt)
+                             : "d"((uint16_t)ATA_PRIMARY_DATA)
+                             : "memory");
         }
         ata_400ns_delay();
     }

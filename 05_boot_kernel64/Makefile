@@ -80,6 +80,7 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/proc_walk_fds.elf \
 	$(USERLAND_BIN)/mmap_stress.elf \
 	$(USERLAND_BIN)/exec_churn.elf \
+	$(USERLAND_BIN)/console_timer.elf \
 	$(USERLAND_BIN)/churn_helper.elf \
 	$(USERLAND_BIN)/sha512_probe.elf \
 	$(USERLAND_BIN)/pipe7e.elf \
@@ -94,6 +95,8 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/pipe7e_stdio_heapjmp.elf \
 	$(USERLAND_BIN)/pipe7e_sjlj_stale.elf \
 	$(USERLAND_BIN)/realpath_probe.elf \
+	$(USERLAND_BIN)/sigstop_probe.elf \
+	$(USERLAND_BIN)/sigstop_peer_probe.elf \
 	$(USERLAND_BIN)/busybox.elf
 
 boot.bin: boot.asm
@@ -156,9 +159,14 @@ fat.img: musl-userland $(USERLAND_ELFS)
 	        mcopy -i fat.img "$$f" "::/root/scripts/$$base" || exit 1; \
 	    fi \
 	done
+# /bin/sh is a second copy of busybox.  FAT has no symlink store
+# (see the tar/st_ino note in docs/open-issues.md), so sh is a full
+# copy, not a link.  ~414 KB of image for a working shebang
+# interpreter, which open-issues item 14 requires.
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    mcopy -i fat.img "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox"; \
+	    mcopy -i fat.img "$(USERLAND_BIN)/busybox.elf" "::/bin/sh"; \
 	else \
 	    echo "ERROR: busybox.elf missing"; exit 1; \
 	fi
@@ -255,6 +263,7 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/proc_walk_fds.elf"  PROC_WALK_FDS ; \
 	mcopy_one "$(USERLAND_BIN)/mmap_stress.elf"    MMAP_STRESS ; \
 	mcopy_one "$(USERLAND_BIN)/exec_churn.elf"      EXEC_CHURN ; \
+	mcopy_one "$(USERLAND_BIN)/console_timer.elf"  CONSOLE_TIMER ; \
 	mcopy_one "$(USERLAND_BIN)/churn_helper.elf"    CHURN_HELPER ; \
 	mcopy_one "$(USERLAND_BIN)/sha512_probe.elf"    SHA512_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e.elf"         PIPE7E ; \
@@ -265,6 +274,14 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/sigterm_ignore.elf"  SIGTERM_IGNORE ; \
 	mcopy_one "$(USERLAND_BIN)/sigspin.elf"     SIGSPIN ; \
 	mcopy_one "$(USERLAND_BIN)/sigchld_probe.elf"  SIGCHLD_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/sigintr_wait4_probe.elf"  SIGINTR_WAIT4_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_intr_probe.elf"  PIPE_INTR_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/pipe_write_intr_probe.elf"  PIPE_WRITE_INTR_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/pause_intr_probe.elf"  PAUSE_INTR_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/nanosleep_intr_probe.elf"  NANOSLEEP_INTR_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/sigstop_probe.elf"  SIGSTOP_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/sigstop_peer_probe.elf"  SIGSTOP_PEER_PROBE ; \
+	mcopy_one "$(USERLAND_BIN)/sigsuspend_probe.elf"  SIGSUSPEND_PROBE ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio.elf"  PIPE7E_STDIO ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_sjlj.elf"  PIPE7E_STDIO_SJLJ ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_heapjmp.elf"  PIPE7E_STDIO_HEAPJMP ; \
@@ -290,11 +307,18 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	    fi \
 	done
 
+# /bin/sh is a second copy of busybox.  FAT has no symlink store
+# (see the tar/st_ino note in docs/open-issues.md), so sh is a full
+# copy, not a link.  ~414 KB of image for a working shebang
+# interpreter, which open-issues item 14 requires.
 	@echo "--- staging busybox at /bin/busybox ---"
 	@if [ -f "$(USERLAND_BIN)/busybox.elf" ]; then \
 	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/busybox"; \
 	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
 	        "$(USERLAND_BIN)/busybox.elf" "::/bin/busybox" ; \
+	    echo "mcopy $(USERLAND_BIN)/busybox.elf -> ::/bin/sh"; \
+	    mcopy -i hdd-single.img@@$$(( $(SINGLE_DRIVE_LBA) * 512 )) \
+	        "$(USERLAND_BIN)/busybox.elf" "::/bin/sh" ; \
 	else \
 	    echo "ERROR: $(USERLAND_BIN)/busybox.elf missing — did the busybox build fail?"; \
 	    exit 1; \

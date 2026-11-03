@@ -31,6 +31,15 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t arg0, uint64_t arg1,
 void user_syscall_init_console_fds(struct pcb* pcb);
 void user_syscall_clear_file_table(struct pcb* pcb);
 
+/*
+ * The console foreground process group, as TIOCSPGRP last wrote it
+ * (0 if never set).  Read by interrupts.c's irq1_handler to decide
+ * who receives a Ctrl-Z (SIGTSTP).  Reads under cli; see the
+ * definition in user_syscall.c.
+ */
+uint64_t console_fg_pgrp_get(void);
+uint64_t console_owner_pgrp_get(void);
+
 /* Slice 2/3 signal delivery.  signal_deliver_frame() reads the
  * syscall-entry stub's frame at g_syscall_stack_top - 120;
  * signal_deliver_frame_iretq(frame_base) reads a 20-slot iretq frame

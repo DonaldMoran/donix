@@ -10,6 +10,7 @@
 #include "include/pmm.h"
 #include "include/vmm.h"
 #include "include/user_syscall.h"
+#include "include/syscall.h"   /* sys_kill (irq1_handler Ctrl-Z) */
 
 /* Written by user_syscall_entry.asm immediately before sysret.  Read
  * here when a fault lands at RIP < 0x1000 in user mode, which is the
@@ -33,7 +34,106 @@ extern volatile uint64_t g_arch_prctl_addr[32];
 #define PIT_MODE     0x36
 
 #define KBD_DATA   0x60
+
+/* Gated diagnostic for the Ctrl-Z raise.  1 = print what
+ * irq1_handler decided (fg value and sys_kill result) on every
+ * Ctrl-Z.  Leave 0 in any committed tree; flip to 1 only to
+ * capture a run. */
+#define TRACE_CTRLZ 0
+/* ^C / console-signal trace.  The CRP dump in console_raise_pending
+ * and the CTRLC-IRQ line in irq1_handler are success-path
+ * diagnostics: they fire on every ^C on a healthy system and scroll
+ * the prompt away.  Failure-path signal is the delivery itself, not
+ * these lines.  Leave 0 in any committed tree; flip to 1 to capture
+ * a run. */
+#ifndef TRACE_CTRLC
+#define TRACE_CTRLC 0
+#endif
 #define KBD_STATUS 0x64
+
+/* Deferred console signal (^C): irq1_handler records the target group and
+ * signal; the syscall dispatcher raises it at a syscall boundary.  Calling
+ * sys_kill inside irq1_handler switches inside the IRQ and kills IRQ1. */
+static volatile long g_console_sig_pgrp = 0;
+static volatile long g_console_sig_no   = 0;
+
+void console_raise_pending(void) {
+    long pgrp, sig;
+    pgrp = g_console_sig_pgrp; sig = g_console_sig_no;
+    g_console_sig_pgrp = 0; g_console_sig_no = 0;
+    if (pgrp > 1 && sig > 0) {
+        extern uint64_t console_owner_pid_get(void);
+#if TRACE_CTRLC
+        serial_lock();
+        serial_print("CRP: target pgrp="); serial_print_dec((uint64_t)pgrp);
+        serial_print(" sig="); serial_print_dec((uint64_t)sig);
+        serial_print(" shell_pid="); serial_print_dec(console_owner_pid_get());
+        serial_print("\n");
+        for (int _i = 0; _i < 32; _i++) {
+            extern pcb_t* process_get_pcb(int);
+            pcb_t* _c = process_get_pcb(_i);
+            if (!_c) continue;
+            serial_print("CRP:  pid="); serial_print_dec(_c->pid);
+            serial_print(" pgrp="); serial_print_dec(_c->pgrp);
+            serial_print(" state="); serial_print_dec((uint64_t)_c->state);
+            serial_print(" bk="); serial_print_dec(_c->block_kind);
+            serial_print(" blk=0x"); serial_print_hex(_c->sig_blocked);
+            serial_print(" pend=0x"); serial_print_hex(_c->sig_pending);
+            serial_print("\n");
+        }
+        serial_unlock();
+#endif
+        /* Pure pending-bit set: NO sys_kill here.  sys_kill can terminate
+         * and context-switch, which is fatal in an IRQ handler (proven:
+         * it kills IRQ1/the timer).  Each target takes the signal at its
+         * own syscall-return/iret delivery point. */
+        extern int process_get_pcb_indexed(int);
+        for (int i = 0; i < 32; i++) {
+            extern pcb_t* process_get_pcb(int);
+            pcb_t* c = process_get_pcb(i);
+            if (!c) continue;
+            if (c->pid == 1) continue;
+            {
+                extern uint64_t console_owner_pid_get(void);
+                if (c->pid == console_owner_pid_get()) continue;
+            }
+            if (c->pgrp != (uint64_t)pgrp) continue;
+            c->sig_pending |= (1ULL << (uint64_t)sig);
+            /*
+             * If the target is READY but not on the ready queue,
+             * requeue it.  The CRP trace showed pid=4 state=READY
+             * pgrp=4 with pend being set, but the process was never
+             * dispatched (READY, off-queue -- next/prev==0 in the
+             * full pool walk).  A READY off-queue process never
+             * observes a pending signal, so the shell's wait4 on it
+             * blocks forever.  Adding it makes the next tick
+             * dispatch it, take the SIGINT at the iretq delivery
+             * point, and terminate.
+             */
+            if (c->state == PROC_STATE_READY) {
+                extern int scheduler_ready_queue_contains(pcb_t*);
+                extern void scheduler_ready_queue_add(pcb_t*);
+                if (!scheduler_ready_queue_contains(c)) {
+                    scheduler_ready_queue_add(c);
+                }
+            }
+            if (c->state == PROC_STATE_BLOCKED &&
+                (c->block_kind == BLOCK_KIND_NONE ||
+                 c->block_kind == BLOCK_KIND_PIPE_READ ||
+                 c->block_kind == BLOCK_KIND_PIPE_WRITE)) {
+                extern void scheduler_ready_queue_add(pcb_t*);
+                extern int scheduler_ready_queue_contains(pcb_t*);
+                c->state = PROC_STATE_READY;
+                if (!scheduler_ready_queue_contains(c)) {
+                    scheduler_ready_queue_add(c);
+                }
+                /* block_kind is deliberately NOT cleared: the blocked
+                 * pipe/console syscall must see sig_pending and return
+                 * -EINTR rather than resume the read. */
+            }
+        }
+    }
+}
 
 /* Boot fingerprint: dump the raw interrupt frame for the first few
    ticks so we can sanity-check the initial timer interceptions. */
@@ -351,7 +451,30 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
    normal prototype. Not done yet. */
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
+    { extern void console_raise_pending(void); console_raise_pending(); }
     g_ticks++;
+    /*
+     * IRQ1 safety net.  Several boots produced a console that
+     * stopped accepting keystrokes after a ^C that killed the
+     * foreground job: the trace showed the ^C reached the right
+     * pgrp and the children died, but IRQ1 then stopped firing
+     * and the shell's read(0) blocked forever.  Every 100 ms
+     * (10 ticks at 100 Hz), force IRQ1 into a known-good state:
+     * unmask it in the PIC's IMR, and send a specific EOI for
+     * IRQ1.  Both are no-ops on a healthy PIC; on a PIC left
+     * with IRQ1 masked or stuck in-service (by whatever sequence
+     * of nested exits and EOIs), this clears it, and the next
+     * keystroke fires IRQ1.  The specific EOI for a line that
+     * is not in service is ignored by the 8259, so this is safe
+     * unconditionally.
+     */
+    if ((g_ticks % 10) == 0) {
+        uint8_t _m = inb(PIC1_DATA);
+        if (_m & 0x02) {
+            outb(PIC1_DATA, _m & ~0x02);
+        }
+        outb(PIC1_CMD, (PIC_EOI | 1));
+    }
     race_p1_timer_dump();
     vga_cursor_tick();
 
@@ -379,6 +502,23 @@ timer_preempt_handler(uint64_t stack_pointer) {
      * IRQ context -- the PS/2 handler already does.
      */
     process_wake_all_blocked();
+    /* Wake any process whose nanosleep deadline has arrived.
+     * Runs in IRQ context with interrupts off (cli held by the
+     * stub), so the state changes are one critical section --
+     * scheduler contract rule 1.  scheduler_ready_queue_add is
+     * idempotent. */
+    for (int _wi = 0; _wi < MAX_PROCESSES; _wi++) {
+        pcb_t* _wp = process_get_pcb(_wi);
+        if (!_wp) continue;
+        if (_wp->state != PROC_STATE_BLOCKED) continue;
+        if (_wp->block_kind != BLOCK_KIND_NANOSLEEP) continue;
+        if (_wp->wake_tick == 0) continue;
+        if (_wp->wake_tick > g_ticks) continue;
+        _wp->wake_tick  = 0;
+        _wp->block_kind = BLOCK_KIND_NONE;
+        _wp->state      = PROC_STATE_READY;
+        scheduler_ready_queue_add(_wp);
+    }
     #define SCHED_QUANTUM 2
 
     pcb_t* current = process_get_current();
@@ -712,6 +852,31 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * current, targeting stack_pointer, before the
              * no-op return.
              */
+            if (process_try_stop_iretq(current)) {
+                /* current is STOPPED and off the ready queue.  Do not
+                 * resume it (returning stack_pointer would).  Fall to
+                 * idle: the same state changes the !next fallback
+                 * does below.  A peer SIGSTOP on a user-mode process
+                 * has no syscall-return delivery point; this is the
+                 * tick that observes it. */
+                pcb_t* _idle = process_find_by_pid(1);
+                if (_idle && _idle != current) {
+                    _idle->state = PROC_STATE_RUNNING;
+                    scheduler_set_current(_idle);
+                    extern void tss_set_kernel_stack(uint64_t stack);
+                    extern void tss_set_syscall_stack(uint64_t stack);
+                    tss_set_kernel_stack(_idle->kernel_stack_top);
+                    tss_set_syscall_stack(_idle->kernel_stack_top);
+                    current->fs_base = rdmsr(0xC0000100);
+                    wrmsr(0xC0000100, _idle->fs_base);
+                    __asm__ volatile("mov %0, %%cr3" : : "r"(_idle->cr3));
+                    return _idle->rsp;
+                }
+                /* No idle to fall to: resume current; its stop will
+                 * be observed at the next dispatch. */
+                current->timeslice_ticks = 0;
+                return stack_pointer;
+            }
             if (current->sig_pending & ~current->sig_blocked) {
                 signal_deliver_frame_iretq(current, stack_pointer);
             }
@@ -753,6 +918,23 @@ timer_preempt_handler(uint64_t stack_pointer) {
              * unchanged; a pending signal on current must be
              * delivered here, targeting stack_pointer.
              */
+            if (process_try_stop_iretq(current)) {
+                pcb_t* _idle = process_find_by_pid(1);
+                if (_idle && _idle != current) {
+                    _idle->state = PROC_STATE_RUNNING;
+                    scheduler_set_current(_idle);
+                    extern void tss_set_kernel_stack(uint64_t stack);
+                    extern void tss_set_syscall_stack(uint64_t stack);
+                    tss_set_kernel_stack(_idle->kernel_stack_top);
+                    tss_set_syscall_stack(_idle->kernel_stack_top);
+                    current->fs_base = rdmsr(0xC0000100);
+                    wrmsr(0xC0000100, _idle->fs_base);
+                    __asm__ volatile("mov %0, %%cr3" : : "r"(_idle->cr3));
+                    return _idle->rsp;
+                }
+                current->timeslice_ticks = 0;
+                return stack_pointer;
+            }
             if (current->sig_pending & ~current->sig_blocked) {
                 signal_deliver_frame_iretq(current, stack_pointer);
             }
@@ -878,6 +1060,21 @@ timer_preempt_handler(uint64_t stack_pointer) {
          * current resumes from its own frame unchanged, and its
          * pending signal will be observed on its next dispatch.
          */
+        if (process_try_stop_iretq(next)) {
+            /* next is STOPPED and off the ready queue.  Do not resume
+             * it (returning next->rsp would).  Resume the interrupted
+             * current from its own frame -- the same refuse shape the
+             * range/rsp checks above use.  current is still RUNNING;
+             * the state and cr3 changes for next were already made
+             * above, but next is not resumable, and the next tick
+             * will pick a different next.  current->cr3 is still
+             * loaded (we changed it for next, so we must restore it). */
+            current->timeslice_ticks = 0;
+            /* Restore current's address space: the cr3 switch for
+             * next happened above; resume current in current's. */
+            __asm__ volatile("mov %0, %%cr3" : : "r"(current->cr3));
+            return stack_pointer;
+        }
         if (next->sig_pending & ~next->sig_blocked) {
             signal_deliver_frame_iretq(next, next->rsp);
         }
@@ -891,20 +1088,124 @@ timer_preempt_handler(uint64_t stack_pointer) {
 void irq1_handler(void) {
     uint8_t status = inb(KBD_STATUS);
     if (!(status & 0x01)) {
-        outb(PIC1_CMD, PIC_EOI);
+        outb(PIC1_CMD, (PIC_EOI | 1));
         return;
     }
 
     uint8_t sc = inb(KBD_DATA);
     switch (sc) {
-        case 0x2A: case 0x36: g_shift = 1; outb(PIC1_CMD, PIC_EOI); return;
-        case 0xAA: case 0xB6: g_shift = 0; outb(PIC1_CMD, PIC_EOI); return;
-        case 0x3A: g_caps ^= 1; outb(PIC1_CMD, PIC_EOI); return;
+        case 0x2A: case 0x36: g_shift = 1; outb(PIC1_CMD, (PIC_EOI | 1)); return;
+        case 0xAA: case 0xB6: g_shift = 0; outb(PIC1_CMD, (PIC_EOI | 1)); return;
+        case 0x3A: g_caps ^= 1; outb(PIC1_CMD, (PIC_EOI | 1)); return;
         /* Ctrl: 0x1D make, 0x9D break (left; the right-Ctrl codes
          * 0xE0 0x1D are not handled -- the E0 prefix is a separate
          * concern and left Ctrl is enough for Ctrl-[). */
-        case 0x1D: g_ctrl = 1; outb(PIC1_CMD, PIC_EOI); return;
-        case 0x9D: g_ctrl = 0; outb(PIC1_CMD, PIC_EOI); return;
+        case 0x1D: g_ctrl = 1; outb(PIC1_CMD, (PIC_EOI | 1)); return;
+        case 0x9D: g_ctrl = 0; outb(PIC1_CMD, (PIC_EOI | 1)); return;
+    }
+
+    /*
+     * Ctrl-Z -> SIGTSTP to the foreground process group.
+     *
+     * scancode 0x2C is the Z key (set 1); 0x1A is `[`, not Z --
+     * Ctrl+[ is already mapped to ESC in scancode_to_ascii, and
+     * that is a different key.  The break code (high bit set)
+     * is dropped so the key release does not raise a second
+     * time.
+     *
+     * The tty eats ^Z when ISIG is on, which is what the termios
+     * fill reports (T_ISIG | T_ICANON); so this raises and does
+     * NOT also enqueue 0x1A.  Passing ^Z through to a raw-mode
+     * reader is a later commit, and it needs TCSETS to actually
+     * store per-fd termios and sys_read to consult ISIG first --
+     * donix does not have that store yet.
+     *
+     * The raise goes through sys_kill(-fg, SIGTSTP), the same
+     * raise the single-pid path uses, so the contract's
+     * SIGTSTP entry (safe point, cli, dispatcher, pending
+     * representation) is unchanged.  fg > 1 refuses pid 1 as a
+     * group: it is never on the ready queue and sys_kill refuses
+     * it as a single target.
+     */
+    if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2C) {
+        long fg    = (long)console_fg_pgrp_get();
+        long owner = (long)console_owner_pgrp_get();
+        /* ^Z at the shell's own prompt must be a no-op: the shell is
+         * the only keyboard reader and stopping it deadlocks the
+         * console.  fg == owner identifies that case; a foreground
+         * child has fg == its own pgrp != owner and is stopped as
+         * before.  (The earlier guard compared cur->pgrp, which is
+         * equal to fg in both cases and wrongly suppressed the child.) */
+#if TRACE_CTRLZ
+        serial_print("CTRLZ: fg="); serial_print_dec((uint64_t)(fg < 0 ? 0 : fg));
+        serial_print(" sc=0x"); serial_print_hex(sc);
+#endif
+        if (fg > 1 && fg != owner) {
+#if TRACE_CTRLZ
+            long r = sys_kill(-fg, 20);   /* SIGTSTP */
+            serial_print(" kill="); serial_print_dec((uint64_t)(r < 0 ? -r : r));
+            serial_print(r < 0 ? " (err)" : " (ok)");
+#else
+            sys_kill(-fg, 20);            /* SIGTSTP */
+#endif
+        }
+#if TRACE_CTRLZ
+        serial_print("\n");
+#endif
+        outb(PIC1_CMD, (PIC_EOI | 1));
+        return;
+    }
+
+    /* Ctrl-C -> SIGINT to the foreground group (owner rule).  DEFERRED:
+     * record the pending signal; the syscall dispatcher raises it.  No
+     * sys_kill here: it would context-switch inside the IRQ and kill IRQ1
+     * (the proven post-^C lockup). */
+    if (g_ctrl && !(sc & 0x80) && (sc & 0x7F) == 0x2E) {
+        outb(PIC1_CMD, (PIC_EOI | 1));
+        long fg    = (long)console_fg_pgrp_get();
+#if TRACE_CTRLC
+        long owner = (long)console_owner_pgrp_get();
+        serial_lock();
+        serial_print("CTRLC-IRQ fg="); serial_print_dec((uint64_t)(fg<0?0:fg));
+        serial_print(" owner="); serial_print_dec((uint64_t)(owner<0?0:owner));
+        serial_print("\n"); serial_unlock();
+#endif
+        /*
+         * Deliver ^C to the foreground pgrp when it contains at
+         * least one process other than the shell / idle.  The
+         * old guard was 'fg != owner', which is true only when
+         * the shell's tcsetpgrp has put a *different* group in
+         * the foreground.  Busybox ash (in this build) puts the
+         * pipeline's children in the shell's own pgrp (fg ==
+         * owner), so the guard refused and ^C did nothing to
+         * those children -- the canary prints show fg=2 owner=2
+         * with the canary still running.  The right test is
+         * "does fg contain a non-shell member":
+         *   - shell alone in fg      -> no-op (prompt ^C)
+         *   - any child in fg        -> deliver SIGINT
+         */
+        /*
+         * Always deliver ^C to the foreground pgrp when fg > 1.
+         * console_raise_pending skips the shell by pid
+         * (console_owner_pid_get), so:
+         *   - ^C at the shell's own prompt: pgrp has only the
+         *     shell, which is skipped -- no-op, as expected;
+         *   - ^C while a child is running in the shell's pgrp
+         *     (the fg == owner case): the child is targeted
+         *     and killed on its next tick, which is what the
+         *     running-process test wants;
+         *   - ^C on a pipeline with its own pgrp: all its
+         *     members are targeted.
+         * The old guard 'fg != owner' refused every fg == owner
+         * ^C, and the busybox ash in this tree puts pipeline
+         * children in the shell's pgrp -- so a running child was
+         * never signalled by ^C.
+         */
+        if (fg > 1) {
+            g_console_sig_pgrp = fg;
+            g_console_sig_no   = 2;   /* SIGINT */
+        }
+        return;
     }
 
     char c = scancode_to_ascii(sc, g_shift, g_caps, g_ctrl);
@@ -917,7 +1218,7 @@ void irq1_handler(void) {
            woken process up on the next tick. */
         process_wake_all_blocked();
     }
-    outb(PIC1_CMD, PIC_EOI);
+    outb(PIC1_CMD, (PIC_EOI | 1));
 }
 
 /*

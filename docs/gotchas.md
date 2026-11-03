@@ -2517,3 +2517,42 @@ the loop became `-0x200`.
 **The rule.**  Read the body, not the comment above it.  A stale
 comment is worse than none, because it sends the next reader down
 a path the code does not have.
+
+## A fault address that is not an instruction boundary is the tell
+
+*2026-11-03.  The `0x42F1A7` `#GP`, re-read.*
+
+A recorded `RIP` that disassembles to a plausible-but-impossible
+instruction -- a `movabs` from nowhere, an opcode that should not
+be there -- may not be at an instruction boundary.  `0x42F1A7`
+was not: it fell inside `mov 0xa0(%r12),%rdi` at `0x42F1A3`.
+The nearest instructions that can raise the recorded fault are
+the real suspects, and the address in the report is either a
+fault/operand address, a transcription slip, or from an older
+build.
+
+**The rule.**  Disassemble from the boundary the disassembler
+finds, not the address in the report.  A disassembly started at
+the reported address that yields a spurious instruction is not
+evidence about the kernel -- it is evidence about the address.
+
+## An anchor that depends on a prior edit must be folded into that edit
+
+*2026-11-03.  The `M2bc` ROADMAP patch, and why its pre-flight
+was right to abort.*
+
+A pre-flight over the original file cannot validate an anchor
+that only exists after an earlier replacement has applied.  The
+`M2bc` patch had two edits -- delete the shebang item, renumber
+the survivors -- whose anchors assumed the shebang was already
+gone.  The pre-flight counted 0 against the original and
+aborted, correctly.
+
+**The fix.**  Make delete-and-renumber one replacement: anchor
+on the contiguous block as it exists now, and emit the final
+state in one `new`.
+
+**The rule.**  Plan edits that do not depend on each other's
+output.  If edit B's old-string contains text edit A deletes,
+B's pre-flight counts 0 against the original.  The check is
+right; the edit plan is wrong.  Fold them.

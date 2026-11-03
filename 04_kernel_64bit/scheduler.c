@@ -4,6 +4,7 @@
 #include "include/user_msr.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/user_syscall.h"
 
 /*
  * SW2_TRACE -- dispatch-trace instrumentation for scheduler_switch_to.
@@ -423,8 +424,17 @@ pcb_t* scheduler_ready_queue_next(void) {
      * falls back to idle.  Skipping current_process is correct --
      * you never switch to the process already on the CPU.
      */
+    /* Never dispatch a non-runnable PCB.  RUNNING is the
+     * already-existing skip (see the long comment above).
+     * ZOMBIE/TERMINATED/UNUSED are added here: a ZOMBIE that
+     * was on the queue got popped, resumed from a stale frame,
+     * and executed its (freed) .text -- the 0x413966 #PF.  A
+     * zombie is never dispatchable, from any caller. */
     while (ready_queue_head &&
-           ready_queue_head->state == PROC_STATE_RUNNING) {
+           (ready_queue_head->state == PROC_STATE_RUNNING ||
+            ready_queue_head->state == PROC_STATE_ZOMBIE ||
+            ready_queue_head->state == PROC_STATE_TERMINATED ||
+            ready_queue_head->state == PROC_STATE_UNUSED)) {
         pcb_t* skip = ready_queue_head;
         ready_queue_head = skip->next;
         if (ready_queue_head) {
@@ -566,6 +576,30 @@ void __attribute__((noreturn)) process_exit(void) {
 
     exiting->state = PROC_STATE_TERMINATED;
     scheduler_ready_queue_remove(exiting);
+    {
+        extern void console_fg_pgrp_reclaim_if(uint64_t pgrp);
+        console_fg_pgrp_reclaim_if(exiting->pgrp);
+    }
+    /*
+     * If this process was the console foreground pgrp, hand the
+     * console back to the owner (the boot shell).  Without this a
+     * ^C that kills the fg child leaves g_console_fg_pgrp naming
+     * a dead group, and the shell's next read(0) is refused by
+     * console_read's fg check -- the console is stuck.  Owner
+     * reclaim mirrors what the shell's tcsetpgrp would do; we do
+     * it here because the shell is not yet running.
+     *
+     * NOTE: reclaim_if ends in sti by design (it is called from
+     * sys_wait4 and the scheduler paths with IF already 1).  It
+     * used to be called here twice; the second call was a
+     * duplicate introduced by 7cb26fb.  Removed.  The IF
+     * discipline inside process_exit (which holds cli from its
+     * top) is handled by converting reclaim_if to the
+     * pushfq/popfq idiom in the next commit; until then this
+     * call leaves IF=1 for the rest of process_exit, which is
+     * the pipe7e #GP.  Do NOT re-order: the duplicate removal
+     * must land first so the IF fix is tested in isolation.
+     */
 
     if (process_get_current() == exiting) {
         process_set_current(NULL);
@@ -642,6 +676,19 @@ void __attribute__((noreturn)) process_exit(void) {
              */
             if (_p == current_process) continue;
             if (_p->pid == 1) continue;   /* idle is never queued */
+            /*
+             * A stale RUNNING process is not on the CPU (it is not
+             * current_process) but every requeue guard tests
+             * state == RUNNING and skips it.  Make it READY so the
+             * test below requeues it.  The write is under the cli
+             * this block holds (contract rule 1).  This is what the
+             * comment above describes; before this line the code
+             * only requeued READY and the stranded RUNNING process
+             * fell through.  Item 7d.
+             */
+            if (_p->state == PROC_STATE_RUNNING) {
+                _p->state = PROC_STATE_READY;
+            }
             if (_p->state != PROC_STATE_READY) continue;
             if (scheduler_ready_queue_contains(_p)) continue;
             scheduler_ready_queue_add(_p);
@@ -917,6 +964,39 @@ void scheduler_switch_to(pcb_t* next) {
     if (next->pid == 1 && current_process &&
         current_process->state == PROC_STATE_RUNNING) {
         return;
+    }
+
+    /*
+     * Stop-check: a READY next with a pending SIGSTOP/SIGTSTP must
+     * be stopped before it is dispatched, not after.  process_yield
+     * dispatches via this function (not the timer's return-next->rsp
+     * path), so a peer SIGSTOP on a process the parent's yield is
+     * about to dispatch never reaches 03b's timer-tail check.
+     *
+     * process_try_stop_iretq is idempotent on a process without a
+     * pending stop, and returns 1 after process_stop has set the
+     * target STOPPED and removed it from the ready queue.  The
+     * caller (process_yield) re-picks on 1.
+     */
+    if (process_try_stop_iretq(next)) {
+        return;
+    }
+
+    /*
+     * 04c: signal delivery at the scheduler_switch_to dispatch
+     * point.  The timer's tail delivers at return-next->rsp; this
+     * path (process_yield's dispatch of next) resumes via
+     * context_switch_resume, and the child is dispatched here, not
+     * by the timer (the tick's next is the parent, woken by
+     * nanosleep).  A SIGCONT handler installed by the child (the
+     * SIGSTOP_PEER_PROBE case) is only reachable if the child is
+     * resumed to it, and the child is resumed here.
+     * signal_deliver_frame_iretq refuses a kernel-mode frame (the
+     * CS slot != 0x33), so a process resumed in kernel mode is not
+     * delivered to -- correct.
+     */
+    if (next->sig_pending & ~next->sig_blocked) {
+        signal_deliver_frame_iretq(next, next->rsp);
     }
 
     SW2_PRINT(
@@ -1206,18 +1286,39 @@ void scheduler_switch_to(pcb_t* next) {
         serial_print_dec(next->pid);
         serial_print(" name=");
         serial_print(next->name);
-        serial_print(" rsp outside stack -> idle\n");
+        serial_print(" rsp outside stack -> restore prev\n");
         serial_unlock();
-        pcb_t* _idle2 = process_find_by_pid(1);
-        if (_idle2 && _idle2 != current_process) {
-            current_process = _idle2;
-            process_set_current(_idle2);
-            _idle2->state = PROC_STATE_RUNNING;
-            next = _idle2;
-        } else {
-            __asm__ volatile("sti");
-            return;
-        }
+        /*
+         * A true refuse: restore current_process to prev and
+         * return to the caller.  process_yield is written to
+         * handle a return from scheduler_switch_to (it
+         * re-promotes current_process from READY to RUNNING and
+         * sti's).  The previous shape substituted idle and fell
+         * through to context_switch, which does not return, so
+         * process_yield's tail never ran and prev stayed on the
+         * ready queue with a context_switch-shaped resume frame.
+         * The timer's dispatch path resumes next->rsp through
+         * irq0_stub's pop, which expects an irq0_stub interrupt
+         * frame; a context_switch switch frame in that slot
+         * iretqs a non-canonical RIP/RSP and takes #GP error 0
+         * (the 2026-11-02 fault at irq0_stub's iretq).
+         * Restore and return; no context_switch.
+         *
+         * NOTE: the sibling refuse below (next->rsp == 0) still
+         * has the fall-to-idle shape and its comment says the
+         * callers do not handle a return.  That comment predates
+         * process_yield's current tail, which does.  Not changed
+         * in this commit; one change at a time.
+         *
+         * process_exit's refuse (the other " rsp outside stack"
+         * string, ~line 850) is a different check: it switches
+         * with context_switch_no_save and halts the exiting
+         * process.  Not touched here.
+         */
+        current_process = prev;
+        process_set_current(prev);
+        __asm__ volatile("sti");
+        return;
     }
 
     /*
@@ -1391,6 +1492,17 @@ void process_yield(void) {
                  */
                 if (_p == current_process) continue;
                 if (_p->pid == 1) continue;   /* idle is never queued */
+                /*
+                 * A stale RUNNING process is not on the CPU (it is
+                 * not current_process) but every requeue guard tests
+                 * state == RUNNING and skips it.  Make it READY so
+                 * the test below requeues it.  The write is under
+                 * the cli process_yield holds from its top (contract
+                 * rule 1).  Item 7d.
+                 */
+                if (_p->state == PROC_STATE_RUNNING) {
+                    _p->state = PROC_STATE_READY;
+                }
                 if (_p->state != PROC_STATE_READY) continue;
                 if (scheduler_ready_queue_contains(_p)) continue;
                 scheduler_ready_queue_add(_p);
@@ -1438,7 +1550,14 @@ void process_yield(void) {
      * whatever it is executing on.
      */
     if (next == current_process) {
-        current_process->state = PROC_STATE_RUNNING;
+        /* Restore the caller to its pre-yield state.  A BLOCKED caller
+         * (e.g. the nanosleep probe) must NOT be forced RUNNING: that
+         * clobbers BLOCKED with no valid saved frame, and the next tick
+         * preempts it mid-hlt and context_switch resumes garbage ->
+         * user RSP=0 #PF.  Only a READY caller (the normal yield) is
+         * promoted to RUNNING here; it is about to resume on the CPU. */
+        if (current_process->state == PROC_STATE_READY)
+            current_process->state = PROC_STATE_RUNNING;
         __asm__ volatile("sti");
         return;
     }
@@ -1460,7 +1579,19 @@ void process_yield(void) {
      * here is at the decision point.  Same shape as the
      * next == current_process guard above.
      */
-    if (next->state == PROC_STATE_RUNNING) {
+    /*
+     * Idle (pid 1) is exempt from the RUNNING check below.  Idle
+     * is RUNNING by design whenever nothing else is, and the
+     * !next fallback above selects it as the fall-to-idle target.
+     * Dispatching idle is the legitimate "nothing runnable, park
+     * the CPU" path the timer already uses; refusing it here left
+     * a caller (e.g. nanosleep's blocked sleeper) spinning in a
+     * refused yield instead of falling to idle, and printed
+     * YIELD-REFUSE on every `sleep`.  Non-idle RUNNING targets
+     * are still refused: a RUNNING non-idle process is on the CPU
+     * elsewhere and must not be dispatched from a stale frame.
+     */
+    if (next->state == PROC_STATE_RUNNING && next->pid != 1) {
         serial_lock();
         serial_print("YIELD-REFUSE: next pid=");
         serial_print_dec(next->pid);
@@ -1468,12 +1599,38 @@ void process_yield(void) {
         serial_print(next->name);
         serial_print(" state=RUNNING\n");
         serial_unlock();
-        current_process->state = PROC_STATE_RUNNING;
+        /* Same restore rule as the next == current_process guard above:
+         * a BLOCKED caller stays BLOCKED.  Forcing RUNNING here was the
+         * YIELD-REFUSE setting a BLOCKED process to RUNNING that produced
+         * the user RSP=0 #PF.  Contract rule 2: check (current state) and
+         * act (write it) must have the same subject. */
+        if (current_process->state == PROC_STATE_READY)
+            current_process->state = PROC_STATE_RUNNING;
         __asm__ volatile("sti");
         return;
     }
 
     scheduler_switch_to(next);
+
+    /*
+     * scheduler_switch_to returned: the dispatch was refused.  In
+     * this function, the only refuse that can happen here is the
+     * stop-check (process_try_stop_iretq(next) returned 1); the
+     * guards above rule out every other refuse.  The target is
+     * STOPPED and off the ready queue.  Do NOT re-pick here:
+     * re-picking calls context_switch(prev = current, next = _re)
+     * and the second save of current corrupts current's resume
+     * frame (the parent's nanosleep sysret returned to user with a
+     * user RSP 0x88 lower than g_user_rsp_save — the 04a first
+     * attempt's fault).  A refused dispatch leaves the caller on
+     * the CPU; it was requeued by the main path above, so the next
+     * tick's scheduler_ready_queue_next will pick it.  The child
+     * is STOPPED and off the queue; the parent is READY on the
+     * queue and will be re-dispatched.
+     */
+    if (current_process->state == PROC_STATE_READY)
+        current_process->state = PROC_STATE_RUNNING;
+    __asm__ volatile("sti");
 }
 
 pcb_t* scheduler_get_current(void) {

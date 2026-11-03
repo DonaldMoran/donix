@@ -3,6 +3,7 @@
 #include "include/vga.h"
 #include "include/serial.h"
 #include "include/fb.h"
+#include "libc.h"
 
 /* ------------------------------------------------------------------ */
 /* Tunables                                                            */
@@ -147,6 +148,7 @@ static int cursor_visible = 1;
  * blink; raise toward 75 for a slower, lazier one.
  */
 static int cursor_drawn   = 0;    /* cursor currently painted on fb? */
+static int cursor_hw_dirty = 0;
 static uint32_t cursor_blink_ticks = 0;   /* counts PIT ticks */
 
 /*
@@ -519,7 +521,7 @@ static void vga_scroll(void) {
     const int cols = con_cols();
     const int rows = con_rows();
 
-    /* Shift the shadow up one row, then repaint the whole grid. */
+    /* Shift the shadow up one row. */
     for (int row = 0; row < rows - 1; row++) {
         for (int col = 0; col < cols; col++) {
             shadow_set(row, col, shadow_get(row + 1, col));
@@ -528,9 +530,38 @@ static void vga_scroll(void) {
     for (int col = 0; col < cols; col++) {
         shadow_set(rows - 1, col, blank_cell());
     }
-    for (int row = 0; row < rows; row++) {
+
+    /* VGA: scroll via framebuffer row blit.
+     *
+     * The old body repainted every cell (cols x rows paint_cell
+     * calls, each an 18-row fb_putchar glyph render -- ~4284
+     * glyphs and ~2.3 MB of framebuffer stores per scroll at
+     * 102x42).  Instead: move the framebuffer up by one glyph
+     * row with memmove (one linear copy; the destination is
+     * below the source, so memmove is correct), then paint only
+     * the new last row (cols glyphs).  ~42x less glyph work.
+     *
+     * Works only when the framebuffer is available.  The VGA
+     * text fallback (fb->available == 0) keeps the old full
+     * repaint path below, because the fallback writes cells,
+     * not pixels, and there is no framebuffer row to move. */
+    const fb_info_t* fb = fb_get_info();
+    if (fb->available) {
+        const size_t row_bytes = (size_t)18 * (size_t)fb->pitch;
+        const size_t shift = (size_t)(rows - 1) * row_bytes;
+        if (shift > 0) {
+            memmove(fb->base, fb->base + row_bytes, shift);
+        }
+        /* New last row: cols glyphs. */
         for (int col = 0; col < cols; col++) {
-            paint_cell(row, col, shadow_get(row, col));
+            paint_cell(rows - 1, col, shadow_get(rows - 1, col));
+        }
+    } else {
+        /* VGA text fallback: the shadow IS the screen; repaint it. */
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                paint_cell(row, col, shadow_get(row, col));
+            }
         }
     }
 
@@ -714,12 +745,12 @@ static void vga_putc_raw(char c) {
             vga_scroll();
             cursor_row = rows - 1;
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\r') {
         cursor_col = 0;
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\b') {
@@ -727,14 +758,14 @@ static void vga_putc_raw(char c) {
             cursor_col--;
             con_put_cell(cursor_row, cursor_col, ' ', cursor_attr);
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == '\t') {
         int next = (cursor_col + 8) & ~7;
         if (next > cols - 1) next = cols - 1;
         cursor_col = next;
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
         return;
     }
     if (c == 0x07) {
@@ -751,7 +782,7 @@ static void vga_putc_raw(char c) {
                 cursor_row = rows - 1;
             }
         }
-        vga_update_hardware_cursor();
+        cursor_hw_dirty = 1;
     }
 }
 
@@ -1126,6 +1157,7 @@ void vga_hide_cursor(void) {
 void vga_putc(char c) {
     serial_lock();
     vga_putc_unlocked(c);
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 
@@ -1134,6 +1166,7 @@ void vga_write(const char* data, size_t count) {
     for (size_t i = 0; i < count; i++) {
         vga_putc_unlocked(data[i]);
     }
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 
@@ -1142,6 +1175,7 @@ void vga_print(const char *s) {
     while (*s) {
         vga_putc_unlocked(*s++);
     }
+    if (cursor_hw_dirty) { vga_update_hardware_cursor(); cursor_hw_dirty = 0; }
     serial_unlock();
 }
 

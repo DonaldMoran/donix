@@ -26,6 +26,9 @@
 # The tick rate is `pit_init` in kmain.c.  It is a compiled constant
 # and is NOT a run-script option; edit kmain.c and rebuild.
 
+# Disable host side Ctrl-Z
+stty susp undef
+
 set -e
 set -o pipefail
 cd "$(dirname "$0")"
@@ -41,7 +44,7 @@ CAPTURE=capture.txt
 # diagnosis.
 DEFAULT_MODE=clean-nofreeze
 
-MODES=(clean-nofreeze nofreeze sdl headless debug monitor int verbose clean-sdl clean-headless)
+MODES=(clean-nofreeze nofreeze sdl gtk headless debug monitor int verbose clean-sdl clean-headless tcg tcg-debug)
 
 # ---- build + stage ---------------------------------------------------
 build() {
@@ -75,13 +78,32 @@ qemu_base_nofreeze() {
         -serial stdio -s -monitor none
 }
 
+# TCG (software emulation) bases: -cpu max instead of -enable-kvm.
+qemu_base_tcg() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -cpu max \
+        -serial stdio -s -monitor none \
+        -no-reboot -no-shutdown
+}
+
+qemu_base_tcg_nofreeze() {
+    echo qemu-system-x86_64 \
+        -drive "file=$IMG,format=raw,if=ide,index=0" \
+        -cpu max \
+        -serial stdio -s -monitor none
+}
+
 mode_qemu() {
     local base; base=$(qemu_base)
     local nf;   nf=$(qemu_base_nofreeze)
+    local tbase; tbase=$(qemu_base_tcg)
+    local tnf;   tnf=$(qemu_base_tcg_nofreeze)
     case "$1" in
         clean-nofreeze) echo "$nf -display sdl" ;;
         nofreeze)       echo "$nf -display sdl" ;;
         sdl)            echo "$base -display sdl" ;;
+        gtk)            echo "$base -display gtk" ;;
         headless)       echo "$base -display none" ;;
         debug)          echo "$base -display sdl -S" ;;
         monitor)        echo "$base -display sdl -monitor unix:/tmp/donix-mon,server,nowait" ;;
@@ -89,6 +111,8 @@ mode_qemu() {
         verbose)        echo "$base -display none -d guest_errors,int,cpu_reset" ;;
         clean-sdl)      echo "$base -display sdl" ;;
         clean-headless) echo "$base -display none" ;;
+        tcg)            echo "$tnf -display sdl" ;;
+        tcg-debug)      echo "$tbase -display sdl -S" ;;
         *) return 1 ;;
     esac
 }
@@ -98,6 +122,7 @@ mode_desc() {
         clean-nofreeze) echo "make clean + SDL, no freeze     fault reboots; reboot works [default]" ;;
         nofreeze)       echo "SDL, no freeze                  fault reboots; reboot works" ;;
         sdl)            echo "SDL window, incremental         fault freezes" ;;
+        gtk)            echo "GTK window, incremental         fault freezes" ;;
         headless)       echo "no display, incremental        fault freezes" ;;
         debug)          echo "SDL, QEMU waits for gdb (-S)   fault freezes, break before boot" ;;
         monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
@@ -105,6 +130,8 @@ mode_desc() {
         verbose)        echo "no display, full log           -d guest_errors,int,cpu_reset" ;;
         clean-sdl)      echo "make clean + SDL               fault freezes" ;;
         clean-headless) echo "make clean + no display        fault freezes" ;;
+        tcg)            echo "TCG (-cpu max), SDL, no freeze  fault reboots (no KVM)" ;;
+        tcg-debug)      echo "TCG (-cpu max), SDL, gdb -S    fault freezes (no KVM)" ;;
     esac
 }
 

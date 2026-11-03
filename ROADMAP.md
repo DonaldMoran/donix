@@ -28,6 +28,9 @@ heap free-list cycle.**  The narrative is the `v0.6.13` entry in
 `v0.6.13` tag; it is not repeated here, per this file's rule that
 completed milestones live in the log and the tag annotations.
 
+v0.6.13 through v0.6.19: see the `v*` tag annotations and
+[`docs/version-history.md`](docs/version-history.md).
+
 For the record, so this file does not re-plan finished work:
 
 - **Phase A** — boot chain, long mode, paging, heap, scheduler, ELF
@@ -121,34 +124,20 @@ that is not a FAT file.
   `open_resolved` to accept the same two paths `stat_resolved` does,
   producing a `FILE_KIND_DIR` slot with `PROC_DIR_SENTINEL` — the
   mechanism `/proc` itself already uses.
-- **`/dev` is not a directory.**  `ls /dev` fails; adding it is the
-  same directory shape `/proc` got, and is the prerequisite for
-  `/dev/tty` and `/dev/urandom`.
-- **`sys_gettimeofday` (99)** — `PS_LONG`/`PS_TIME` need it, so
-  `ps -l` is off.
 - **`/etc/passwd`** — so `ps`'s USER column shows a name instead of
   the numeric uid.
-- **A nonexistent pid stats as a directory** — the check is on the
-  path shape, not on `process_find_by_pid`.
 
 ### The seam's remaining consumers, in order
 
 Each is a consumer of the seam, ordered by what it unlocks.  None
 is scheduled.
 
-1. **`/dev` as a listable directory** — `/dev/tty`, `/dev/urandom`,
-  and `ls /dev`.  Small, patterned work.
-2. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
+1. **FAT-backed symlinks** — a `DONIX_LINK:`-style marker in an
   ordinary file, hidden entirely inside the seam.  See
   `open-issues.md` item 8.
-3. **Shebang (`#!`) and `/bin/sh`.**  `./script.sh` works only via
-  ash's `ENOEXEC` fallback; the kernel has no `#!` handling and
-  `/bin` has no `sh`.  Both must land together: `#!` parsing in
-  `sys_execve` and an interpreter on the image.  See
-  `open-issues.md` item 14.
-3. **`ln`, `link`, `readlink` with real targets**, and archive
+2. **`ln`, `link`, `readlink` with real targets**, and archive
   symlink restoration (`tar`, `unzip`).
-4. **A mount framework**, if and when a second filesystem exists.
+3. **A mount framework**, if and when a second filesystem exists.
 
 ---
 
@@ -172,10 +161,11 @@ value.
   non-`PF_X` segment); what remains is the stack.
 - **`sys_brk` heap base and the mmap window.**  Fixed addresses;
   latent collisions.
-- **Signal delivery (`SIGPIPE`, `SIGBUS`).**  `sys_rt_sigaction` is
-  a stub; `-EPIPE` is delivered without `SIGPIPE`.  A subsystem, and
-  the prerequisite for job control, `kill(2)`, and a Wayland
-  `wl_shm` client's `SIGBUS`.  See `open-issues.md`.
+- **`SIGBUS` on fault.**  `rt_sigaction` is real and `SIGPIPE` is
+  wired (`yes | head` terminates the writer); job control ships.
+  What remains is `SIGBUS` on a faulting `mmap` access -- the
+  prerequisite for a Wayland `wl_shm` client's overrun.  See
+  `open-issues.md`.
 - **Kernel log routing.**  Route diagnostics to serial only, or add
   a `SYS_KLOG(level)` syscall.
 - **Real FatFs timestamp storage.**  The timestamp syscalls return 0
@@ -228,8 +218,10 @@ honest about what is and is not on that path.
   `memfd` or file.  Currently refused; see `open-issues.md`.
 - **`memfd_create` + `ftruncate`** for `wl_shm` pools.
 - **`poll` (or `epoll`)** — the client's main loop.
-- **`SIGBUS` on buffer overrun** — needs real signal delivery, the
-  same subsystem `SIGPIPE` needs (see `open-issues.md`).
+- **`SIGBUS` on buffer overrun** — the three delivery points (syscall
+  return, timer `iretq`, fault) exist (`20261029-slice6-done`);
+  `SIGBUS`-on-`mmap`-fault semantics are not wired.  See
+  `open-issues.md`.
 - **`futex`** — verify it exists; musl threads need it anyway.
 
 **Explicitly not Wayland prerequisites, despite being commonly

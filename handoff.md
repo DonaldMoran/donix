@@ -5,305 +5,281 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-10-28.  **`v0.6.18` is released.**  Signals
-slices 1-5 are in it, with `tkill`, the busybox `KILL` applet, and
-the `SIG_IGN` fix.  The release tag carries the per-release
-summary.  Every path syscall reaches its filesystem
-through the mount table (`mount_driver(backend)->op(...)`); the
-resolver is `vfs_resolve(path, follow_final)`; symlinks work end to
-end.  `test.sh` is 57/57 and `canary --full` is 28/28, verified
-from `/` on a freshly built image, three times interleaved.  Read
-"The concurrency contract" in `docs/contract.md` before touching
-shared state, then "Where we are".
+**Last updated:** 2026-11-03, documentation pass for `v0.6.19`.
+**`v0.6.18` is the last pushed release; nothing was pushed.** `dev` =
+`d69c2ab` plus the uncommitted docs edits (ahead of `origin/dev` by
+100 before the edits). `origin/dev` = `799e98f` = `v0.6.18`. No
+stashes. Build green. `canary --full` 28/28 and `test.sh` 57/57 at
+`d69c2ab` (clean rebuild, no probes). Two scratch tags from the
+2026-11-03 tar session: `20261103-tar-dirflush` (`a0664a8`) and
+`20261103-tar-padding` (`d69c2ab`).
 
-**WHAT THE VFS IS NOW, in one paragraph.**  `g_mounts` maps `/`
-(FAT), `/dev`, and `/proc` to `fs_driver_t` vtables: `unlink`,
-`rename`, `mkdir`, `open`, `stat`, `access`.  `resolve_at` became
-`vfs_resolve`, which canonicalizes the path, selects the mount by
-longest prefix on a component boundary, and -- when `follow_final`
-is 1 -- follows a `DONIX_LINK:` marker (an ordinary FAT file whose
-first line is `DONIX_LINK:<target>`), capped at 8 hops (`-ELOOP`).
-Every path syscall calls `vfs_resolve` and then the mount's
-operation; no syscall tests `BACKEND_*` to choose an operation.
-Devices are rows in `g_dev_table` with `(major, minor, ino, read,
-write)`; `/dev/null` is 1,3; `console` 5,1; `tty` 5,0; `zero` 1,5;
-`urandom` 1,9.  `st_dev`/`st_ino` are identity, `st_rdev` is the
-device number.
+**WHERE WE ARE.** The 2026-11-03 session fixed **busybox `tar`**.
+It was two bugs, both in vendored FatFs, both the same class: **state
+staged in `fs->win` is not flushed before something else moves the
+window.** `move_window()` is a no-op when `fs->winsect` already
+equals the requested sector even if `fs->win` holds something else.
 
-**WHAT IS NOT DONE.**  A real `mount(2)` (the table is `static
-const`); file-backed `mmap`; `link(2)`/`mknod(2)` (FAT cannot store
-them); shebang + `/bin/sh` in the kernel (the image half is done);
-`chmod`/`chown` (90-93) accept and drop, FAT has no mode or owner;
-and three signal gaps, named in "Signals: what remains" below --
-SIGCHLD does not interrupt a blocked `wait4`, there is no
-`sigsuspend`/`pause`, and SIGSTOP/SIGTSTP default-terminate rather
-than stop.  SSE state is not saved (open-issues item 10).  No
-privilege model (item 9).
+1. **`a0664a8` (`20261103-tar-dirflush`)** -- `f_open`: `dir_register`
+   stages the new directory entry into `fs->win` via `dj.dir` but
+   does not flush it. A later `f_open`/`f_read`/`f_write` on the same
+   volume calls `move_window`, reloads `fs->win`, and the staged name
+   is discarded; the close-time `sync_window` then writes the **old**
+   sector back over the entry. Fix: `sync_window(fs)` right after
+   `dir_register` succeeds in `f_open`, while `dj.dir` is valid.
+2. **`d69c2ab` (`20261103-tar-padding`)** -- `f_write`: the
+   cluster-boundary code above the **direct-write branch** sets the
+   new FAT link in `fs->win` (`wflag=1`), but the direct branch
+   writes data sectors from the caller's buffer and `continue`s
+   without flushing. A later `create_chain`'s `move_window` is a
+   no-op if `winsect` already equals the FAT sector, the chain read
+   is stale, `create_chain` returns 1, `ABORT(FR_INT_ERR)` sets
+   `FIL.err=2` -- **sticky** -- and every later `f_write` fails. That
+   made tar's end-of-archive padding write return short:
+   `write error: I/O error` on create, `short read` on list/extract.
+   Fix: `sync_window(fs)` before the direct `disk_write`.
 
-**THE RELEASE TAGS.**  `v0.6.16` (the VFS), `v0.6.17` (FAT
-`st_ino`, `tar`, `chmod`/`chown`), and `v0.6.18` (signals slices
-1-5) are the release record; their annotations carry the
-per-release summary.  `v0.6.18`'s scratch tags have been dropped.
+Both verified on a clean rebuild: `canary --full` 28/28,
+`test.sh` 57/57, full `tar -cvf` / `-tvf` / `-xvf` round trip
+**silent with `rc=0`** and matching contents (3072-byte archive for
+two small members; 2048 for one), and the six-line redirect/tar
+matrix green. **Directory members work too:** `tar -cvf dir.tar
+a.txt b.txt src` (with `src/c.txt`) creates a 4608-byte archive
+listing `src/` as `drwxr-xr-x`, and `tar -xvf` recreates the tree
+with matching contents and `rc=0`. One cosmetic warning remains on
+extract -- see NEXT item 4.
 
-**WHERE WE ARE.**  `v0.6.15` (busybox batch 1), `v0.6.16` (the
-VFS), `v0.6.17` (FAT `st_ino`, `tar`, `chmod`/`chown`), and
-`v0.6.18` (signals slices 1-5) are released.  Work is now
-pre-`v0.6.19`.  The working tree is `dev`, clean.
+The prior session (2026-11-02) closed the `exec_churn`
+performance issue (ATA PIO data port, `rep insw`/`rep outsw`) and
+the `sys_fork` eager-copy issue (byte loop -> `rep movsb`); see
+the 2026-11-02 commits list under "State on disk".
 
-**NEXT.**  Signals are done for the scope they were given.  The
-three remaining gaps are real work, not probes, and each is its
-own session: (a) SIGCHLD interrupting a blocked `wait4` -- a
-signal-arrival wake for a blocked syscall, which is a scheduler
-change, not a delivery change; (b) `sigsuspend`/`pause` -- an
-atomic unblock-and-wait, which is a syscall addition; (c)
-SIGSTOP/SIGTSTP stop + SIGCONT resume -- job control, open-issues
-item 13.  After those, in order: shebang + `/bin/sh` kernel half
-(item 14); SSE save/restore then remove the userland `-mno-sse*`
-flags (item 10); the privilege model (item 9); busybox batch 2.
-`test.sh`'s md5 is still listed in the old work list; it is not
-blocking anything.
+**NEXT -- highest-value work.**
+1. **`docs/open-issues.md` item 10 -- SSE save/restore.**
+   `CR4.OSFXSR` is set but the kernel saves no SSE state;
+   userland is pinned to `-mno-sse*` as a stopgap. The fix is
+   `fxsave`/`fxrstor`/`xsave` in `context_switch.asm` and the
+   interrupt path, then remove the `-mno-sse*` flags from the
+   userland build. One commit, one test. The risky part is
+   alignment of the save region and any latent SSE use in the
+   kernel once `-mno-sse` is dropped from kernel CFLAGS (do not
+   drop the kernel's flags in the same commit as the userland
+   flags -- kernel SSE and userland SSE are two separate
+   decisions).
+2. **`docs/open-issues.md` item 9 -- the privilege model.**
+   uid/gid are 0 for every process; no per-process uid/euid
+   split, no setuid, no `chown`. The item lists the shape:
+   `setuid`/`seteuid` (105/117), a setuid-root marker on a
+   FAT-hostile filesystem (magic-marker, same shape as item 8),
+   a `sudoers` equivalent, then 102/104/107/108/115 return 1000
+   with root as an escalation.
 
-### Signals: what is in, and what was proven
+   **NOTE FOR THE NEXT SESSION BEFORE STARTING ITEM 2.** Item 9
+   is the second-biggest numbered item, not a thing donix needs
+   right now. There is no current user-facing feature it
+   unlocks: every binary on the image is built here, there is no
+   network service, no multi-user login, and no applet in
+   `test.sh` that behaves differently as non-root. The cost is
+   real -- every filesystem syscall grows a permission check,
+   the five identity syscalls flip from 0 to 1000 together (and
+   `tar -x`/`ps`/`whoami` output changes with them), `chmod`/
+   `chown` become real (which means FAT needs a mode store or a
+   side-channel), and the setuid marker is security-relevant in
+   a way item 8's symlink marker is not. **Before starting item
+   9, ask what it unlocks that will be used soon.** If the
+   answer is "nothing in the near term," pick one of the
+   visible-payoff items instead: real FatFs timestamps,
+   `gettimeofday` (96) / `time` (201), or SSE (item 10). Item 9
+   is a multi-session project and is correctly deferred until
+   there is a reason for it.
+3. **`umask` is unimplemented (syscall 95).** `mkdir -p` fails
+   with `Unknown syscall: 95` and then mis-creates; `mkdir`
+   without `-p` works. Small, self-contained, and it unblocks
+   `mkdir -p` for scripts. Candidate for a short session.
+4. **`mkdir` on an existing directory returns `EPERM` instead of
+   `EEXIST`.** Symptom: `tar -xvf` of an archive with a directory
+   member prints `tar: can't create directory 'src': Operation
+   not permitted`, even though the directory is created and the
+   tree extracts correctly (`rc=0`, contents match). Cause:
+   busybox `tar` does `mkdir`, then treats `EEXIST` as "already
+   there, fine" but warns on any other errno; the kernel's
+   `sys_mkdir` returns `-EPERM` for an existing directory.
+   Correct POSIX: `-EEXIST` when the target exists and is a
+   directory, `-ENOTDIR` when it exists as a file. Small; read
+   `sys_mkdir` before patching (not read this session). Pair it
+   with `umask` -- both are small syscall-completion fixes, both
+   unblock script-level behavior, neither touches FatFs.
 
-Delivered at three points: syscall exit (after the switch, with
-the interrupted syscall's result passed to `signal_deliver_frame`
-and preserved in `ucontext.gregs[RAX]`), the tick's `iretq`
-(`signal_deliver_frame_iretq`), and the fault frame
-(`signal_deliver_frame_exc`).  Each refuses a kernel-mode frame
-(`(cs & 3) != 3`); the tick path additionally refuses to dispatch
-mid-syscall.  `sys_rt_sigreturn` returns `v[G_RAX]` -- the
-interrupted syscall's result -- so a `wait4` that a signal was
-delivered over still reports the child pid.
+**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** The C is
+`context_switch_resume`'s unknown-CS branch. Not observed since the
+2026-11-02 disk-path fixes (`905bc70` ATA rep-pio, `a0664a8` /
+`d69c2ab` FatFs window flush). Three clean `canary --full` runs
+before that (`873be27`, `6df4fef`, `78216bc`), and none since. That
+is evidence, not a close -- no mechanism was ever named, and the
+fault is intermittent. No C work is planned. The refuted paths below
+are still refuted.
 
-Raises: SIGCHLD in `process_exit` (bit-set only, after the wake
-and ZOMBIE, inside the existing `cli`); SIGPIPE in `sys_write`'s
-pipe branch (`readers_open == 0`); SIGKILL acted on at the raise
-(it cannot be caught or blocked); everything else via
-`kill`/`tgkill`/`tkill`.
+---
 
-Dispositions: `signal_handler[]` stores 0 (`SIG_DFL`), 1
-(`SIG_IGN`), or a handler address.  The three deliver helpers
-branch: `0` -> `signal_default_action`; `1` -> clear the bit,
-resume without a handler; otherwise build the user-stack frame
-and enter the handler.  `signal_default_action` is ignore for
-SIGCHLD, SIGURG, SIGWINCH, SIGCONT and terminate for everything
-else.
-
-**Verified by running, 2026-10-23, on the `20261023-sigign`
-build:**
-
-- Gate: `echo hi | wc` -> `1 1 3`; `sigchld_probe` -> handler
-  ran, `wait4` returned 5, reaped; `sleep 1` returns;
-  `canary --full` 28/28; `sh /root/scripts/test.sh` 57/57.
-  Run three times interleaved.
-- SIGPIPE: `yes | head -n 1 ; echo after` -> `y` / `after`.
-- Default-terminate: `kill -9 $$` -> `Killed`, status 137;
-  `kill -15 $$` -> `Terminated`, status 143; `kill -2 $$` ->
-  silent, status 130 (busybox suppresses the SIGINT message;
-  the exit status is the proof).  Parent shell survives all
-  three.
-- SIG_IGN: `sigterm_ignore` -> `survived kill(SIGTERM)`,
-  status 0.
-- Real handlers unchanged: `kill_self` (handler before `kill`
-  returns), `sigsegv_probe` (handler round-trip, resumes, exit
-  0), `sigspin` (tick delivery, `HANDLER-RAN i=1`).
-
-`tkill` (200) is implemented as `kill(tid, sig)`, a thin wrapper
-over `sys_kill`; busybox `kill` uses it to signal itself, and
-without it `kill -2 $$` printed `Unknown syscall: 200`.
-
-**SIG_IGN was broken and is fixed.**  `sys_rt_sigaction` used to
-collapse `SIG_IGN` (1) to 0, making it indistinguishable from
-`SIG_DFL`; a process that ignored a signal was terminated by it.
-`sigterm_ignore` found it (status 143).  The collapse is deleted;
-`SIG_IGN` stays 1 and the deliver helpers clear-and-resume.  This
-is commit `6de2d63`, tag `20261023-sigign`.
-
-**Known limits carried forward:**
-- SIGCHLD does not interrupt a blocked `wait4`.  The shell's
-  `wait` loop works because `process_wake_parent_if_waiting`
-  wakes the parent; a program that blocks in `read` and expects
-  SIGCHLD's handler to run stays blocked until something else
-  wakes it.
-- No `sigsuspend`/`pause`/`sigwait`; there is no atomic
-  unblock-and-wait.
-- SIGSTOP/SIGTSTP default-terminate (STOP is not implemented);
-  SIGCONT's default is ignore, which is correct, but there is no
-  stopped state to continue.  Job control is open-issues item 13.
-- `signal_deliver_frame*` requires a nonzero restorer (musl
-  always sets `SA_RESTORER`; a caller that installs a handler
-  with `restorer == 0` gets no delivery and the bit stays set).
-- No SIGBUS generator: x86 has no `#BUS` vector and donix's
-  `mmap` is anonymous-only.
-- `siginfo` is passed as NULL; the handler is the simple
-  `void(int)` shape.  `sigaction` masks and `SA_*` flags beyond
-  `SA_RESTORER` are not honored.
-- `signal_deliver_frame` and `sys_rt_sigreturn` both compute the
-  frame base as `g_syscall_stack_top - 120` while
-  `user_syscall_entry.asm` pushes 128 bytes.  The gate passing
-  means the constant is consistent with what is tested, not that
-  it is right.  A change to the stub's pushes or the delivery
-  point must re-derive it.
-
-**What slice 2 taught the slice-3 author, so it is not re-walked:**
-
-- **Do NOT call `signal_deliver_frame` from the asm stub.**  The
-  first attempt did; the extra call + return address + callee
-  frame pushed the 16 KB kernel stack over on the deepest
-  syscalls (`musl_sh`'s `read(0)` at its prompt), and the stub's
-  `pop`s read user-stack data as the resume frame.  Boot-time
-  `#PF` at RIP `0x40B845`, CR2 `0x1000`.  The deliver check runs
-  at the top of `syscall_dispatch`, inside the C frame every
-  syscall already returns through.
-- **The handler entry `RSP` is `frame`, not `frame + 8`.**  The
-  frame is `[restorer][ucontext_t]`; the handler is a normal C
-  function whose epilogue `pop rbp; ret` pops `frame[0]`.  If
-  entry RSP is `frame + 8`, the `ret` pops `frame[16]`
-  (`uc_link = 0`) and jumps to address 0.  `sys_rt_sigreturn`
-  reads the `ucontext_t` from the user RSP saved at syscall
-  entry, which is `frame + 8`.
-- **`killtest` cannot close a slice's delivery acceptance.**  Use
-  `kill_self` for delivery-and-restore, `sigspin` for the tick
-  path, `sigsegv_probe` for the fault path, `sigchld_probe` for
-  SIGCHLD, `sigterm_ignore` for SIG_IGN.
-
-**DONE SINCE `v0.6.17`** (restore points: `20261021-slice5-done`,
-`20261023-tkill`, `20261023-sigign`, on `dev`, no version bump):
-
-*Batch 1 -- `ps -l` / sysinfo* (`20261020-psl-sysinfo`): `ps -l`
-works -- busybox gained `FEATURE_PS_LONG`/`PS_TIME`, and the
-kernel gained `sys_sysinfo` (99).  **99 is `sysinfo`, not
-`gettimeofday`** (96; `time` is 201).  `ps -l`'s `STIME` was a
-separate defect: `proc_build_stat` emits `p->creation_time`,
-which was never assigned; `process_initialize_pcb` now records
-`g_ticks`.
-
-*Batch 2 -- kernel shell echo* (`b06787d`): the kernel shell's
-echo and command output go to the serial terminal.
-
-*Batch 3 -- signals slices 1-5:*
-- Slice 1 (`588ae53`, `3f60a19`, `ce69a7b`): pending and blocked
-  masks, `kill`/`tgkill` raise, `sigdump`/`killtest`.  No
-  delivery.
-- Slice 2 (`866588f` design, `d2126d8` code): delivery at the top
-  of `syscall_dispatch`, `sys_rt_sigreturn` (15), the
-  `ucontext_t` frame at `restorer (8) + 816 bytes`.  Verified by
-  `kill_self`.
-- Slice 3 (`17ffeb9`, `a1c90ff`, `c4b3ba7`): delivery on `iretq`,
-  `signal_deliver_frame_iretq` taking the target PCB as a
-  parameter.  Verified by `sigspin`.
-- Slice 4 (`1d256ed`, `f90d517`): fault raises.  Verified by
-  `sigsegv_probe`.
-- Slice 5 (`7245390` = `20261021-slice5-done`): SIGPIPE,
-  default-action table, SIGKILL.  Then the SIGCHLD half:
-  `593b349` (deliver on the way out, result preserved),
-  `dfd5240` (stage `sigchld_probe`), `42302e7` (SIGCHLD raise in
-  `process_exit`, result preserved via `v[G_RAX]`).  Verified by
-  `sigchld_probe`, `yes | head`, and the `kill -9/-15/-2 $$`
-  exit statuses 137/143/130.
-- `7994fce`: `sigchld_probe` source brought into the tree -- it
-  had existed only on the scratch copy, and a clean build failed
-  without it.
-- `b976b40`: `tkill` (200).
-- `33c4384` = `20261023-tkill`: busybox `CONFIG_KILL=y`, so the
-  default-action table could be exercised.
-- `6de2d63` = `20261023-sigign`: `SIG_IGN` is a disposition, not
-  `SIG_DFL`; `sigterm_ignore` added and surviving.
-
-**The scratch tags since `v0.6.17` are the restore points**:
-`20261020-psl-sysinfo`, `20261021-signal-slice1-base`,
-`-slice1-pre-docs`, `-slice1-docs-post`, `-slice2-done`,
-`-slice3-done`, `-slice4-done`, `-slice5-done`,
-`-shell-echo-pre-fix`, `-shell-echo-post-fix`, `20261023-session-work`,
-`20261023-tkill`, `20261023-sigign`.  Nothing is pushed: the
-policy is not to push until `v0.6.18` is ready and verified.  The
-release procedure draws the summary from these and drops them.
-
-**Working style -- how this project gets changed**
+## Working style -- how this project gets changed
 
 Read this before proposing any command block.
 
-**One change at a time.** A "change" is a commit, verified before
-the next one starts.  **Verify by RUNNING, not by committing** --
-build, run, see the behavior, THEN commit.
+**One change at a time.** A "change" is a commit, verified by
+**RUNNING** before the next starts -- build, run, see the behavior,
+THEN commit. A build passing is not a test passing.
 
 **The state check comes before the command block.** Every command
 block starts with `git status -sb` (or `git log`).
 
 **A command block is one paste -- write it to a file first.**
-`git add`, `git status`, `git commit`, and `git tag` belong in
-**one** block, with the message inline via heredoc.  **Do not
-paste a block with `cd ... || exit 1` into an interactive
-shell** -- the `exit` closes the terminal.  Write to
-`/tmp/<name>.sh` with `cat > ... <<'SCRIPT_EOF'`, then
-`bash /tmp/<name>.sh`.
+`git add`, `git status`, `git commit`, and `git tag` belong in **one**
+block, with the message inline via heredoc. **Do not paste a block
+with `cd ... || exit 1` into an interactive shell** -- the `exit`
+closes the terminal. Write to `/tmp/<name>.sh` with
+`cat > ... <<'SCRIPT_EOF'`, then run it as a **separate** paste.
+Never paste a multi-line block with trailing backslashes into an
+interactive shell. **`cd "$HOME/..."` or a literal path in the
+script, never `cd "$(dirname "$0")"` when the script is pasted --
+`$0` is the interactive shell, and the `cd` fails.** A `set -e`
+at the top of the *script* is fine; a `set -e` pasted into the
+interactive shell is a terminal-killer.
+
+**Never put a destructive git command inside a block that also
+runs diagnostics.** A `git checkout -- <file>` or `git restore`
+in a block whose other lines are `git status`/`git log`/`grep` is
+a trap. If a revert is wanted, name it on its own line, say what
+it discards, and run it as its own paste.
 
 **Python edits with `count != 1` abort checks are the preferred
-edit style.**  **`set -e` at the top.**  **Idempotent edit
-scripts.**  **Do the count check IN PYTHON (`str.count`), not
-with `grep`.**  `grep -Fc` does not do multi-line matches;
-`grep -Fxc` requires a whole-line match.  `str.count` is the only
-honest multi-line count.
+edit style.** **`set -e` at the top.** **Idempotent edit scripts.**
+**Do the count check IN PYTHON (`str.count`), not with `grep`.**
+`grep -Fc` does not do multi-line matches; `grep -Fxc` requires a
+whole-line match. `str.count` is the only honest multi-line count.
 
 **BEFORE ASSERTING A COUNT, count the occurrences in the file and
 write the expected number from that count, not from memory.**
 
-**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.**  Grep the
+**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.** Grep the
 file, confirm the count is 1 **and** the match is in the intended
-function.
+function. Anchor from the file's current bytes (`cat -A`), open
+`rb`/`wb` to preserve line endings. If an anchor aborts, **ask for
+the current bytes** -- do not guess a second anchor.
 
 **A post-write check string must be copied from the `new`
 literal, not retyped.**
 
-**Ask for source you do not have.**  Before patching a file it
-has not seen **in this session**, ask for it.  **Before writing
-an anchor, read the file with `cat -A` and quote the bytes.**
+**Ask for source you do not have.** Before patching a file it has
+not seen **in this session**, ask for it. **Before writing an
+anchor, read the file with `cat -A` and quote the bytes.**
 
-**The build is TWO steps.**  `make -C 04_kernel_64bit
+**The build is TWO steps.** `make -C 04_kernel_64bit
 FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
-hdd-single.img` builds the image.  Running only the second copies
-a STALE `kernel.bin`.  Always run both, and verify `kernel.elf`
-is newer than the source you edited.
+hdd-single.img` builds the image. Running only the second copies
+a STALE `kernel.bin`. Always run both, and verify the mtime chain
+`source` < `.o` < `kernel.elf` < `kernel.bin` < `hdd-single.img`.
+**After a session of probe edits and reverts, run a full
+`make clean` before the next behavioral test** -- per-file `rm`
+is not enough when multiple files were patched.
 
-**`nm` output moves between builds.**  Re-run `nm` before using
+**The patch-script write changes the mode of the file it writes.**
+A Python `open(..., "wb")` or `os.replace` drops the `+x` bit
+that the file had. `78216bc`'s follow-up `ea4dc2e` restored
+`user_syscall.c` from 100644 to 100755 for exactly this reason.
+If a patched file was executable, `chmod +x` it back, or commit
+the mode change as its own explicit commit -- do not leave a
+mode change hidden inside a content commit.
+
+**`nm` output moves between builds.** Re-run `nm` before using
 any address.
 
-**A diagnostic on the SUCCESS path is noise.  A diagnostic on
-the FAILURE path is signal.**  `SW2-*`, `HEAP_TRACE_MERGE`, the
+**A diagnostic on the SUCCESS path is noise. A diagnostic on
+the FAILURE path is signal.** `SW2-*`, `HEAP_TRACE_MERGE`, the
 `HEAP: corrupt` prints, and `heap_validate`'s check prints are
-success-or-transient-path; they are gated.  The refuse lines
+success-or-transient-path; they are gated. The refuse lines
 (`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`, `EXIT-REFUSE`)
 and the `C` report are failure-path (kept).
 
-**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
-`-g`).  Use raw offsets: `pid` 0x000, `name` 0x008, `state`
-0x028, `cr3` 0x030, `entry_point` 0x038,
-`kernel_stack_virt` 0x048, `kernel_stack_top` 0x050, `rsp`
-0x110, `rip` 0x118, `next` 0x120, `prev` 0x128, `block_kind`
-0x158.  `sizeof(pcb_t)` = 0x618.  **CONSIDER BUILDING WITH
-`-g`.**
+**Test harness.** `./run` (no arg) = clean rebuild + fresh
+`hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
+gdb stub on `:1234`, `capture.txt` written (overwritten each run --
+**copy it aside after any failure or pass you want to keep**).
+`./run debug` adds `-S` (frozen at reset). **`./run tcg` /
+`./run tcg-debug`** = the same flow in TCG (`-cpu max`, no
+`-enable-kvm`). The Makefile run targets also use `-cpu max` + TCG
+-- **state which launcher was used.** Default cwd `/root` (prompt
+`~`).
 
-**Do not run `git reset --hard` without stashing first.  Do not
-edit `third_party/`.  Do not commit `kmain.c`'s `pit_init` knob
--- the committed value is 100.  Do not call a race closed on one
-clean run.**
+**In-guest gate.** `cd /`, then `canary --full` (28/28) and
+`/root/scripts/test.sh` (57/57). **Use multiple `^Z`/`fg` cycles.**
+One is not always enough to reach an intermittent fault; several
+reliably do.
+
+**`perf kvm stat` is the way to count VM-Exits.** `sudo dnf
+install -y perf` on the Fedora host. Two terminals: guest runs
+the test; host runs `sudo perf kvm stat record -a sleep 15`, then
+`sudo perf kvm stat report` (`q` to quit the pager), then
+`rm -f perf.data.guest`. The report names `io`, `npf`,
+`interrupt`, `vintr`, `idle-halt`. **An `io`-dominated report
+does not mean "port I/O is slow"; it means "the guest is doing
+port I/O on a hot path."** The 2026-11-02 session spent hours
+chasing that to the console before finding the ATA data port.
+Read the guest source before reading the exit reason.
+
+**On Fedora 44, `perf kvm stat record` aborts with `double free
+or corruption (!prev)` in cleanup, after writing `perf.data.guest`.**
+The capture is complete and `perf kvm stat report` on it works.
+The abort is in `kvm_events_record()` (it `strdup`s `rec_argv`
+entries and frees them after `parse_options()` reorders `argv`),
+not in the guest and not in the kernel. Do not chase it as a
+donix issue. If `report` also aborts on the same host, use
+`sudo perf kvm stat live` as the workaround. The `perf.data*`
+files are now in `.gitignore` (`e52bd2f`).
+
+**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
+`-g`). Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028,
+`cr3` 0x030, `entry_point` 0x038, `kernel_stack_virt` 0x048,
+`kernel_stack_top` 0x050, `rsp` 0x110, `rip` 0x118, `next` 0x120,
+`prev` 0x128, `block_kind` 0x158. `sizeof(pcb_t)` = 0x618.
+**CONSIDER BUILDING WITH `-g`.**
+
+**gdb write watchpoint is safe for the canary `.text` `#PF`.** The
+"do not use gdb" applies to timing-sensitive repro (gdb-at-fault
+masks the race). A **write watchpoint** on the physical or virtual
+PTE does not mask it.
+
+**Do not** `git reset --hard` without stashing; **do not** edit
+`third_party/`; **do not** commit `kmain.c`'s `pit_init` knob -- the
+committed value is 100; **do not** call a race closed on one clean
+run.
+
+**Do not** assume a commit fixed something because its message says
+it did. `f91d31a` claims to fix canary/pipe7e/ctrl-Z; it does not.
+`7cb26fb` claims to fix `^C`/`^Z`/nesting and DOES -- and it also
+introduces the pipe7e `#GP` (`0196d66`, `162a1d3` fixed that).
+**Test every commit before trusting its message -- and note that one
+commit can be both a fix and a regression at once.**
+
+**A handoff claim is not evidence.** The old handoff said `d1ae213` was
+green; it was not. **Re-run every repro on a fresh boot and read the
+bytes before acting.**
 
 ---
 
 ## Releases
 
 **Before a release:** the scratch `2026MMDD-*` tags are annotated
-and are the source for the version summary.  **Write the summary
-from them BEFORE dropping them.**  The release tag and the merge
-commit are local objects; once they exist, the scratch tags may
-be dropped.
+and are the source for the version summary. **The scratch tags
+are PRESERVED until the user decides to push to GitHub, and
+are dropped ONLY after the summary is written and reviewed by
+the user.** A session does NOT drop them on its own initiative.
 
 **The release procedure** (on `dev`, pre-release):
 
-1. **Patch the docs first.**  Update this file's release
-   paragraph and (optionally) `docs/version-history.md`.  Commit.
-2. **Bump the version string in `kmain.c` manually** (the
-   banner).  Commit.
+1. **Patch the docs first.** Update this file's release paragraph
+   and (optionally) `docs/version-history.md`. Commit.
+2. **Bump the version string in `kmain.c` manually** (the banner).
+   Commit.
 3. **Tag** `vX.Y.Z` annotated, on `dev`, summary from the scratch
    tags' annotations and `vPREV..HEAD`:
 
@@ -330,25 +306,35 @@ be dropped.
 Do not use `git push --tags` -- it would push the scratch tags.
 Push `vX.Y.Z` by name.
 
-**Current release state.**  **`v0.6.18` is released.**  Work is
-now pre-**`v0.6.19`**.  The release tags `v0.6.15` through
-`v0.6.18` carry their summaries; the scratch tags they were drawn
-from have been dropped.
+**The GitHub push policy.** **Nothing is pushed until `vX.Y.Z` is
+ready and verified.** `origin/dev` is not force-pushed; every
+unpushed `dev` commit is intentional work. Run
+`git log --oneline origin/dev..dev | wc -l` for the current count.
+
+**Current release state.** **`v0.6.18` is the last pushed release.**
+This session is the `v0.6.19` documentation pass; the banner bump
+and tag happen only when the user says so, and **nothing is pushed
+until the user says so.** The scratch tags are preserved. Do not
+push, tag a release, or drop the scratch tags on the session's own
+initiative.
 
 ---
 
 ## What donix is
 
-A fork of dons-os.  Goal: a Unix-like OS that runs static
-musl-linked binaries on the Linux x86_64 ABI, natively.  Newlib
-is gone.  Userland is a tracked source tree at `userland/musl/`.
-Phase B (busybox) is well underway: the shell is interactive,
-pipelines and redirection work, and the applet set now includes
-`bc`, `dc`, `diff`, `du`, `awk` in addition to the file/text
-applets.
+A fork of dons-os. Goal: a Unix-like OS that runs static
+musl-linked binaries on the Linux x86_64 ABI, natively. Newlib is
+gone. Userland is a tracked source tree at `userland/musl/`. Phase B
+(busybox) is well underway: the shell is interactive, pipelines and
+redirection work, job control works (`^C`, `^Z`, `jobs`, `fg`), and
+the applet set now includes `bc`, `dc`, `diff`, `du`, `awk` in
+addition to the file/text applets. **`tar` now creates, lists and
+extracts correct, well-formed archives, including directory
+members** (`a0664a8` + `d69c2ab`).
 
-Full strategy: `docs/strategy.md`.  Direction: `ROADMAP.md`.
-Concurrency rules: `docs/contract.md`.
+Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
+Concurrency rules: `docs/contract.md`. Open issues:
+`docs/open-issues.md`.
 
 ---
 
@@ -356,105 +342,164 @@ Concurrency rules: `docs/contract.md`.
 
 ### Current baseline
 
-- `test.sh` 57/57; canary `--full` 28/28; pipe7e clean at 100 kHz
-  and on a >3.5-hour 100 Hz soak.  The 2026-10-23 signal gate ran
-  28/28 + 57/57 three times interleaved.
-- Busybox batch 1 (prompt, readlink, `ls` features,
-  human-readable, long options) and five applets (`bc`, `dc`,
-  `diff`, `du`, `awk`) enabled and verified by running them.
-- Signals slices 1-5 complete and verified (see "Signals: what is
-  in" above).  `tkill` (200) in; `CONFIG_KILL=y`;
-  `SIG_IGN` fixed and proven.
-- `docs/contract.md` is the durable concurrency rule; read it
-  before any shared-state change.
+- `test.sh` **57/57** at `78216bc` (2026-11-02 very late, gate for
+  the fork commit).
+- `canary --full` **28/28** at `78216bc` (same run). The full 28-row
+  sequence, no skips.
+- `exec_churn` 24 rounds pass at `78216bc`; every round reports
+  `fork 0` (tick-quantized). See the Refuted section -- this is
+  not a measurement of the fork copy.
+- `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it;
+  `fg` resumes.
+- `^C` -> SIGINT reaches the foreground pgrp; the console survives
+  and the prompt returns.
+- `busybox sh` nesting -> works.
+- The C is not observed since the 2026-11-02 disk-path fixes; still
+  open -- evidence, not a close. See "THE C HALT" above.
 
 ### Next -- the highest-value work
 
-1. **SIGCHLD interrupting a blocked `wait4`.**  A program that
-  blocks in `read`/`pause` and expects the handler to run does
-  not get it.  This is a scheduler change (a signal-arrival wake
-  for a blocked syscall), not a delivery change.
-2. **`sigsuspend`/`pause`/`sigwait`.**  Atomic unblock-and-wait.
-3. **Job control** (open-issues item 13): SIGSTOP/SIGTSTP stop,
-  SIGCONT resume, process groups, controlling terminal,
-  `tcsetpgrp`.  Needs (1) and (2).
-4. **Shebang + `/bin/sh` kernel half** (item 14): `#!` parsing in
-  `sys_execve` with a depth guard.  Image half is done.
-5. **SSE** (item 10): save/restore XMM on context switch and the
-  interrupt path, then remove the userland `-mno-sse*` flags.
-6. **Privilege model** (item 9).
-7. busybox batch 2; `test.sh`'s md5.
+1. `docs/open-issues.md` item 10 -- SSE save/restore.
+2. `docs/open-issues.md` item 9 -- the privilege model, **with the
+   note above**: no current user-facing payoff; ask what it unlocks
+   before starting it. Real FatFs timestamps, `gettimeofday`/
+   `time`, or SSE may be a better use of the next session.
 
 ### Refuted -- do NOT re-walk
 
-- **The reserve / frame placement.**  `67701df` + `5587d70`.
-- **The `next->rsp = 0` clear.**  Broke blocking; reverted.
-- **The pipe-waiter fields as the `C`'s stale holder.**  The
-  pipe7e helper writes 2 bytes and never blocks, so they are
-  never set.
-- **The `current_process` dual-copy divergence at the `C`.**  Both
-  copies agreed.  (The `process_destroy` fix is still correct.)
-- **A switch-to-self guard in `scheduler_switch_to`'s TAIL.**  It
-  fires after `current_process = next` and refuses every dispatch.
-  The tail check is `state != READY`, not `next == current_process`.
-- **A caller heap overflow.**  The enriched trace + the merge trace
-  proved the merge arithmetic correct; the "corruption" was an
-  interleaved `kfree`.  The heap had a race, not an overflow.
-- Do not re-open: item 11, the session-48 zone scan,
-  the `fs_base` path, the `longjmp`/`setjmp` family.
+These were discarded in earlier sessions. They are listed so a
+future session does not spend the same cycles. If any turns out
+to be a different root cause, that is a **new** hypothesis, not a
+revival of these.
 
----
+- **The `efc8e08` rsp/irq0_rsp split, and `frame_kind`.** Discarded
+  with the 2026-11-02 reset; not on `dev`.
+- **The four uncommitted scheduler guards** (`process_yield`
+  FRAME_IRQ0 skip, `scheduler_ready_queue_add` non-PCB guard,
+  `scheduler_switch_to` non-PCB guard, `scheduler_switch_to`
+  frame-CS validate). Discarded with the reset and the stash drop.
+- **The `EXIT-REFUSE frame-CS` guard in `process_exit`.** Discarded
+  with the reset and the stash drop.
+- **The canary `.text` `#PF` probe stack** (`[PT-CANARY]`,
+  `[PT-WP]`, `[PHDR]`/`[EHDR]`, `[UNMAP_IN_CR3]`, `[FREE_CLONE]`,
+  `[PCLAIM]`). Dropped with `stash@{1}`.
+- **The physical-address gates on `.text` PTE zeroing.** Boot
+  dependent; do not reapply without new evidence.
+- **The `f91d31a` "scheduler guards fix canary/pipe7e/ctrl-Z"
+  claim.** Disproved by running.
+- **`exec_churn`'s KVM slowness is the console / the serial poll
+  loop / the VGA cursor CRTC writes.** Refuted 2026-11-02: the
+  serial `inb` poll was commented out and `prnt` was unchanged;
+  `console_timer` measured the console at microseconds in the
+  same boot that ran `exec_churn` at 4 s; the VGA cursor patch
+  (later committed as `20261102-console-cursor-defer`) also did
+  not move `prnt`. The cost was the ATA data port in `ata.c`,
+  fixed by `rep insw`/`rep outsw`.
+- **`ata_poll_drq` spinning.** Instrumented 2026-11-02:
+  2,113 calls, 128 total spins. Not the cost.
+- **`exec_churn` can measure the `sys_fork` eager-copy cost.**
+  Refuted 2026-11-02, same session as the fork `rep movsb` commit
+  (`78216bc`). `exec_churn`'s floor is the 10 ms PIT tick; every
+  round reports `fork 0` **before and after** the fix. The byte
+  loop was ~1-3 ms per fork (below one tick), and so is the
+  `rep movsb` -- the two are indistinguishable to `exec_churn`.
+  The round totals vary between boots (`360,000 us` in the
+  handoff's baseline vs `440,000 us` at `78216bc`) because they
+  are dominated by how many rounds happened to land on 1 vs 2
+  ticks, not by the fork copy. **A sub-tick fork benchmark is
+  what the next session needs if this is ever to be measured.**
+  Do not re-walk `exec_churn` as evidence for or against a fork
+  change.
+- **The `perf kvm stat record` `double free` is a donix issue.**
+  Refuted 2026-11-02. It is a Fedora 44 `perf` bug in
+  `kvm_events_record()`'s cleanup (see "Test harness" above). The
+  capture writes and the report reads correctly. Do not chase it
+  in the kernel.
 
-## Open issues (top 6)
+### Open issues
 
-1. **Signals: three gaps remain** -- SIGCHLD does not interrupt a
-  blocked `wait4`; no `sigsuspend`/`pause`; SIGSTOP/SIGTSTP
-  default-terminate.  See "Signals: what remains" in this file.
-  Delivery, dispositions (including `SIG_IGN`), the default-action
-  table, SIGPIPE, SIGCHLD-to-`wait4`, and `tkill` are done and
-  verified.
-2. **`open-issues.md` item 10: `CR4.OSFXSR` without an XMM save.**
-3. **`open-issues.md` item 13: `CONFIG_ASH_JOB_CONTROL` gap.**
-4. **`process_dump_all`'s `DETACHED` state** -- may mask a stranded
-  process bug.
-5. **Item 7a/7b** -- the boot-time `#PF` and the busybox `#GP`.
-6. **`gettimeofday` (96) / `time` (201) not implemented** -- no
-  caller on the image today; `date`/`time` need them if enabled.
-
-Plus: **the VFS** (see Next), **shebang + `/bin/sh`**, and the
-open-issues list.
+The full list is `docs/open-issues.md`. The numbered items are 9
+(no privilege model) and 10 (no SSE save/restore). The
+un-numbered items (7a, 7b, 7e, the `0x413962` `#PF`, the
+`.bss`-adjacent faults, and the small VFS/proc/pipe entries) are
+real and stay in that file; they are not in this session's NEXT.
+Read `docs/open-issues.md` before touching the VFS, fork, exec,
+or the signal paths.
 
 ---
 
 ## State on disk
 
-Kernel sources: `04_kernel_64bit/`.  `capture.txt` is gitignored.
+Kernel sources: `04_kernel_64bit/`. `capture.txt` is gitignored,
+overwritten each `./run` -- **copy it aside after any failure or
+pass you want to keep.**
 
 **After a fresh image, one manual step:** the image stages
-`/bin/busybox` alone.  To get the applet symlinks (including
-`/bin/sh`, which shebang will need), boot and run
-`/bin/busybox --install -s /bin`.  The absolute path is required:
+`/bin/busybox` alone. To get the applet symlinks (including
+`/bin/sh`, which shebang needs), boot and run
+`/bin/busybox --install -s /bin`. The absolute path is required:
 busybox reads `/proc/self/exe` to find itself, donix has no
 `/proc/self/exe`, and it falls back to `argv[0]` -- which must
-start with `/`.  This is a manual step, not part of the build;
-automating it is a Makefile/boot change and is not done.
+start with `/`. This is a manual step, not part of the build.
 
-`v0.6.15`, `v0.6.16`, and `v0.6.17` are the release record.  The
-scratch tags listed above are the current restore points; there
-is no single `20261021-slice5-done` tag as a release, and nothing
-is pushed until `v0.6.18` is complete and verified.  The next
-release procedure draws the release summary from these tags
-before dropping them.
+**`third_party/`** is **gitignored** -- do not commit edits to it.
+`third_party/busybox/` has `busybox` (stripped) and
+`busybox_unstripped` + `.map` if a userspace symbol is ever needed.
+**`third_party/musl-install/` is gitignored and is needed for the
+build.** If it's missing after a `git clean -xdf`, copy it back from
+a working tree, or rebuild it with `toolchain/install_musl.sh`.
+`04_kernel_64bit/fatfs/ff.c` is **tracked** (not `third_party/`),
+built by the cross-GCC, and now contains **two** `sync_window` fixes
+(`a0664a8` in `f_open`, `d69c2ab` in `f_write`). Any further edit
+there must re-run the full gate (`canary --full` + `test.sh` + the
+tar round trip + the redirect/tar matrix), not just a build.
+
+**`~/code/saved`** -- not a baseline. Run
+`git -C ~/code/saved status --short` before any comparison; treat
+"not a baseline" as the default. It has been dirty twice.
+
+**The reset baseline.** `dev` = `873be27`, tag
+`reset-baseline-873be27`. No stashes exist. `efc8e08` is not on
+`dev`; it survives as a commit object. If a future session needs
+the discarded guards, they are not in the tree -- read
+`git log --all --oneline` for `efc8e08` and the session log, but
+treat them as **refuted** per the section above.
+
+**The 2026-11-02 performance and correctness commits** (six, on
+top of `f902af6`):
+- `78216bc` `20261102-fork-rep-movsb` -- fork `EAGER_COPY_REGION`
+  `rep movsb`. **The item 1 commit.**
+- `ea4dc2e` -- `user_syscall.c` mode restore (100644 -> 100755,
+  dropped by `78216bc`'s Python write).
+- `e52bd2f` -- gitignore `perf.data*`.
+- `905bc70` `20261102-ata-rep-pio` -- the ATA fix.
+- `fdbcbc7` `20261102-console-cursor-defer` -- independent
+  improvement.
+- `5db42f2` `20261102-exec-churn-ns-timing` -- test-only.
+- `6df4fef` `20261102-console-timer` -- test-only.
+
+(`f902af6` is `20261102-handoff-rewrite`; the six above are the
+work on top of it.)
 
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last release: signals slices 1-5, `tkill`,
-busybox `KILL`, `SIG_IGN` fixed.**  The signal work is verified
-by running -- nine probes, two full probe runs, four consecutive
-gate runs at 28/28 + 57/57 -- and the three remaining signal gaps
-(SIGCHLD-interrupts-wait, `sigsuspend`, job control) are named in
-"NEXT" and open-issues item 13.  Next: those three, then
-shebang+/bin/sh, SSE, privilege.  Read `docs/contract.md` and
-"NEXT" in this file before any code.**
+**`v0.6.18` is the last pushed release; nothing is pushed.** The
+tree is at `d69c2ab` plus the uncommitted docs edits, no stashes,
+ahead of `origin/dev` by 100 before the edits. The **busybox `tar`
+bug is fixed in two parts**: `a0664a8` (`f_open` flushes the
+staged directory entry after `dir_register`) and `d69c2ab`
+(`f_write` flushes the FAT window before a direct data write).
+Both are stale-`fs->win` bugs. `canary --full` 28/28, `test.sh`
+57/57, a full `tar` create/list/extract round trip (regular files
+**and directory members**) silent with `rc=0` and matching
+contents, and the six-line redirect/tar matrix are green on a
+clean rebuild with the probes reverted. **This session is the
+`v0.6.19` documentation pass; the bump and tag happen when the
+user says so, and nothing is pushed until the user says so.**
+NEXT, if the user wants OS work, is item 10 (SSE), item 9
+(privilege model, with the "is this worth a session" note), or the
+two small syscall-completion fixes (`umask` 95, `mkdir`/`EEXIST`);
+otherwise treat any user-reported bug as a new task. Read
+`docs/contract.md` and this file's NEXT before any code.

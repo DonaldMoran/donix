@@ -3491,6 +3491,7 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 			if (!FF_FS_READONLY && mode && (stat & STA_PROTECT)) {	/* Check write protection if needed */
 				return FR_WRITE_PROTECTED;
 			}
+			fs->wflag = 0; fs->winsect = (LBA_t)0 - 1;	/* Invalidate window: shared across processes */
 			return FR_OK;				/* The filesystem object is already valid */
 		}
 	}
@@ -3838,6 +3839,14 @@ FRESULT f_open (
 					res = enq_share() ? dir_register(&dj) : FR_TOO_MANY_OPEN_FILES;
 #else
 					res = dir_register(&dj);
+					/* Flush the staged dir entry while dj.dir is valid.
+					 * dj.dir points into fs->win; any later f_open/f_read/
+					 * f_write on this volume reloads fs->win and discards
+					 * the staged name, so the close-time sync_window would
+					 * flush the old bytes back over it. */
+					if (res == FR_OK) {
+						res = sync_window(fs);
+					}
 #endif
 				}
 				mode |= FA_CREATE_ALWAYS;		/* File is created */
@@ -4160,6 +4169,14 @@ FRESULT f_write (
 				if (csect + cc > fs->csize) {	/* Clip at cluster boundary */
 					cc = fs->csize - csect;
 				}
+				/* Flush the FAT window before the direct data write.  The
+				 * cluster-boundary code above wrote the new FAT link into
+				 * fs->win (wflag=1); the direct write below does not touch
+				 * that window, and a later create_chain's move_window is a
+				 * no-op when fs->winsect already equals the FAT sector even
+				 * if fs->win holds a data sector, so create_chain can read
+				 * a stale link and return 1 (ABORT FR_INT_ERR). */
+				if (sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);
 				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) ABORT(fs, FR_DISK_ERR);
 #if FF_FS_MINIMIZE <= 2
 #if FF_FS_TINY

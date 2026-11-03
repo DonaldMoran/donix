@@ -140,6 +140,10 @@ static void process_initialize_pcb(pcb_t* pcb) {
     pcb->exit_status = 0;
     pcb->wait_pid = 0;
     pcb->creation_time = g_ticks;   /* 100 Hz; /proc/<pid>/stat field 22 */
+    /* Job control: a process starts as the leader of its own group. */
+    pcb->pgrp = pcb->pid;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
     process_count++;
 }
 
@@ -725,6 +729,28 @@ void process_wake_all_blocked(void) {
 }
 
 /*
+ * Return 1 if any live process in pgrp is not the shell
+ * (pid 1) and not the idle (pid 1).  Used by the ^C raise to
+ * decide whether there is a foreground child to interrupt.
+ * 'Shell' is identified by pid 1 -- the boot shell's pid in
+ * this tree.  If the boot shell is not pid 1, the test still
+ * holds: fg will typically have been set by tcsetpgrp to a
+ * child group, and any non-pid-1 member counts as a child.
+ */
+int process_pgrp_has_child(uint64_t pgrp) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcb_t* p = &pcb_pool[i];
+        if (p->state == PROC_STATE_UNUSED) continue;
+        if (p->state == PROC_STATE_ZOMBIE) continue;
+        if (p->state == PROC_STATE_TERMINATED) continue;
+        if (p->pgrp != pgrp) continue;
+        if (p->pid == 1) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Wake the parent of `child` if it is blocked in waitpid on this
  * child, or on any child (wait_pid == (uint64_t)-1).
  *
@@ -1029,6 +1055,12 @@ void process_reclaim(pcb_t* pcb) {
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
+    /* Job-control fields: a reused slot must not inherit a pending
+     * stop or a stale pgrp.  See the pcb_t comment in process.h. */
+    pcb->pgrp = 0;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
+    pcb->wake_tick = 0;
     process_count--;
 }
 
@@ -1051,6 +1083,12 @@ void process_destroy(pcb_t* pcb) {
     pcb->sig_pending = 0;
     pcb->sig_blocked = 0;
     for (int _i = 0; _i < 64; _i++) pcb->signal_restorer[_i] = 0;
+    /* Job-control fields: a reused slot must not inherit a pending
+     * stop or a stale pgrp.  See the pcb_t comment in process.h. */
+    pcb->pgrp = 0;
+    pcb->stop_pending = 0;
+    pcb->in_stop_safe_point = 0;
+    pcb->wake_tick = 0;
     process_count--;
     scheduler_ready_queue_remove(pcb);
     if (current_process == pcb) scheduler_set_current(NULL);
@@ -1081,3 +1119,13 @@ _Static_assert(offsetof(pcb_t, rsp)              == 0x110, "context_switch.asm: 
 _Static_assert(offsetof(pcb_t, rip)              == 0x118, "context_switch.asm: rip offset");
 _Static_assert(offsetof(pcb_t, block_kind)       == 0x158, "context_switch.asm: block_kind offset");
 _Static_assert(offsetof(pcb_t, user_rsp)         == 0x610, "context_switch.asm: user_rsp offset");
+
+/*
+ * PROC_STATE_STOPPED is compared by number in context_switch.asm's
+ * save-path selector (offset 0x028, value 6).  The assembly has no
+ * way to know the enum; this pins the value the way the offset
+ * asserts pin the layout.  If proc_state_t is ever extended before
+ * STOPPED, this fails the build, and both the enum comment and the
+ * assembly compare must be updated together.
+ */
+_Static_assert(PROC_STATE_STOPPED == 6, "context_switch.asm: PROC_STATE_STOPPED value");
