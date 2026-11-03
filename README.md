@@ -68,8 +68,8 @@ That's the point. That's the whole point.
   `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
   `symlink`, `chmod`, `fchmod`, `chown`, `fchown`,
   `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`), `kill`,
-  `tgkill`, `tkill`, `rt_sigaction`, `rt_sigprocmask`,
-  `rt_sigreturn` -
+  `tgkill`, `tkill`, `getpgid`, `getpgrp`, `setpgid`,
+  `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` -
   the numbers
   and semantics match Linux x86_64. musl's `printf`, `malloc`, and
   `opendir` work unmodified.
@@ -112,10 +112,14 @@ That's the point. That's the whole point.
   `SIGURG`, `SIGWINCH`, `SIGCONT`); `SIG_IGN` is honored
   (`sigterm_ignore` survives SIGTERM).  `SIGSEGV`, `SIGILL`,
   `SIGFPE`, `SIGTRAP` raise with handlers, and a handler can edit
-  the saved `RIP` and resume past the fault.  Not done: `SIGCHLD`
-  does not interrupt a blocked `wait4`; there is no
-  `sigsuspend`/`pause`; `SIGSTOP`/`SIGTSTP` terminate instead of
-  stop.  See `open-issues.md`.
+  the saved `RIP` and resume past the fault.  A blocked `wait4`, a
+  pipe read or write, `pause`, and `rt_sigsuspend` all return
+  `-EINTR` on a pending signal.  Job control works: `SIGSTOP` and
+  `SIGTSTP` stop, `SIGCONT` resumes, and `wait4` reports a stopped
+  child (`WUNTRACED`); `^C` delivers `SIGINT` to the foreground
+  process group, `^Z` stops the foreground child, `jobs` lists it,
+  and `fg`/`bg` resume and continue it.  Remaining kernel limits
+  (SSE state, privilege model) are in `docs/open-issues.md`.
 - **Lists processes.** `ps` works: it reads `/proc`, and prints a
   process table with pid, user, vsize, state, and command - for
   `idle`, `musl_sh`, `busybox`, and every process you start.
@@ -266,9 +270,12 @@ console). It also enables the `bc`, `dc`, `diff`, `du`, and `awk`
 applets, and `tar`.  (`tar` was briefly off at `v0.6.16` because
 its creation path wrote an empty archive: every FAT file reported
 `Inode: 0`, so busybox's self-archive check treated every member
-as the archive.  `v0.6.17` gives FAT a real `st_ino`, and `tar -cf`
-through `tar -tvf` now work -- including recording a symlink as
-`lrwxrwxrwx ... -> target`.)
+as the archive.  `76d66db` gives FAT a real `st_ino` -- necessary
+but not sufficient: the archive was still lost on create and short
+on list/extract because of two vendored-FatFs `fs->win` flush bugs
+(`a0664a8`, `d69c2ab`).  `tar -cvf`/`-tvf`/`-xvf` now round-trip,
+including directory members, and `tar -tvf` records a symlink as
+`lrwxrwxrwx ... -> target`.  Detail in `docs/open-issues.md`.)
 
 ---
 
