@@ -408,3 +408,53 @@ or walk `elf_page_list` and unmap by VA from the list itself.
   removed, or reordered means `kf[]` must be re-derived and
   `signal_deliver_frame` + `sys_rt_sigreturn` updated in the same
   commit.
+
+## vfork child faults in musl startup (open, not fixed)
+
+**Status: partially fixed. `time true` is not reliable; do not claim vfork
+works.** Work done in the 2026-11-04 session, on top of `c652c8f`.
+
+**Fixed (keep):**
+- `c652c8f` -- `vmm_create_address_space` clone-then-unmap.  This fixed
+  the **triple fault** (the machine no longer resets on `time true`).
+- vfork block/wake: `sys_vfork` blocks the parent on
+  `BLOCK_KIND_VFORK` (excluded from the tick wake in
+  `process_wake_all_blocked`), and the parent was observed blocked
+  (kind=6) and woken.
+
+**Measured correct (nine checks, each against actual bytes):**
+cr3 clone; exec frame slots (`ktop[-7]`/`[-9]` sane); sysret target
+(valid busybox RIPs, sane `rbx`); exec argv/stack layout (correct SysV);
+`.data`/relocation copy (`[0x469000]=0x5`, `[0x469018]=0x44D4E6`);
+`elf_load_into_process` entry (`0x413882` = ELF `e_entry`); kernel-stack
+slot allocator; brk unmap (disabling it changed nothing);
+`vmm_map_page_in_cr3` / `vmm_unmap_page_in_cr3` bodies (both correct).
+
+**Open bug:** `time true` intermittently faults in the vfork child during
+musl/busybox startup.  Sometimes it succeeds (`real 0m 0.18s`); often it
+faults at a **real busybox RIP** with a **register holding 0/small where
+a pointer belongs**:
+- `RIP 0x4512E8`, `mov %r13,0x8(%r12)`, `CR2 0x8` -> `%r12 = 0`
+  (a list insert through a null head).
+- `RIP 0x422300`, `testb $0x1,0x21(%rbx)`, `CR2 0xEF` -> `%rbx = 0xCE`.
+- Earlier: `RIP 0`/`CR2 0`, same class.
+
+**Leading hypothesis (not proven):** a callee-saved register (`%r12`,
+`%rbx`) is intermittently wrong on the syscall-return path for the vfork
+child -- same family as the C halt / pipe7e intermittents.  The next
+measurement would be a check in `user_syscall_entry` just before
+`o64 sysret`: if `%r12` (or `%rbx`) is 0 or `< 0x1000`, print it and the
+syscall number.  Not yet run.
+
+**FALSE POSITIVE -- do not re-chase.**  The `PTAUDIT` "22 anomalies at
+`0x455000..0x45C000`" were **not** corruption.  `phys = 0x8000_0000_07D6_xxxx`
+in a donix PTE is the **normal encoding** (the HHDM address is stored in
+the PTE phys field; `pte_phys()` / `phys_to_virt()` account for it).  The
+`MAPAUDIT` probe never fired because **no caller passed a bad phys** --
+together those meant "ordinary PTEs", which was misread as corruption
+for several turns.  The pages are busybox's own image.
+
+**Stashed, not committed:** the exec-side vfork work (`process.c` wake arm,
+`user_syscall.c` cr3 swap + wake) is in `stash@{0}`, message
+"vfork 3b ... not a complete fix".
+
