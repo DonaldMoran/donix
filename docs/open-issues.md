@@ -1,7 +1,10 @@
 # Open issues
 
-**Last updated: 2026-11-04 (second session documentation pass)** (HEAD on
-`dev` after the `umask`/`mkdir` commit).
+**Last updated: 2026-11-04 (third session, after `153dda9`)** (HEAD on
+`dev` at `153dda9`, two `sys_execve` fixes landed this session).
+**Read the section "The `time true` fault, after the third-session
+fixes" below before doing anything else with `time`/`time true`.
+It names what is left and what the next probe is.**
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -603,6 +606,159 @@ sysret, in `__init_libc`/`_start`/`rsp_init`.
 **Not vfork.** The vfork work (V2, V1, exec cr3 swap, wake arm,
 auxv) is complete and correct; the parent-reap path works end to
 end. See the vfork heading above for the closed record.
+
+## The `time true` fault, after the third-session fixes (open)
+
+**Status (2026-11-04, third session).**  Two `sys_execve` fixes landed
+on `dev`:
+
+- **`939e3ef`** -- `sys_execve`: set `pcb->user_rsp = rsp_init`.
+  `sys_execve` rewrote the syscall-entry frame's user-RSP slot
+  (`ktop[-9] = rsp_init`) but never updated `pcb->user_rsp`.  The
+  exec'ing process returns via `sysret` and reads `ktop[-9]` (correct);
+  the vfork child resumes through `context_switch_resume`, which loads
+  the user-RSP slot from `pcb->user_rsp` (`pcb` offset `0x610`,
+  asserted in `process.c`).  For the child, `pcb->user_rsp` was the
+  stale pre-exec value, `0x180` above the new stack's `rsp_init`.  The
+  child started inside the strings region of the new stack; that was
+  the busybox-side signature (`RSP = g_user_rsp_save + 0x180`,
+  `rcx 0x40FBC0`).  **After this fix the busybox-side `0x40FBC0` fault
+  no longer occurs.**
+- **`153dda9`** -- `sys_execve`: 16-byte-align `rsp_init` per the SysV
+  AMD64 ABI.  `sys_execve` placed `rsp_init` at
+  `argv_region_bottom - 8`, where `argv_region_bottom = user_stack_top
+  - 16 KB`.  `user_stack_top` is 16-aligned (`process.c:408-409`), so
+  `rsp_init` was 8 mod 16.  musl's `_start` does `pop %rsi` then
+  `and -16, %rsp`; with `rsp_init` misaligned by 8 that `and` is a
+  no-op and `__libc_start_main`'s frame is 8 bytes higher than on
+  Linux, so every subsequent `call`'s return address lands 8 bytes off
+  from where musl's layout expects it, and a later `ret` pops a slot
+  that was never pushed (zeroed fresh stack).  **After this fix the
+  argc/argv/envp/auxv layout IS at `rsp_init`** (visible in the fault
+  dump at `rsp + 0x30 = rsp_init`: `argc`, `argv[0]`, `NULL`,
+  `envp[0]`, `NULL`), and **the fault has moved forward** -- the child
+  now gets past `__libc_start_main` into the busybox applet-dispatch
+  region.
+
+**What still faults, in two signatures, both `RIP 0`, `CR2 0`,
+`error 0x15`, `CS 0x33`:**
+
+- **`num 13` (`rt_sigaction`), `last sysret rcx 0x44CC0D`,**
+  `RSP = g_user_rsp_save + 0x390` -- observed on `pid 264` (`time
+  true`) and `pid 268` (`time ls /`) after `153dda9`.
+- **`num 218` (`set_tid_address`), `last sysret rcx 0x44AC73`,**
+  `RSP = g_user_rsp_save + 0x180` -- observed on `pid 266` (`time
+  true`) after `153dda9`.
+
+Both are `RIP 0` from a `ret` popping a slot that is `0` in the fault
+dump; in both dumps, **the entire stack region between `fault_rsp`
+and `rsp_init` is zero** -- the popped slot was never written after
+startup.  That is the remaining bug.  It is **not** the
+`pcb->user_rsp` slot, and it is **not** the 8-mod-16 entry alignment
+(both are now fixed).  It is a `ret` in busybox's startup popping a
+slot that is zero on a fresh stack.
+
+**The next probe (one boot, one `time ls /`):**
+
+1. `./run debug`, attach gdb.
+2. `hbreak *0x44cc0d` and `hbreak *0x44ac73`, each with `commands`
+   printing **`rsp=%lx fs=%lx`** (the discriminator is `$rsp`; the
+   `0x44CC0D` fault has `rsp - rsp_init = 0x390`, the `0x44AC73`
+   fault has `0x180`; `$fs_base` is the same VA across busybox
+   processes and is **not** a per-process marker -- see the
+   `$fs_base` correction below).
+3. **And** one `serial_print` in `sys_execve` at the
+   `self->user_rsp = rsp_init` line, printing `rsp_init`,
+   `self->user_rsp`, and `self->kernel_stack_top[-9]`.
+4. Run `time ls /` until it faults.
+5. Read the `$rsp` at the last breakpoint hit, compare to `rsp_init`.
+
+**What the result means, and what the fix is:**
+
+- **If `$rsp == rsp_init` at the breakpoint**, the delivered `_start`
+  `rsp` is exactly right and the remaining fault is a busybox/musl
+  startup issue in `third_party/` (not editable in-tree).  The fix is
+  a **workaround**: e.g. force-initialize the slot the `ret` pops, or
+  shrink `__init_libc`'s frame, or carry a one-byte patch to
+  `third_party/musl/` and document it as a local patch.
+- **If `$rsp != rsp_init`** (it will be `rsp_init + 0x390` or `+0x180`
+  at the fault), then either `process_fork`'s `frame_rsp = is_user ?
+  pcb->user_stack_top : pcb->kernel_stack_top;` is the wrong source
+  (it should be the **parent's** user `RSP` for fork/vfork, and
+  `sys_execve`'s `pcb->user_rsp = rsp_init` is what a vfork-then-exec
+  should see), or the resume path (`context_switch_resume` vs the
+  syscall-return `sysret`) reads a slot that `sys_execve` does not
+  write.  **The fix is in the delivery path, not in the ABI.**
+
+**`$fs_base` is not a per-process marker.**  It is the same VA
+(`0x46a138`) in every busybox process and in most musl binaries;
+`%rsp` is the same VA across processes.  **Only `pid` or `CR3`
+distinguishes processes.**  The 2026-11-04 third-session WATCH hits
+confirmed this: a `WATCH` line with `fs=0x46a138` and `rip=0x40b061`
+(a `/usr/bin/*` binary's `__init_libc`) was indistinguishable, by
+`fs` alone, from a busybox process.  The handoff's working-style rule
+must be read as: **print `pid` or `CR3`; `$fs_base` and `%rsp` are
+not sufficient on their own.**
+
+**`time` is not usable today; `true` alone works.**  In the
+third-session boot:
+
+    ~ # true              (silent, returns to prompt)   -- works
+    ~ # time              (prints usage)                 -- works
+    ~ # time true         (faults at RIP 0)              -- faults
+    ~ # time ls /         (faults at RIP 0)              -- faults
+
+`time`'s own startup faults; `true` alone starts fine; `time` with no
+args prints usage without a fault.  So `time true` and `time ls /` are
+**not** a test of the `true`/`ls` applets -- they are a test of
+**`time`'s own `__init_libc` / `__libc_start_main` startup** on a
+forked child of the shell.  **`/usr/bin/TIME` does not exist** (only
+`/bin/time`, a busybox applet).  The shell's PATH lookup tries
+`/usr/bin/TIME`, gets `FR_NO_FILE`, falls back to `/bin/time`; that is
+expected, not a bug.  `/bin/true` does not exist either; `time
+/bin/true` prints `can't execute '/bin/true': No such file or
+directory` and exits 127 -- that line is correct behavior, not a
+control.
+
+**The `time` applet's accounting is broken and separate.**  `real`
+prints `0m 0.34s` on some runs and `1191h 48m 18s` on others; `user`
+and `sys` print about `152710235h` in every run.  This is
+`getrusage`/`times` reading uninitialized data (or a wrong unit), not
+the `time true` fault and not the alignment fix.  **Do not fix it in
+the same session as the `time true` fault.**
+
+**A third `time true` fault signature existed before `153dda9`:**
+`num 61` (`wait4`), `rcx 0x44CC0D`, `RSP = g_user_rsp_save + 0xB0`.
+It was observed on `pid 8` and `pid 10` before the alignment fix and
+did not recur in the post-fix boot.  **Recorded, not chased.**
+
+**A boot-time fault outside `time true` was observed:**
+`pid 3` (`busybox`), `num 7` (`poll`), `rcx 0x44D6A3`, `RSP =
+g_user_rsp_save + 0x10`, before any `time true` in the boot.  Its
+frame dump contains kernel addresses in GPR slots (`0xFFFFFFFF802A2E23`,
+`0xFFFF800007E52B8B`) but the user-stack window below is normal.
+Not `time true`; recorded, not chased.  A boot-time `#PF`/`#GP` that
+does not reproduce is not closed.
+
+**`process_fork`'s `frame_rsp = is_user ? pcb->user_stack_top :
+pcb->kernel_stack_top;`** (`process.c:453`) is a candidate, not yet
+proven.  For a plain `fork` or `vfork`, the child should resume at the
+**parent's user `RSP`** (from the syscall-entry frame), not at
+`user_stack_top`.  For a `vfork`-then-`exec`, `sys_execve` sets
+`pcb->user_rsp = rsp_init`, and the child should resume at
+`rsp_init`; whether the resume path uses `pcb->user_rsp` or the frame
+`process_fork` built is what the next probe's `$rsp` comparison
+answers.  **Do not change `frame_rsp` without that answer.**
+
+**Status of the old "busybox applet dispatch faults after exec"
+heading above.**  Its `0x40FBC0` probe is **closed by measurement**:
+the slot was `0x40B163` at `0x40FBC0` (correct at sysret) in every
+run of the third session, so the writer of the busybox-side slot was
+not between `0x40FBC0` and `0x40FBF0`; the writer of the
+`0x40FBF0`-pop-0 was between those two addresses (true-side) or in
+`__init_libc`'s chain (busybox-side).  The `user_rsp` fix and the
+align fix moved both.  Read this section first; the heading above is
+history.
 
 
 ## Three history corrections from the 2026-11-04 evening session
