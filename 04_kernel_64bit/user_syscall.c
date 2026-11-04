@@ -11540,6 +11540,142 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
  * tick mid-clone could schedule another process whose allocations
  * race with ours.
  */
+/*
+ * Linux x86_64 vfork(2) -- syscall 58.
+ *
+ * True vfork, not an alias of fork: the child runs on the parent's
+ * address space (child->cr3 = parent->cr3, no eager copy), and the
+ * parent blocks until the child execs or exits.  The child's
+ * elf_page_list is empty and borrows_cr3 is set, so its exit does
+ * not free the parent's pages (see process_cleanup_elf_pages and
+ * the process_reclaim/process_destroy guards).
+ *
+ * The tail (fs_base, signal state, cwd, fd copy, frame, brk, pgrp,
+ * parent_pid) matches sys_fork's tail deliberately: those are PCB
+ * fields, not address-space pages, and the child needs them before
+ * it execs.  Skipping them would leave the child with fs_base == 0
+ * and fault at CR2 = 0 on its first TLS access, exactly the failure
+ * sys_fork's comment documents.
+ *
+ * The parent block uses the console_read/pipe block idiom: set
+ * state=BLOCKED under cli, dequeue, sti, process_yield, reset
+ * state=RUNNING on resume.  No hand-rolled scheduler_switch_to.
+ */
+long sys_vfork(void) {
+    __asm__ volatile("cli");
+
+    pcb_t* parent = process_get_current();
+    if (!parent) {
+        __asm__ volatile("sti");
+        return -(long)EAGAIN_;
+    }
+
+    pcb_t* child = process_create(parent->name, parent->entry_point, 0);
+    if (!child) {
+        __asm__ volatile("sti");
+        return -(long)EAGAIN_;
+    }
+    scheduler_ready_queue_remove(child);
+
+    /* SHARE the address space.  No EAGER_COPY_REGION calls. */
+    child->cr3          = parent->cr3;
+    child->borrows_cr3  = 1;
+    child->elf_page_list = NULL;
+    child->elf_num_pages = 0;
+
+    /* PCB state the child needs before it execs (see the header). */
+    child->fs_base    = parent->fs_base;
+    child->sig_blocked = parent->sig_blocked;
+    child->sig_pending = 0;
+    for (int _i = 0; _i < 64; _i++) {
+        child->signal_handler[_i]  = parent->signal_handler[_i];
+        child->signal_restorer[_i] = parent->signal_restorer[_i];
+    }
+    {
+        size_t _i = 0;
+        while (parent->cwd[_i] && _i < sizeof(child->cwd) - 1) {
+            child->cwd[_i] = parent->cwd[_i];
+            _i++;
+        }
+        child->cwd[_i] = '\0';
+    }
+
+    user_syscall_clear_file_table(child);     
+     
+    for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
+        file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
+        if (!_slot) continue;
+        __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
+        child->file_table[_fd] = _slot;
+    }
+
+    /*
+     * Build the child's iretq-resume frame from the parent's current
+     * syscall-entry frame.  This sets the child's %rax to 0, which is
+     * how fork() signals "you are the child" to user code.
+     */
+    process_fork_copy_frame(child, parent);
+
+    /*
+     * Child inherits the parent's heap break so its brk region starts
+     * where the parent's was.  The pages themselves are now copied
+     * (see the eager-copy block above), so writes to the brk region
+     * in either process no longer alias.
+     */
+    child->brk_virt = parent->brk_virt;
+
+    /* POSIX: a fork child inherits the parent's process group (only a
+     * session leader gets a new one).  Without this, every forked child
+     * stayed in its own group (process_create sets pgrp = pid), so a ^C
+     * or ^Z to the shell's foreground group never reached the pipeline
+     * children: the pool walk showed four zombies with pgrp == pid, and
+     * the ^C print fg=<shell group> matched none of them.  The wait4
+     * parent then blocked forever and the console stalled. */
+    child->pgrp = parent->pgrp;
+    /* Apply a deferred setpgid the parent issued before we
+     * created this child.  See sys_setpgid. */
+    extern struct deferred_setpgid g_defer_pgid[16];
+    for (int _i = 0; _i < 16; _i++) {
+        if (g_defer_pgid[_i].pid == (long)child->pid) {
+            child->pgrp = (uint64_t)g_defer_pgid[_i].pgid;
+            g_defer_pgid[_i].pid = 0;
+            g_defer_pgid[_i].pgid = 0;
+            break;
+        }
+    }
+    child->parent_pid = parent->pid;
+    child->state = PROC_STATE_READY;
+    scheduler_ready_queue_add(child);
+
+    /*
+     * Block the parent until the child execs or exits (true vfork
+     * semantics).  The block is set under the cli this function
+     * opened with; the dispatch goes through process_yield ->
+     * scheduler_switch_to, which does its own cli and tail check.
+     *
+     * docs/contract.md: #1/#2 state write + dequeue under cli.
+     * #3 voluntary block, the dispatcher's tail does the restore.
+     * #4 through process_yield, no direct current_process write.
+     * #5 no async writer in this commit -- process_wake_all_blocked
+     *    skips block_kind != BLOCK_KIND_NONE, so the tick does not
+     *    wake us; the child's exec/exit is the only waker, and that
+     *    is not wired yet.  So vfork currently blocks forever; that
+     *    is the expected result of this commit, not a bug.
+     * #6 the child shares our cr3; borrows_cr3 (set below, before
+     *    the child can run) makes its exit skip the frees.
+     */
+    parent->state      = PROC_STATE_BLOCKED;
+    parent->block_kind = BLOCK_KIND_VFORK;
+    parent->wait_pid   = child->pid;
+    scheduler_ready_queue_remove(parent);
+    __asm__ volatile("sti");
+    process_yield();
+    /* Resumed by the child's exec/exit wake. */
+    parent->state = PROC_STATE_RUNNING;
+
+    return (long)child->pid;
+}
+
 long sys_fork(void) {
     __asm__ volatile("cli");
 
@@ -11944,6 +12080,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
         case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
         case SYS_FORK:            result = (uint64_t)sys_fork(); break;
+        case SYS_VFORK:           result = (uint64_t)sys_vfork(); break;
         case SYS_EXECVE:          result = (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2); break;
         case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
         case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;

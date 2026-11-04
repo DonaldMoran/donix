@@ -168,6 +168,7 @@
 #define SYS_NANOSLEEP       35
 #define SYS_GETPID          39
 #define SYS_FORK            57
+#define SYS_VFORK           58
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61

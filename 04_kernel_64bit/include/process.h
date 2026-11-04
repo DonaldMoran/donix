@@ -61,6 +61,16 @@ typedef enum {
 #define BLOCK_KIND_PIPE_WRITE 3
 #define BLOCK_KIND_PAUSE      4
 #define BLOCK_KIND_NANOSLEEP 5
+/*
+ * Blocked in vfork(2) waiting for the child to exec or exit.
+ * A specific kind, not NONE: process_wake_all_blocked skips any
+ * process whose block_kind != BLOCK_KIND_NONE, so the 100 Hz
+ * tick does NOT wake a vfork parent.  That is load-bearing --
+ * a tick-woken parent would run concurrently with a child still
+ * on the shared cr3.  The only waker for this kind is the child's
+ * exec/exit path (process_wake_parent_if_waiting's vfork arm).
+ */
+#define BLOCK_KIND_VFORK      6
 
 // Process Control Block
 typedef struct pcb {
