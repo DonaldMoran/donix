@@ -11682,6 +11682,35 @@ long sys_vfork(void) {
         _vf[0x18 / 8] = 0;   /* r12 */
         _vf[0x40 / 8] = 0;   /* rbp */
         _vf[0x68 / 8] = 0;   /* rbx */
+        /*
+         * V3b: also zero the six caller-saved slots.  V3
+         * deliberately left them alone ('a separate decision and
+         * a separate commit'); this is that commit.
+         *
+         * The vfork child's continuation after this point is
+         * execve or _exit, exactly as with the callee-saved
+         * registers.  The caller-saved values it would inherit
+         * from the parent are not meaningful there either, and
+         * a stale one (the mallocng free poison 0x8080..8080 in
+         * r10, for example) can be read by musl's
+         * static_init_tls after the child execs into the new
+         * image.  The exec-handoff + V3 + wake build's
+         * time-true fault showed exactly that shape: last
+         * sysret target 0x40FBC0 inside static_init_tls,
+         * r10 == 0x8080808080808080, RIP 0 / CR2 0 / error
+         * 0x15.  Zeroing them removes the inheritance the same
+         * way V3 removed the callee-saved one.
+         *
+         * Frame slots from process_fork_copy_frame's layout:
+         *   f[0x28/8]=r10 f[0x30/8]=r9  f[0x38/8]=r8
+         *   f[0x48/8]=rdi f[0x50/8]=rsi f[0x58/8]=rdx
+         */
+        _vf[0x28 / 8] = 0;   /* r10 */
+        _vf[0x30 / 8] = 0;   /* r9  */
+        _vf[0x38 / 8] = 0;   /* r8  */
+        _vf[0x48 / 8] = 0;   /* rdi */
+        _vf[0x50 / 8] = 0;   /* rsi */
+        _vf[0x58 / 8] = 0;   /* rdx */
     }
 
     /*
