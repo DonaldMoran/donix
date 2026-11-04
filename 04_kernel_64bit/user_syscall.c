@@ -11650,6 +11650,39 @@ long sys_vfork(void) {
      * how fork() signals "you are the child" to user code.
      */
     process_fork_copy_frame(child, parent);
+    /*
+     * V3: a vfork child resumes with a fork-shaped frame -- the
+     * parent's user RIP, RSP, and full register file -- because
+     * process_fork_copy_frame is fork's frame builder.  For fork
+     * that is the ABI: the child returns from the same syscall with
+     * the same registers.  For vfork it is wrong: the child is
+     * going to execve or _exit, and the parent's callee-saved
+     * registers are not meaningful in the child's continuation.
+     *
+     * Overwrite the six callee-saved slots with 0.  The
+     * open-issues entry's 0x4512E8 mov %r13,0x8(%r12) fault with
+     * %r12 == 0 is exactly the parent's r12 arriving in the child;
+     * the exec-handoff build's fault at the new image's first
+     * instructions showed the same register file empty (r12 == 0,
+     * r10 == the mallocng free poison).  Zeroing the callee-saved
+     * slots removes that inheritance.
+     *
+     * Do NOT touch rdi/rsi/rdx/r8/r9/r10: those are fork's
+     * caller-saved continuation registers; zeroing them is a
+     * separate decision and a separate commit.
+     */
+    {
+        uint64_t* _vf = (uint64_t*)(child->kernel_stack_top - 20 * 8);
+        /* process_fork_copy_frame's frame layout (POP_ALL_GPRS order):
+         *   f[0x00/8]=r15 f[0x08/8]=r14 f[0x10/8]=r13 f[0x18/8]=r12
+         *   f[0x40/8]=rbp f[0x68/8]=rbx  */
+        _vf[0x00 / 8] = 0;   /* r15 */
+        _vf[0x08 / 8] = 0;   /* r14 */
+        _vf[0x10 / 8] = 0;   /* r13 */
+        _vf[0x18 / 8] = 0;   /* r12 */
+        _vf[0x40 / 8] = 0;   /* rbp */
+        _vf[0x68 / 8] = 0;   /* rbx */
+    }
 
     /*
      * Child inherits the parent's heap break so its brk region starts
