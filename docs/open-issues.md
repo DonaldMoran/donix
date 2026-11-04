@@ -1,10 +1,11 @@
 # Open issues
 
-**Last updated: 2026-11-04 (third session, after `153dda9`)** (HEAD on
-`dev` at `153dda9`, two `sys_execve` fixes landed this session).
-**Read the section "The `time true` fault, after the third-session
-fixes" below before doing anything else with `time`/`time true`.
-It names what is left and what the next probe is.**
+**Last updated: 2026-11-04 (fourth session, after `0f97048`)** (HEAD on
+`dev` at `0f97048`, two `sys_execve` reverts and one kept fix).
+**Read the section "The `time true` fault, after the fourth-session
+reverts" below before doing anything else with `time`/`time true`,
+`^C`, or `busybox sh`.** It names what is left, what the reverts
+cost, and the shell tests the green gate does not cover.
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -759,6 +760,77 @@ not between `0x40FBC0` and `0x40FBF0`; the writer of the
 `__init_libc`'s chain (busybox-side).  The `user_rsp` fix and the
 align fix moved both.  Read this section first; the heading above is
 history.
+
+## The `time true` fault, after the fourth-session reverts (open)
+
+**Status (2026-11-04, fourth session).**  The third session landed two
+`sys_execve` changes (`939e3ef` `pcb->user_rsp = rsp_init` and
+`153dda9` 16-byte-align `rsp_init`).  Both moved the `time true`
+fault forward.  **Both broke the interactive shell, and both are now
+reverted.**  The fourth session also found and kept one real fix
+(`54e3b2d`, the `clear_child_tid` reset).
+
+**Kept:**
+
+- **`54e3b2d`** -- `sys_execve` clears `pcb->clear_child_tid` on
+  exec.  This fixes the `pipe7e` kernel-mode `#PF` (`CR2 0x4087D0`,
+  `error 0x2`, `CS 0x18`, PTE not present).  That fault was
+  introduced by `4312aab` (`set_tid_address` `clear_child_tid`)
+  and is **not** present at `v0.6.19`.  `pipe7e` now reaches
+  `iter 4000` without a `#PF` (vs `iter 0` before).  This is the
+  fourth session's real gain.
+
+**Reverted:**
+
+- **`e128c92`** -- reverts `153dda9`.  With `153dda9` applied,
+  `busybox sh` invoked from the `donix>` fallback hangs after its
+  banner (no prompt).  With the revert, `busybox sh` re-enters the
+  ash prompt normally.  Verified side by side against `testme`
+  (`v0.6.19`).
+- **`0f97048`** -- reverts `939e3ef`.  With `939e3ef` applied,
+  `^C` on a foreground `sleep 100` fails (the child is not
+  interrupted).  With the revert, `^C` works.  Verified against
+  `testme`.
+
+**The gate gap that let both regressions through.**  `canary --full`
+(28/28) and `test.sh` (57/57) were **green** with `939e3ef` and
+`153dda9` applied.  Neither test covers **`^C` on a foreground
+child** or **`busybox sh` re-entry from the `donix>` fallback**.
+**A `sys_execve` stack change (`pcb->user_rsp`, `rsp_init`
+alignment) must be tested with both before it lands.**  That is the
+working-style lesson of the fourth session; it belongs next to the
+gate section in `handoff.md`.
+
+**Where `time true` is now.**  Back to its **pre-third-session
+state**: the busybox-side signature, `num 218` (`set_tid_address`),
+`last sysret rcx 0x40FBC0`, `RSP = g_user_rsp_save + 0x180`, with the
+`__init_tls` frame intact at `rsp-0x18 = 0x40FBA0`, `rsp-0x20 =
+0x4659FE`, `rsp-0x28 = 0x80000FBFE8`, `rsp-0x30 = 0x80000FBFF8`.  The
+`argv`/`envp`/auxv layout at `rsp` is **correct** (`argc`, `argv[0]`,
+`NULL`, `envp[0]`, `envp[1]`, `NULL`, auxv pairs), and the fault is a
+`ret` in `__init_libc`'s chain popping a slot that is **already
+zero**.  **The `0x44cc0d` / `0x44ac73` probe addresses in the
+third-session section above are stale** -- those were downstream of
+the two reverted changes.  The next probe is the pre-session one:
+`hbreak *0x40fbc0` with `$rsp` and `$fs_base`, then a watchpoint on
+the popped slot (`0x80000FBE28` for the true-side, or the
+`rsp-0x10` slot of the busybox-side dump).  Read `$rsp` and `pid`
+at every hit; `$fs_base` is the same VA across busybox processes and
+is **not** a per-process marker.
+
+**`time true` is not a race.**  The busybox-side fault fires on the
+**first** `time true` invocation in a boot where `^C`, `^Z`, `fg`,
+`canary --full`, `test.sh`, and `pipe7e` all pass.  It is
+deterministic in shape.  The `^C` intermittence seen earlier in the
+session (works once, fails later) is **race-shaped** and is a
+**separate** observation.  Do not conflate the two: the `time true`
+fault is not evidence of a race, and the `^C` intermittence is not
+evidence about `time true`.
+
+**The `race_probe` dump fires on every `time true` fault.**  That is
+instrumentation, not a race detector.  It reports the standing
+`wake_no_waiter == writers_nonzero` question; it does not mean the
+fault is a race.  Do not read the `RACE PROBE DUMP` as a mechanism.
 
 
 ## Three history corrections from the 2026-11-04 evening session
