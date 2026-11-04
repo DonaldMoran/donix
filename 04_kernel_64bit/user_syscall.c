@@ -6295,7 +6295,6 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
-    self->user_rsp    = rsp_init;
     /* clear_child_tid is a per-address-space registration:
      * the VA is meaningful only in the address space that
      * set it.  execve replaces the address space, so the
