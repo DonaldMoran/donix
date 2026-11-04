@@ -1,11 +1,12 @@
 # Open issues
 
-**Last updated: 2026-11-04 (fourth session, after `0f97048`)** (HEAD on
-`dev` at `0f97048`, two `sys_execve` reverts and one kept fix).
-**Read the section "The `time true` fault, after the fourth-session
-reverts" below before doing anything else with `time`/`time true`,
-`^C`, or `busybox sh`.** It names what is left, what the reverts
-cost, and the shell tests the green gate does not cover.
+**Last updated: 2026-11-04 (fourth session, after `4b24e71`)** (HEAD on
+`dev` at `4b24e71`, the docs commits plus the fourth-session code).
+**The `time true` cause is now known: `static_init_tls` on a static
+busybox with no `PT_PHDR` and no `_DYNAMIC`. See the section
+"Why `time true` faults: static_init_tls" below.** It is not a
+`time` applet bug and not a kernel bug. Read that section and the
+fourth-session section before doing anything with `time`.
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -900,3 +901,78 @@ diagnostic on the failure path named the failing call in one run,
 after three guesses had failed.**  `set -e` in the runner also
 closed the terminal on the abort; the abort itself was the useful
 signal and must be visible.
+
+## Why `time true` faults: static_init_tls (open, root cause found)
+
+**Filed 2026-11-04, fourth session.**  The `time true` fault is not the
+`time` applet and not the kernel.  It is musl's `static_init_tls`
+running in a statically-linked busybox whose ELF has no `PT_PHDR` and
+no dynamic section.
+
+**Evidence (read from the built busybox):**
+
+    readelf -lW third_party/busybox/busybox_unstripped
+      -> three LOAD segments, NO PT_PHDR record
+    readelf -dW third_party/busybox/busybox_unstripped
+      -> "There is no dynamic section in this file."
+    nm third_party/busybox/busybox_unstripped | grep -w _DYNAMIC
+      -> no defined _DYNAMIC (weak-undefined, resolves to 0)
+
+**The code path.**  `third_party/musl-src/src/env/__init_tls.c`'s
+`static_init_tls` computes the load base two ways:
+
+    if (phdr->p_type == PT_PHDR)
+        base = aux[AT_PHDR] - phdr->p_vaddr;
+    if (phdr->p_type == PT_DYNAMIC && _DYNAMIC)
+        base = (size_t)_DYNAMIC - phdr->p_vaddr;
+
+**Both are inoperative here.**  There is no `PT_PHDR`, so the first
+branch does not run.  `_DYNAMIC` is weak-undefined and resolves to 0,
+so `&& _DYNAMIC` is false and the second branch does not run.  `base`
+stays 0, so `main_tls.image = 0 + tls_phdr->p_vaddr` is a tiny
+address, and the TLS image copy faults.
+
+**The musl `_DYNAMIC` fallback is present.**  The declaration
+(`extern weak hidden const size_t _DYNAMIC[];`) and the
+`PT_DYNAMIC && _DYNAMIC` branch are both in the file.  This is the
+musl fix from commit `5bf7eba2` (2016), and it is **inoperative**
+because a static binary with no dynamic section has no `_DYNAMIC`
+symbol to relocate against.  The fix's own commit message says it
+depends on relocations having been performed; a binary with no
+`.dynamic` section has none.
+
+**This is a known class.**  The musl mailing list thread
+"Segmentation fault on statically linked programs" carries the same
+`static_init_tls` stack trace and names the cause: a binutils that
+produces invalid static binaries (the Alpine
+`binutils-ld-fix-static-linking.patch` fixes the linker script so
+static binaries get valid program headers).  The musl `_DYNAMIC`
+fallback is the workaround for binaries that cannot get `PT_PHDR`;
+it requires `_DYNAMIC` to exist, and a static binary without a
+dynamic section does not have it.
+
+**Why `time` and not `date`/`true`/`ls`.**  `time` re-execs busybox
+(`vfork` + `execvp` for the child).  The re-exec'd child runs
+`_start` -> `__init_libc` -> `__init_tls` -> `static_init_tls` and
+hits the broken base.  `date`, `uptime`, `true`, and `ls` run
+in-process (`FEATURE_PREFER_APPLETS`), never re-exec, and never hit
+`static_init_tls` on a fresh exec.  **`time` is the canary: it is
+the only tested applet that re-execs busybox.**  `\time true` (the
+backslash forces the shell to look up `/bin/time` rather than use
+the `time` reserved word) faults the same way, with the true-side
+signature (`RSP = g_user_rsp_save + 0x10`, `num 218`,
+`rcx 0x40FBC0`, `argc = 1`, `argv[0] = "true"`, stack correct).
+
+**The fix is not in donix's tracked source.**  It is a
+binutils/linker change (emit `PT_PHDR` for the static busybox, or a
+linker script that does), or a different linker.  `third_party/` is
+gitignored; the busybox build and link flags are the place to change
+it.  **The next session's first work on `time` is the busybox link,
+not the `0x40FBC0` probe and not the kernel.**
+
+**What not to do.**  Do not patch `third_party/musl-src` for this
+-- the fix is already present and does not help.  Do not chase the
+`time` applet's source -- `time_main` is correct.  Do not run the
+`0x40FBC0` probe for this fault -- it is not the busybox applet
+dispatch fault; the fault is `static_init_tls` on a static binary
+with a bad base.
