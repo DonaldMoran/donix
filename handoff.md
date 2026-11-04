@@ -5,127 +5,105 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-04 (third session), at `8dc6f99`.
-**`v0.6.19` is the last pushed release.** `dev` is at `8dc6f99`; its
-parents are `153dda9`, `939e3ef`, `86c8864`, `ae97ae9`, `4312aab`.
-`origin/dev` = `ba56b3d`. Ahead **29**, clean tree, **stash present**
+**Last updated:** 2026-11-04 (fourth session), at `52e1569`.
+**`v0.6.19` is the last pushed release.** `dev` is at `52e1569`; its
+parents are `0f97048`, `e128c92`, `54e3b2d`, `6ca3690`, `8dc6f99`.
+`origin/dev` = `ba56b3d`. Ahead **34**, clean tree, **stash present**
 (`stash@{0}`: vfork 3b diagnostics; preserved, do not drop). No push,
 no tag this session; banner still `v0.6.19`. `main` = `7e4748b` (the
 `--no-ff` merge of `v0.6.19`). Scratch tag `20261104-gettimeofday-time`
 is on `5a3b65e` (still preserved).
 
+**`~/code/testme` is a `v0.6.19` reference tree (`ba56b3d`, tagged).**
+It is the known-good comparison. **Do not modify it.** When a shell
+behavior is in doubt, boot `testme` and compare.
+
 ---
 
 ## START HERE
 
-**Before doing anything else with `time`, `time true`, or
-`time ls /`, read `docs/open-issues.md`'s section "The `time true`
-fault, after the third-session fixes".** It names the two remaining
-fault signatures, the two `sys_execve` fixes that already landed
-(`939e3ef`, `153dda9`), the gate status, and the **exact next probe**
-(`hbreak *0x44cc0d` / `hbreak *0x44ac73` printing `$rsp` and
-`$fs_base`, plus a `serial_print` in `sys_execve` printing
-`rsp_init` / `self->user_rsp` / `self->kernel_stack_top[-9]`).
+**Before doing anything else with `time`, `time true`, `^C`, or
+`busybox sh`, read `docs/open-issues.md`'s section "The `time true`
+fault, after the fourth-session reverts".** It names what is left,
+what the three reverts/fixes did, the gate gap, and the pre-session
+`0x40FBC0` probe that is the next step.
 
 **You do not need the conversation history.** You need this file's
 `WHERE WE ARE` and `NEXT` sections, and that one section of
-`docs/open-issues.md`. Everything else is either in `docs/` (read on
-demand) or in the Refuted list below (do not re-walk).
+`docs/open-issues.md`.
 
-**Do not re-run the `0x40FBC0` probe.** It is **closed by
-measurement**: the slot was `0x40B163` at `0x40FBC0` in every run of
-the third session. The writer is not there.
+**Do not re-apply `939e3ef` or `153dda9`.** Both were reverted
+(`0f97048`, `e128c92`). They moved the `time true` fault forward but
+broke the shell: `939e3ef` breaks `^C` on a foreground child,
+`153dda9` breaks `busybox sh` re-entry. **Any `sys_execve` stack
+change must be tested with both before it lands.** See the gate gap
+below.
 
-**Do not re-derive the `user_rsp` or alignment fixes.** They are in
-(`939e3ef`, `153dda9`), verified by gate, and they moved the fault
-forward.
+**`time true` is not a race.** It fails deterministically on the first
+invocation in a boot where everything else passes. The `race_probe`
+dump is instrumentation, not a race detector.
 
 ---
 
 ## WHERE WE ARE
 
-**`v0.6.19` is the last pushed release.** `dev` is at `8dc6f99`.
-Ahead **29**, clean, stash present. Nothing pushed this session.
+**`v0.6.19` is the last pushed release.** `dev` is at `52e1569`.
+Ahead **34**, clean, stash present. Nothing pushed this session.
 
-**WHAT LANDED THIS SESSION (four commits, all gate-green):**
+**WHAT LANDED THIS SESSION (fourth session, five commits):**
 
-1. **`86c8864`** (docs) -- second-session handoff rewrite and
-   `docs/open-issues.md` patch, committed before this session's code
-   work started.
-2. **`939e3ef`** (code) -- `syscalls`: `sys_execve` now sets
-   `pcb->user_rsp = rsp_init`. `sys_execve` rewrote the
-   syscall-entry frame's user-RSP slot (`ktop[-9] = rsp_init`) but
-   never updated `pcb->user_rsp`. The exec'ing process returns via
-   `sysret` and reads `ktop[-9]` (correct); the **vfork child**
-   resumes through `context_switch_resume`, which loads the user-RSP
-   slot from `pcb->user_rsp` (`pcb` offset `0x610`, asserted in
-   `process.c`). For the child, `pcb->user_rsp` was the stale pre-exec
-   value, `0x180` above the new stack's `rsp_init`. **Effect: the
-   busybox-side `0x40FBC0` / `+0x180` fault no longer occurs.**
-   Gate 28/28 + 57/57.
-3. **`153dda9`** (code) -- `syscalls`: `sys_execve` 16-byte-aligns
-   `rsp_init` per the SysV AMD64 ABI. `sys_execve` placed `rsp_init`
-   at `argv_region_bottom - 8`; `user_stack_top` is 16-aligned, so
-   `rsp_init` was 8 mod 16. musl's `_start` does `pop %rsi` then
-   `and -16, %rsp`; with the misalignment that `and` is a no-op, so
-   `__libc_start_main`'s frame was 8 bytes higher than on Linux and a
-   later `ret` popped a never-pushed slot. **Effect: the
-   argc/argv/envp/auxv layout is now visibly at `rsp_init`** and the
-   child gets past `__libc_start_main` into the applet-dispatch
-   region. **Fault moved forward, not eliminated.** Gate 28/28 +
-   57/57.
-4. **`8dc6f99`** (docs) -- `docs/open-issues.md` new section "The
-   `time true` fault, after the third-session fixes", with the
-   `$fs_base`-is-not-a-marker correction and the exact next probe.
+1. **`6ca3690`** (docs) -- third-session handoff rewrite, from the
+   session start.
+2. **`54e3b2d`** (code, **kept**) -- `sys_execve` clears
+   `pcb->clear_child_tid` on exec. **This is the session's real
+   gain.** It fixes the `pipe7e` kernel-mode `#PF` (`CR2 0x4087D0`,
+   `error 0x2`, `CS 0x18`, PTE not present) that `4312aab`
+   introduced. `pipe7e` reaches `iter 4000` without a `#PF` (vs
+   `iter 0` before).
+3. **`e128c92`** (revert) -- reverts `153dda9` (16-byte-align
+   `rsp_init`). With `153dda9`, `busybox sh` from the `donix>`
+   fallback hangs after its banner.
+4. **`0f97048`** (revert) -- reverts `939e3ef` (`pcb->user_rsp =
+   rsp_init`). With `939e3ef`, `^C` on a foreground child fails.
+5. **`52e1569`** (docs) -- `docs/open-issues.md` fourth-session
+   section: the reverts, the kept fix, the gate gap, the
+   `time true` state.
 
-**`time true` STILL FAULTS, in two signatures, both `RIP 0`,
-`CR2 0`, `error 0x15`, `CS 0x33`:**
+**Baseline, verified in the fourth-session boot (all in one boot):**
 
-- **`num 13` (`rt_sigaction`), `last sysret rcx 0x44CC0D`,**
-  `RSP = g_user_rsp_save + 0x390`.
-- **`num 218` (`set_tid_address`), `last sysret rcx 0x44AC73`,**
-  `RSP = g_user_rsp_save + 0x180`.
-
-In both dumps the **entire stack region between `fault_rsp` and
-`rsp_init` is zero** -- the popped slot was never written after
-startup. That is the remaining bug. **It is not the
-`pcb->user_rsp` slot and not the entry alignment.** A `ret` in
-busybox's startup pops a slot that is zero on a fresh stack.
-
-**`time` is not usable today; `true` alone works.** Verified in the
-third-session boot: `true` (silent, returns) works; `time` (no args,
-prints usage) works; `time true` faults; `time ls /` faults.
-**`/usr/bin/TIME` does not exist.** The shell's PATH lookup tries it,
-gets `FR_NO_FILE`, falls back to `/bin/time` (a busybox applet). That
-is expected. `/bin/true` does not exist either. **`time /bin/true`
-prints `can't execute '/bin/true': No such file or directory` and
-exits 127 -- that is correct behavior, not a control.** Valid real-file
-controls are `/usr/bin/HELLO`, `/usr/bin/ECHO`, `/usr/bin/CAT`.
+- `canary --full` **28/28**
+- `test.sh` **57/57**
+- **`^C` on a foreground `sleep 100` returns the prompt** (worked)
+- **`^Z` on `sleep 100` -> `[1]+ Stopped`; `jobs` lists it; `fg`
+  resumes**
+- **`exit` from `ash` -> `donix>`; `busybox sh` at `donix>` -> the
+  ash prompt** (re-entry works)
+- **`pipe7e` reaches `iter 4000` without a `#PF`**
+- **`time true` faults**, busybox-side signature: `num 218`,
+  `last sysret rcx 0x40FBC0`, `RSP = g_user_rsp_save + 0x180`, the
+  `__init_tls` frame intact below the fault, the `argv`/`envp`/auxv
+  layout at `rsp` correct, and a `ret` in `__init_libc`'s chain
+  popping a slot that is already zero.
+- **`time` is not usable.** `true` alone works; `time` with no args
+  prints usage; `time true` and `time ls /` fault. **`/usr/bin/TIME`
+  and `/bin/true` do not exist.**
 
 ---
 
 ## NEXT -- the highest-value work, in order
 
-1. **The `0x44cc0d` / `0x44ac73` probe with `$rsp` and the
-   `sys_execve` `serial_print`.** This is the single next step and it
-   is scoped in `docs/open-issues.md`. In brief: `./run debug`, two
-   `hbreak`s (`*0x44cc0d`, `*0x44ac73`) each with `printf
-   "PROBE rsp=%lx fs=%lx\n", $rsp, $fs_base`, plus one
-   `serial_print` in `sys_execve` at the `self->user_rsp = rsp_init`
-   line printing `rsp_init`, `self->user_rsp`,
-   `self->kernel_stack_top[-9]`. Run `time ls /` until it faults. The
-   `$rsp` at the last hit compared to `rsp_init` decides:
-   - **`$rsp == rsp_init`** -> delivered `_start` `rsp` is right; the
-     fault is a busybox/musl startup issue in `third_party/`
-     (not editable in-tree). Fix is a **workaround** (documented
-     patch, force-initialize the slot, or shrink the frame).
-   - **`$rsp != rsp_init`** -> the delivery path is the bug. The two
-     candidates are `process_fork`'s
-     `frame_rsp = is_user ? pcb->user_stack_top : pcb->kernel_stack_top`
-     (`process.c:453`, wrong source for fork/vfork -- should be the
-     parent's user `RSP`), and the resume path reading a slot
-     `sys_execve` does not write. **Do not change `frame_rsp` without
-     the probe result.**
+1. **The `0x40FBC0` probe on the pre-session `time true` fault.**
+   This is the pre-session probe, restored by the reverts. Boot
+   `./run debug`, attach gdb, `hbreak *0x40fbc0` with `commands`
+   printing `slot=%lx rsp=%lx fs=%lx` for
+   `*(unsigned long*)0x80000fbe28`, `$rsp`, `$fs_base`, then
+   `continue`. Run `time true` until it faults. **The last PROBE line
+   before the fault, with its `$rsp`, names which slot is which.**
+   `$fs_base` is the same VA across busybox processes and is **not**
+   a per-process marker; `$rsp` and the fault dump's `pcb pid/name`
+   are the discriminators. Then a watchpoint on the popped slot
+   (`0x80000FBE28` true-side, or `rsp-0x10` of the busybox-side dump)
+   with `$rip` at the hit names the writer.
 2. **`sys_mkdir` `-ENOTDIR` vs `-EEXIST`** for the file case.
    POSIX wants `-ENOTDIR` when the target exists as a file. Small,
    `sys_mkdir`-local; no current caller depends on it.
@@ -134,17 +112,29 @@ controls are `/usr/bin/HELLO`, `/usr/bin/ECHO`, `/usr/bin/CAT`.
 4. **`docs/open-issues.md` item 9 -- the privilege model.**
    **Before starting, ask what it unlocks.** If "nothing," skip.
 5. **The `time` applet's accounting bug** (`real 0m 0.34s` on some
-   runs, `1191h 48m 18s` on others; `user`/`sys` about `152710235h`
-   in every run). Separate from the `time true` fault. **Do not fix
-   in the same session as the `time true` fault.**
-6. **The live `wake_no_waiter == writers_nonzero` observation
-   (111 == 111).** Recorded in `docs/open-issues.md`; a standing
-   question, not a mechanism. Do **not** chase it on this evidence.
+   runs, `1191h 48m` on others; `user`/`sys` about `152710235h`).
+   Separate from the `time true` fault. **Do not fix in the same
+   session as the `time true` fault.**
+6. **The `^C` intermittence** seen earlier in the fourth session
+   (works once, fails later). It is race-shaped and **separate** from
+   the `time true` fault. Not diagnosed. Do not conflate the two.
 
-**NOT DONE, NOT THIS SESSION'S WORK.** The C halt
-(`context_switch_resume`'s unknown-CS branch) has not been observed
-since the 2026-11-02 disk-path fixes. No mechanism was named. Do not
-chase it without new evidence.
+---
+
+## THE GATE GAP (new this session -- read before any `sys_execve` change)
+
+**`canary --full` (28/28) and `test.sh` (57/57) do not cover `^C` on
+a foreground child or `busybox sh` re-entry.** Both `939e3ef` and
+`153dda9` passed the green gate and broke one of those two shell
+behaviors. **Any change to `sys_execve`'s user stack (`pcb->user_rsp`,
+`rsp_init`, the argv/envp/auxv layout) must be tested with:**
+
+- **`sleep 100` then `^C`** -> the prompt returns
+- **`exit` from `ash` -> `donix>` -> `busybox sh`** -> the ash
+  prompt returns
+
+before it is committed. **A green `canary`/`test.sh` is not
+sufficient for a stack-layout change.**
 
 ---
 
@@ -152,60 +142,54 @@ chase it without new evidence.
 
 *This session's additions first.*
 
-- **The `0x40FBC0` probe as the writer-finder.** It fired with
-  `slot=0x40b163` and `fs=0x46a138` in every run; the busybox-side
-  slot is correct at `0x40FBC0`. **Closed by measurement.** Do not
-  re-run it.
-- **`$fs_base` as a per-process marker.** It is the **same VA**
-  (`0x46a138`) in every busybox process and in most musl binaries.
-  `%rsp` is the same VA across processes. **Only `pid` or `CR3`
-  distinguishes processes.** A `WATCH` line with `fs=0x46a138` and
-  `rip=0x40b061` (a `/usr/bin/*` binary's `__init_libc`) was
-  indistinguishable, by `fs` alone, from a busybox process. **The
-  working-style rule below is corrected to say: print `pid` or
-  `CR3`.**
-- **`self->user_rsp = rsp_init` as the sole fix.** It moved the
-  busybox-side fault from `0x40FBC0`/`+0x180` to `0x44AC73`/`+0x160`.
-  It did not eliminate `time true`.
-- **The 16-byte alignment as the sole fix.** It moved the fault
-  further (past `__libc_start_main`) but did not eliminate it.
-- **`process_fork`'s `frame_rsp = pcb->user_stack_top` as the fix.**
-  Named as a **candidate**, not proven. Do not change it without
-  the probe result.
-- **`time /bin/true` as a control, again.** `/bin/true` does not
-  exist; the line is correct behavior for a missing file. **Valid
-  real-file controls are `/usr/bin/HELLO`, `/usr/bin/ECHO`,
-  `/usr/bin/CAT`.** The `time true` test does **not** depend on a
-  second exec of a `true` binary; `time` is a busybox applet and
-  `true` is a busybox applet, and `time`'s own startup faults before
-  it reaches `true`.
+- **`939e3ef` (`pcb->user_rsp = rsp_init`) as a safe fix.** It
+  regressed `^C` on a foreground child. **Reverted by `0f97048`.**
+  Do not re-apply without the `^C` test.
+- **`153dda9` (16-byte-align `rsp_init`) as a safe fix.** It
+  regressed `busybox sh` re-entry. **Reverted by `e128c92`.** Do not
+  re-apply without the `busybox sh` test.
+- **The `0x44cc0d` / `0x44ac73` probe addresses.** Those were
+  downstream of the two reverted changes. **Stale.** The next probe is
+  the pre-session `0x40FBC0` one.
+- **`time true` as a race.** It fails deterministically on the first
+  invocation in a boot where `^C`, `^Z`, `fg`, `canary`, `test.sh`,
+  and `pipe7e` all pass. The `race_probe` dump is instrumentation.
+- **The `race_probe` `RACE PROBE DUMP` as a mechanism.** It reports
+  the standing `wake_no_waiter == writers_nonzero` question. It does
+  not mean the fault is a race.
+- **`time /bin/true` as a control.** `/bin/true` does not exist.
+  Valid real-file controls are `/usr/bin/HELLO`, `/usr/bin/ECHO`,
+  `/usr/bin/CAT`.
+- **`$fs_base` as a per-process marker.** Same VA across busybox
+  processes. **Only `pid` or `CR3` distinguishes.** The working-style
+  rule below has been corrected.
 - **`argv_scratch` / `envp_scratch` as the cause.** `argv_scratch`
-  is 4 KB, `envp_scratch` is kmalloc'd. Already refuted; unchanged.
-- **A `call *%rax` with `rax = 0` as the fault.** The third-session
-  dumps show a `ret` popping a zeroed slot, not a `call`.
+  is 4 KB, `envp_scratch` is kmalloc'd. Already refuted.
+- **A `call *%rax` with `rax = 0` as the fault.** The dumps show a
+  `ret` popping a zeroed slot.
 - **The boot-time `pid 3` `num 7` fault as a `time true` signature.**
-  It occurs before any `time true` in the boot, on `pid 3` (the
-  shell), and its frame is different. Recorded in
-  `docs/open-issues.md`; do not fold into `time true`.
+  Recorded, not chased. Not `time true`.
+- **The `clear_child_tid` store in `process_exit` as a `^C` cause.**
+  `54e3b2d` (the `sys_execve` reset) is kept and the `^C` failure
+  was `939e3ef`, not `process_exit`.
 
-*Earlier, unchanged (see the 2026-11-04 evening and second-session
-sections in `git log` for the full list).*  Do not re-walk: the
-`cli` window; signal delivery as the zeroer; `memset` as the zeroer;
-the sysret slot arithmetic; "the slot flips `0x40B163`→0 in one
-process"; the three `exec_path` forms; `.bss`-not-zeroed;
-`0x448C6A`/`CR2=0x34` as the root cause (real, separate bug, fixed by
-`1bf2ca2`); `lbb_prepare`/`run_applet_and_exit`/`applet_main[rbx]`;
-the auxv; `set_tid_address`'s return; mmap; V3/V3b register
-inheritance; the `efc8e08` rsp split and `frame_kind`; the four
-uncommitted scheduler guards; the `EXIT-REFUSE frame-CS` guard; the
-canary `.text` `#PF` probe stack; the physical-address gates on
-`.text` PTE zeroing; the `f91d31a` claim; `exec_churn`'s KVM slowness
-is the console; `ata_poll_drq` spinning; `exec_churn` can measure the
-`sys_fork` eager-copy cost; the `perf kvm stat record` `double free`
-is a donix issue; the 2026-11-04 PTAUDIT "22 anomalies"; the
-2026-11-04 empty-low-half `vmm_create_address_space`; V3/V3b register
-zeroing; the missing auxv; `static_init_tls` at `0x40FBC0` as a
-`call *%rax`; `kmain.c`'s self-tests map over the ELF text page.
+*Earlier, unchanged.*  Do not re-walk: the `cli` window; signal
+delivery as the zeroer; `memset` as the zeroer; the sysret slot
+arithmetic; "the slot flips `0x40B163`->0 in one process"; the three
+`exec_path` forms; `.bss`-not-zeroed; `0x448C6A`/`CR2=0x34` as the
+root cause (real, separate, fixed by `1bf2ca2`); `lbb_prepare` /
+`run_applet_and_exit` / `applet_main[rbx]`; the auxv;
+`set_tid_address`'s return; mmap; V3/V3b register inheritance; the
+`efc8e08` rsp split and `frame_kind`; the four uncommitted scheduler
+guards; the `EXIT-REFUSE frame-CS` guard; the canary `.text` `#PF`
+probe stack; the physical-address gates on `.text` PTE zeroing; the
+`f91d31a` claim; `exec_churn`'s KVM slowness; `ata_poll_drq` spinning;
+`exec_churn` can measure `sys_fork`'s eager-copy cost; the
+`perf kvm stat record` `double free` is a donix issue; the
+2026-11-04 PTAUDIT "22 anomalies"; the empty-low-half
+`vmm_create_address_space`; V3/V3b register zeroing; the missing auxv;
+`static_init_tls` at `0x40FBC0` as a `call *%rax`; `kmain.c`'s
+self-tests map over the ELF text page.
 
 ---
 
@@ -230,7 +214,11 @@ closes the terminal. Write to `/tmp/<name>.sh` with
 "$(dirname "$0")"` when the script is pasted.**
 
 **A block that writes a file must actually be run as its own paste.**
-Two steps, both explicit.
+Two steps, both explicit. **And a `/tmp/<name>.sh` file may be stale
+from an earlier session: re-write it in the same paste that runs it,
+or `cat` it and read before running.** This session committed a
+handoff under an obsolete message because the script in `/tmp` was
+old.
 
 **Never put a destructive git command inside a block that also runs
 diagnostics.** A `git checkout -- <file>` or `git restore` in a block
@@ -248,10 +236,9 @@ only honest multi-line count.
 that may abort.** It closes the terminal on the non-zero exit and
 hides the abort message, which is the signal. Use
 `python3 /tmp/patch.py ; git diff --stat` (semicolon) and read the
-`ABORT` line. The patch script's own `sys.exit(1)` is enough to
-signal failure; `set -e` on top of it is a trap. `set -e` **inside**
-a written script is fine and is the preferred style for the script
-itself; it is the *runner* that must not have it.
+`ABORT` line. `set -e` **inside** a written `/tmp/*.sh` script is
+fine and is the preferred style for the script itself; it is the
+*runner* pasted at the prompt that must not have it.
 
 **A one-run diagnostic on the FAILURE path beats three guesses.**
 When a branch or an address is in doubt, add the print, build, run
@@ -277,6 +264,13 @@ For a removal edit (`new` is a short, non-unique replacement), skip
 the post-check; the `count(old) == 1` pre-check plus a single
 `s.replace(old, new, 1)` is sufficient.
 
+**A conflict resolution is a patch script, not a hand edit.** The
+`<<<<<<<` / `=======` / `>>>>>>>` block is resolved by a Python
+script that extracts the `HEAD` side, deletes exactly the line(s) the
+revert removes, preserves the comment bytes byte-for-byte, then
+`git add` + `git revert --continue`. **The `grep -n` for the removed
+line after the commit is the proof the tree is what the build sees.**
+
 **The build is TWO steps.** `make -C 04_kernel_64bit
 FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
 hdd-single.img` builds the image. Running only the second copies a
@@ -289,12 +283,11 @@ before the next behavioral test.**
 
 **The patch-script write changes the mode of the file it writes in
 some environments.** A Python `open(..., "wb")` on the **same path**
-(not `os.replace`) is supposed to preserve inode and mode bits, but
-two files this session came out `755` after a patch script
-(`04_kernel_64bit/user_syscall.c`) and were fixed with `chmod 644`.
+is supposed to preserve inode and mode bits, but tracked `.c` and
+`.md` files have come out `755` after a patch script several times.
 **Verify `stat -c '%a'` before and after every patch script; if the
-mode is not `644` on a tracked `.c` or `.md` file, `chmod 644` as its
-own paste.**
+mode is not `644` on a tracked file, `chmod 644` as its own paste
+before staging.**
 
 **`nm` output moves between builds.** Re-run `nm` before using any
 address. **And the symbol at an address may be the *next* symbol, not
@@ -310,8 +303,8 @@ sibling together are the evidence.
 
 **gdb printf with no per-process marker is not evidence about a
 process.** `%rsp` is the same VA in every process; `$fs_base` is the
-same VA in every busybox process. **Print `pid` or `CR3` at every hit,
-or the lines are cross-process and the inference is invalid.**
+same VA in every busybox process. **Print `pid` or `CR3` at every
+hit, or the lines are cross-process and the inference is invalid.**
 `$fs_base` and `%rsp` alone are not sufficient. This is the single
 most expensive mistake this project has made.
 
@@ -327,8 +320,11 @@ screen, that is the `-S`, not a fault**). **`./run tcg` /
 **state which launcher was used.** Default cwd `/root`.
 
 **In-guest gate.** `cd /`, then `canary --full` (28/28) and
-`/root/scripts/test.sh` (57/57). **Use multiple `^Z`/`fg` cycles.**
-One is not always enough to reach an intermittent fault.
+`/root/scripts/test.sh` (57/57). **Plus the two shell tests this
+session added:** `sleep 100` then `^C` returns the prompt; `exit`
+from `ash` -> `donix>` -> `busybox sh` -> the ash prompt. **Use
+multiple `^Z`/`fg` cycles.** One is not always enough to reach an
+intermittent fault.
 
 ---
 
@@ -377,8 +373,8 @@ ready and verified.** `origin/dev` is not force-pushed; every unpushed
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `8dc6f99`; its parents are `153dda9`, `939e3ef`,
-`86c8864`, `ae97ae9`, `4312aab`. Ahead **29**, clean, **stash
+`dev` is at `52e1569`; its parents are `0f97048`, `e128c92`,
+`54e3b2d`, `6ca3690`, `8dc6f99`. Ahead **34**, clean, **stash
 present**. `origin/dev` = `ba56b3d`. Scratch tag
 `20261104-gettimeofday-time` on `5a3b65e`. Work is now
 pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
@@ -403,7 +399,7 @@ correct archive members, including directory members.**
 -- the honest base). **`time` builds, its vfork parent-reap path works,
 but `time`'s own startup still faults on a forked child; `time` is not
 usable as a command today.** See `docs/open-issues.md`'s
-"The `time true` fault, after the third-session fixes".
+"The `time true` fault, after the fourth-session reverts".
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -416,41 +412,43 @@ Concurrency rules: `docs/contract.md`. Open issues:
 ### Current baseline
 
 - `test.sh` **57/57**, `canary --full` **28/28** at every gate point
-  this session, on a fresh boot, after both code commits. **Re-run
-  both on a fresh boot before trusting them.**
+  this session, on a fresh boot. **Re-run both on a fresh boot before
+  trusting them.**
 - `date` prints `Thu Jan 1 00:00:44 UTC 1970`, `uptime` prints
   `up 0 min`, load `0.00` -- correct for donix.
 - `mktemp` works (both `/tmp/tmp.XXXXXX` forms).
-- `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
+- **`^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it; `fg`
   resumes. `^C` -> SIGINT reaches the foreground pgrp; the console
-  survives.
+  survives.** Verified in the fourth-session boot.
+- **`exit` from `ash` -> `donix>` (the musl_sh boot shell);
+  `busybox sh` at `donix>` -> the ash prompt.** Verified.
 - **`mkdir -p /b/c/d` succeeds silently**, `ls /b/c/d` empty,
   `mkdir /b` prints `File exists`, `mkdir ""` prints `No such file
   or directory`. `umask` returns `0022` and round-trips through
   `077` and `022`.
+- **`pipe7e` reaches `iter 4000` without a `#PF`** (`54e3b2d`).
 - **`time` is not usable**; `true` alone works; `time` (no args)
   prints usage. **`/usr/bin/TIME` and `/bin/true` do not exist.**
-- **`time true` and `time ls /` fault at `RIP 0`** in **two
-  signatures** (see `docs/open-issues.md`): `num 13` /
-  `rcx 0x44CC0D` / `+0x390`, and `num 218` / `rcx 0x44AC73` /
-  `+0x180`. The shell prints `Command terminated by signal 11` and
-  returns to the prompt. **No `CR2=0x34` fault since `1bf2ca2`.**
+- **`time true` faults** at the busybox-side signature (see
+  `docs/open-issues.md`). The shell prints `Command terminated by
+  signal 11` and returns to the prompt. **No `CR2=0x34` fault since
+  `1bf2ca2`.**
 - The C is not observed since the 2026-11-02 disk-path fixes; still
   open -- evidence, not a close.
 
 ### Next -- the highest-value work
 
-1. The `0x44cc0d` / `0x44ac73` probe with `$rsp` and the
-   `sys_execve` `serial_print`. Scoped in `docs/open-issues.md`.
-   **Two-branch decision** (`$rsp == rsp_init` -> busybox-only,
-   workaround; `$rsp != rsp_init` -> delivery-path fix).
+1. The pre-session `0x40FBC0` probe. Scoped in `docs/open-issues.md`.
+   **`hbreak *0x40fbc0` with `$rsp` and `$fs_base`, then a watchpoint
+   on the popped slot with `$rip`.**
 2. `sys_mkdir` `-ENOTDIR` vs `-EEXIST` for the file case.
 3. Item 10 SSE.
 4. Item 9 privilege model -- **with the "is this worth a session"
    note.**
 5. The `time` accounting bug (separate; do not fix with the `time
    true` fault).
-6. The `111 == 111` pipe equality -- recorded, not chased.
+6. The `^C` intermittence -- recorded, not diagnosed, race-shaped,
+   separate from `time true`.
 
 ### Refuted -- do NOT re-walk
 
@@ -460,12 +458,9 @@ this section is a pointer, not a duplicate.
 ### Open issues
 
 The full list is `docs/open-issues.md`. The numbered items are 9 (no
-privilege model) and 10 (no SSE save/restore). **The 2026-11-04 third
-session added the section "The `time true` fault, after the
-third-session fixes"** -- read that section before doing anything
-with `time`/`time true`. **The `$fs_base`-is-not-a-per-process-marker
-correction is in that section** and the working-style rule above has
-been updated to match.
+privilege model) and 10 (no SSE save/restore). **Read the section
+"The `time true` fault, after the fourth-session reverts" before doing
+anything with `time`/`time true`/`^C`/`busybox sh`.**
 
 ---
 
@@ -474,6 +469,9 @@ been updated to match.
 Kernel sources: `04_kernel_64bit/`. `capture.txt` is gitignored,
 overwritten each `./run` -- **copy it aside after any failure or pass
 you want to keep.**
+
+**`~/code/testme` is the `v0.6.19` reference tree (`ba56b3d`,
+tagged).** It is the known-good comparison. **Do not modify it.**
 
 **After a fresh image, one manual step:** the image stages
 `/bin/busybox` alone. To get the applet symlinks (including `/bin/sh`,
@@ -488,10 +486,9 @@ there) and creates the rest. That is expected; `ls /bin` is the
 check.
 
 **`/bin` contains only `busybox` and `sh`.** There is no `/bin/true`,
-`/bin/echo`, `/bin/cat`. **`time true` works because `true` is a
-busybox applet** -- but `time`'s own startup faults today, so `time
-true` is not a working test. `time /bin/true` fails at `f_open` with
-`FR_NO_FILE` -- the file does not exist. Use `/usr/bin/HELLO`,
+`/bin/echo`, `/bin/cat`. `time true` works because `true` is a
+busybox applet -- but `time`'s own startup faults today. `time
+/bin/true` fails at `f_open` with `FR_NO_FILE`. Use `/usr/bin/HELLO`,
 `/usr/bin/ECHO`, `/usr/bin/CAT` for real-file control tests.
 
 **`third_party/`** is **gitignored** -- do not commit edits to it.
@@ -525,7 +522,7 @@ commit object. Treat its guards as **refuted**.
 `9a36e76`, `ef090f4` (docs), and `ba56b3d` (version banner `v0.6.19`,
 tagged).
 
-**The 2026-11-04 commits (27, on top of `9b62951`):**
+**The 2026-11-04 commits (31, on top of `9b62951`):**
 
 - `5a3b65e` -- syscalls 96/201, tagged
   `20261104-gettimeofday-time`.
@@ -565,11 +562,18 @@ tagged).
 - `86c8864` -- docs: second-session handoff rewrite + open-issues
   patch.
 - `939e3ef` -- **`syscalls`: `sys_execve` -- set
-  `pcb->user_rsp = rsp_init`.**
+  `pcb->user_rsp = rsp_init`.**  **Reverted by `0f97048`.**
 - `153dda9` -- **`syscalls`: `sys_execve` -- 16-byte-align
-  `rsp_init` per SysV AMD64 ABI.**
+  `rsp_init` per SysV AMD64 ABI.**  **Reverted by `e128c92`.**
 - `8dc6f99` -- docs: open-issues -- third-session `time true` status
   and next probe.
+- `6ca3690` -- handoff: rewrite for the third session at `8dc6f99`.
+- `54e3b2d` -- **`syscalls`: `sys_execve` -- clear
+  `clear_child_tid` on execve.**  Fixes the `pipe7e` `#PF`.
+- `e128c92` -- **Revert of `153dda9`.**
+- `0f97048` -- **Revert of `939e3ef`.**
+- `52e1569` -- docs: open-issues -- fourth-session reverts, `pipe7e`
+  fix, gate gap.
 
 **Stash.** `stash@{0}`: "vfork 3b (wake arm + sys_vfork) +
 diagnostics; time true intermittent, not a complete fix." This is a
@@ -579,26 +583,25 @@ preserved diagnostic trail. **Do not drop, do not pop.**
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `8dc6f99` (parents `153dda9`,
-`939e3ef`, `86c8864`, `ae97ae9`, `4312aab`), ahead 29, clean, stash
-present, nothing pushed.** The 2026-11-04 third session landed two
-real `sys_execve` fixes -- **`939e3ef`** sets `pcb->user_rsp =
-rsp_init` (closes the busybox-side `0x40FBC0`/`+0x180` fault), and
-**`153dda9`** 16-byte-aligns `rsp_init` per SysV AMD64 ABI (moves the
-fault past `__libc_start_main` and into the applet-dispatch region).
-Both are gate-green (28/28 + 57/57). **`time true` still faults, in
-two signatures, both `RIP 0` from a `ret` popping a zeroed slot:
-`num 13` / `rcx 0x44CC0D` / `+0x390`, and `num 218` /
-`rcx 0x44AC73` / `+0x180`. The region between `fault_rsp` and
-`rsp_init` is zero in both.** **`time` is not usable today; `true`
-alone works; `time` with no args prints usage.** **NEXT: the
-`hbreak *0x44cc0d` / `hbreak *0x44ac73` probe with `$rsp` and
-`$fs_base`, plus a `serial_print` in `sys_execve` printing
-`rsp_init` / `self->user_rsp` / `self->kernel_stack_top[-9]` -- the
-`$rsp` vs `rsp_init` comparison decides whether the fix is a
-`third_party/` workaround or the delivery path.** **Read
-`docs/open-issues.md`'s section "The `time true` fault, after the
-third-session fixes" before doing anything with `time`.** Every
-earlier hypothesis is in the Refuted list. Read `docs/contract.md`
-and this file's NEXT before any code. **Do not move to `v0.6.20`
-until the user says so.**
+**`v0.6.19` is released; `dev` is at `52e1569` (parents `0f97048`,
+`e128c92`, `54e3b2d`, `6ca3690`, `8dc6f99`), ahead 34, clean, stash
+present, nothing pushed.** The 2026-11-04 fourth session landed
+**`54e3b2d`** (kept -- `sys_execve` clears `clear_child_tid` on
+exec, fixing the `pipe7e` kernel-mode `#PF`) and **reverted
+`939e3ef`** (`0f97048`) and **`153dda9`** (`e128c92`), because both
+moved the `time true` fault forward but broke the interactive shell:
+`939e3ef` broke `^C` on a foreground child, `153dda9` broke
+`busybox sh` re-entry. **The gate (`canary --full` 28/28 +
+`test.sh` 57/57) was green with both applied and covers neither shell
+behavior -- that is this session's lasting lesson.** Baseline
+verified in one boot: 28/28, 57/57, `^C` and `^Z`/`fg` work,
+`busybox sh` re-entry works, `pipe7e` reaches `iter 4000`, and
+`time true` faults at its pre-session busybox-side signature.
+**`time` is not usable.** **NEXT: the pre-session `0x40FBC0` probe
+with `$rsp` and `$fs_base`, then a watchpoint on the popped slot --
+read `docs/open-issues.md`'s "The `time true` fault, after the
+fourth-session reverts" first.** **Do not re-apply `939e3ef` or
+`153dda9` without the `^C` and `busybox sh` tests.** Every earlier
+hypothesis is in the Refuted list. Read `docs/contract.md` and this
+file's NEXT before any code. **Do not move to `v0.6.20` until the
+user says so.**
