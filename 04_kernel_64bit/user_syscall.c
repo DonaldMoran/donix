@@ -9172,9 +9172,9 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
  * specific test requires it.
  */
 long sys_set_tid_address(int* tidptr) {
-    (void)tidptr;
     pcb_t* current = process_get_current();
     if (!current) return 1;
+    current->clear_child_tid = (uint64_t)tidptr;
     return (long)current->pid;
 }
 

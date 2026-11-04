@@ -557,6 +557,33 @@ void __attribute__((noreturn)) process_exit(void) {
      */
     close_all_files(exiting);
 
+    /*
+     * clear_child_tid (set_tid_address, syscall 218).  Write 0 to
+     * the user VA the process registered, so a peer that is joining
+     * on it sees the exit.
+     *
+     * Done HERE, after close_all_files and before the state change,
+     * because:
+     *   - the process's own CR3 is still loaded (process_reclaim,
+     *     which swaps/frees the address space, has NOT run yet --
+     *     it runs at the bottom for the no-parent case, and in the
+     *     parent's sys_wait4 for the zombie case, where the child's
+     *     CR3 is gone).  The store must happen while the child's
+     *     own page tables are active.
+     *   - cli is held from the top of process_exit, so this is in
+     *     the same critical section as the rest of teardown.
+     *
+     * LIMIT: this rejects 0 and non-canonical-kernel VAs (>= 2^47,
+     * which a user VA cannot be), but it does NOT walk the page
+     * table.  A user that passes a canonical-but-unmapped VA would
+     * fault here.  Making this a safe copy_to_user-style store is a
+     * separate hardening; no current caller does that.
+     */
+    if (exiting->clear_child_tid != 0 &&
+        exiting->clear_child_tid < 0x0000800000000000ULL) {
+        *(volatile uint64_t*)exiting->clear_child_tid = 0;
+    }
+
     {
         serial_lock();
         #if TRACE_EXIT

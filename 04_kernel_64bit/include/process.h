@@ -418,6 +418,20 @@ typedef struct pcb {
      * clean.
      */
     uint64_t borrows_cr3;
+
+    /* Linux clear_child_tid (set_tid_address(2), syscall 218).
+     * The user VA passed to set_tid_address; the kernel writes 0
+     * there when this process exits, so a thread-joining peer sees
+     * the exit.  We are single-threaded and musl only reads the
+     * return value in __libc_start_main, so no current test
+     * depends on the clear -- this is correctness, not a fix for
+     * the time-true fault (open-issues has the record).
+     *
+     * APPENDED AT THE END, after borrows_cr3, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset, so a reused slot starts
+     * clean. */
+    uint64_t clear_child_tid;
 } pcb_t;
 
 /* Job-control helpers.  Defined in user_syscall.c.  Called from
