@@ -390,45 +390,60 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
 }
 
 /*
- * Build a fresh address space containing only the shared kernel
- * mappings: a new PML4 whose entries 256..511 are shallow-copied from
- * src_cr3 (the HHDM and kernel image, shared by design and never
- * remapped per-process), whose low half is empty, and whose recursive
- * entry points at the new PML4.
+ * Build the address space a freshly exec'd vfork child runs on:
+ * every kernel mapping preserved, no user mappings.
  *
- * This is the exec primitive.  vmm_clone_page_table deep-copies the
- * low half, which is right for fork (the child keeps the parent's
- * image) and wrong for exec on a vfork child: exec maps a new image
- * into the cr3, and inheriting the parent's user PTEs leaves a mixed
- * page table (some new pages, some parent pages, some entries the new
- * image's layout does not touch).  A fresh kernel-only space means
- * elf_load_into_process fills the low half from nothing.
+ * It is vmm_clone_page_table followed by unmapping the four user
+ * ranges.  The clone is what keeps the kernel mappings -- including
+ * the low 2 MB identity map vmm_init installs at PML4 index 0, which
+ * the fault handler and early boot structures live in.  An earlier
+ * version of this function built a PML4 with an empty low half and
+ * dropped that identity map; the child's first kernel access then
+ * faulted, the fault handler faulted in turn, and the machine
+ * triple-faulted and reset.  The clone-then-clear shape is the fix.
  *
- * Returns the new PML4 physical address, or 0 on allocation failure.
+ * The user pages cleared here are the parent's physical pages (the
+ * child borrowed them); the PTEs are zeroed but the pages are NOT
+ * freed -- the parent still owns them.  elf_load_into_process then
+ * fills the low half with the new image.
+ *
+ * stack_virt..stack_top and [0x8000200000, brk_virt) are the dynamic
+ * ranges, passed by the caller (sys_execve knows them from the pcb).
+ * The ELF (0x400000-0x600000) and mmap (0x8010000000-0x8010400000)
+ * ranges are fixed.
+ *
+ * Returns the new cr3, or 0 if the clone failed.
  */
-uint64_t vmm_create_address_space(uint64_t src_cr3) {
-    uint64_t new_pml4_phys = pmm_alloc_page_for_tables();
-    if (!new_pml4_phys) return 0;
+uint64_t vmm_create_address_space(uint64_t src_cr3,
+                                  uint64_t stack_virt, uint64_t stack_top,
+                                  uint64_t brk_virt) {
+    uint64_t new_cr3 = vmm_clone_page_table(src_cr3);
+    if (!new_cr3) return 0;
 
-    uint64_t* src_pml4 = (uint64_t*)phys_to_virt(src_cr3);
-    uint64_t* new_pml4 = (uint64_t*)phys_to_virt(new_pml4_phys);
-    memset(new_pml4, 0, PAGE_SIZE);
-
-    for (int i = 0; i < 512; i++) {
-        if (i == RECURSIVE_PML4_INDEX) continue;
-
-        uint64_t src_pml4e = src_pml4[i];
-        if (!(src_pml4e & PT_PRESENT)) continue;
-
-        /* High-half entries (HHDM, kernel image) are shared. */
-        if (i >= 256) {
-            new_pml4[i] = src_pml4e;
+    /* Fixed user ranges. */
+    const struct { uint64_t start, end; } fixed[] = {
+        { 0x0000000000400000ULL, 0x0000000000600000ULL },  /* ELF    */
+        { 0x0000008010000000ULL, 0x0000008010400000ULL },  /* mmap   */
+    };
+    for (size_t r = 0; r < sizeof(fixed)/sizeof(fixed[0]); r++) {
+        for (uint64_t va = fixed[r].start; va < fixed[r].end; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
         }
-        /* Low half stays zero; exec populates it. */
     }
 
-    new_pml4[RECURSIVE_PML4_INDEX] = new_pml4_phys | PT_PRESENT | PT_WRITE;
-    return new_pml4_phys;
+    /* Dynamic user ranges, if the caller supplied them. */
+    if (stack_virt && stack_top && stack_top > stack_virt) {
+        for (uint64_t va = stack_virt; va < stack_top; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
+        }
+    }
+    if (brk_virt > 0x0000008000200000ULL) {
+        for (uint64_t va = 0x0000008000200000ULL; va < brk_virt; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
+        }
+    }
+
+    return new_cr3;
 }
 
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
