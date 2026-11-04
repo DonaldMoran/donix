@@ -294,6 +294,21 @@ context_switch_resume:
     mov rax, [r12 + 0x30]
     mov cr3, rax
 
+    ; Restore the incoming process's FS base.  fs_base is per-process
+    ; state set by arch_prctl(ARCH_SET_FS) during musl's __init_tls.
+    ; context_switch_resume restores cr3 and the GPR frame but never
+    ; restored fs_base, so the next process to run clobbered it and
+    ; the previous one's next %fs-relative access (musl's errno load
+    ; in __syscall_ret at 0x448C6A) dereferenced a stale pointer --
+    ; the #PF with CR2=0x34 (errno's TLS offset) for every exec'd
+    ; musl binary.  wrmsr clobbers eax/edx/ecx, so it runs before
+    ; POP_ALL_GPRS.
+    mov rax, [r12 + 0x378]              ; next->fs_base (offset asserted in process.c)
+    mov rdx, rax
+    shr rdx, 32
+    mov ecx, 0xC0000100
+    wrmsr
+
     ; Restore from the saved frame. This unified path replaces the
     ; previous two-branch (user / kernel) dispatch.
     ;
