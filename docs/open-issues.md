@@ -1,7 +1,7 @@
 # Open issues
 
-**Last updated: 2026-11-03 (v0.6.19 documentation pass)** (HEAD on
-`dev` at `d69c2ab` plus the docs commits).
+**Last updated: 2026-11-04 (second session documentation pass)** (HEAD on
+`dev` after the `umask`/`mkdir` commit).
 This file lists **only open issues**.  Closed items
 are removed, not struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -139,26 +139,51 @@ remains: two empty files with the same name in different
 directories collide in `st_ino`, because `FILINFO` carries no
 parent -- see `fat_ino`.
 
-**`umask` (95) is unimplemented.**  `mkdir -p` calls it first and
-fails with `Unknown syscall: 95`, then mis-creates the tree; `mkdir`
-without `-p` works.  The fix is a real `sys_umask`: store a
-per-process mask (a `pcb_t` field, appended so the `_Static_assert`
-offsets do not move) and return the previous one; the FAT/`S_IFDIR`
-mode synthesis in `stat` already reports the standard `0755`, so the
-mask only needs to be stored for a caller that reads it back.  Small,
-self-contained, and it unblocks `mkdir -p` for scripts.  Read
-`sys_umask`/`sys_mkdir` before patching.
+**`umask` (95) is implemented.**  `sys_umask` stores the low nine
+mode bits in a `pcb_t.umask` field (appended after
+`clear_child_tid`, no asserted offset moves) and returns the
+previous mask, defaulting to `022` on first use because
+`process_initialize_pcb` zeroes the field.  FatFs has no mode
+store, so the mask is not persisted; `sys_mkdir` applies it to the
+mode it hands the driver, which is the honest extent.  Verified
+on the 2026-11-04 second session: `umask` prints `0022`,
+`umask 077` then `umask` prints `0077`, `umask 022` restores
+`0022`.  **This is a syscall-completion fix, not a mode store** --
+`chmod`/`chown` and item 9 remain the places a real mode store
+would land.
 
-**`sys_mkdir` returns `-EPERM` for an existing directory; it should
-be `-EEXIST`.**  busybox `tar` does `mkdir`, treats `EEXIST` as
-"already there, fine," and warns on any other errno, so `tar -xvf` of
-an archive with a directory member prints `tar: can't create
-directory 'src': Operation not permitted` even though the directory
-is created and the tree extracts correctly (`rc=0`, contents match).
-Correct POSIX: `-EEXIST` when the target exists and is a directory,
-`-ENOTDIR` when it exists as a file.  Cosmetic today; pair it with
-`umask` -- both are small syscall-completion fixes, neither touches
-FatFs.  Read `sys_mkdir` before patching.
+**`sys_mkdir` returns `-EEXIST` for an existing directory, and
+`mkdir -p` now works.**  `fat_mkdir` translates `FR_EXIST` to
+`-(long)17` before falling through to `fatfs_errno`, which still
+maps `FR_EXIST` to `-EPERM_` for every other FatFs caller; the
+translation is scoped to `mkdir` because `f_mkdir` is the only
+call in that function.  Separately, `sys_mkdir` returns
+`-EEXIST` for a resolved path of `"/"`: **the check must run
+before `strip_dot_prefix`**, which turns `"/"` into `"."` --
+`f_mkdir` rejects `"."` as `FR_INVALID_NAME`, and `fatfs_errno`
+maps that to `-ENOENT`.  A first attempt placed the check after
+the strip and was dead code; a one-run `serial_print` named it
+(`path='/' rr=0 resolved='/' post-strip "."`).  With both,
+`mkdir -p /b/c/d` succeeds silently, `ls /b/c/d` is empty,
+`mkdir /b` prints `File exists`, and `mkdir ""` still returns
+`-ENOENT`.  Correct POSIX for the file case (`-ENOTDIR` when the
+target exists as a file) is **not** implemented and is not
+covered by the `FR_EXIST` translation -- `f_mkdir` does not
+distinguish "exists as file" from "exists as directory" in the
+error it returns.  That refinement is open.
+
+**`set_tid_address` (218) `clear_child_tid` is implemented.**
+`sys_set_tid_address` keeps its return value (the current pid,
+which musl reads in `__libc_start_main`) and stores the user VA
+in `pcb_t.clear_child_tid`; `process_exit` (scheduler.c) writes
+`0` to `*clear_child_tid` after `close_all_files` and before the
+state change, while the exiting process's own CR3 is still
+loaded.  The store rejects `0` and non-canonical-kernel VAs but
+does **not** walk the page table, so a canonical-but-unmapped VA
+would fault there.  No current caller does that; making it a
+safe `copy_to_user`-style store is a separate hardening.  This
+is a real correctness fix and it is **not** the `time true`
+fault (see the next heading).
 
 **`tkill` (200) is implemented as `kill(tid, sig)`.**  Not an
 open issue; noted so it is not re-added.  busybox's `kill`
@@ -220,6 +245,17 @@ never explained.  Do not chase it as a signal bug and do not
 call it closed on one clean run: it is a standing question about
 the pipe wake counts, separate from signals.  If it reproduces
 as a hang, the ring's `P13` events are the place to read.
+
+**The 2026-11-04 second session observed the equality live.**
+The `RACE PROBE DUMP` on the runs that faulted `time true`
+reported `P12 calls: 714 refcount_gt1: 492 pipe_case: 222
+wake_fired: 86 wake_no_waiter: 111 writers_nonzero: 111`, with
+`total records` around 16.4M and 18.7M on the two boots.
+**`wake_no_waiter == writers_nonzero` at 111 == 111.**  It was
+seen during the same boot as the `time true` fault but that does
+not prove the two are related; it is recorded as a live
+observation of the standing question, not as a mechanism and not
+as a signal bug.  Do not chase it on this evidence alone.
 
 **Item 7a — the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not
@@ -386,6 +422,11 @@ or walk `elf_page_list` and unmap by VA from the list itself.
   window forks a child with pages the exec cleanup will neither
   unmap nor free.  Leak, not corruption; extend the cleanup row to
   the live bound, or unmap by VA from `elf_page_list`.
+- `sys_mkdir` does not distinguish "exists as file" from "exists
+  as directory": both come back from `f_mkdir` as `FR_EXIST`,
+  which `fat_mkdir` translates to `-EEXIST`.  POSIX wants
+  `-ENOTDIR` for the file case.  Cosmetic today; no caller in
+  the tree depends on the distinction.
 
 ## Also open -- verify
 
@@ -408,6 +449,17 @@ or walk `elf_page_list` and unmap by VA from the list itself.
   removed, or reordered means `kf[]` must be re-derived and
   `signal_deliver_frame` + `sys_rt_sigreturn` updated in the same
   commit.
+- `sys_mkdir`'s `"/"` check must stay **before** `strip_dot_prefix`.
+  `strip_dot_prefix` turns `"/"` into `"."`, `f_mkdir(".")` returns
+  `FR_INVALID_NAME`, and `fatfs_errno` maps that to `-ENOENT`; a
+  check placed after the strip never fires.  Moving the check, or
+  changing `strip_dot_prefix`'s handling of `"/"`, needs a
+  behavioral re-run of `mkdir -p`.
+- `fat_mkdir`'s `FR_EXIST -> -(long)17` translation is local to
+  `mkdir`.  `fatfs_errno`'s `FR_EXIST -> -EPERM_` is shared by every
+  other FatFs caller (`open(O_CREAT|O_EXCL)`, `rename`, `link`).
+  Do not move the translation into `fatfs_errno` without checking
+  every caller; that is a wider behavior change than `mkdir`.
 
 ## vfork child faults in musl startup (open, not fixed)
 
@@ -503,9 +555,9 @@ re-walk.**
   `AT_SECURE == 0`) and returns at `0x40B215`;
   `libc_start_main_stage2` (`0x44860B`) calls `main` through
   `%r12 = 0x413DA6`. **None of that is a call through 0.**
-  `sys_set_tid_address`'s `tidptr` gap is real (see the
-  `set_tid_address` entry above) and worth fixing on its own
-  merits, but it is not this fault.
+  `sys_set_tid_address`'s `tidptr` gap was real and has since
+  been implemented (`4312aab`, see the `set_tid_address` entry
+  above); it is still **not** this fault.
 - **`static_init_tls` at `0x40FBC0` is a `call *%rax`.** The
   symbol at `0x40FA40` is `__init_tls`; `0x40FBC0` is the
   instruction after `__init_tls`'s `set_tid_address` `syscall`
@@ -515,28 +567,45 @@ re-walk.**
   maps `0xFFFFFFFF82000000`. Neither touches `0x40FBC0`.
 
 **Next step: the `0x40FBC0` probe, with the corrected
-`exception_frame_t`.** `time true` has one signature left: `RIP 0`,
-`CR2 0`, `error 0x15`, `last syscall num 218`
-(`set_tid_address`), `last sysret rcx 0x40FBC0`, fault
-`RSP = g_user_rsp_save + 0x10`. The `__init_tls` `ret` at
-`0x40FBF0` pops 0 from `0x80000FBE28`; the `__set_thread_area`
-call frame below it is intact. This is **not** applet dispatch:
-the `lbb_prepare`/`run_applet_and_exit`/`applet_main[rbx]`
-candidates were refuted by objdump (the child never reaches
-`0x413a81`).
+`exception_frame_t`, scoped to the right frame.** The probe is
+still the way to name the zeroed-return writer, but the
+2026-11-04 second session's dumps showed **two distinct `time
+true` signatures, both live in one boot**, and the handoff's
+original description matches only the second:
 
-One `hbreak *0x40fbc0` printing `slot=%lx rsp=%lx fs=%lx` for
-`*(unsigned long*)0x80000fbe28`, `$rsp`, `$fs_base`, per process.
-Then a **watchpoint** on `0x80000fbe28` with `$rip` and
-`info registers rdi rsi rdx` at the hit, if the slot is correct at
-sysret. A silent breakpoint is itself a result.
+- **the busybox-side signature** (`pcb pid/name: N busybox`):
+  `RSP = 0x80000FBFA0 = g_user_rsp_save + 0x180`, and the
+  `__init_tls` call frame is **intact** at `rsp-0x18 = 0x40FBA0`,
+  `rsp-0x20 = 0x4659FE`, `rsp-0x28 = 0x80000FBFE8`,
+  `rsp-0x30 = 0x80000FBFF8`.  The `ret` that popped 0 is **above**
+  `__init_tls`'s return, in `__init_libc`'s call chain.  A
+  breakpoint at `0x40FBC0` fires for this process, shows the slot
+  correct, and the fault happens later -- one frame too low.
+- **the true-side signature** (`pcb pid/name: N true`):
+  `RSP = 0x80000FBE30 = g_user_rsp_save + 0x10`, the
+  `__init_tls` call frame intact below the fault, matching the
+  original "the `__init_tls` `ret` at `0x40FBF0` pops 0 from
+  `0x80000FBE28`".  The `0x40FBC0` breakpoint is the right probe
+  for **this** one.
+
+Both signatures show `last syscall num 218` and `last sysret rcx
+0x40FBC0`; they differ in fault RSP and in which `ret` popped 0.
+A probe at `0x40FBC0` must print a per-process marker (`$fs_base`
+or pid) so the two are not confused, and the **last** `PROBE`
+line before the fault is the one to read.  A watchpoint on the
+slot that was popped then names the writer, with `$rip` and
+`rdi/rsi/rdx` at the hit.
+
+**A silent breakpoint is itself a result.** If `0x40FBC0` does
+not fire before a `true`-side fault, the writer is before the
+sysret, in `__init_libc`/`_start`/`rsp_init`.
 
 **Not vfork.** The vfork work (V2, V1, exec cr3 swap, wake arm,
 auxv) is complete and correct; the parent-reap path works end to
 end. See the vfork heading above for the closed record.
 
 
-## Two history corrections from the 2026-11-04 evening session
+## Three history corrections from the 2026-11-04 evening session
 
 **`time /bin/true` never worked, and "no fault" was not an
 improvement.** `/bin` contains only `busybox` and `sh`; there is no
@@ -566,3 +635,40 @@ must be read with that in mind.
 `CR2=0x34` / `RIP=0x448C6A` (`__errno_location`) fault was the
 per-process TLS base not being restored on context switch. It is
 gone. It was **not** the `time true` fault, which survived it.
+
+
+## Two measurement corrections from the 2026-11-04 second session
+
+**The handoff's `argv_scratch` item is mis-stated and is closed.**
+The handoff's NEXT item 3 said
+"`sys_execve`'s `argv_scratch[64][256]` = 16 KB on a 16 KB
+`PROC_STACK_SIZE` stack."  Measured: `objdump -d kernel.elf`
+shows `sys_execve`'s frame is `sub $0x1a68,%rsp` = **6760 bytes**
+of `PROC_STACK_SIZE` = 16384; `EXEC_MAX_ARGC` is 16 and
+`EXEC_MAX_ARG_LEN` is 256, so `argv_scratch` is **16 * 256 = 4096
+bytes**, not 16 KB and not `[64][256]`; and the 16 KB array
+(`EXEC_MAX_ENVC * EXEC_MAX_ARG_LEN`) is `envp_scratch`, which is
+**already `kmalloc`'d** (`user_syscall.c:5845-5849`).  There is
+no 16 KB stack overflow in `sys_execve` to fix.  Moving
+`argv_scratch` to the heap would save 4 KB of a 9624-byte margin
+and is defensible for symmetry with `envp_scratch`, but it is
+**not** the fix the item named; if it is ever done, its commit
+message must say so.
+
+**The `mkdir("/")` check must run before `strip_dot_prefix`.**
+The first attempt at the `mkdir -p` unblock checked
+`local_path[0] == '\0'` **after** `strip_dot_prefix`, on the
+theory that `strip_dot_prefix("/")` leaves `""`.  A one-run
+`serial_print` showed it does not: `path='/' rr=0(+) resolved='/'
+user_first=47` and then `post-strip local_path='.' user_first=47`.
+`strip_dot_prefix` turns `"/"` into `"."`, `f_mkdir(".")` returns
+`FR_INVALID_NAME`, `fatfs_errno` maps that to `-ENOENT`, and
+busybox `mkdir -p` treats `-ENOENT` as "parent missing" and stops
+with `can't create directory '/': No such file or directory`.
+The fix is the check before the strip, on `'/'` followed by
+`'\0'` -- see the `sys_mkdir` entry above.  **The general lesson,
+which belongs next to the working-style rules, is that a
+diagnostic on the failure path named the failing call in one run,
+after three guesses had failed.**  `set -e` in the runner also
+closed the terminal on the abort; the abort itself was the useful
+signal and must be visible.
