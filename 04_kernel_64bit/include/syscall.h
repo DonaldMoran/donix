@@ -191,6 +191,7 @@
 #define SYS_FCHMOD          91
 #define SYS_CHOWN           92
 #define SYS_FCHOWN          93
+#define SYS_UMASK           95
 #define SYS_SYSINFO          99
 #define SYS_GETUID          102
 #define SYS_GETGID          104

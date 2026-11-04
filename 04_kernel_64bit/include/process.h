@@ -432,6 +432,18 @@ typedef struct pcb {
      * process_initialize_pcb's memset, so a reused slot starts
      * clean. */
     uint64_t clear_child_tid;
+
+    /* umask(2), syscall 95.  Stored and returned; NOT consulted by
+     * FatFs, which has no mode store.  sys_mkdir applies it to the
+     * mode it passes the driver, so a caller that reads back its
+     * umask and a caller that inspects a created directory see
+     * consistent values -- but the directory's mode is still the
+     * synthesized 0755/0644, because FAT has nowhere to keep it.
+     *
+     * APPENDED AT THE END, after clear_child_tid, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset. */
+    uint32_t umask;
 } pcb_t;
 
 /* Job-control helpers.  Defined in user_syscall.c.  Called from

@@ -4374,6 +4374,14 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
 /* The FatFs mkdir operation, moved out of sys_mkdir. */
 static long fat_mkdir(const char* local_path) {
     FRESULT r = f_mkdir(local_path);
+    /* Linux wants -EEXIST (17) when the name exists, not -EPERM.
+     * Translated here, not in fatfs_errno, so the change is scoped
+     * to mkdir: fatfs_errno's FR_EXIST -> -EPERM_ is shared by
+     * every FatFs caller.  The literal 17 follows the note above
+     * this function; the tree has no EEXIST_ define. */
+    if (r == FR_EXIST) {
+        return -(long)17;
+    }
     if (r != FR_OK) {
         return fatfs_errno(r);
     }
@@ -4404,13 +4412,26 @@ long sys_mkdir(const char* path, int mode) {
         }
         local_path[i] = '\0';
     }
+    /* A resolved path of "/" is the root, and the root exists.
+     * This MUST be checked before strip_dot_prefix, which turns
+     * "/" into "." -- f_mkdir rejects "." as FR_INVALID_NAME and
+     * fatfs_errno maps that to -ENOENT, so without this branch
+     * mkdir("/") reports "no such file or directory" for the
+     * root.  busybox mkdir -p calls mkdir on every path prefix
+     * including "/", and treats -EEXIST as "already there,
+     * fine"; -ENOENT made it stop with "can't create directory
+     * '/': No such file or directory".  (Verified by a one-run
+     * serial_print: path='/', rr=0, resolved='/', and after
+     * strip_dot_prefix local_path was ".". ) */
+    if (local_path[0] == '/' && local_path[1] == '\0') {
+        return -(long)17;  /* EEXIST */
+    }
+
     strip_dot_prefix(local_path);
 
     if (local_path[0] == '\0') {
-        /* An empty path is not a valid path on any Unix.  Linux
-         * returns -ENOENT from mkdir("") too.  The early return
-         * keeps an empty-path call out of the FatFs diagnostic
-         * path. */
+        /* mkdir("") is -ENOENT, as on Linux.  The root case was
+         * handled above, before strip_dot_prefix. */
         return -(long)ENOENT_;
     }
 
@@ -9179,6 +9200,35 @@ long sys_set_tid_address(int* tidptr) {
 }
 
 /*
+ * Linux x86_64 umask(2) -- syscall 95.
+ *
+ * Store the new mask and return the previous one.  Only the low
+ * nine mode bits are meaningful (0777); the rest are dropped, as
+ * on Linux.
+ *
+ * FatFs has no mode store, so the mask is not persisted anywhere
+ * a later stat() could read it.  sys_mkdir applies it to the mode
+ * it hands the driver, which is the honest extent: a caller that
+ * reads its own umask back gets the value it set, and a directory
+ * created with a restrictive umask is still 0755 on disk because
+ * there is nowhere to record the difference.  See the pcb_t
+ * field comment.
+ *
+ * Default is 022, set here on first use because
+ * process_initialize_pcb zeroes the field.  Matching Linux's
+ * default matters for mkdir -p, which busybox calls first.
+ */
+long sys_umask(int mask) {
+    pcb_t* current = process_get_current();
+    if (!current) return -(long)EFAULT_;
+    uint32_t new_mask = (uint32_t)(mask & 0777);
+    uint32_t old_mask = current->umask;
+    if (old_mask == 0) old_mask = 022;
+    current->umask = new_mask;
+    return (long)old_mask;
+}
+
+/*
  * Linux x86_64 kill(2) -- syscall 62.
  *
  * Slice 1 of docs/signal-design.md: set the target's pending bit
@@ -12276,6 +12326,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
         case SYS_RENAME:          result = (uint64_t)sys_rename((const char*)arg0, (const char*)arg1); break;
         case SYS_MKDIR:           result = (uint64_t)sys_mkdir((const char*)arg0, (int)arg1); break;
+        case SYS_UMASK:           result = (uint64_t)sys_umask((int)arg0); break;
         case SYS_RMDIR:           result = (uint64_t)sys_rmdir((const char*)arg0); break;
         case SYS_UNLINK:          result = (uint64_t)sys_unlink((const char*)arg0); break;
 
