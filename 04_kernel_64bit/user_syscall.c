@@ -11667,6 +11667,28 @@ long sys_vfork(void) {
     parent->state      = PROC_STATE_BLOCKED;
     parent->block_kind = BLOCK_KIND_VFORK;
     parent->wait_pid   = child->pid;
+    /*
+     * Save the live caller-saved GPRs before yielding.
+     *
+     * context_switch.asm's ring-0 save path persists only the
+     * six callee-saved GPRs; on resume it loads all 15 from the
+     * PCB, so rax..r11 come from whatever is in the PCB slots.
+     * Every other block site in this file (console_read, pipe
+     * read, pipe write) writes those slots from the live
+     * registers before process_yield.  sys_vfork did not, so a
+     * vfork parent resumed with rax..r11 zeroed and ran the
+     * rest of sys_vfork on that register file.  V1 fix; see
+     * handoff.md, NEXT item 1.
+     */
+    __asm__ volatile("movq %%rax, %0" : "=m"(parent->rax) :: "memory");
+    __asm__ volatile("movq %%rcx, %0" : "=m"(parent->rcx) :: "memory");
+    __asm__ volatile("movq %%rdx, %0" : "=m"(parent->rdx) :: "memory");
+    __asm__ volatile("movq %%rsi, %0" : "=m"(parent->rsi) :: "memory");
+    __asm__ volatile("movq %%rdi, %0" : "=m"(parent->rdi) :: "memory");
+    __asm__ volatile("movq %%r8,  %0" : "=m"(parent->r8)  :: "memory");
+    __asm__ volatile("movq %%r9,  %0" : "=m"(parent->r9)  :: "memory");
+    __asm__ volatile("movq %%r10, %0" : "=m"(parent->r10) :: "memory");
+    __asm__ volatile("movq %%r11, %0" : "=m"(parent->r11) :: "memory");
     scheduler_ready_queue_remove(parent);
     __asm__ volatile("sti");
     process_yield();
