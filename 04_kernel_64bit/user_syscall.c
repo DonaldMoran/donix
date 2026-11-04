@@ -6314,6 +6314,17 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
     self->user_rsp    = rsp_init;
+    /* clear_child_tid is a per-address-space registration:
+     * the VA is meaningful only in the address space that
+     * set it.  execve replaces the address space, so the
+     * old VA (if any) is stale and must not be written on
+     * exit.  The new program's __init_tls calls
+     * set_tid_address again and sets it fresh.  Without this
+     * reset, the exec'd process carries the pre-exec VA into
+     * its new CR3, and process_exit's store faults when that
+     * VA is unmapped there (pipe7e, CR2 0x4087D0, kernel
+     * #PF error 0x2). */
+    self->clear_child_tid = 0;
     /* True vfork wakes the parent on exec.  Exit already wakes via
      * process_wake_parent_if_waiting (scheduler.c:624); this is the
      * exec half.  Under the cli execve opened with; the waker only
