@@ -986,7 +986,7 @@ void process_start(pcb_t* process) {
 }
 
 void process_cleanup_elf_pages(pcb_t* pcb) {
-    if (!pcb || !pcb->elf_page_list) return;
+    if (!pcb || pcb->borrows_cr3 || !pcb->elf_page_list) return;
     for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
         uint64_t phys = pcb->elf_page_list[i];
         if (phys) pmm_free_page(phys);
@@ -1001,7 +1001,7 @@ void process_reclaim(pcb_t* pcb) {
     if (pcb->state == PROC_STATE_UNUSED) return;
 
     process_cleanup_elf_pages(pcb);
-    process_free_clone(pcb->cr3);
+    if (!pcb->borrows_cr3) process_free_clone(pcb->cr3);
     pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
@@ -1067,7 +1067,7 @@ void process_reclaim(pcb_t* pcb) {
 void process_destroy(pcb_t* pcb) {
     if (!pcb || pcb->state == PROC_STATE_UNUSED) return;
     process_cleanup_elf_pages(pcb);
-    process_free_clone(pcb->cr3);
+    if (!pcb->borrows_cr3) process_free_clone(pcb->cr3);
     pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);

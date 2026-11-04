@@ -390,6 +390,24 @@ typedef struct pcb {
     /* Declarations for the helpers (defined in user_syscall.c next
      * to signal_default_action).  They are declared in this header
      * so process.c and the probe's compile-time view agree. */
+
+    /*
+     * Set by sys_vfork: the child shares its parent's cr3 and does
+     * not own the pages it runs on.  process_cleanup_elf_pages and
+     * the process_free_clone call sites in process_reclaim and
+     * process_destroy must skip their frees when this is set, or a
+     * vfork child's exit frees the parent's live address space.
+     *
+     * APPENDED AT THE END, after shebang_depth, so no offset the
+     * _Static_assert block pins moves.  Same rule as cwd,
+     * fault_signal, signal_restorer, wake_tick, and the
+     * job-control fields.  A bool, not a refcount: a vfork parent
+     * blocks until its single child execs/exits, so there is never
+     * a second borrower.  Zero-initialized by
+     * process_initialize_pcb's memset, so a reused slot starts
+     * clean.
+     */
+    uint64_t borrows_cr3;
 } pcb_t;
 
 /* Job-control helpers.  Defined in user_syscall.c.  Called from
