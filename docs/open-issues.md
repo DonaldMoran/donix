@@ -458,3 +458,81 @@ for several turns.  The pages are busybox's own image.
 `user_syscall.c` cr3 swap + wake) is in `stash@{0}`, message
 "vfork 3b ... not a complete fix".
 
+
+## busybox applet dispatch faults after exec (open, next session's first work)
+
+**Filed 2026-11-04, at `325e85b`.** This is the `time true`
+fault, narrowed through eight commits and one revert.
+
+**What `time true` does now.** The shell's `time` vforks a
+child; the child execs busybox `time`; `time_main` vforks again
+to run `true`; that second child execs `true`. The **first**
+child is fine: it runs `_start` -> `__init_libc` ->
+`__init_tls` -> `main` -> `time_main`, and `time_main` prints a
+wall time when the second child dies. **The second child is the
+one that faults**: it runs `_start` -> `__init_libc` ->
+`__init_tls` -> `set_tid_address` -> `__init_libc`'s
+not-setuid return path -> `libc_start_main_stage2` -> `call
+*%r12` with `%r12 = 0x413DA6` (main, non-zero) -> `main` ->
+`lbb_prepare` (`0x4139F6`) -> `bb_basename(argv[0])` ->
+`run_applet_and_exit` (`0x413A93`), and **the `call *%rax`
+with `rax = 0` is in one of those last three.** The fault is
+`RIP 0`, `CR2 0`, `error 0x15` (present + user + fetch), and the
+PTE walked is **VA 0's identity-map page** (`pte = 0x3`,
+`phys = 0`, supervisor-only) -- the child transferred control to
+VA 0.
+
+**What is REFUTED by this session's disassembly -- do not
+re-walk.**
+
+- **The V3/V3b register zeroing was the fault.** With
+  `c1bd883`/`f57299b` the fault was `0x453DC5`; with them
+  reverted (`325e85b`) it is back at `RIP 0` after
+  `__init_tls`. The zeroing was **masking** `__init_tls`, not
+  fixing anything. The revert is the Linux vfork contract
+  (child gets the parent's registers) and is kept.
+- **The missing auxv is the fault.** `a10e585` writes the auxv;
+  the stack dump shows `AT_PHDR = 0x400040`, `AT_PHENT = 0x38`,
+  `AT_ENTRY = 0x413882`, `AT_RANDOM`, `AT_NULL` in place.
+  `__init_libc` reads it and proceeds. The fault is unchanged.
+- **`sys_set_tid_address` is the fault.** `__init_tls`
+  (`0x40FA40`, **not** `static_init_tls`) calls
+  `set_tid_address(&0x46AA20)` at `0x40FBB4` and returns at
+  `0x40FBC3`; `__init_libc` (`0x40B060`) takes the "not setuid"
+  path (`AT_UID == AT_EUID`, `AT_GID == AT_EGID`,
+  `AT_SECURE == 0`) and returns at `0x40B215`;
+  `libc_start_main_stage2` (`0x44860B`) calls `main` through
+  `%r12 = 0x413DA6`. **None of that is a call through 0.**
+  `sys_set_tid_address`'s `tidptr` gap is real (see the
+  `set_tid_address` entry above) and worth fixing on its own
+  merits, but it is not this fault.
+- **`static_init_tls` at `0x40FBC0` is a `call *%rax`.** The
+  symbol at `0x40FA40` is `__init_tls`; `0x40FBC0` is the
+  instruction after `__init_tls`'s `set_tid_address` `syscall`
+  -- its `ret`.
+- **`kmain.c`'s self-tests map over the ELF text page.**
+  `kmain.c:550` maps `0x40000000` and unmaps it; `kmain.c:707`
+  maps `0xFFFFFFFF82000000`. Neither touches `0x40FBC0`.
+
+**Next step: the `lbb_prepare` (`0x4139F6`) and
+`run_applet_and_exit` (`0x413A93`) disassembly.** The
+`call *%rax` with `rax = 0` is in one of them. Two likely
+shapes:
+
+- **`run_applet_and_exit` returns 0** -- the applet name
+  (`bb_basename(argv[0])`) did not match the applet table, and
+  `main` calls through the returned 0. That would point at the
+  exec'd child's `argv[0]` -- i.e. `sys_execve`'s argv layout,
+  which the auxv work has already touched.
+- **`lbb_prepare` calls through a function pointer** -- a
+  `getauxval`-derived or `.rodata`-derived pointer that is 0.
+  That would point at a missing or unmapped `.rodata` page, or
+  at a `getauxval` value we do not supply (e.g. `AT_PLATFORM`,
+  `AT_HWCAP`).
+
+**The fix, once named, is one commit**, gated the same way
+(`canary` 28/28, `test.sh` 57/57, three `time true` trials).
+
+**Not vfork.** The vfork work (V2, V1, exec cr3 swap, wake arm,
+auxv) is complete and correct; the parent-reap path works end to
+end. See the vfork heading above for the closed record.
