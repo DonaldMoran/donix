@@ -514,25 +514,55 @@ re-walk.**
   `kmain.c:550` maps `0x40000000` and unmaps it; `kmain.c:707`
   maps `0xFFFFFFFF82000000`. Neither touches `0x40FBC0`.
 
-**Next step: the `lbb_prepare` (`0x4139F6`) and
-`run_applet_and_exit` (`0x413A93`) disassembly.** The
-`call *%rax` with `rax = 0` is in one of them. Two likely
-shapes:
+**Next step: the `0x40FBC0` probe, with the corrected
+`exception_frame_t`.** `time true` has one signature left: `RIP 0`,
+`CR2 0`, `error 0x15`, `last syscall num 218`
+(`set_tid_address`), `last sysret rcx 0x40FBC0`, fault
+`RSP = g_user_rsp_save + 0x10`. The `__init_tls` `ret` at
+`0x40FBF0` pops 0 from `0x80000FBE28`; the `__set_thread_area`
+call frame below it is intact. This is **not** applet dispatch:
+the `lbb_prepare`/`run_applet_and_exit`/`applet_main[rbx]`
+candidates were refuted by objdump (the child never reaches
+`0x413a81`).
 
-- **`run_applet_and_exit` returns 0** -- the applet name
-  (`bb_basename(argv[0])`) did not match the applet table, and
-  `main` calls through the returned 0. That would point at the
-  exec'd child's `argv[0]` -- i.e. `sys_execve`'s argv layout,
-  which the auxv work has already touched.
-- **`lbb_prepare` calls through a function pointer** -- a
-  `getauxval`-derived or `.rodata`-derived pointer that is 0.
-  That would point at a missing or unmapped `.rodata` page, or
-  at a `getauxval` value we do not supply (e.g. `AT_PLATFORM`,
-  `AT_HWCAP`).
-
-**The fix, once named, is one commit**, gated the same way
-(`canary` 28/28, `test.sh` 57/57, three `time true` trials).
+One `hbreak *0x40fbc0` printing `slot=%lx rsp=%lx fs=%lx` for
+`*(unsigned long*)0x80000fbe28`, `$rsp`, `$fs_base`, per process.
+Then a **watchpoint** on `0x80000fbe28` with `$rip` and
+`info registers rdi rsi rdx` at the hit, if the slot is correct at
+sysret. A silent breakpoint is itself a result.
 
 **Not vfork.** The vfork work (V2, V1, exec cr3 swap, wake arm,
 auxv) is complete and correct; the parent-reap path works end to
 end. See the vfork heading above for the closed record.
+
+
+## Two history corrections from the 2026-11-04 evening session
+
+**`time /bin/true` never worked, and "no fault" was not an
+improvement.** `/bin` contains only `busybox` and `sh`; there is no
+`/bin/true` file. `sys_execve` reported `f_open(...) -> 4`
+(`FR_NO_FILE`) and the shell printed `can't execute '/bin/true': No
+such file or directory` and exited 127 -- **before any child
+existed**. It is not a control, not a fix, and not evidence about the
+`RIP 0` fault. The valid real-file controls are `/usr/bin/HELLO`,
+`/usr/bin/ECHO`, `/usr/bin/CAT`; all three fault, at `0x400221`,
+`0x4002EC`, `0x40039D` respectively, with the corrected
+`exception_frame_t`.
+
+**The one gdb run where `time true` succeeded was never reproduced.**
+It happened in a single run with an `hbreak` at `0x40FBC0` armed;
+later runs with the same breakpoint armed faulted. The cause is
+unknown. It is **not** an explanation of the fault, **not** a fix,
+and **must not** be cited as evidence that the fault is a race or
+that gdb masks it.
+
+**The `exception_frame_t` layout was the reason every earlier "fault
+site" was wrong.** The old struct began at `error_code`; the stubs
+push 15 GPRs first. `frame->rip` read `r14`, `frame->cs` read `r13`,
+`frame->rsp` read `r11`. Fixed by `fb188f0`; every dump before it
+must be read with that in mind.
+
+**`fs_base` was a separate, real bug, fixed by `1bf2ca2`.** The
+`CR2=0x34` / `RIP=0x448C6A` (`__errno_location`) fault was the
+per-process TLS base not being restored on context switch. It is
+gone. It was **not** the `time true` fault, which survived it.
