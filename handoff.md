@@ -7,8 +7,8 @@ session** -- ask for it when the current task needs it.
 
 **Last updated:** 2026-11-04 (evening), at the handoff commit itself.
 **`v0.6.19` is the last pushed release.** `dev` is the commit that
-added this file (`git log -1 --format=%h` to see it); its parent is
-`1bf2ca2`. `origin/dev` = `ba56b3d`. Ahead **21**, clean tree,
+added this line; its parent is `9cf7380`. `origin/dev` = `ba56b3d`.
+Ahead **23**, clean tree,
 **stash present** (`stash@{0}`: vfork 3b diagnostics; preserved, do
 not drop). No push, no tag this session; banner still `v0.6.19`.
 `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`). Scratch tag
@@ -273,8 +273,8 @@ ready and verified.** `origin/dev` is not force-pushed; every unpushed
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is the commit that added this file; its parent is `1bf2ca2`.
-Ahead **21**, clean, **stash present**. `origin/dev` = `ba56b3d`.
+`dev` is the commit that added this line; its parent is `9cf7380`.
+Ahead **23**, clean, **stash present**. `origin/dev` = `ba56b3d`.
 Scratch tag `20261104-gettimeofday-time` on `5a3b65e`. Work is now
 pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
 a gate is wanted it is set in this file before that release session,
@@ -367,6 +367,17 @@ Concurrency rules: `docs/contract.md`. Open issues:
   process slot flips" premise; the three `exec_path` forms;
   `.bss`-not-zeroed; `0x448C6A`/`CR2=0x34` as the `time true` root
   cause; `lbb_prepare`/`run_applet_and_exit`/`applet_main[rbx]`.
+- **NEW 2026-11-04 evening, corrections after the session closed:**
+  `time /bin/true` as a working control, and "no fault is an
+  improvement" -- there is no `/bin/true`; `f_open` returned
+  `FR_NO_FILE` and the shell exited 127 **before a child existed**.
+  Valid real-file controls are `/usr/bin/HELLO`, `/usr/bin/ECHO`,
+  `/usr/bin/CAT`; all three fault (`0x400221`, `0x4002EC`,
+  `0x40039D`). And the **one gdb run where `time true` succeeded**
+  -- never reproduced, cause unknown, **not** evidence of a race and
+  **not** a fix. Both are written out in
+  `docs/open-issues.md`, heading "Two history corrections from the
+  2026-11-04 evening session".
 
 ### Open issues
 
@@ -468,8 +479,8 @@ preserved diagnostic trail. **Do not drop, do not pop.**
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is the commit that added this file
-(parent `1bf2ca2`), ahead 21, clean, stash present, nothing pushed.**
+**`v0.6.19` is released; `dev` is the commit that added this line
+(parent `9cf7380`), ahead 23, clean, stash present, nothing pushed.**
 The 2026-11-04 evening session landed two real kernel fixes:
 **`fb188f0`** made `exception_frame_t` match the 20-slot stub frame
 (every earlier `#PF`/`#GP` dump had printed GPRs as `rip`/`cs`/`rsp`,
