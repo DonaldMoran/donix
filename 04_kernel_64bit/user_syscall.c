@@ -11672,6 +11672,16 @@ long sys_vfork(void) {
     process_yield();
     /* Resumed by the child's exec/exit wake. */
     parent->state = PROC_STATE_RUNNING;
+    /*
+     * Clear the block state.  process_wake_all_blocked skips any
+     * process whose block_kind != BLOCK_KIND_NONE, so a parent that
+     * left BLOCK_KIND_VFORK set on resume would never be woken by
+     * the 100 Hz tick for any later block.  wait_pid likewise: it
+     * names the child of the vfork that has now exec'd or exited.
+     * (V2 fix; see handoff.md, NEXT item 1.)
+     */
+    parent->block_kind = BLOCK_KIND_NONE;
+    parent->wait_pid   = 0;
 
     return (long)child->pid;
 }
