@@ -203,6 +203,8 @@
 #define SYS_TKILL           200
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_GETTIMEOFDAY    96
+#define SYS_TIME            201
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
 #define SYS_TGKILL          234

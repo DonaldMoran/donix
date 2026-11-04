@@ -8003,6 +8003,44 @@ long sys_uname(void* user_buf) {
  * point.  Reading it twice would be worse; this reads it once
  * into a local.
  */
+/*
+ * Linux x86_64 time(2) -- syscall 201.
+ *
+ * donix has no wall clock (see sys_clock_gettime).  time() reports
+ * the same g_ticks counter as seconds since boot: g_ticks / 100 at
+ * the 100 Hz PIT.  If user_tloc is non-NULL, the seconds are also
+ * stored there (Linux permits NULL).
+ */
+long sys_time(void* user_tloc) {
+    uint64_t ticks = g_ticks;               /* one read */
+    int64_t  secs  = (int64_t)(ticks / 100);
+    if (user_tloc) {
+        if (safe_copy_to_user(user_tloc, &secs, sizeof(secs)) != 0)
+            return -(long)EFAULT_;
+    }
+    return (long)secs;
+}
+
+/*
+ * Linux x86_64 gettimeofday(2) -- syscall 96.
+ *
+ * Fills struct timeval { int64 tv_sec; int64 tv_usec; } from the
+ * same g_ticks counter.  tv_usec = (g_ticks % 100) * 10000, i.e.
+ * 10 ms granularity -- the PIT resolution, reported honestly.
+ * tz (arg1) is obsolete and ignored; NULL tv is permitted.
+ */
+long sys_gettimeofday(void* user_tv, void* user_tz) {
+    (void)user_tz;
+    if (!user_tv) return 0;
+    uint64_t ticks = g_ticks;               /* one read */
+    struct { int64_t tv_sec; int64_t tv_usec; } tv;
+    tv.tv_sec  = (int64_t)(ticks / 100);
+    tv.tv_usec = (int64_t)((ticks % 100) * 10000);
+    if (safe_copy_to_user(user_tv, &tv, sizeof(tv)) != 0)
+        return -(long)EFAULT_;
+    return 0;
+}
+
 long sys_clock_gettime(int clk_id, void* user_ts) {
     if (!user_ts) return -(long)EFAULT_;
 
@@ -11942,6 +11980,8 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_ARCH_PRCTL:      result = (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1); break;
         case SYS_GETDENTS64:      result = (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2); break;
         case SYS_SET_TID_ADDRESS: result = (uint64_t)sys_set_tid_address((int*)arg0); break;
+        case SYS_GETTIMEOFDAY:    result = (uint64_t)sys_gettimeofday((void*)arg0, (void*)arg1); break;
+        case SYS_TIME:            result = (uint64_t)sys_time((void*)arg0); break;
         case SYS_CLOCK_GETTIME:   result = (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1); break;
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); result = 0; break;
         case SYS_TGKILL:          result = (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2); break;
