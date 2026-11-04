@@ -6017,7 +6017,25 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     {
         uint64_t argv_region_top    = new_user_stack_top;
-        uint64_t argv_region_bottom = argv_region_top - (16 * 1024);
+        /* SysV AMD64 ABI: rsp at the program entry point
+         * (_start) must be 16-byte aligned.  new_user_stack_top is
+         * 16-aligned (process.c:408-409), so argv_region_top -
+         * 16 KB is 16-aligned, and rsp_init (= argv_region_bottom
+         * - 8) is 8 mod 16 -- misaligned by 8.
+         *
+         * musl's _start does "pop %rsi" (argc) then "and -16, %rsp".
+         * With rsp_init misaligned by 8, "and -16" does nothing, so
+         * __libc_start_main's entry rsp is 8 bytes higher than on
+         * Linux, and every subsequent call's return address is 8
+         * bytes off from where musl's frame layout expects it.  A
+         * later ret then pops a slot that was never pushed (zeroed
+         * fresh stack), jumps to RIP 0 -- the time true fault.
+         *
+         * Subtract an additional 8 so rsp_init % 16 == 0.  The
+         * 8-byte gap at the top of the region is unused padding;
+         * nothing in the layout depends on the region being
+         * exactly 16 KB. */
+        uint64_t argv_region_bottom = argv_region_top - (16 * 1024) - 8;
 
         size_t array_bytes = ((size_t)argc + 1) * sizeof(uint64_t);
         size_t envp_bytes  = ((size_t)envc + 1) * sizeof(uint64_t);
