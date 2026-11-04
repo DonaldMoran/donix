@@ -802,7 +802,10 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         #endif
         return NULL;
     }
-    if (parent->block_kind != BLOCK_KIND_WAITPID) {
+    int _is_waitpid = (parent->block_kind == BLOCK_KIND_WAITPID);
+    int _is_vfork   = (parent->block_kind == BLOCK_KIND_VFORK &&
+                       parent->wait_pid == child->pid);
+    if (!_is_waitpid && !_is_vfork) {
         RACE_P11_WAKE_TRY(cpid, parent->pid, 4, parent->state,
                           parent->block_kind, parent->wait_pid);
         #if TRACE_WAKE
@@ -819,7 +822,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
 
     /* Match: parent->wait_pid == child->pid, or == (uint64_t)-1
        (wait for any child). */
-    if (parent->wait_pid != (uint64_t)-1 &&
+    if (_is_waitpid && parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
         RACE_P11_WAKE_TRY(cpid, parent->pid, 5, parent->state,
                           parent->block_kind, parent->wait_pid);
