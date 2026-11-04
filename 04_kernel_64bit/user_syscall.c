@@ -6295,6 +6295,7 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
+    self->user_rsp    = rsp_init;
     /* True vfork wakes the parent on exec.  Exit already wakes via
      * process_wake_parent_if_waiting (scheduler.c:624); this is the
      * exec half.  Under the cli execve opened with; the waker only
