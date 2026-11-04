@@ -389,6 +389,48 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
     return new_pml4_phys;
 }
 
+/*
+ * Build a fresh address space containing only the shared kernel
+ * mappings: a new PML4 whose entries 256..511 are shallow-copied from
+ * src_cr3 (the HHDM and kernel image, shared by design and never
+ * remapped per-process), whose low half is empty, and whose recursive
+ * entry points at the new PML4.
+ *
+ * This is the exec primitive.  vmm_clone_page_table deep-copies the
+ * low half, which is right for fork (the child keeps the parent's
+ * image) and wrong for exec on a vfork child: exec maps a new image
+ * into the cr3, and inheriting the parent's user PTEs leaves a mixed
+ * page table (some new pages, some parent pages, some entries the new
+ * image's layout does not touch).  A fresh kernel-only space means
+ * elf_load_into_process fills the low half from nothing.
+ *
+ * Returns the new PML4 physical address, or 0 on allocation failure.
+ */
+uint64_t vmm_create_address_space(uint64_t src_cr3) {
+    uint64_t new_pml4_phys = pmm_alloc_page_for_tables();
+    if (!new_pml4_phys) return 0;
+
+    uint64_t* src_pml4 = (uint64_t*)phys_to_virt(src_cr3);
+    uint64_t* new_pml4 = (uint64_t*)phys_to_virt(new_pml4_phys);
+    memset(new_pml4, 0, PAGE_SIZE);
+
+    for (int i = 0; i < 512; i++) {
+        if (i == RECURSIVE_PML4_INDEX) continue;
+
+        uint64_t src_pml4e = src_pml4[i];
+        if (!(src_pml4e & PT_PRESENT)) continue;
+
+        /* High-half entries (HHDM, kernel image) are shared. */
+        if (i >= 256) {
+            new_pml4[i] = src_pml4e;
+        }
+        /* Low half stays zero; exec populates it. */
+    }
+
+    new_pml4[RECURSIVE_PML4_INDEX] = new_pml4_phys | PT_PRESENT | PT_WRITE;
+    return new_pml4_phys;
+}
+
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
     uint64_t* pml4 = (uint64_t*)phys_to_virt(cr3);
     uint32_t pml4_idx = (virt >> 39) & 0x1FF;
