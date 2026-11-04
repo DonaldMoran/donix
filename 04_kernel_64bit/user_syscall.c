@@ -5910,6 +5910,35 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     /* ---- 5. Tear down the old address space, then load the new one. ---- */
+    /*
+     * vfork child exec: stop borrowing.  It needs its own address
+     * space before the new image is mapped.  elf_load_into_process
+     * maps into pcb->cr3 (it does not allocate a fresh one), so
+     * mapping into the parent's cr3 would overwrite the parent's
+     * PTEs.  Build a fresh kernel-only address space, and do NOT
+     * free the old one -- it is the parent's.  borrows_cr3 clears
+     * here; the clone is now owned, so the normal free/load below
+     * applies to it.
+     *
+     * KNOWN: vmm_clone_page_table deep-copies the low half, so the
+     * clone still contains the parent's user mappings outside the
+     * new image's segments.  That is a child-visible stale mapping
+     * (not a parent corruption -- separate PTEs) and is recorded as
+     * an open issue, not solved here.
+     */
+    if (self->borrows_cr3) {
+        uint64_t _fresh = vmm_create_address_space(self->cr3,
+                                                   self->user_stack_virt,
+                                                   self->user_stack_top,
+                                                   self->brk_virt);
+        if (!_fresh) {
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+        self->cr3 = _fresh;
+        self->borrows_cr3 = 0;
+    }
     exec_free_and_unmap_user_pages(self);
     self->user_stack_virt = 0;
     self->user_stack_phys = 0;
@@ -6130,6 +6159,12 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
+    /* True vfork wakes the parent on exec.  Exit already wakes via
+     * process_wake_parent_if_waiting (scheduler.c:624); this is the
+     * exec half.  Under the cli execve opened with; the waker only
+     * sets the parent READY + enqueues, no dispatch (contract
+     * #3/#4). */
+    process_wake_parent_if_waiting(self);
     self->rip         = entry;
     self->exit_status = 0;
     self->wait_pid    = 0;
