@@ -6003,13 +6003,128 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         uint64_t array_base    = argv_region_bottom;
         uint64_t envp_array_base = argv_region_bottom + array_bytes;
-        uint64_t strings_start = argv_region_bottom + array_bytes + envp_bytes;
+        uint64_t auxv_base = envp_array_base + envp_bytes;
+        uint64_t auxv_va   = auxv_base + 16;
+        uint64_t strings_start = auxv_va + 14 * 2 * 8;
 
         /*
          * Pack argv strings, then envp strings, growing up from
          * strings_start.  A single cursor so the two pools cannot
          * overlap.
          */
+        /*
+         * auxv.  musl's __init_libc reads the auxv that follows
+         * the envp NULL on the stack; without it AT_PHDR,
+         * AT_PHNUM, AT_ENTRY, and AT_RANDOM are all 0, and the
+         * startup path (static_init_tls, __libc_start_main)
+         * jumps or calls through a NULL that the missing auxv
+         * left there.  time true's post-V3b fault (RIP 0, CR2 0,
+         * error 0x15, rax 0, __clock_gettime / time_main on the
+         * stack) is that shape.
+         *
+         * Linux stack order: argc, argv[] pointers, NULL,
+         * envp[] pointers, NULL, auxv pairs, AT_NULL, then the
+         * strings above.  This block places the auxv at
+         * auxv_base = envp_array_base + envp_bytes (immediately
+         * after the envp pointer array's NULL, which is where
+         * musl's __init_libc starts walking), and strings_start
+         * is above the auxv so the strings cannot run into it.
+         * The overflow check auxv_base + 16 + 2*14*8 >
+         * argv_region_top bounds the auxv; the strings loop's
+         * own cursor + slen > argv_region_top bounds the
+         * strings.
+         *
+         * AT_RANDOM needs 16 bytes of seed; musl uses it for the
+         * stack canary and __randname.  g_ticks-seeded, non-
+         * cryptographic -- the honest limit donix has.
+         *
+         * HEAP, not stack: sys_execve's argv_scratch is 16 KB on
+         * a 16 KB PROC_STACK_SIZE stack, so this function has no
+         * room for another few hundred bytes of stack locals.
+         * envp_scratch is kmalloc'd for the same reason; this is
+         * the same pattern.  The first auxv attempt used stack
+         * arrays and the resulting overflow corrupted the iretq
+         * frame's SS slot, producing a #GP error 0x2BE0 in the
+         * kernel on test.sh.  Do not move these back to stack.
+         */
+        {
+            extern volatile uint64_t g_ticks;
+            enum {
+                A_NULL=0, A_PHDR=3, A_PHENT=4, A_PHNUM=5, A_PAGESZ=6,
+                A_BASE=7, A_ENTRY=9, A_UID=11, A_EUID=12, A_GID=13,
+                A_EGID=14, A_HWCAP=16, A_SECURE=23, A_RANDOM=25
+            };
+            /* 14 entries * 2 uint64 + AT_RANDOM's 16 seed bytes. */
+            uint8_t* _auxv_buf = (uint8_t*)kmalloc(2 * 14 * 8 + 16);
+            if (!_auxv_buf) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: kmalloc auxv failed\n");
+                #endif
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t* _rnd = (uint64_t*)_auxv_buf;
+            uint64_t* _auxv = (uint64_t*)(_auxv_buf + 16);
+            uint64_t _t = g_ticks;
+            _rnd[0] = _t * 0x9E3779B97F4A7C15ULL;
+            _rnd[1] = _t ^ 0x2545F4914F6CDD1DULL;
+            if (auxv_base + 16 + 2 * 14 * 8 > argv_region_top) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv region overflow\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t _rnd_va = auxv_base;
+            if (safe_copy_to_user_cr3(self->cr3, (void*)_rnd_va,
+                                      _rnd, 16) != 0) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv random write failed\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+
+            int _n = 0;
+            #define _AV(t, v) do { _auxv[_n++] = (uint64_t)(t); _auxv[_n++] = (uint64_t)(v); } while (0)
+            _AV(A_PHDR,   0x400000ULL + (uint64_t)ehdr.e_phoff);
+            _AV(A_PHNUM,  (uint64_t)ehdr.e_phnum);
+            _AV(A_PHENT,  (uint64_t)ehdr.e_phentsize);
+            _AV(A_ENTRY,  entry);
+            _AV(A_BASE,   0ULL);
+            _AV(A_PAGESZ, 4096ULL);
+            _AV(A_RANDOM, _rnd_va);
+            _AV(A_HWCAP,  0ULL);
+            _AV(A_UID,    0ULL);
+            _AV(A_EUID,   0ULL);
+            _AV(A_GID,    0ULL);
+            _AV(A_EGID,   0ULL);
+            _AV(A_SECURE, 0ULL);
+            _AV(A_NULL,   0ULL);
+            #undef _AV
+            size_t _auxv_bytes = (size_t)_n * sizeof(uint64_t);
+            if (safe_copy_to_user_cr3(self->cr3, (void*)auxv_va,
+                                      _auxv, _auxv_bytes) != 0) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv write failed\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            kfree(_auxv_buf);
+        }
+
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
         uint64_t env_vaddrs[EXEC_MAX_ENVC];
