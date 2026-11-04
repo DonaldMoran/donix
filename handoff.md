@@ -5,10 +5,10 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-04 (fourth session), at `52e1569`.
-**`v0.6.19` is the last pushed release.** `dev` is at `52e1569`; its
-parents are `0f97048`, `e128c92`, `54e3b2d`, `6ca3690`, `8dc6f99`.
-`origin/dev` = `ba56b3d`. Ahead **34**, clean tree, **stash present**
+**Last updated:** 2026-11-04 (fourth session), at `63cb81b`.
+**`v0.6.19` is the last pushed release.** `dev` is at `63cb81b`; its
+parents are `4b24e71`, `52e1569`, `0f97048`, `e128c92`, `54e3b2d`.
+`origin/dev` = `ba56b3d`. Ahead **36**, clean tree, **stash present**
 (`stash@{0}`: vfork 3b diagnostics; preserved, do not drop). No push,
 no tag this session; banner still `v0.6.19`. `main` = `7e4748b` (the
 `--no-ff` merge of `v0.6.19`). Scratch tag `20261104-gettimeofday-time`
@@ -22,11 +22,14 @@ behavior is in doubt, boot `testme` and compare.
 
 ## START HERE
 
-**Before doing anything else with `time`, `time true`, `^C`, or
-`busybox sh`, read `docs/open-issues.md`'s section "The `time true`
-fault, after the fourth-session reverts".** It names what is left,
-what the three reverts/fixes did, the gate gap, and the pre-session
-`0x40FBC0` probe that is the next step.
+**Before doing anything else with `time`, read
+`docs/open-issues.md`'s section "Why `time true` faults:
+`static_init_tls`".** It names the root cause: the static busybox
+has no `PT_PHDR` and no `_DYNAMIC`, so musl's `static_init_tls`
+computes `base = 0` and the TLS image copy faults. **The next work
+on `time` is the busybox link, not the `0x40FBC0` probe and not the
+kernel.** For `^C`/`busybox sh`, read the fourth-session section
+of `docs/open-issues.md`.
 
 **You do not need the conversation history.** You need this file's
 `WHERE WE ARE` and `NEXT` sections, and that one section of
@@ -92,18 +95,17 @@ Ahead **34**, clean, stash present. Nothing pushed this session.
 
 ## NEXT -- the highest-value work, in order
 
-1. **The `0x40FBC0` probe on the pre-session `time true` fault.**
-   This is the pre-session probe, restored by the reverts. Boot
-   `./run debug`, attach gdb, `hbreak *0x40fbc0` with `commands`
-   printing `slot=%lx rsp=%lx fs=%lx` for
-   `*(unsigned long*)0x80000fbe28`, `$rsp`, `$fs_base`, then
-   `continue`. Run `time true` until it faults. **The last PROBE line
-   before the fault, with its `$rsp`, names which slot is which.**
-   `$fs_base` is the same VA across busybox processes and is **not**
-   a per-process marker; `$rsp` and the fault dump's `pcb pid/name`
-   are the discriminators. Then a watchpoint on the popped slot
-   (`0x80000FBE28` true-side, or `rsp-0x10` of the busybox-side dump)
-   with `$rip` at the hit names the writer.
+1. **Fix the busybox link so the static binary has `PT_PHDR` (or a
+   real `_DYNAMIC`).** This is the `time` root cause: with no
+   `PT_PHDR` and no dynamic section, `static_init_tls` computes
+   `base = 0` and the TLS image copy faults. The musl `_DYNAMIC`
+   fallback is present in `third_party/musl-src/src/env/__init_tls.c`
+   but inoperative because `_DYNAMIC` is weak-undefined. The fix is
+   a binutils/linker-script change (emit `PT_PHDR` for the static
+   busybox, Alpine `binutils-ld-fix-static-linking.patch` style), or
+   a different linker -- **not a kernel change and not the
+   `0x40FBC0` probe.** Read `docs/open-issues.md`'s "Why `time
+   true` faults: `static_init_tls`" before starting.
 2. **`sys_mkdir` `-ENOTDIR` vs `-EEXIST`** for the file case.
    POSIX wants `-ENOTDIR` when the target exists as a file. Small,
    `sys_mkdir`-local; no current caller depends on it.
