@@ -11766,69 +11766,6 @@ long sys_vfork(void) {
      */
     process_fork_copy_frame(child, parent);
     /*
-     * V3: a vfork child resumes with a fork-shaped frame -- the
-     * parent's user RIP, RSP, and full register file -- because
-     * process_fork_copy_frame is fork's frame builder.  For fork
-     * that is the ABI: the child returns from the same syscall with
-     * the same registers.  For vfork it is wrong: the child is
-     * going to execve or _exit, and the parent's callee-saved
-     * registers are not meaningful in the child's continuation.
-     *
-     * Overwrite the six callee-saved slots with 0.  The
-     * open-issues entry's 0x4512E8 mov %r13,0x8(%r12) fault with
-     * %r12 == 0 is exactly the parent's r12 arriving in the child;
-     * the exec-handoff build's fault at the new image's first
-     * instructions showed the same register file empty (r12 == 0,
-     * r10 == the mallocng free poison).  Zeroing the callee-saved
-     * slots removes that inheritance.
-     *
-     * Do NOT touch rdi/rsi/rdx/r8/r9/r10: those are fork's
-     * caller-saved continuation registers; zeroing them is a
-     * separate decision and a separate commit.
-     */
-    {
-        uint64_t* _vf = (uint64_t*)(child->kernel_stack_top - 20 * 8);
-        /* process_fork_copy_frame's frame layout (POP_ALL_GPRS order):
-         *   f[0x00/8]=r15 f[0x08/8]=r14 f[0x10/8]=r13 f[0x18/8]=r12
-         *   f[0x40/8]=rbp f[0x68/8]=rbx  */
-        _vf[0x00 / 8] = 0;   /* r15 */
-        _vf[0x08 / 8] = 0;   /* r14 */
-        _vf[0x10 / 8] = 0;   /* r13 */
-        _vf[0x18 / 8] = 0;   /* r12 */
-        _vf[0x40 / 8] = 0;   /* rbp */
-        _vf[0x68 / 8] = 0;   /* rbx */
-        /*
-         * V3b: also zero the six caller-saved slots.  V3
-         * deliberately left them alone ('a separate decision and
-         * a separate commit'); this is that commit.
-         *
-         * The vfork child's continuation after this point is
-         * execve or _exit, exactly as with the callee-saved
-         * registers.  The caller-saved values it would inherit
-         * from the parent are not meaningful there either, and
-         * a stale one (the mallocng free poison 0x8080..8080 in
-         * r10, for example) can be read by musl's
-         * static_init_tls after the child execs into the new
-         * image.  The exec-handoff + V3 + wake build's
-         * time-true fault showed exactly that shape: last
-         * sysret target 0x40FBC0 inside static_init_tls,
-         * r10 == 0x8080808080808080, RIP 0 / CR2 0 / error
-         * 0x15.  Zeroing them removes the inheritance the same
-         * way V3 removed the callee-saved one.
-         *
-         * Frame slots from process_fork_copy_frame's layout:
-         *   f[0x28/8]=r10 f[0x30/8]=r9  f[0x38/8]=r8
-         *   f[0x48/8]=rdi f[0x50/8]=rsi f[0x58/8]=rdx
-         */
-        _vf[0x28 / 8] = 0;   /* r10 */
-        _vf[0x30 / 8] = 0;   /* r9  */
-        _vf[0x38 / 8] = 0;   /* r8  */
-        _vf[0x48 / 8] = 0;   /* rdi */
-        _vf[0x50 / 8] = 0;   /* rsi */
-        _vf[0x58 / 8] = 0;   /* rdx */
-    }
-
-    /*
      * Child inherits the parent's heap break so its brk region starts
      * where the parent's was.  The pages themselves are now copied
      * (see the eager-copy block above), so writes to the brk region
