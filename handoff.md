@@ -529,9 +529,10 @@ ready and verified.** `origin/dev` is not force-pushed; every unpushed
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `016b22f`; recent history `62b5433`, `711ac16`,
-`695c53c`, `2bba981`, `c8ef340`, `63cb81b`. Ahead **42**, clean
-except the untracked `toolchain (Copy)/`, **stash present**.
+`dev` is at `bb8c8b2`; recent history `6a6fb4d`, `4f48728`, `26c3bde`,
+`c3deb8e`, `62b5433`, `711ac16`, `695c53c`, `2bba981`, `c8ef340`,
+`63cb81b`. Ahead **47**, **clean** (no untracked entry; the
+`toolchain (Copy)/` dir was removed), **stash present**.
 `origin/dev` = `ba56b3d`. Scratch tag `20261104-gettimeofday-time`
 on `5a3b65e`. Work is now pre-`v0.6.20`. **There is no release gate
 recorded for `v0.6.20`; if a gate is wanted it is set in this file

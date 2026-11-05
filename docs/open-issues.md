@@ -743,7 +743,12 @@ for the `time true` re-exec path.**  The `CR2=0x34` / `RIP=0x448C6A`
 restored on context switch.  `1bf2ca2` fixed the general case; the
 fifth-session boot shows it is **back for `time true`**.  The
 fourth-session note "It was **not** the `time true` fault, which
-survived it" is **corrected**: it is the live `time true` fault now.
+survived it" is **corrected by the 5-boot count**: the
+`CR2=0x34` / `0x448C6A` signature did not appear in any of the 5
+boots, and the live signature is `CR2 = 0` / `RIP = 0` / `error =
+0x15`.  `fs_base` itself is **refuted** as the cause (`0x46A138`
+correct at every probe, every boot).  This paragraph is kept as
+history.
 
 **`$fs_base` is not a per-process marker.**  It is the same VA
 (`0x46a138`) in every busybox process; `%rsp` is the same VA across
