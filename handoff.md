@@ -49,23 +49,37 @@ The fourth-session claim that `static_init_tls` computes `base = 0`
    no TLS image to copy. **Do not patch `static_init_tls`'s `base`
    computation; it is dead code for this binary.**
 
-**The live `time true` fault, measured 2026-11-04 fifth session on
-the build of record:**
+**The live `time true` fault, measured across 5 boots (2026-11-04
+fifth session).**  The symptom is identical every boot; the last
+syscall before the fault is not.
 
-    #PF: CR2 = 0x34, RIP = 0x448C6A, error = 0x7 (present+user+write)
-         pte = 0x3 (present, writable), CS = 0x33
-         RSP = 0x80000FBF00, CR3 = 0x357000
-         auxv correct: AT_PHDR 0x400040, AT_ENTRY 0x413882,
-                       AT_PHNUM 7, AT_PHENT 0x38, AT_RANDOM present
-         argv/envp intact at rsp+0x1F0
+    boot 1: CR2=0 RIP=0 err=0x15  num=13  rcx=0x44CC0D  fs=0x46A138
+    boot 2: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 3: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 4: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 5: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
 
-This is the `__errno_location` / per-process `%fs`-base fault shape.
-`docs/open-issues.md` says the `CR2=0x34` / `RIP=0x448C6A` fault was
-fixed by `1bf2ca2` and is **not** the `time true` fault. **That is
-now disproven for the re-exec path:** it is the live `time true`
-signature. `1bf2ca2` did not close it for this path. The
-"do not re-walk `0x448C6A`/`CR2=0x34`" instruction is **withdrawn** --
-it is exactly what the next session must walk.
+The fault always ends in an instruction fetch from address 0: `CR2 = 0`,
+`RIP = 0`, error `0x15` (present+user+fetch), `fs_base` correct at
+`0x46A138`. This is a `ret` or jump through a register to a zeroed
+target -- a control target going to 0, not a data address.
+
+**The landing point moves through startup.** In 4/5 boots the last
+syscall was `218` (`set_tid_address`, return `0x40FBC0`, early
+`__init_tls`); in 1/5 it was `13` (`rt_sigaction`, return `0x44CC0D`,
+later in `__libc_start_main`). The corruption window is
+timing-dependent; a breakpoint at `0x40FBC0` would miss boot 1.
+
+`CR2 = 0x34` / `RIP = 0x448C6A` did not appear in any of the 5 boots;
+that trace is retired. The `num 13` / `0x44CC0D` trace is **live**, not
+stale -- boot 1 produced it on an unmodified tree.
+
+`context_switch.asm`'s `wrmsr` is faithful; the corruption is in the
+user stack or a user register around whichever syscall the child is in
+when the race lands. The next instrument is a kernel-side check on the
+user `RIP` about to be returned to, on both return paths, printing
+`pid`, the target `RIP`, and the user stack top when the target is
+zero -- not a breakpoint at a fixed landing point.
 
 **`busybox_unstripped` is stale and is not the build of record.**
 `third_party/busybox/busybox_unstripped` is 516232 bytes, sha
@@ -142,12 +156,15 @@ invocation in a boot where everything else passes.
 ## WHAT IS BROKEN
 
 - **`time true` / `time ls` fault** at the live signature:
-  `CR2 0x34`, `RIP 0x448C6A`, `error 0x7` (present+user+write),
-  `pte 0x3`. The shell prints `Command terminated by signal 11` and
+  `CR2 = 0`, `RIP = 0`, `error 0x15` (present+user+fetch), with
+  `fs_base` correct. The last syscall before the fault moves between
+  boots: `218` (`set_tid_address`, 4/5) or `13` (`rt_sigaction`,
+  1/5). The shell prints `Command terminated by signal 11` and
   returns to the prompt. **`time` is not usable as a command.**
-  The mechanism is **not** `static_init_tls` (no `PT_TLS` in the
-  build of record) and is **not** closed -- the `1bf2ca2` fault is
-  back for the re-exec path.
+  The mechanism is a `ret`/jump to a zeroed control target; it is
+  **not** `static_init_tls` (no `PT_TLS` in the build of record),
+  **not** `fs_base` (correct at every probe), and **not**
+  `context_switch.asm` (the `wrmsr` is faithful).
 - **`time`'s accounting is garbage**: `real` is plausible but `user`
   / `sys` print about `152710235h`. This is `getrusage`/`times`
   returning nonsense on donix -- **a kernel accounting bug, separate
@@ -633,22 +650,25 @@ preserved diagnostic trail. **Do not drop, do not pop.**
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `016b22f`, ahead 42, clean except
-the untracked `toolchain (Copy)/`, stash present, nothing pushed.**
-The fourth-session `static_init_tls` root cause is **refuted**: the
-fifth session refuted three fixes against it, and the build of record
-has **no `PT_TLS`**, so the `base` computation is dead code for this
-binary. **The live `time true` fault is `CR2 0x34` / `RIP 0x448C6A` /
-`error 0x7` (write) / `pte 0x3`** -- the `__errno_location` /
-`fs_base` shape, which `1bf2ca2` did **not** close for the re-exec
-path. `busybox_unstripped` is stale; the oracle is
-`busybox.elf` (== `third_party/busybox/busybox`). Baseline verified in
-one boot: `canary --full` 28/28, `test.sh` 57/57, `pipe7e` past
-`iter 1000`, `^C`/`^Z`/`fg` work, `busybox sh` re-entry works,
-`date`/`time` (no args) work, interactive applets do not need
-`--install`. **`time true` faults; `time` is not usable as a
-command.** The `time` accounting bug is separate and kernel-side.
-**NEXT: re-diagnose the live fault (one gdb run with `pid`/`CR3` at
-`0x448C6A`), or `sys_mkdir -ENOTDIR`, or SSE, or the privilege model
-(items 2-4 are independent of `time`).** Do not re-walk the refuted
-routes. **Do not move to `v0.6.20` until the user says so.**
+**`v0.6.19` is released; `dev` is at `9683cb9`, ahead 43, clean,
+stash present, nothing pushed.** The fourth-session `static_init_tls`
+root cause is **refuted**: three fixes failed against it, and the
+build of record has **no `PT_TLS`**, so the `base` computation is
+dead code. **A 5-boot count (2026-11-04 fifth session) measured the
+live `time true` fault: `CR2 = 0`, `RIP = 0`, `error 0x15`
+(fetch), `fs_base` correct at `0x46A138`.** It is a `ret`/jump to a
+zeroed control target. The last syscall before the fault moves:
+`218` (`set_tid_address`) in 4/5 boots, `13` (`rt_sigaction`) in 1/5.
+**`CR2 0x34` / `0x448C6A` did not appear in any of the 5 boots and is
+retired.** `busybox_unstripped` is stale; the oracle is
+`busybox.elf` (== `third_party/busybox/busybox`). Baseline verified:
+`canary --full` 28/28, `test.sh` 57/57, `pipe7e` past `iter 1000`,
+`^C`/`^Z`/`fg` work, `busybox sh` re-entry works, `date`/`time`
+(no args) work, interactive applets do not need `--install`.
+**`time true` faults; `time` is not usable as a command.** The
+`time` accounting bug is separate and kernel-side. **NEXT: the
+return-RIP instrument (a kernel-side check on the user RIP about to
+be returned to, both paths, printing `pid`/target RIP/user stack top
+when the target is zero), or `sys_mkdir -ENOTDIR`, or SSE, or the
+privilege model.** Do not re-walk the refuted routes. **Do not move
+to `v0.6.20` until the user says so.**

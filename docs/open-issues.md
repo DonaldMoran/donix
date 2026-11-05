@@ -447,7 +447,7 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ---
 
-## The live `time true` fault (2026-11-04, fifth session, corrected)
+## The live `time true` fault (2026-11-04, fifth session, 5-boot count)
 
 **The fourth-session "static_init_tls root cause" is refuted, twice.**
 This section replaces the fourth-session "Why `time true` faults"
@@ -512,40 +512,55 @@ Every `readelf`/`nm`/`objdump` diagnostic must use `busybox.elf`,
 not `busybox_unstripped`.  Several earlier `readelf` conclusions
 were drawn against the stale file.
 
-### The live fault
+### The live fault (5-boot count)
 
-Measured 2026-11-04 fifth session, on the build of record:
+A 5-boot count with kernel probes (pid, fs_base, MSR) on
+`sys_execve`, `sys_arch_prctl`, and `context_switch_resume` measured
+the live fault.  The `fs_base` hypothesis is dead: the base is
+correct at every point.
 
-    === PAGE FAULT (#PF) ===
-      CR2 (Bad Address) : 0x0000000000000034
-      Faulting RIP      : 0x0000000000448C6A
-      Raw Error Code    : 0x0000000000000007   (present+user+write)
-      CS                : 0x0000000000000033
-      RSP               : 0x00000080000FBF00
-      CR3               : 0x0000000000357000
-      pte               : 0x0000000000000003   (present, writable)
-    auxv on the child stack: AT_PHDR 0x400040, AT_ENTRY 0x413882,
-      AT_PHNUM 7, AT_PHENT 0x38, AT_RANDOM present; argv/envp intact.
+**The symptom is identical on every boot.  The last syscall is not.**
 
-This is the `__errno_location` / per-process `%fs`-base shape.
-**`1bf2ca2` fixed the general case but did not cover this re-exec
-path.**  The fault is deterministic on the first `time true` in a
-boot.
+    boot 1: CR2=0 RIP=0 err=0x15  num=13  rcx=0x44CC0D  fs=0x46A138
+    boot 2: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 3: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 4: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
+    boot 5: CR2=0 RIP=0 err=0x15  num=218 rcx=0x40FBC0  fs=0x46A138
 
-The `num 218` / `rcx 0x40FBC0` / `RSP = g_user_rsp_save + 0x180`
-trace recorded in the fourth/fifth-session notes is **not** this
-fault; `0x40FA40` is `__init_tls`, and `0x40FBC0` is the `ret` after
-its `set_tid_address` syscall.  `static_init_tls` at `0x40FBC0` as a
-`call *%rax` is **refuted.**
+**The fault always ends in an instruction fetch from address 0**:
+`CR2 = 0`, `RIP = 0`, error `0x15` (present + user + fetch), and
+`fs_base` is the correct `0x46A138`.  This is a `ret` (or a jump
+through a register) to a zeroed target.  The corruption is a control
+target going to 0, not a data address.
 
-### The next step is a read, not a patch
+**The landing point moves through startup.**  In 4 of 5 boots the
+last syscall was `218` (`set_tid_address`, return `0x40FBC0`, early
+`__init_tls`).  In 1 of 5 it was `13` (`rt_sigaction`, return
+`0x44CC0D`, later in `__libc_start_main`).  The corruption window is
+timing-dependent and can land on either return path; a single
+breakpoint at `0x40FBC0` would miss boot 1.
 
-**One gdb run at `0x448C6A`, printing `pid` or `CR3` at every hit**,
-to see which process, what `%fs_base`, and whether the write to
-`0x34` is a TLS-base-relative write or a real object.  `%rsp` and
-`$fs_base` are the same VA across busybox processes; only `pid` or
-`CR3` distinguishes them.  This is the single most expensive mistake
-this project has made -- do not skip the marker.
+**`CR2 = 0x34` / `RIP = 0x448C6A` did not appear in any of the 5
+boots.**  That trace is not the current fault and is retired.
+
+**The `num 13` / `0x44CC0D` trace is live, not stale.**  It was
+previously listed as a stale trace from the reverted
+`153dda9`/`939e3ef` state; boot 1 of this count produced it on an
+unmodified tree.  Do not dismiss it.
+
+**`context_switch.asm` is not the cause.**  The `wrmsr` installs the
+correct `fs_base`.  The saved return addresses (`0x40FBC0`,
+`0x44CC0D`) are correct.  The corruption is in the user stack or a
+user register, in the window around whichever syscall the child is in
+when the race lands.
+
+### The next step is an instrument, not a breakpoint
+
+A kernel-side check on the user `RIP` about to be returned to, on
+both return paths, that prints `pid`, the target `RIP`, and the user
+stack top when the target is zero.  That catches the corruption
+before the fetch faults, on whichever syscall it follows.  A
+breakpoint at a fixed landing point (`0x40FBC0`) would miss boot 1.
 
 ### The options, and their reproducibility
 
