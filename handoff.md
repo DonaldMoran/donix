@@ -5,14 +5,21 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-04 (fourth session), at `63cb81b`.
-**`v0.6.19` is the last pushed release.** `dev` is at `63cb81b`; its
-parents are `4b24e71`, `52e1569`, `0f97048`, `e128c92`, `54e3b2d`.
-`origin/dev` = `ba56b3d`. Ahead **36**, clean tree, **stash present**
+**Last updated:** 2026-11-04 (fifth session), at `c8ef340`.
+**`v0.6.19` is the last pushed release.** `dev` is at `c8ef340`; its
+parents are `63cb81b`, `4b24e71`, `52e1569`, `0f97048`, `e128c92`.
+`origin/dev` = `ba56b3d`. Ahead **37**, clean tree, **stash present**
 (`stash@{0}`: vfork 3b diagnostics; preserved, do not drop). No push,
 no tag this session; banner still `v0.6.19`. `main` = `7e4748b` (the
 `--no-ff` merge of `v0.6.19`). Scratch tag `20261104-gettimeofday-time`
 is on `5a3b65e` (still preserved).
+
+**`~/code/testme` is the `v0.6.19` reference tree, but its busybox
+omits `date`/`time`/`uptime` from its applet set** even though
+`configs/busybox.config` enables them. `cmp`-identical to `testme`
+confirms ELF *shape*, not *applet set*; the applet-set oracle is
+`busybox --list`, and the build of record is `configs/busybox.config`
+plus `toolchain/musl-gcc.sh`.
 
 **`~/code/testme` is a `v0.6.19` reference tree (`ba56b3d`, tagged).**
 It is the known-good comparison. **Do not modify it.** When a shell
@@ -23,13 +30,24 @@ behavior is in doubt, boot `testme` and compare.
 ## START HERE
 
 **Before doing anything else with `time`, read
-`docs/open-issues.md`'s section "Why `time true` faults:
-`static_init_tls`".** It names the root cause: the static busybox
-has no `PT_PHDR` and no `_DYNAMIC`, so musl's `static_init_tls`
-computes `base = 0` and the TLS image copy faults. **The next work
-on `time` is the busybox link, not the `0x40FBC0` probe and not the
-kernel.** For `^C`/`busybox sh`, read the fourth-session section
-of `docs/open-issues.md`.
+`docs/open-issues.md`'s section "The `time true` fix attempts of the
+2026-11-04 fifth session".** It records the three fix attempts made
+that session -- all measured, all reverted -- and the four options
+that remain with their reproducibility. The root cause is unchanged:
+the static busybox has no `PT_PHDR` and no `_DYNAMIC`, so musl's
+`static_init_tls` computes `base = 0` and the TLS image copy faults.
+
+**Three fix routes are refuted; do not re-walk them.**
+`-Wl,--dynamic-linker` has no effect on a static non-PIE link;
+`-fuse-ld=lld` emits `PHDR` but moves the base `0x400000`->`0x200000`,
+adds `PT_INTERP`, and loses the applets; a from-scratch `SECTIONS`
+block discards the real sections (a 714-byte-code skeleton). The
+measurements are in that open-issues section.
+
+**Reproducibility is a first-class constraint.** A fix must be
+tracked and built by the clone script, or a cloner does not get it.
+`busybox_ldscript` is gitignored and binutils-version-dependent, so
+the linker-script route is a local experiment, not a shippable fix.
 
 **You do not need the conversation history.** You need this file's
 `WHERE WE ARE` and `NEXT` sections, and that one section of
@@ -43,15 +61,14 @@ change must be tested with both before it lands.** See the gate gap
 below.
 
 **`time true` is not a race.** It fails deterministically on the first
-invocation in a boot where everything else passes. The `race_probe`
-dump is instrumentation, not a race detector.
+invocation in a boot where everything else passes.
 
 ---
 
 ## WHERE WE ARE
 
-**`v0.6.19` is the last pushed release.** `dev` is at `52e1569`.
-Ahead **34**, clean, stash present. Nothing pushed this session.
+**`v0.6.19` is the last pushed release.** `dev` is at `c8ef340`.
+Ahead **37**, clean, stash present. Nothing pushed this session.
 
 **WHAT LANDED THIS SESSION (fourth session, five commits):**
 
@@ -95,17 +112,35 @@ Ahead **34**, clean, stash present. Nothing pushed this session.
 
 ## NEXT -- the highest-value work, in order
 
-1. **Fix the busybox link so the static binary has `PT_PHDR` (or a
-   real `_DYNAMIC`).** This is the `time` root cause: with no
-   `PT_PHDR` and no dynamic section, `static_init_tls` computes
-   `base = 0` and the TLS image copy faults. The musl `_DYNAMIC`
-   fallback is present in `third_party/musl-src/src/env/__init_tls.c`
-   but inoperative because `_DYNAMIC` is weak-undefined. The fix is
-   a binutils/linker-script change (emit `PT_PHDR` for the static
-   busybox, Alpine `binutils-ld-fix-static-linking.patch` style), or
-   a different linker -- **not a kernel change and not the
-   `0x40FBC0` probe.** Read `docs/open-issues.md`'s "Why `time
-   true` faults: `static_init_tls`" before starting.
+The full ranking with the reproducibility analysis is in
+`docs/open-issues.md`'s fifth-session section. This is the short
+form. **No decision has been made between the `time` options.**
+
+1. **The `time` question: which route.** Four options, with the
+   constraint that a fix must be tracked and built by the clone
+   script:
+   - **Own `time` binary** (`userland/musl/apps/time.c` + image
+     staging line). Tracked, built by the clone script, low risk.
+     Gives a working `time`; does **not** fix the busybox `time
+     true` fault (busybox's own startup still faults).
+   - **musl `static_init_tls` patch** via a tracked
+     `toolchain/*.patch` applied by `toolchain/install_musl.sh`.
+     Reproducible; fixes the fault itself. **Blast radius: every
+     static musl binary's startup.** The fourth-session gate gap
+     applies; the narrowest guard is for static `ET_EXEC` with
+     `base == 0`.
+   - **Dynamic linking.** Fixes the fault by construction, but is
+     **not a small option**: the kernel has no `PT_INTERP` handling
+     (`elf.c:91` skips non-`PT_LOAD`; `elf.c:232` returns the
+     binary's `e_entry`), no `/lib` staging in the image,
+     `userland/musl/Makefile` builds `-static -no-pie` only, and
+     `third_party/musl-install/lib/` has no `libc.so`. A
+     multi-session kernel + build-system project.
+   - **Linker script** (`busybox_ldscript` = default `ld` script +
+     `PHDRS`). Mechanism proven; content refuted; **not
+     reproducible** for a cloner. Local experiment only, with a
+     `readelf -SW` section-size gate (`.text` ~`0x541e5`, not
+     `0x2ca`) before any boot.
 2. **`sys_mkdir` `-ENOTDIR` vs `-EEXIST`** for the file case.
    POSIX wants `-ENOTDIR` when the target exists as a file. Small,
    `sys_mkdir`-local; no current caller depends on it.
@@ -142,7 +177,28 @@ sufficient for a stack-layout change.**
 
 ## WHAT WAS REFUTED -- do NOT re-walk.
 
-*This session's additions first.*
+*Fifth-session additions first.*
+
+- **`-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1` as a way to
+  force `PT_PHDR`.** No effect on a static non-PIE link; the binary
+  is byte-identical in shape (no `PHDR`/`INTERP`/`DYNAMIC`).
+- **`-fuse-ld=lld` as a fix.** Emits `PHDR` but moves the base
+  `0x400000`->`0x200000` (entry `0x214140`), adds `PT_INTERP`
+  requesting `/lib/ld-musl-x86_64.so.1`, loses `date`/`time`/
+  `uptime`, and the boot faults at `CR2 0x400040` (auxv `AT_PHDR`).
+- **A from-scratch `SECTIONS` block in `busybox_ldscript`.** The
+  mechanism works (`trylink` uses the file, `PHDR` appears, no
+  `INTERP`), but the hand-built `SECTIONS` discarded the real
+  sections (`.text` `0x2ca` instead of `0x541e5`, no applets). A
+  correct script must be the default `ld` script plus `PHDRS` and
+  `:seg`, gated by `readelf -SW` before any boot.
+- **`testme` as an applet-set reference.** Its busybox omits
+  `date`/`time`/`uptime`. Use `busybox --list`.
+- **Dynamic linking as a small option.** The kernel has no
+  `PT_INTERP` handling, no `/lib` staging, a static-only userland
+  build, and no `libc.so`.
+
+*Fourth-session additions.*
 
 - **`939e3ef` (`pcb->user_rsp = rsp_init`) as a safe fix.** It
   regressed `^C` on a foreground child. **Reverted by `0f97048`.**

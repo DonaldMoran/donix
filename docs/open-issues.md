@@ -834,6 +834,158 @@ instrumentation, not a race detector.  It reports the standing
 fault is a race.  Do not read the `RACE PROBE DUMP` as a mechanism.
 
 
+## The `time true` fix attempts of the 2026-11-04 fifth session (open)
+
+**Filed 2026-11-04, fifth session, at `c8ef340`.**  The root cause is
+unchanged from the fourth session: the static busybox ELF has no
+`PT_PHDR` and no dynamic section, so musl's `static_init_tls` cannot
+compute a load base, `base` stays 0, and the TLS image copy faults.
+This section records the three fix attempts made against that cause,
+their measurements, and the options that remain.  None of the three
+attempts is in the tree; all were reverted.
+
+### Attempt 1 -- `-Wl,--dynamic-linker` (refuted)
+
+`third_party/busybox/scripts/trylink`'s final link was given
+`-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1`, and busybox was
+rebuilt with `toolchain/musl-gcc.sh`.  **The flag had no effect.**
+The result is byte-identical in shape to the unmodified binary:
+516232 bytes, entry `0x413882`, `__init_tls`/`static_init_tls` at
+`0x40fa40`, and **no `PHDR`, no `INTERP`, no `DYNAMIC`**.  bfd drops
+the flag on a fully static link.
+
+**Do not re-apply.**  The `-Wl` form cannot force `PT_PHDR` on a
+static non-PIE link.
+
+### Attempt 2 -- `-fuse-ld=lld` (refuted as a fix)
+
+`userland/musl/Makefile`'s busybox rule was changed to pass
+`CC="$(abspath $(MUSL_GCC)) -fuse-ld=lld"`.  LLD **did** emit `PHDR`,
+but the binary was wrong in four ways:
+
+- **The load base moved** from `0x400000` to `0x200000`; entry
+  became `0x214140` (was `0x413882`).
+- **`PT_INTERP` was emitted**, requesting
+  `/lib/ld-musl-x86_64.so.1` -- wrong for a static binary, and the
+  file does not exist on the image.
+- **The `date`/`time`/`uptime` applets were lost** (`--list` did not
+  contain them).
+- **The boot faulted at `CR2 0x400040`** -- the auxv `AT_PHDR` --
+  because the loader and the ELF disagreed on the base (PTE for
+  `0x400040` not present, `error 0x4`, `CS 0x33`).
+
+**`PT_PHDR` presence is necessary but not sufficient.**  The load
+base and the absence of `PT_INTERP` must also be right, and LLD
+changes both.  Reverted with `git checkout -- userland/musl/Makefile`.
+
+### Attempt 3 -- a from-scratch `SECTIONS` in `busybox_ldscript` (mechanism proven, content refuted)
+
+`trylink` has a first-class hook: a file named
+`third_party/busybox/busybox_ldscript` causes
+`-Wl,-T,busybox_ldscript` (trylink lines 192, 206, 228).  **No
+`Makefile` or `trylink` edit is needed**; removing the file reverts
+the link.  A from-scratch script was written with `PHDRS` and a
+hand-built `SECTIONS` block.  `trylink` **did** use it (`Custom
+linker script 'busybox_ldscript' found, using it`), and `PHDR`
+appeared with **no `INTERP`** -- the right shape.  But the
+hand-written `SECTIONS` discarded the real section contents:
+
+- `LOAD 0` was `0x2ca` bytes; the real `.text` is `0x541e5`.
+- `LOAD 1` was `0x38`; the real `.rodata` is `0x12bd3`.
+- Entry was `0x400210` (should be `0x413882`).
+- `--list` had no applets -- a 714-byte-code skeleton.
+
+**The mechanism is proven; the content was wrong.**  A correct
+script must be the **default `ld` script byte-for-byte plus a
+`PHDRS` block and `:seg` suffixes**, so the default placement rules
+keep the sections intact.  The default script is 276 lines
+(`ld --verbose`, sha256 `3e46a9c1bd09be84e237e57779efd9bc8ea9c3e7807b0c4a7ce45c9da87d60d3`)
+and has no `PHDRS` block of its own.
+
+**Gate before any boot of a script-built binary:** `readelf -SW`
+must show `.text` ~`0x541e5` (not `0x2ca`).  A script that loses the
+sections is detectable at `readelf`, before a boot cycle.
+
+### The exact link constraints
+
+Any future `busybox_ldscript` must satisfy the link that is actually
+run: `trylink` passes `--gc-sections`, `--sort-section,alignment`,
+`--sort-common`, `-static`, and `ld` applies its default
+`-z separate-code` (the default script is the `--rosegment`
+variant).  The bfd layout is three `LOAD`s:
+`.init .text .fini` (R E), `.rodata .eh_frame .note.gnu.property` (R),
+`.init_array ... .bss` (RW), plus `NOTE`/`GNU_PROPERTY`/`GNU_STACK`/
+`GNU_RELRO`.  A custom `PHDRS` must reproduce that grouping and the
+`GNU_RELRO` segment, or the page permissions or relro change.
+
+### `testme` is not a valid applet-set reference
+
+`~/code/testme/third_party/busybox/busybox` omits `date`, `time`,
+and `uptime` even though `configs/busybox.config` enables them.
+`cmp`-identical to `testme` confirms ELF *shape* only, not *applet
+set*.  The oracle is `busybox --list`; the build of record is
+`configs/busybox.config` plus
+`make -C third_party/busybox CC="$PWD/toolchain/musl-gcc.sh"`.
+
+### Busybox build path and the stamp
+
+`./run` and the top-level `Makefile` do not build busybox.  The musl
+build runs through `userland/musl/Makefile`'s `musl-userland` target
+(reached by `hdd-single.img`), which invokes
+`make -C third_party/busybox CC=$(abspath toolchain/musl-gcc.sh)`.
+A bare `make -C third_party/busybox` falls through to host gcc and
+produces a **glibc** binary (7 MB, entry `0x4ac070`, no
+`__init_tls`).  The rule's stamp,
+`userland/musl/build/.busybox.stamp`, depends only on
+`third_party/busybox/.config` -- **not** on the `Makefile` or on the
+binary -- so any change to the busybox build flags or binary
+requires `rm -f userland/musl/build/.busybox.stamp
+userland/musl/build/busybox.elf` before the next build, or the old
+binary is silently copied.
+
+### The options that remain, and their reproducibility
+
+The constraint that matters for a shippable fix: **a fix must be
+tracked and built by the clone script, or a cloner does not get
+it.**
+
+**1. Own `time` as a tracked userland binary.**
+`userland/musl/apps/time.c` plus an image-Makefile staging line.
+Tracked, built by the clone script, runs like every other musl ELF
+on the image.  **Gives a working `time`; does not fix the busybox
+`time true` fault** (busybox's own startup still faults).  Low risk:
+a normal new applet.
+
+**2. Patch musl's `static_init_tls` via a tracked patch.**
+A `.patch` in `toolchain/` applied by `toolchain/install_musl.sh`
+(tracked, run by the clone script).  The narrowest guard is for
+static `ET_EXEC` with `base == 0`: use `tls_phdr->p_vaddr`
+directly.  Reproducible; fixes the fault itself.  **Blast radius:
+every static musl binary's startup.**  The fourth-session gate gap
+applies -- `canary`/`test.sh` can be green while `^C` and
+`busybox sh` break.  Requires the six-behavior gate.
+
+**3. Dynamic linking.**  Fixes the fault by construction (`PT_PHDR`
+appears for a dynamic link).  **Not a small option:** a read-only
+check at `c8ef340` found (a) no `PT_INTERP` handling anywhere in
+`04_kernel_64bit/` (`elf.c:91` skips anything that is not `PT_LOAD`;
+`elf.c:232` returns `ehdr->e_entry`, the binary's entry, not an
+interpreter's), (b) no `/lib` directory and no `.so` staging in
+`05_boot_kernel64/Makefile`, (c) `userland/musl/Makefile` builds
+`-static -no-pie` only, and (d) `third_party/musl-install/lib/` has
+no `libc.so` and no `ld-musl*`.  Dynamic requires kernel `PT_INTERP`
+support, a shared-libc build, `/lib` staging, and a second userland
+link path -- a multi-session kernel + build-system project.
+
+**4. Linker script.**  Proven mechanism, but `busybox_ldscript` is
+gitignored and the result depends on the host binutils version
+(`-z separate-code` is a binutils default that has changed across
+versions).  **Not reproducible for a cloner** without a tracked
+build-system change, and then binutils-version-dependent.  Recorded
+as a local experiment, not a shippable fix.
+
+---
+
 ## Three history corrections from the 2026-11-04 evening session
 
 **`time /bin/true` never worked, and "no fault" was not an
