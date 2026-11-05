@@ -5,10 +5,11 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-04 (fifth session), at `62b5433`.
-**`v0.6.19` is the last pushed release.** `dev` is at `62b5433`; its
-parents are `711ac16`, `695c53c`, `2bba981`, `c8ef340`, `63cb81b`.
-`origin/dev` = `ba56b3d`. Ahead **40**, clean tree, **stash present**
+**Last updated:** 2026-11-04 (fifth session, corrected), at `016b22f`.
+**`v0.6.19` is the last pushed release.** `dev` is at `016b22f`; its
+recent history is `62b5433`, `711ac16`, `695c53c`, `2bba981`,
+`c8ef340`, `63cb81b`. `origin/dev` = `ba56b3d`. Ahead **42**, clean
+tree except an untracked `toolchain (Copy)/`, **stash present**
 (`stash@{0}`: vfork 3b diagnostics; preserved, do not drop). No push,
 no tag this session; banner still `v0.6.19`. `main` = `7e4748b` (the
 `--no-ff` merge of `v0.6.19`). Scratch tag `20261104-gettimeofday-time`
@@ -26,19 +27,60 @@ oracle is `busybox --list`; the build of record is
 
 ## START HERE
 
-**The root cause of the `time` fault is settled and is not in
-doubt:** the static busybox ELF has no `PT_PHDR` and no `_DYNAMIC`,
-so musl's `static_init_tls` computes `base = 0` and the TLS image
-copy faults. This is a busybox-link problem, not a kernel problem.
-Read `docs/open-issues.md`'s section "The `time true` fix attempts of
-the 2026-11-04 fifth session" before touching `time`.
+**The `time true` fault is live and its mechanism is NOT settled.**
+The fourth-session claim that `static_init_tls` computes `base = 0`
+(no `PT_PHDR`, no `_DYNAMIC`) and the TLS image copy faults is
+**refuted twice over**:
+
+1. **The fifth session measured three fixes against it and all three
+   failed** (see `docs/open-issues.md`, "The `time true` fix attempts
+   of the 2026-11-04 fifth session"). `-Wl,--dynamic-linker` had no
+   effect; `-fuse-ld=lld` moved the base, added `PT_INTERP`, lost the
+   applets, and faulted at `CR2 0x400040`; a from-scratch `SECTIONS`
+   discarded the real sections.
+2. **The build of record cannot produce that fault at all.** The
+   shipped busybox (`userland/musl/build/busybox.elf`, which is
+   byte-identical to `third_party/busybox/busybox`, sha
+   `2d62a991...`, 428032 bytes) has program headers `LOAD`x3, `NOTE`,
+   `GNU_PROPERTY`, `GNU_STACK`, `GNU_RELRO` and **no `PT_TLS`, no
+   `PT_PHDR`, no `PT_DYNAMIC`, no `PT_INTERP`.** With no `PT_TLS`,
+   `tls_phdr` stays 0, the `if (tls_phdr)` block in
+   `static_init_tls` is skipped, `base` is never read, and there is
+   no TLS image to copy. **Do not patch `static_init_tls`'s `base`
+   computation; it is dead code for this binary.**
+
+**The live `time true` fault, measured 2026-11-04 fifth session on
+the build of record:**
+
+    #PF: CR2 = 0x34, RIP = 0x448C6A, error = 0x7 (present+user+write)
+         pte = 0x3 (present, writable), CS = 0x33
+         RSP = 0x80000FBF00, CR3 = 0x357000
+         auxv correct: AT_PHDR 0x400040, AT_ENTRY 0x413882,
+                       AT_PHNUM 7, AT_PHENT 0x38, AT_RANDOM present
+         argv/envp intact at rsp+0x1F0
+
+This is the `__errno_location` / per-process `%fs`-base fault shape.
+`docs/open-issues.md` says the `CR2=0x34` / `RIP=0x448C6A` fault was
+fixed by `1bf2ca2` and is **not** the `time true` fault. **That is
+now disproven for the re-exec path:** it is the live `time true`
+signature. `1bf2ca2` did not close it for this path. The
+"do not re-walk `0x448C6A`/`CR2=0x34`" instruction is **withdrawn** --
+it is exactly what the next session must walk.
+
+**`busybox_unstripped` is stale and is not the build of record.**
+`third_party/busybox/busybox_unstripped` is 516232 bytes, sha
+`6bb18f92...`, dated before the shipped binary, and is a *different
+link*. Every `readelf`/`nm`/`objdump` diagnostic must point at
+`userland/musl/build/busybox.elf` (== `third_party/busybox/busybox`),
+not at `busybox_unstripped`. Several earlier `readelf` conclusions
+were drawn against the stale file.
 
 **Three fix routes are refuted; do not re-walk them.**
 `-Wl,--dynamic-linker` has no effect on a static non-PIE link;
 `-fuse-ld=lld` emits `PHDR` but moves the base `0x400000`->`0x200000`,
 adds `PT_INTERP`, and loses the applets; a from-scratch `SECTIONS`
-block discards the real sections. The measurements are in that
-open-issues section.
+block discards the real sections. The measurements are in
+`docs/open-issues.md`.
 
 **Reproducibility is a first-class constraint.** A fix must be
 tracked and built by the clone script, or a cloner does not get it.
@@ -48,7 +90,7 @@ the linker-script route is a local experiment, not a shippable fix.
 **`time` is one of six `NEXT` items, not the only one.** Items 2-4
 (`sys_mkdir -ENOTDIR`, SSE save/restore, the privilege model) are
 independent, small, and can be taken without touching `time`. Item 1
-is the long pole. Read `NEXT` in full.
+(the live fault) is the long pole. Read `NEXT` in full.
 
 **Do not re-apply `939e3ef` or `153dda9`.** Both were reverted
 (`0f97048`, `e128c92`). They moved the `time true` fault forward but
@@ -59,18 +101,21 @@ below.
 
 **Stale fault traces -- do not reason from these.** `num 13`
 (`rt_sigaction`) / `rcx 0x44CC0D`, `RIP 0` / `CR2 0` / `num 61`
-(`wait4`), and the VA-0 identity-map `CR2 0` / `pte 0x3` traces in
-`docs/open-issues.md` are all from the reverted `153dda9`/`939e3ef`
-state. The **live** fault is the busybox-side signature: `num 218`
-(`set_tid_address`), `last sysret rcx 0x40FBC0`, `RSP =
-g_user_rsp_save + 0x180`, with the `__init_tls` frame intact.
+(`wait4`), the VA-0 identity-map `CR2 0` / `pte 0x3` traces, and the
+recorded `num 218` / `rcx 0x40FBC0` / `RSP = g_user_rsp_save +
+0x180` trace in `docs/open-issues.md` are all from the reverted
+`153dda9`/`939e3ef` state or from a stale binary. **The live fault is
+`CR2 0x34` / `RIP 0x448C6A` / `error 0x7` / `pte 0x3`**, as above.
+`static_init_tls` at `0x40FBC0` as a `call *%rax` is **refuted**:
+`0x40FA40` is `__init_tls`; `0x40FBC0` is the `ret` after its
+`set_tid_address` syscall.
 
 **`time true` is not a race.** It fails deterministically on the first
 invocation in a boot where everything else passes.
 
 ---
 
-## WHAT WORKS (verified in the fifth-session boot)
+## WHAT WORKS (verified in the fifth-session boots)
 
 - `canary --full` **28/28**
 - `test.sh` **57/57**
@@ -96,10 +141,13 @@ invocation in a boot where everything else passes.
 
 ## WHAT IS BROKEN
 
-- **`time true` / `time ls` fault** at the busybox-side signature
-  (`num 218`, `rcx 0x40FBC0`, `RSP = g_user_rsp_save + 0x180`). The
-  shell prints `Command terminated by signal 11` and returns to the
-  prompt. **`time` is not usable as a command.**
+- **`time true` / `time ls` fault** at the live signature:
+  `CR2 0x34`, `RIP 0x448C6A`, `error 0x7` (present+user+write),
+  `pte 0x3`. The shell prints `Command terminated by signal 11` and
+  returns to the prompt. **`time` is not usable as a command.**
+  The mechanism is **not** `static_init_tls` (no `PT_TLS` in the
+  build of record) and is **not** closed -- the `1bf2ca2` fault is
+  back for the re-exec path.
 - **`time`'s accounting is garbage**: `real` is plausible but `user`
   / `sys` print about `152710235h`. This is `getrusage`/`times`
   returning nonsense on donix -- **a kernel accounting bug, separate
@@ -108,7 +156,8 @@ invocation in a boot where everything else passes.
 - **The `^C` intermittence** (works once, fails later) is
   race-shaped and **separate** from the `time true` fault. Not
   diagnosed.
-- **No `CR2=0x34` fault since `1bf2ca2`** -- that one is closed.
+- **No `CR2=0x34` fault since `1bf2ca2`** is **no longer true** for
+  the `time true` re-exec path; see above.
 - **The C** is not observed since the 2026-11-02 disk-path fixes;
   still open -- evidence, not a close.
 
@@ -118,31 +167,32 @@ invocation in a boot where everything else passes.
 
 The full ranking with the reproducibility analysis is in
 `docs/open-issues.md`'s fifth-session section. **No decision has been
-made between the `time` options.** Items 2–4 are independent of the
+made between the `time` options.** Items 2-4 are independent of the
 `time` question and can be taken without touching it; item 1 is the
 long pole.
 
-1. **The `time` question: which route.** Four options, with the
-   constraint that a fix must be tracked and built by the clone
-   script:
+1. **The `time` question: re-diagnose the live fault.** The
+   fourth-session `static_init_tls` route is refuted and is not
+   producible by the build of record. The live fault is
+   `CR2 0x34` / `0x448C6A` (write). The next step is **not** a
+   patch -- it is one gdb run with `pid` or `CR3` printed at
+   `0x448C6A` (the single most expensive mistake in this project is
+   a cross-process inference from `%rsp`/`$fs_base`), to see which
+   process, what `%fs_base`, and whether the write is to the TLS
+   base or to a real object at `0x34`. After that, the options:
    - **Own `time` binary** (`userland/musl/apps/time.c` + image
      staging line). Tracked, built by the clone script, low risk.
      Gives a working `time`; does **not** fix the busybox `time
      true` fault, and inherits the `getrusage` accounting bug.
-   - **musl `static_init_tls` patch** via a tracked
-     `toolchain/*.patch` applied by `toolchain/install_musl.sh`.
-     Reproducible; fixes the fault itself. **Blast radius: every
-     static musl binary's startup.** The gate gap applies; the
-     narrowest guard is for static `ET_EXEC` with `base == 0`.
-   - **Dynamic linking.** Fixes the fault by construction, but is
-     **not a small option**: the kernel has no `PT_INTERP` handling
-     (`elf.c:91` skips non-`PT_LOAD`; `elf.c:232` returns the
-     binary's `e_entry`), no `/lib` staging in the image,
-     `userland/musl/Makefile` builds `-static -no-pie` only, and
-     `third_party/musl-install/lib/` has no `libc.so`. A
-     multi-session kernel + build-system project.
-   - **Linker script** (`busybox_ldscript` = default `ld` script +
-     `PHDRS`). Mechanism proven; content refuted; **not
+   - **Re-open the `fs_base` / context-switch restore path** for the
+     re-exec case. `1bf2ca2` fixed the general case; the re-exec
+     path still faults. Narrowest fix is likely a `%fs`-base
+     reload-on-exec correction, gated by the six-behavior gate.
+   - **Dynamic linking.** Fixes the fault by construction only if
+     the fault is in startup; it is a multi-session kernel +
+     build-system project (no `PT_INTERP` handling, no `/lib`
+     staging, static-only userland build, no `libc.so`).
+   - **Linker script.** Mechanism proven; content refuted; **not
      reproducible** for a cloner. Local experiment only, with a
      `readelf -SW` section-size gate (`.text` ~`0x541e5`, not
      `0x2ca`) before any boot.
@@ -154,10 +204,10 @@ long pole.
    userland flag removal).
 4. **`docs/open-issues.md` item 9 -- the privilege model.**
    **Before starting, ask what it unlocks.** If "nothing," skip.
-5. **The `time` accounting bug** (item 5 above, under WHAT IS
-   BROKEN). Kernel `getrusage`/`times` accounting; separate from the
-   `time true` fault. **Do not fix in the same session as the `time
-   true` fault.**
+5. **The `time` accounting bug** (under WHAT IS BROKEN). Kernel
+   `getrusage`/`times` accounting; separate from the `time true`
+   fault. **Do not fix in the same session as the `time true`
+   fault.**
 6. **The `^C` intermittence.** Race-shaped, separate, not
    diagnosed. Use multiple `^Z`/`fg` cycles to reach it.
 
@@ -168,8 +218,9 @@ long pole.
 **`canary --full` (28/28) and `test.sh` (57/57) do not cover `^C` on
 a foreground child or `busybox sh` re-entry.** Both `939e3ef` and
 `153dda9` passed the green gate and broke one of those two shell
-behaviors. **Any change to `sys_execve`'s user stack, or to musl's
-startup path, must be tested with:**
+behaviors. **Any change to `sys_execve`'s user stack, to the
+`%fs_base` restore path, or to musl's startup path, must be tested
+with:**
 
 - **`sleep 100` then `^C`** -> the prompt returns
 - **`exit` from `ash` -> `donix>` -> `busybox sh`** -> the ash
@@ -193,6 +244,16 @@ sufficient.**
   mechanism works (`trylink` uses the file, `PHDR` appears, no
   `INTERP`), but the hand-built `SECTIONS` discarded the real
   sections (`.text` `0x2ca` instead of `0x541e5`, no applets).
+- **Patching musl's `static_init_tls` `base` computation.** The
+  build of record has no `PT_TLS`, so `base` is never read; the
+  patch is dead code for this binary. (New, 2026-11-04.)
+- **The `static_init_tls` at `0x40FBC0` as a `call *%rax`.**
+  `0x40FA40` is `__init_tls`; `0x40FBC0` is the `ret` after its
+  `set_tid_address` syscall.
+- **`busybox_unstripped` as the build-of-record oracle.** It is
+  stale (516232 bytes, `6bb18f92...`) and is a different link from
+  the shipped 428032-byte `busybox.elf` (== `busybox`,
+  `2d62a991...`). Use `busybox.elf`.
 - **`testme` as an applet-set reference.** Its busybox omits
   `date`/`time`/`uptime`. Use `busybox --list`.
 - **Dynamic linking as a small option.** Kernel has no `PT_INTERP`
@@ -231,9 +292,7 @@ sufficient.**
 *Earlier, unchanged.*  Do not re-walk: the `cli` window; signal
 delivery as the zeroer; `memset` as the zeroer; the sysret slot
 arithmetic; "the slot flips `0x40B163`->0 in one process"; the three
-`exec_path` forms; `.bss`-not-zeroed; `0x448C6A`/`CR2=0x34` as the
-root cause (real, separate, fixed by `1bf2ca2`); `lbb_prepare` /
-`run_applet_and_exit` / `applet_main[rbx]`; the auxv;
+`exec_path` forms; `.bss`-not-zeroed; the auxv;
 `set_tid_address`'s return; mmap; V3/V3b register inheritance; the
 `efc8e08` rsp split and `frame_kind`; the four uncommitted scheduler
 guards; the `EXIT-REFUSE frame-CS` guard; the canary `.text` `#PF`
@@ -243,8 +302,7 @@ probe stack; the physical-address gates on `.text` PTE zeroing; the
 `perf kvm stat record` `double free` is a donix issue; the
 2026-11-04 PTAUDIT "22 anomalies"; the empty-low-half
 `vmm_create_address_space`; V3/V3b register zeroing; the missing auxv;
-`static_init_tls` at `0x40FBC0` as a `call *%rax`; `kmain.c`'s
-self-tests map over the ELF text page.
+`kmain.c`'s self-tests map over the ELF text page.
 
 ---
 
@@ -439,14 +497,14 @@ ready and verified.** `origin/dev` is not force-pushed; every unpushed
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `62b5433`; its parents are `711ac16`, `695c53c`,
-`2bba981`, `c8ef340`, `63cb81b`. Ahead **40**, clean, **stash
-present**. `origin/dev` = `ba56b3d`. Scratch tag
-`20261104-gettimeofday-time` on `5a3b65e`. Work is now
-pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
-a gate is wanted it is set in this file before that release session,
-not during it. The user has said not to move to `v0.6.20` until they
-say so.**
+`dev` is at `016b22f`; recent history `62b5433`, `711ac16`,
+`695c53c`, `2bba981`, `c8ef340`, `63cb81b`. Ahead **42**, clean
+except the untracked `toolchain (Copy)/`, **stash present**.
+`origin/dev` = `ba56b3d`. Scratch tag `20261104-gettimeofday-time`
+on `5a3b65e`. Work is now pre-`v0.6.20`. **There is no release gate
+recorded for `v0.6.20`; if a gate is wanted it is set in this file
+before that release session, not during it. The user has said not to
+move to `v0.6.20` until they say so.**
 
 ---
 
@@ -463,9 +521,10 @@ correct archive members, including directory members.**
 **`mkdir -p` works.**
 `date`/`uptime` report seconds since boot as a 1970-epoch date (no RTC
 -- the honest base). **`time` builds, its vfork parent-reap path works,
-but `time`'s own startup still faults on a forked child; `time` is not
-usable as a command today.** See `docs/open-issues.md`'s fifth-session
-section.
+but `time true` still faults on a forked child at
+`CR2 0x34` / `RIP 0x448C6A` (write); `time` is not usable as a
+command today.** See `docs/open-issues.md`'s "The live `time true`
+fault" section.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -516,22 +575,26 @@ rebuild from `configs/busybox.config` fixed it. Do not diagnose
 **Before `--install`, `/bin` contains only `busybox` and `sh`.**
 There is no `/bin/true`, `/bin/echo`, `/bin/cat`; after
 `--install -s /bin` the applet names are symlinks (see above).
-**`time true` does NOT work** -- it faults at the `static_init_tls`
-signature. The `true` applet itself works when run directly; it is
-`time`'s re-exec of busybox that faults. `time /bin/true` fails at
-`f_open` with `FR_NO_FILE` (there is no `/bin/true` file). Use
-`/usr/bin/HELLO`, `/usr/bin/ECHO`, `/usr/bin/CAT` for real-file
-control tests.
+**`time true` does NOT work** -- it faults at the live signature
+(`CR2 0x34` / `RIP 0x448C6A` / write). The `true` applet itself works
+when run directly; it is `time`'s re-exec of busybox that faults.
+`time /bin/true` fails at `f_open` with `FR_NO_FILE` (there is no
+`/bin/true` file). Use `/usr/bin/HELLO`, `/usr/bin/ECHO`,
+`/usr/bin/CAT` for real-file control tests.
 
 **`third_party/`** is **gitignored** -- do not commit edits to it.
-`third_party/busybox/` has `busybox` (stripped) and
-`busybox_unstripped`; the `.map` file is **not** present, so `nm -n` +
-`objdump -d` are the symbol tools, and `readelf -lW` gives the program
-headers. `third_party/musl-install/` is gitignored and is needed for
-the build. If it's missing after a `git clean -xdf`, copy it back from
-a working tree, or rebuild it with `toolchain/install_musl.sh`.
-**`configs/busybox.config`** is the busybox build config;
-`CONFIG_TIME=y`, `CONFIG_TRUE=y`, `CONFIG_LS=y`,
+`third_party/busybox/` has `busybox` (stripped, 428032 bytes, sha
+`2d62a991...`) and `busybox_unstripped` (516232 bytes, sha
+`6bb18f92...`) -- **`busybox_unstripped` is a stale, different link;
+the build of record is `userland/musl/build/busybox.elf` (== the
+stripped `busybox`).** The `.map` file is **not** present, so `nm -n`
++ `objdump -d` are the symbol tools, and `readelf -lW` gives the
+program headers -- **run them on `busybox.elf`, not on
+`busybox_unstripped`.** `third_party/musl-install/` is gitignored and
+is needed for the build. If it's missing after a `git clean -xdf`,
+copy it back from a working tree, or rebuild it with
+`toolchain/install_musl.sh`. **`configs/busybox.config`** is the
+busybox build config; `CONFIG_TIME=y`, `CONFIG_TRUE=y`, `CONFIG_LS=y`,
 `CONFIG_FEATURE_PREFER_APPLETS=y`, `CONFIG_FEATURE_SH_STANDALONE=y`,
 `CONFIG_SH_IS_ASH=y`. Turning more applets on will **not** touch the
 `time true` fault; do not edit this config to chase it. A bare
@@ -544,6 +607,13 @@ gates that rebuild and depends only on `.config` -- any change to the
 busybox build flags or binary requires
 `rm -f userland/musl/build/.busybox.stamp userland/musl/build/busybox.elf`
 before the next build.
+
+**`toolchain/install_musl.sh` reuses `third_party/musl-src` in place
+if it is already at `v1.2.5`; it does not re-materialize it.** A
+patch applied to `musl-src` therefore persists across runs, and
+reverting the tracked script does **not** undo it -- the revert is
+`git -C third_party/musl-src checkout -- <file>` followed by a
+rebuild.
 
 **`04_kernel_64bit/fatfs/ff.c`** is tracked and has two `sync_window`
 fixes; any further edit there must re-run the full gate.
@@ -563,19 +633,22 @@ preserved diagnostic trail. **Do not drop, do not pop.**
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `62b5433`, ahead 40, clean, stash
-present, nothing pushed.** The `time` root cause is settled (no
-`PT_PHDR` / no `_DYNAMIC` -> `static_init_tls` base 0), three fix
-routes are refuted by measurement, and the four remaining options are
-recorded with their reproducibility in `docs/open-issues.md`'s
-fifth-session section. **No decision has been made between them.**
-Baseline verified in one boot: `canary --full` 28/28, `test.sh` 57/57,
-`pipe7e` past `iter 1000`, `^C`/`^Z`/`fg` work, `busybox sh`
-re-entry works, `date`/`time` (no args) work, interactive applets do
-not need `--install`. **`time true` faults at the busybox-side
-signature; `time` is not usable as a command.** The `time` accounting
-bug is separate and kernel-side. **NEXT: the four `time` options (no
-decision), or `sys_mkdir -ENOTDIR`, or SSE, or the privilege model
+**`v0.6.19` is released; `dev` is at `016b22f`, ahead 42, clean except
+the untracked `toolchain (Copy)/`, stash present, nothing pushed.**
+The fourth-session `static_init_tls` root cause is **refuted**: the
+fifth session refuted three fixes against it, and the build of record
+has **no `PT_TLS`**, so the `base` computation is dead code for this
+binary. **The live `time true` fault is `CR2 0x34` / `RIP 0x448C6A` /
+`error 0x7` (write) / `pte 0x3`** -- the `__errno_location` /
+`fs_base` shape, which `1bf2ca2` did **not** close for the re-exec
+path. `busybox_unstripped` is stale; the oracle is
+`busybox.elf` (== `third_party/busybox/busybox`). Baseline verified in
+one boot: `canary --full` 28/28, `test.sh` 57/57, `pipe7e` past
+`iter 1000`, `^C`/`^Z`/`fg` work, `busybox sh` re-entry works,
+`date`/`time` (no args) work, interactive applets do not need
+`--install`. **`time true` faults; `time` is not usable as a
+command.** The `time` accounting bug is separate and kernel-side.
+**NEXT: re-diagnose the live fault (one gdb run with `pid`/`CR3` at
+`0x448C6A`), or `sys_mkdir -ENOTDIR`, or SSE, or the privilege model
 (items 2-4 are independent of `time`).** Do not re-walk the refuted
-routes or the stale fault traces. **Do not move to `v0.6.20` until
-the user says so.**
+routes. **Do not move to `v0.6.20` until the user says so.**
