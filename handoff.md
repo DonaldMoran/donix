@@ -567,9 +567,9 @@ There is no `/bin/true`, `/bin/echo`, `/bin/cat`; after
 **`time true` does NOT work** -- it faults at the `static_init_tls`
 signature (see the `time` section). The `true` applet itself works
 when run directly; it is `time`'s re-exec of busybox that faults.
-busybox applet -- but `time`'s own startup faults today. `time
-/bin/true` fails at `f_open` with `FR_NO_FILE`. Use `/usr/bin/HELLO`,
-`/usr/bin/ECHO`, `/usr/bin/CAT` for real-file control tests.
+`time /bin/true` fails at `f_open` with `FR_NO_FILE` (there is no
+`/bin/true` file). Use `/usr/bin/HELLO`, `/usr/bin/ECHO`,
+`/usr/bin/CAT` for real-file control tests.
 
 **`third_party/`** is **gitignored** -- do not commit edits to it.
 `third_party/busybox/` has `busybox` (stripped) and
