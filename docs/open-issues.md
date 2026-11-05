@@ -4,8 +4,10 @@
 **The fourth-session claim that the `time true` fault is
 `static_init_tls` computing `base = 0` is refuted.**  The build of
 record has no `PT_TLS`, so `base` is never read; and the live fault
-is `CR2 0x34` / `RIP 0x448C6A` (write), not a TLS-image copy.  Read
-"The live `time true` fault" before doing anything with `time`.
+is `CR2 = 0` / `RIP = 0` / `error = 0x15` (instruction fetch), not a
+TLS-image copy.  Read "The `time true` fault: closed hypotheses and
+the one open probe" before doing anything with `time`.  (`CR2 0x34` /
+`0x448C6A` is history -- it did not appear in the 5-boot count.)
 This file lists **only open issues**.  Closed items are removed, not
 struck through; their history is in `git log` and
 `docs/session-log.md`.  An item appears here only while it is a
@@ -248,7 +250,8 @@ it is recorded as a live observation of the standing question, not as
 a mechanism and not as a signal bug.  Do not chase it on this
 evidence alone.  (The 2026-11-04 fifth-session boot that produced the
 live `CR2 0x34` fault had `P12 calls: 0` -- no pipe activity on that
-path.)
+path.  That was the pre-5-boot signature; the 5-boot count is
+`CR2 = 0` / `RIP = 0` / `error = 0x15`.)
 
 **Item 7a â€” the boot-time `#PF` at `0x400000`.**  Unobserved, not
 fixed.  An intermittent fault that stops reproducing is not closed.
@@ -727,6 +730,13 @@ push 15 GPRs first.  `frame->rip` read `r14`, `frame->cs` read
 `r13`, `frame->rsp` read `r11`.  Fixed by `fb188f0`; every dump
 before it must be read with that in mind.
 
+> **SUPERSEDED 2026-11-04 by the 5-boot count.**  The paragraph
+> below said `CR2=0x34` / `0x448C6A` was "the live `time true` fault
+> now".  The 5-boot count did not produce that signature once; the
+> live signature is `CR2 = 0` / `RIP = 0` / `error = 0x15`.  See
+> "The `time true` fault: closed hypotheses and the one open probe".
+> The paragraph is kept as history.
+
 **`fs_base` was a separate, real bug, fixed by `1bf2ca2` -- but not
 for the `time true` re-exec path.**  The `CR2=0x34` / `RIP=0x448C6A`
 (`__errno_location`) fault was the per-process TLS base not being
@@ -794,13 +804,16 @@ vforks again to run `true`; that second child execs `true`.  The
 **first** child is fine: it runs `_start` -> `__init_libc` ->
 `__init_tls` -> `main` -> `time_main`, and `time_main` prints a wall
 time when the second child dies.  **The second child is the one that
-faults**, at the live `CR2 0x34` / `0x448C6A` signature.
+faults**, at the live `CR2 = 0` / `RIP = 0` / `error = 0x15`
+signature (the `CR2 0x34` / `0x448C6A` reference here is history).
 
 **REFUTED by that session's disassembly -- do not re-walk:**
 
 - **The V3/V3b register zeroing was the fault.**  With
   `c1bd883`/`f57299b` the fault was `0x453DC5`; with them reverted
-  (`325e85b`) it is back at the live signature.  The zeroing was
+  (`325e85b`) it is back at the live signature (then
+  `CR2 0x34` / `0x448C6A`; history -- the 5-boot count is `CR2 = 0` /
+  `RIP = 0` / `error = 0x15`).  The zeroing was
   **masking** the fault, not fixing anything.  The revert is the
   Linux vfork contract and is kept.
 - **The missing auxv is the fault.**  `a10e585` writes the auxv; the

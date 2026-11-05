@@ -5,15 +5,23 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-04 (fifth session, corrected), at `016b22f`.
-**`v0.6.19` is the last pushed release.** `dev` is at `016b22f`; its
-recent history is `62b5433`, `711ac16`, `695c53c`, `2bba981`,
-`c8ef340`, `63cb81b`. `origin/dev` = `ba56b3d`. Ahead **42**, clean
-tree except an untracked `toolchain (Copy)/`, **stash present**
-(`stash@{0}`: vfork 3b diagnostics; preserved, do not drop). No push,
-no tag this session; banner still `v0.6.19`. `main` = `7e4748b` (the
-`--no-ff` merge of `v0.6.19`). Scratch tag `20261104-gettimeofday-time`
-is on `5a3b65e` (still preserved).
+**Last updated:** 2026-11-04 (fifth session, reconciled), at `6a6fb4d`.
+**`v0.6.19` is the last pushed release.** `dev` is at `6a6fb4d`; its
+recent history is `4f48728`, `26c3bde`, `c3deb8e`, `62b5433`,
+`711ac16`, `695c53c`, `2bba981`, `c8ef340`, `63cb81b`.
+`origin/dev` = `ba56b3d`. Ahead **46**, **clean** (the untracked
+`toolchain (Copy)/` was removed; no untracked entry), **stash
+present** (`stash@{0}`: vfork 3b diagnostics; preserved, do not
+drop). No push, no tag this session; banner still `v0.6.19`.
+`main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`). Scratch tag
+`20261104-gettimeofday-time` is on `5a3b65e` (still preserved).
+
+**DOCS CURRENT -- one live signature.**  The live `time true` fault is
+`CR2 = 0` / `RIP = 0` / `error = 0x15` (present+user+fetch), `fs_base`
+correct.  Any other signature in this file is **history**; the
+authority is `docs/open-issues.md`'s "The `time true` fault: closed
+hypotheses and the one open probe".  `CR2 0x34` / `RIP 0x448C6A` is
+history (it did not appear in the 5-boot count).
 
 **`~/code/testme` is the `v0.6.19` reference tree (`ba56b3d`, tagged).**
 It is the known-good *boot* comparison. **Do not modify it.** But its
@@ -118,8 +126,11 @@ below.
 (`wait4`), the VA-0 identity-map `CR2 0` / `pte 0x3` traces, and the
 recorded `num 218` / `rcx 0x40FBC0` / `RSP = g_user_rsp_save +
 0x180` trace in `docs/open-issues.md` are all from the reverted
-`153dda9`/`939e3ef` state or from a stale binary. **The live fault is
-`CR2 0x34` / `RIP 0x448C6A` / `error 0x7` / `pte 0x3`**, as above.
+`153dda9`/`939e3ef` state or from a stale binary.  **The live fault
+is `CR2 = 0` / `RIP = 0` / `error = 0x15`** (the 5-boot count above);
+see `docs/open-issues.md`'s closed-hypotheses section.  **The old
+`CR2 0x34` / `RIP 0x448C6A` claim is history** -- it did not appear in
+any of the 5 boots.
 `static_init_tls` at `0x40FBC0` as a `call *%rax` is **refuted**:
 `0x40FA40` is `__init_tls`; `0x40FBC0` is the `ret` after its
 `set_tid_address` syscall.
@@ -173,8 +184,9 @@ invocation in a boot where everything else passes.
 - **The `^C` intermittence** (works once, fails later) is
   race-shaped and **separate** from the `time true` fault. Not
   diagnosed.
-- **No `CR2=0x34` fault since `1bf2ca2`** is **no longer true** for
-  the `time true` re-exec path; see above.
+- **No `CR2=0x34` fault since `1bf2ca2`** -- the 5-boot count saw
+  none.  The live `time true` fault is `CR2 = 0` / `RIP = 0` /
+  `error = 0x15`; see above.
 - **The C** is not observed since the 2026-11-02 disk-path fixes;
   still open -- evidence, not a close.
 
@@ -188,15 +200,18 @@ made between the `time` options.** Items 2-4 are independent of the
 `time` question and can be taken without touching it; item 1 is the
 long pole.
 
-1. **The `time` question: re-diagnose the live fault.** The
+1. **The `time` question: the one open probe.** The
    fourth-session `static_init_tls` route is refuted and is not
-   producible by the build of record. The live fault is
-   `CR2 0x34` / `0x448C6A` (write). The next step is **not** a
-   patch -- it is one gdb run with `pid` or `CR3` printed at
-   `0x448C6A` (the single most expensive mistake in this project is
-   a cross-process inference from `%rsp`/`$fs_base`), to see which
-   process, what `%fs_base`, and whether the write is to the TLS
-   base or to a real object at `0x34`. After that, the options:
+   producible by the build of record.  The live fault is
+   `CR2 = 0` / `RIP = 0` / `error = 0x15` (5-boot count; the
+   `CR2 0x34` / `0x448C6A` claim is history).  The block at
+   `rsp_init` is correct and the child `ret`s from a zeroed frame
+   at `rsp_init - 0x38`.  **The one open probe:** pid 5's loaded
+   user RSP at the stub's `mov rsp, [rsp - 72]`, compared to
+   `[BLK] pid=5 rsp_init`, **read with a `pid` marker** (a global
+   like `g_last_sysret_rsp` is another process's value -- the single
+   most expensive mistake in this project is a cross-process
+   inference).  After that, the options:
    - **Own `time` binary** (`userland/musl/apps/time.c` + image
      staging line). Tracked, built by the clone script, low risk.
      Gives a working `time`; does **not** fix the busybox `time
@@ -539,9 +554,11 @@ correct archive members, including directory members.**
 `date`/`uptime` report seconds since boot as a 1970-epoch date (no RTC
 -- the honest base). **`time` builds, its vfork parent-reap path works,
 but `time true` still faults on a forked child at
-`CR2 0x34` / `RIP 0x448C6A` (write); `time` is not usable as a
-command today.** See `docs/open-issues.md`'s "The live `time true`
-fault" section.
+`CR2 = 0` / `RIP = 0` / `error = 0x15`; `time` is not usable as a
+command today.**  (The older `CR2 0x34` / `0x448C6A` text elsewhere
+in this file is **history**.)  See `docs/open-issues.md`'s "The
+`time true` fault: closed hypotheses and the one open probe"
+section.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -593,8 +610,10 @@ rebuild from `configs/busybox.config` fixed it. Do not diagnose
 There is no `/bin/true`, `/bin/echo`, `/bin/cat`; after
 `--install -s /bin` the applet names are symlinks (see above).
 **`time true` does NOT work** -- it faults at the live signature
-(`CR2 0x34` / `RIP 0x448C6A` / write). The `true` applet itself works
-when run directly; it is `time`'s re-exec of busybox that faults.
+(`CR2 = 0` / `RIP = 0` / `error = 0x15`).  (The older `CR2 0x34` /
+`0x448C6A` reference here is **history**.)  The `true` applet itself
+works when run directly; it is `time`'s re-exec of busybox that
+faults.
 `time /bin/true` fails at `f_open` with `FR_NO_FILE` (there is no
 `/bin/true` file). Use `/usr/bin/HELLO`, `/usr/bin/ECHO`,
 `/usr/bin/CAT` for real-file control tests.
