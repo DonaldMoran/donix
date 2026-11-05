@@ -587,6 +587,64 @@ mappings outside the new image -- remains the named open issue, but
 it is a diagnosis, not the fix, and the tree already unmaps the old
 pages after the fresh-address-space block.
 
+### The `time true` fault: closed hypotheses and the one open probe
+
+The 2026-11-04 session ran eight hypotheses against the
+`CR2=0` / `RIP=0` / `err=0x15` fault.  All eight are **closed by
+measurement**:
+
+- `static_init_tls` / `base = 0` -- refuted (no `PT_TLS` in the build
+  of record; `base` is dead code).
+- `fs_base` / TLS-base restore -- refuted (`0x46A138` correct at every
+  probe, every boot).
+- The vfork stash fix -- already in the tree (`001a756`); the fault
+  survived it.
+- `cli`/`sti` mispairing -- audited; none.  `console_fg_pgrp_reclaim_if`
+  is the correct `pushfq/popfq` idiom; `process_exit` stays under
+  `cli`.
+- Region size 16 KB -> 32 KB -- moved the fault down by exactly the
+  region delta; same symptom, different offset.  Not the variable.
+- Auxv `AT_RANDOM` placement -- moved the seed out of `auxv_base`;
+  the fault is unchanged.  The block print shows the auxv is correct
+  end to end.
+- The sysret's user RSP -- `last sysret rsp` matches `g_user_rsp_save`
+  and is in range.  (The `last sysret rsp` vs `rsp_init` "mismatch"
+  seen mid-session was a comparison across processes; it is not a
+  bug.)
+- `pcb->user_rsp` save/restore -- correct.  `interrupts.c:760` writes
+  `frame->rsp` (the user RSP from the interrupt frame);
+  `context_switch.asm:209` pushes it into the resume frame;
+  `context_switch.asm:620` is a diagnostic dump, not the resume path.
+
+**What is established:**
+
+- The `sys_execve` block at `rsp_init` is **correct**.  The block
+  print (pid 5) showed `argc=1`, `argv[0]` valid, `argv NULL`,
+  `envp[0]` valid, `envp NULL`, a full 13-pair auxv with a real
+  `AT_RANDOM` seed, and the strings -- all correct.
+- The user stack is **zeroed at alloc** by `exec_alloc_user_stack`'s
+  per-page loop.  Correct and expected.
+- The child's `rsp` at fault is `rsp_init - 0x38`, in a zeroed,
+  mapped, writable stack page (page 11 of 16).  A `ret` there pops
+  `0`.
+
+**The one open probe:** the per-`pid` user RSP the syscall-entry stub
+loads at `mov rsp, [rsp - 72]`, for pid 5, compared to
+`[BLK] pid=5 rsp_init=0x80000FBFD8`.
+
+- If the stub loads `rsp_init` for pid 5, the frame is right and the
+  child's own `_start`/`__init_tls` code path is the zero -- the next
+  step is gdb `si` from the sysret (`0x40FBC0` / `0x44CC0D`) with
+  `pid` printed.
+- If the stub loads something else for pid 5, the exec frame for pid 5
+  is wrong, and the fix is in `sys_execve`'s `ktop[-7]`/`ktop[-9]`
+  writes or the stub's load.
+
+`g_last_sysret_rsp` is global and is overwritten by every sysret; it
+must be read with a `pid` marker, or it is another process's value.
+That was the session's one mis-read and is recorded here so it is not
+repeated.
+
 ### The options, and their reproducibility
 
 The constraint that matters for a shippable fix: **a fix must be
