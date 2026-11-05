@@ -561,8 +561,12 @@ rebuild from `configs/busybox.config` fixed it.  Do not diagnose
 `not found` for an applet as "run `--install`" without checking
 `busybox --list` first.
 
-**`/bin` contains only `busybox` and `sh`.** There is no `/bin/true`,
-`/bin/echo`, `/bin/cat`. `time true` works because `true` is a
+**Before `--install`, `/bin` contains only `busybox` and `sh`.**
+There is no `/bin/true`, `/bin/echo`, `/bin/cat`; after
+`--install -s /bin` the applet names are symlinks (see above).
+**`time true` does NOT work** -- it faults at the `static_init_tls`
+signature (see the `time` section). The `true` applet itself works
+when run directly; it is `time`'s re-exec of busybox that faults.
 busybox applet -- but `time`'s own startup faults today. `time
 /bin/true` fails at `f_open` with `FR_NO_FILE`. Use `/usr/bin/HELLO`,
 `/usr/bin/ECHO`, `/usr/bin/CAT` for real-file control tests.
