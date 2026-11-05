@@ -562,6 +562,31 @@ stack top when the target is zero.  That catches the corruption
 before the fetch faults, on whichever syscall it follows.  A
 breakpoint at a fixed landing point (`0x40FBC0`) would miss boot 1.
 
+### The vfork stash is superseded, not pending
+
+`stash@{0}` ("vfork 3b (wake arm + sys_vfork) + diagnostics; time
+true intermittent, not a complete fix") is **already in the tree**.
+Its two halves were committed in `001a756` ("vfork: exec gives the
+child its own cr3; wake the parent on exec"):
+
+- `process.c` `process_wake_parent_if_waiting` has the `_is_vfork`
+  arm (`block_kind == BLOCK_KIND_VFORK && wait_pid == child->pid`).
+- `sys_execve` has the `process_wake_parent_if_waiting(self)` call
+  after `self->entry_point = entry;`.
+
+**The fix landed and `time true` still faults** (the 5-boot data
+above is from a tree that contains it).  So the stash is a
+superseded diagnostic record, not a pending change.  Do not
+re-inspect or re-apply it; the remaining fault is downstream of the
+exec-side wake and the fresh-address-space block, and it is not
+fixed by either.
+
+The stash's own "KNOWN" comment -- `vmm_clone_page_table`
+deep-copies the low half, so the clone keeps the parent's user
+mappings outside the new image -- remains the named open issue, but
+it is a diagnosis, not the fix, and the tree already unmaps the old
+pages after the fresh-address-space block.
+
 ### The options, and their reproducibility
 
 The constraint that matters for a shippable fix: **a fix must be
