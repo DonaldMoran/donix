@@ -531,17 +531,35 @@ you want to keep.**
 **`~/code/testme` is the `v0.6.19` reference tree (`ba56b3d`,
 tagged).** It is the known-good comparison. **Do not modify it.**
 
-**After a fresh image, one manual step:** the image stages
-`/bin/busybox` alone. To get the applet symlinks (including `/bin/sh`,
-which shebang needs), boot and run `/bin/busybox --install -s /bin`.
-The absolute path is required: busybox reads `/proc/self/exe` to find
-itself, donix has no `/proc/self/exe`, and it falls back to `argv[0]`
--- which must start with `/`. This is a manual step, not part of the
-build. **Note:** on this image, `busybox --install -s /bin` prints
-`Operation not permitted` for `/bin/busybox` and `/bin/sh` (the
-`FR_EXIST` -> `-EPERM_` mapping for those two, which are already
-there) and creates the rest. That is expected; `ls /bin` is the
-check.
+**Interactive applet use does NOT need `--install`.**  BusyBox is
+built with `CONFIG_FEATURE_SH_STANDALONE=y`, so `ash` recognizes the
+compiled-in applet names and runs them in-process -- `date`, `time`,
+`ls`, `cat`, `true` all work on a fresh image with only
+`/bin/busybox` and `/bin/sh` staged.  Verified 2026-11-04: `date`
+printed the epoch date before any `--install`.
+
+**`--install` is needed only for path-based exec** -- a shebang such
+as `#!/bin/date`, or a program that `execve("/bin/date")`.  Without
+it, `/bin/date` is `f_open -> 4` (`FR_NO_FILE`) and the shell prints
+`sh: /bin/date: not found`.  After `/bin/busybox --install -s /bin`
+the symlink exists and `/bin/date` runs.  `/bin/sh` is staged by the
+build as a copy of busybox, so shebang lines that name `/bin/sh`
+work without `--install`.
+
+The absolute path is required for `--install` itself: busybox reads
+`/proc/self/exe` to find itself, donix has no `/proc/self/exe`, and
+it falls back to `argv[0]` -- which must start with `/`.  **Note:**
+`busybox --install -s /bin` prints `Operation not permitted` for
+`/bin/busybox` and `/bin/sh` (the `FR_EXIST` -> `-EPERM_` mapping for
+those two, which are already there) and creates the rest.  That is
+expected; `ls /bin` is the check.
+
+**Correction to an earlier claim:** a `sh: date: not found` seen in a
+prior session was a *missing applet in the binary* (the `testme`
+busybox omitted `date`/`time`/`uptime`), not a missing symlink.  The
+rebuild from `configs/busybox.config` fixed it.  Do not diagnose
+`not found` for an applet as "run `--install`" without checking
+`busybox --list` first.
 
 **`/bin` contains only `busybox` and `sh`.** There is no `/bin/true`,
 `/bin/echo`, `/bin/cat`. `time true` works because `true` is a
