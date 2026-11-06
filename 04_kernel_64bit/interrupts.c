@@ -67,11 +67,16 @@ static volatile long g_console_sig_no   = 0;
  * context-switch, which is fatal under cli and was the proven post-^C
  * IRQ1 lockup.  One delivery mechanism, not two.
  */
-void console_request_sigint(long fg) {
-    if (fg > 1) {
+void console_request_signal(long fg, int sig) {
+    if (fg > 1 && sig > 0) {
         g_console_sig_pgrp = fg;
-        g_console_sig_no   = 2;   /* SIGINT */
+        g_console_sig_no   = sig;
     }
+}
+
+/* Kept for existing callers; equivalent to console_request_signal(fg,2). */
+void console_request_sigint(long fg) {
+    console_request_signal(fg, 2);
 }
 
 void console_raise_pending(void) {

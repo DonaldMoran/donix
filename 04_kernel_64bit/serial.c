@@ -179,13 +179,15 @@ static volatile unsigned rx_head = 0;   /* write */
 static volatile unsigned rx_tail = 0;   /* read  */
 
 /*
- * Drain the UART RX FIFO into the ring.  Returns 1 if a 0x03 was
- * seen (and consumed) during the drain, else 0.  Called from the
- * timer tick, interrupts off.  Does NOT take serial_lock: the tick
- * is already cli-off and this prints nothing.
+ * Drain the UART RX FIFO into the ring.  Returns the signal number
+ * consumed during the drain -- 2 for 0x03 (^C), 20 for 0x1A (^Z) --
+ * or 0 if neither was seen.  Both control bytes are consumed (never
+ * ringed); every other byte is ringed for the reader.  Called from
+ * the timer tick, interrupts off.  Does NOT take serial_lock: the
+ * tick is already cli-off and this prints nothing.
  */
 int serial_rx_drain_ring(void) {
-    int saw_ctrlc = 0;
+    int saw_sig = 0;
     /* Bounded: at most the FIFO depth per tick.  An unbounded
      * while(data-ready) can spin forever if the emulated FIFO reports
      * data-ready without the read clearing it (seen: the guest froze
@@ -195,8 +197,8 @@ int serial_rx_drain_ring(void) {
     for (int _i = 0; _i < 16; _i++) {
         if ((inb(0x3F8 + 5) & 0x01) == 0) break;
         uint8_t b = (uint8_t)inb(0x3F8);
-        if (b == 0x03) {
-            saw_ctrlc = 1;
+        if (b == 0x03 || b == 0x1A) {
+            saw_sig = (b == 0x03) ? 2 : 20;
             continue;   /* consume the signal byte, do not ring it */
         }
         unsigned next = (rx_head + 1u) & (SERIAL_RX_RING_SIZE - 1u);
@@ -207,7 +209,7 @@ int serial_rx_drain_ring(void) {
         rx_ring[rx_head] = b;
         rx_head = next;
     }
-    return saw_ctrlc;
+    return saw_sig;
 }
 
 int serial_rx_poll(void) {

@@ -231,9 +231,20 @@ int kbd_buffer_get(char *c) {
  * register read is destructive, so the tick stole typed bytes.
  */
 void serial_tick_poll(void) {
-    if (!serial_rx_drain_ring()) return;
+    int sig = serial_rx_drain_ring();
+    if (!sig) return;
     long fg = (long)console_fg_pgrp_get();
-    if (fg > 1) console_request_sigint(fg);
+    if (sig == 2) {
+        /* ^C: deliver to the fg pgrp; console_raise_pending skips the
+         * shell by pid, so fg == owner (busybox ash's layout) works. */
+        if (fg > 1) console_request_signal(fg, 2);
+        return;
+    }
+    /* ^Z: same owner rule as irq1_handler's Ctrl-Z -- fg > 1 and the
+     * fg pgrp is not the shell's own.  Applied here, at record time,
+     * because the delivery is deferred. */
+    long owner = (long)console_owner_pgrp_get();
+    if (fg > 1 && fg != owner) console_request_signal(fg, 20);
 }
 
 int kbd_buffer_get_mux(char *c) {
