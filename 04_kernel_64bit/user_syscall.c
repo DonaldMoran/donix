@@ -4086,6 +4086,38 @@ long sys_flock(int fd, int operation) {
 }
 
 /*
+ * Linux x86_64 fdatasync(2) -- syscall 75.
+ *
+ * Flush the file's data and the FAT metadata that describes it
+ * (the cluster chain and the directory entry) to disk.
+ * FatFs's f_sync does exactly that; there is no finer-grained
+ * "data only" call on FAT, and the size / first-cluster fields
+ * live in the directory entry, so f_sync is the correct
+ * implementation of fdatasync here.
+ *
+ * fd must be an open FILE slot.  A pipe, a console, a directory,
+ * a /proc entry, or a /dev entry is not a FAT file and gets
+ * -EBADF.  Linux gives fdatasync on a directory -EINVAL; the
+ * difference is not observable to any current caller and the
+ * sweep will not exercise it.  If a caller ever needs the
+ * distinction, split it here.
+ *
+ * WHY THIS EXISTS.  busybox `shred` calls fdatasync(75) after
+ * each overwrite pass.  Without a handler the call printed
+ * "Unknown syscall: 75" and returned -ENOSYS, which shred treats
+ * as "the sync did not happen" -- best-effort, but the
+ * overwritten bytes may not have reached the disk before the
+ * next pass, which is the opposite of shred's contract.
+ */
+long sys_fdatasync(int fd) {
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+    FIL* file_obj = (FIL*)slot->obj;
+    FRESULT r = f_sync(file_obj);
+    return r == FR_OK ? 0 : fatfs_errno(r);
+}
+
+/*
  * The shared unlink body, given a path that is already an absolute
  * Unix-form path (from resolve_at or a direct caller).
  *
@@ -12515,6 +12547,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
         case SYS_FLOCK:           result = (uint64_t)sys_flock((int)arg0, (int)arg1); break;
+        case SYS_FDATASYNC:       result = (uint64_t)sys_fdatasync((int)arg0); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
         case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
         case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
