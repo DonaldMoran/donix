@@ -167,12 +167,14 @@
 #define SYS_DUP2            33
 #define SYS_NANOSLEEP       35
 #define SYS_GETPID          39
+#define SYS_TIMES           43
 #define SYS_FORK            57
 #define SYS_VFORK           58
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
 #define SYS_KILL            62
+#define SYS_GETRUSAGE       98
 #define SYS_UNAME           63
 #define SYS_SETPGID         109
 #define SYS_GETPGRP         111
@@ -303,7 +305,7 @@ long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_newfstatat(int dirfd, const char* pathname, void* user_stat, int flags);
-long sys_wait4(long pid, int* user_status, int options);
+long sys_wait4(long pid, int* user_status, int options, void* user_rusage);
 /*
  * kill(62) and tgkill(234) -- slice 1 of docs/signal-design.md.
  *

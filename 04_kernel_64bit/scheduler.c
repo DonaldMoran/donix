@@ -601,6 +601,13 @@ void __attribute__((noreturn)) process_exit(void) {
         serial_unlock();
     }
 
+    /* Propagate this process's ticks to its parent for wait4's
+     * rusage and getrusage(RUSAGE_CHILDREN).  Done while exiting
+     * is still valid, before the state change. */
+    if (exiting->parent_pid != 0) {
+        pcb_t* _p = process_find_by_pid(exiting->parent_pid);
+        if (_p) _p->children_ticks += exiting->total_ticks;
+    }
     exiting->state = PROC_STATE_TERMINATED;
     scheduler_ready_queue_remove(exiting);
     {

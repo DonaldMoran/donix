@@ -6421,9 +6421,17 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 }
 
 // ============================================================
+/* Convert a 100 Hz tick count to (sec, usec).  The ONLY place
+ * the 100 Hz constant belongs; every rusage and times fill goes
+ * through it. */
+static void ticks_to_timeval(uint64_t ticks, uint64_t* tv_sec, uint64_t* tv_usec) {
+    *tv_sec  = ticks / 100;
+    *tv_usec = (ticks % 100) * 10000;
+}
+
 // SYS_WAIT4 (61)
 // ============================================================
-long sys_wait4(long pid, int* user_status, int options) {
+long sys_wait4(long pid, int* user_status, int options, void* user_rusage) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)ECHILD;
 
@@ -6557,6 +6565,24 @@ long sys_wait4(long pid, int* user_status, int options) {
              * console_fg_pgrp_reclaim_if, which now only resets
              * when the pgrp has no live member left.
              */
+            /* Fill the parent's struct rusage from the child's
+             * total_ticks (wait4's fourth argument, previously
+             * absent).  struct rusage on x86_64 is 144 bytes:
+             * ru_utime and ru_stime are each (i64 tv_sec, i64
+             * tv_usec), then 14 long counters.  utime from
+             * total_ticks, stime zeroed, matching
+             * /proc/<pid>/stat's "both total_ticks" honesty. */
+            if (user_rusage != NULL) {
+                unsigned char ru[144];
+                uint64_t usec = 0;
+                for (int k = 0; k < 144; k++) ru[k] = 0;
+                ticks_to_timeval(zombie->total_ticks,
+                                 (uint64_t*)(ru + 0), &usec);
+                *(uint64_t*)(ru + 8) = usec;
+                if (safe_copy_to_user(user_rusage, ru, 144) != 0) {
+                    return -(long)EFAULT_;
+                }
+            }
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
@@ -6730,6 +6756,52 @@ long sys_wait4(long pid, int* user_status, int options) {
         
         process_yield();
     }
+}
+
+// SYS_TIMES (43)
+//
+// struct tms on x86_64 is four clock_t (i64):
+//   tms_utime, tms_stime, tms_cutime, tms_cstime.
+// Returns jiffies since boot (Linux semantics).
+long sys_times(void* user_tms) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (user_tms != NULL) {
+        uint64_t buf[4];
+        buf[0] = self->total_ticks;
+        buf[1] = 0;
+        buf[2] = self->children_ticks;
+        buf[3] = 0;
+        if (safe_copy_to_user(user_tms, buf, sizeof(buf)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+    extern volatile uint64_t g_ticks;
+    return (long)g_ticks;
+}
+
+// SYS_GETRUSAGE (98)
+//
+// who: 0 = RUSAGE_SELF, -1 = RUSAGE_CHILDREN, 1 = RUSAGE_THREAD.
+// 144-byte struct rusage, same layout as wait4's fill.
+long sys_getrusage(int who, void* user_rusage) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (user_rusage != NULL) {
+        uint64_t ticks;
+        if (who == -1) ticks = self->children_ticks;
+        else if (who == 0 || who == 1) ticks = self->total_ticks;
+        else return -(long)EINVAL_;
+        unsigned char ru[144];
+        uint64_t usec = 0;
+        for (int k = 0; k < 144; k++) ru[k] = 0;
+        ticks_to_timeval(ticks, (uint64_t*)(ru + 0), &usec);
+        *(uint64_t*)(ru + 8) = usec;
+        if (safe_copy_to_user(user_rusage, ru, 144) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+    return 0;
 }
 
 // ============================================================
@@ -12357,7 +12429,9 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_VFORK:           result = (uint64_t)sys_vfork(); break;
         case SYS_EXECVE:          result = (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2); break;
         case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
-        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
+        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2, (void*)arg3); break;
+        case SYS_TIMES:           result = (uint64_t)sys_times((void*)arg0); break;
+        case SYS_GETRUSAGE:       result = (uint64_t)sys_getrusage((int)arg0, (void*)arg1); break;
         case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
         case SYS_SETPGID:         result = (uint64_t)sys_setpgid((long)arg0, (long)arg1); break;
         case SYS_GETPGRP:         result = (uint64_t)sys_getpgrp(); break;

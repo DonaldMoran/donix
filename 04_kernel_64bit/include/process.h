@@ -444,6 +444,13 @@ typedef struct pcb {
      * _Static_assert block pins moves.  Zeroed by
      * process_initialize_pcb's memset. */
     uint32_t umask;
+
+    /* Accumulated total_ticks of this process's reaped children,
+     * for wait4's rusage and getrusage(RUSAGE_CHILDREN).
+     * APPENDED AT THE END, after umask, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset. */
+    uint64_t children_ticks;
 } pcb_t;
 
 /* Job-control helpers.  Defined in user_syscall.c.  Called from
