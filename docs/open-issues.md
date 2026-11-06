@@ -385,6 +385,24 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open -- small defects and missing features
 
+- **No timezone: `date` prints the host's local time labeled
+  `UTC`.** The RTC work reads the CMOS and reports the epoch
+  second count; the C library prints that as `UTC` because
+  donix has no `TZ` and no `/usr/share/zoneinfo`.  `run` now
+  passes `-rtc base=localtime` (`20261106-rtc-localtime`), so
+  the RTC carries the host's local time and the guest's `date`
+  shows the same wall time the host does -- mislabeled
+  `UTC` because the label is the absent TZ.  This matches a
+  real PC's CMOS, which is localtime by default.  The proper
+  fix is a TZ in the shell's envp: `load_elf_into_user_process`
+  in `kmain.c` builds the initial `musl_sh` frame with
+  `argc=0`, `argv=NULL`, `envp=NULL` -- the shell has no
+  environment, and the envp propagates through `musl_sh`'s
+  `execve` of busybox.  Setting `TZ=EST5EDT` (musl parses the
+  POSIX TZ string without a zoneinfo file) needs the same
+  argv/envp frame layout as `sys_execve`'s section 6 -- ~80
+  lines.  Own session.
+
 - **`touch -d '<date>'` on a nonexistent path keeps `get_fattime`'s
   value.** `touch -d '2020-01-01 12:34:56' /tmp/newfile` does
   `open(O_CREAT)` then `utimensat(times)` in the same call.  The
