@@ -5448,6 +5448,31 @@ long sys_symlink(const char* user_target, const char* user_linkpath) {
     return 0;
 }
 
+/*
+ * Linux x86_64 link(2) -- syscall 86.
+ *
+ * FAT has no hard links.  Linux on a FAT mount returns -EPERM for
+ * link(2); donix does the same.  busybox `ln` sees -EPERM and
+ * falls back to copying the file, which is what `ln` does on
+ * filesystems without hardlinks -- the same behavior a Linux user
+ * sees if they `ln` on a FAT mount.
+ *
+ * This does NOT make `ln` a hardlink; it cannot, on FAT.  It
+ * only removes the "Unknown syscall: 86" noise by giving
+ * link(2) the errno Linux gives it on FAT.  The sweep row `ln`
+ * stays OBSERVE (copy-or-fail), not PASS -- `ln` on FAT is a
+ * copy tool, and the honest answer is that it copies.
+ *
+ * oldpath and newpath are not validated: -EPERM is the answer
+ * for any call, whether the source exists or not, exactly as
+ * Linux on FAT.  A caller that probes for hardlink support sees
+ * the same answer either way.
+ */
+long sys_link(const char* oldpath, const char* newpath) {
+    (void)oldpath; (void)newpath;
+    return -(long)EPERM_;
+}
+
 long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
     if (!user_path || !buf) return -(long)EFAULT_;
 
@@ -12664,6 +12689,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_MKDIR:           result = (uint64_t)sys_mkdir((const char*)arg0, (int)arg1); break;
         case SYS_UMASK:           result = (uint64_t)sys_umask((int)arg0); break;
         case SYS_RMDIR:           result = (uint64_t)sys_rmdir((const char*)arg0); break;
+        case SYS_LINK:            result = (uint64_t)sys_link((const char*)arg0, (const char*)arg1); break;
         case SYS_UNLINK:          result = (uint64_t)sys_unlink((const char*)arg0); break;
 
         case SYS_SYMLINK:         result = (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1); break;

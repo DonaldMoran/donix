@@ -87,6 +87,7 @@
  *  82  rename            sys_rename
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
+ *  86  link              sys_link           (returns -EPERM; FAT has no hardlinks)
  *  87  unlink            sys_unlink
  *  88  symlink           sys_symlink       (writes a DONIX_LINK marker)
  *  89  readlink          sys_readlink      (returns the marker's target)
@@ -191,6 +192,7 @@
 #define SYS_RENAME          82
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
+#define SYS_LINK            86
 #define SYS_UNLINK          87
 #define SYS_SYMLINK         88
 #define SYS_READLINK        89
