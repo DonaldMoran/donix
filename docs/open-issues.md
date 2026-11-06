@@ -385,6 +385,22 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open -- small defects and missing features
 
+- **`touch -d '<date>'` on a nonexistent path keeps `get_fattime`'s
+  value.** `touch -d '2020-01-01 12:34:56' /tmp/newfile` does
+  `open(O_CREAT)` then `utimensat(times)` in the same call.  The
+  create writes the directory entry (and the `ATA` flush from
+  `09d2f98` makes it durable), but `f_utime` returns `FR_NO_FILE`
+  on the just-created file and the file keeps `get_fattime`'s
+  value (the current time, not the `-d` value).  **On an existing
+  file, `touch -d` round-trips exactly** (the `09d2f98` fix), and
+  `touch f` (no `-d`), `vi`, `tar -xf` mtime preservation, and the
+  cross-`touch` read all work.  The gap is the create-then-set in
+  one `touch` invocation.  A `winsect = (LBA_t)-1` invalidate was
+  tried and reverted: `(LBA_t)-1` is a sector number, and a later
+  `sync_window` wraps it below the `ATA_WRITE_PROTECT_LBAS` floor.
+  The real fix is in `f_utime`'s path or a `sync_fs` + re-stat in
+  `sys_utimensat`; own session.
+
 - **`f_utime` on a file that `f_open` just created returns
   `FR_NO_FILE`.** The directory entry is staged in `fs->win` and
   not flushed until `f_sync` / `f_close`; `f_utime`'s `follow_path`
