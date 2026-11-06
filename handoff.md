@@ -314,6 +314,12 @@ screen, that is the `-S`, not a fault**). **`./run tcg` /
 `-enable-kvm`). The Makefile run targets also use `-cpu max` + TCG --
 **state which launcher was used.** Default cwd `/root`.
 
+**Writing a new `expect` harness:** `docs/expect-harness.md` has
+the two spawn patterns (`./run headless` vs. QEMU directly for a
+staged binary), the two verdict-pattern rules, the `-no-shutdown`
+shutdown rule, and the capture rule. Read it before writing a
+`.exp`; `tools/gate.exp` is the worked example.
+
 **In-guest gate.** `cd /`, then `canary --full` (28/28) and
 `/root/scripts/test.sh` (57/57). **Plus the two shell tests:**
 `sleep 100` then `^C` returns the prompt; `exit` from `ash` ->
