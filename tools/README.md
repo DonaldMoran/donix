@@ -5,6 +5,11 @@ kernel, userland, or image code.
 
 ## gate.exp
 
+This directory is for **tracked, reproducible harnesses**. An ad
+hoc probe ("does this one change still boot," "does `cat` read
+this file") goes in `/tmp/<name>.exp`, not here -- see
+`docs/expect-harness.md`, "Where the `.exp` file goes".
+
 Boots `./run headless` and runs the three automated gates:
 `canary --full`, `/root/scripts/test.sh`, `/usr/bin/EXEC_CHURN`.
 Prints a three-line verdict; exits 0 on all-green.

@@ -8,6 +8,25 @@ demonstrated there.
 
 ---
 
+## Where the `.exp` file goes
+
+**`tools/` is for tracked, reproducible harnesses** -- the
+automated gate, and anything else that should ship with a clone
+and be re-runnable by any session.
+
+**An ad hoc probe goes in `/tmp`.** If the question is "does
+`cat` read this file" or "does this one change still boot," the
+`.exp` is scratch: write it to `/tmp/<name>.exp` (and its log to
+`/tmp/<name>.expect.log`), run it, delete it or let `/tmp` clear.
+Do not leave a one-off under `tools/` -- it shows up as `??` in
+`git status` and a later session has to decide whether it is a
+tool or debris.
+
+The same `/tmp` caveat as any paste applies: re-write the script
+in the same paste that runs it if `/tmp` may have been cleared.
+
+---
+
 ## Two spawn patterns
 
 ### Pattern A -- `./run headless` (builds and boots)
