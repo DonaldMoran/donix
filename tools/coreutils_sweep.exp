@@ -280,19 +280,6 @@ foreach row $smoke {
 # These are the "THE GATE GAP" behaviors.  Adding them here means a
 # green run of this .exp IS the gate, not just an approximation of it.
 
-# sleep 100 then ^C -> prompt returns
-send "sleep 100\r"
-after 2000
-send "\003"
-if {[run_one "echo __INT__OK" "INT"]} {
-    lappend results "PASS    shell: sleep+^C returns prompt"
-    incr np
-} else {
-    lappend results "FAIL    shell: sleep+^C did not return prompt"
-    lappend fail_list "shell-sleep-int"
-    incr nf
-}
-
 # exit from ash -> donix> -> busybox sh -> ash prompt
 send "exit\r"
 set back 0
@@ -316,6 +303,83 @@ if {$back} {
     incr nf
 }
 
+# sleep 100 then ^C -> prompt returns.
+#
+# Control bytes need a real byte path to the guest UART:
+#   - Pattern A (`./run headless`) pipes QEMU through `tee`, so a
+#     byte written to the expect pty never reaches the guest; `send
+#     "\003"` kills the wrapper ("spawn id ... not open").
+#   - Pattern B with `-serial stdio` makes QEMU's stdin a host tty:
+#     `^C` there is the tty INTR char and SIGINTs QEMU itself
+#     (observed: "qemu-system-x86_64: terminating on signal 2").
+# So QEMU is given a UNIX-socket serial and expect drives it through
+# `socat -,raw,echo=0`, which passes 0x03 as a BYTE.  This row is last
+# because it replaces the spawn every earlier run_one used.
+catch {exec kill -TERM $run_pid}
+catch {exec pkill -TERM -P $run_pid}
+catch {close}
+catch {wait}
+catch {exec rm -f /tmp/donix-ctrlc.sock}
+
+# QEMU flags mirrored from run's qemu_base(), with the serial on a socket.
+spawn qemu-system-x86_64 \
+    -drive "file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0" \
+    -enable-kvm -cpu host -rtc base=localtime \
+    -serial unix:/tmp/donix-ctrlc.sock,server,nowait \
+    -monitor none -no-reboot -no-shutdown -display none
+set qemu_pid [exp_pid $spawn_id]
+
+# Wait for QEMU to create the socket file before connecting socat.
+set _w 0
+while {![file exists /tmp/donix-ctrlc.sock]} {
+    after 100; incr _w
+    if {$_w > 100} { puts "\n=== SWEEP: ^C socket never appeared ===" }
+}
+
+if {[catch {
+    # raw,echo=0: 0x03 is a byte for the guest, not socat's INTR.
+    spawn socat -,raw,echo=0 UNIX-CONNECT:/tmp/donix-ctrlc.sock
+    expect {
+        -re {(\r?\n|^)(donix> |~ # |/ # )$} { }
+        timeout { error "pattern-B boot timeout" }
+    }
+    send "cd /\r"
+    expect -re {(\r?\n|^)[^ \r\n]* # $}
+    # Honest two-step: `sleep 100` on its own line (no marker, so no
+    # echo of the command can be mistaken for output), send 0x03, and
+    # require the prompt back because sleep was killed.  Then a
+    # SEPARATE `echo __INT__OK` confirms the shell is live again.
+    send "sleep 100\r"
+    after 2000
+    send "\003"
+    expect {
+        -re {(\r?\n|^)[^ \r\n]* # $} { }
+        timeout { error "no prompt after ^C (sleep not interrupted)" }
+    }
+    send "echo __INT__OK\r"
+    expect {
+        -re {__INT__OK} { }
+        timeout { error "shell not live after ^C" }
+    }
+    send "echo __INT__OK\r"
+    expect {
+        -re {__INT__OK} { }
+        timeout { error "no __INT__OK after ^C" }
+    }
+} err]} {
+    lappend results "FAIL    shell: sleep+^C did not return prompt ($err)"
+    lappend fail_list "shell-sleep-int"
+    incr nf
+} else {
+    lappend results "PASS    shell: sleep+^C returns prompt"
+    incr np
+}
+catch {exec kill -TERM $qemu_pid}
+catch {exec pkill -TERM -P $qemu_pid}
+catch {close}
+catch {wait}
+catch {exec rm -f /tmp/donix-ctrlc.sock}
+
 # ---- verdict ----
 puts "\n===== SWEEP RESULTS ====="
 foreach r $results { puts $r }
@@ -328,11 +392,12 @@ if {[llength $fail_list] > 0} {
 }
 
 # ---- shutdown ----
-send "exit\r"
-after 2000
+# The spawn may already be closed by the Pattern-B ^C row above;
+# guard the send and keep every cleanup step idempotent.
+if {![catch {send "exit\r"}]} { after 2000 }
 catch {exec kill -TERM $run_pid}
 catch {exec pkill -TERM -P $run_pid}
-close
-wait
+catch {close}
+catch {wait}
 
 if {$nf > 0} { exit 1 } else { exit 0 }

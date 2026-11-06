@@ -385,6 +385,13 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open -- small defects and missing features
 
+- **Control bytes need a socket serial in `.exp` harnesses.**
+  `./run` pipes QEMU through `tee` (Pattern A), so an expect pty byte
+  never reaches the guest; `-serial stdio` (Pattern B) makes `^C` the
+  tty INTR char and SIGINTs QEMU. Any harness that sends `^C`/`^Z`
+  must use `-serial unix:...,server,nowait` + `socat -,raw,echo=0`.
+  See `docs/expect-harness.md` and `tools/coreutils_sweep.exp`.
+
 - **No timezone: `date` prints the host's local time labeled
   `UTC`.** The RTC work reads the CMOS and reports the epoch
   second count; the C library prints that as `UTC` because

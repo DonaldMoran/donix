@@ -66,6 +66,26 @@ this copy. The load-bearing ones for `expect` are `-serial stdio`
 need a window). `-s` is the gdb stub on `:1234`; drop it if the
 test does not use gdb.
 
+**Control bytes (`^C`, `^Z`) need the socket form, not either pattern
+above.** Pattern A pipes QEMU through `tee`, so a byte written to the
+expect pty never reaches the guest UART. Pattern B with `-serial
+stdio` makes QEMU's stdin a host tty, where `^C` is the tty INTR char
+and SIGINTs QEMU itself (`qemu-system-x86_64: terminating on signal
+2`). To deliver a control byte to the guest, put the serial on a UNIX
+socket and drive it through `socat` in raw mode:
+
+    spawn qemu-system-x86_64 ... \
+        -serial unix:/tmp/donix-ctrlc.sock,server,nowait ...
+    while {![file exists /tmp/donix-ctrlc.sock]} { after 100 }
+    spawn socat -,raw,echo=0 UNIX-CONNECT:/tmp/donix-ctrlc.sock
+    ...
+    send "\003"
+
+`-,raw,echo=0` is load-bearing: without it `0x03` is socat's INTR char
+and kills socat. `tools/coreutils_sweep.exp`'s `sleep 100 + ^C` row is
+the worked example.
+
+
 ---
 
 ## Two verdict-pattern rules (both are bugs we hit)
