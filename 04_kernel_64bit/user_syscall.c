@@ -4118,6 +4118,84 @@ long sys_fdatasync(int fd) {
 }
 
 /*
+ * Linux x86_64 sched_getaffinity(2) -- syscall 204.
+ *
+ * Copy the calling process's CPU affinity mask into `mask`, which
+ * holds `cpusetsize` bytes.  donix is a single-CPU build: one
+ * PIT, one scheduler, one idle process.  The mask is CPU 0 only:
+ * bit 0 set, all other bits zero.  That is not a placeholder; it
+ * is the truth of the machine this kernel boots on.
+ *
+ * ABI.  musl on x86_64 defines cpu_set_t as `unsigned long[16]`
+ * -- 128 bytes, CPU_SETSIZE 1024, one bit per CPU.  The syscall
+ * must not write more than cpusetsize bytes, and must accept any
+ * cpusetsize the ABI permits (including values larger than the
+ * kernel's own struct, which the caller may use to size a
+ * larger set than the one this kernel has).  Linux's minimum is
+ * one unsigned long -- 8 bytes -- because a smaller set cannot
+ * hold bit 0.
+ *
+ * ERRORS, matching Linux where they can:
+ *   -EINVAL   cpusetsize < sizeof(unsigned long)
+ *   -ESRCH    pid is positive and names no live process
+ *   -EFAULT   mask is a bad user pointer
+ *
+ * DEVIATION FROM LINUX, NAMED.  sched_getaffinity(getpid(), ...)
+ * and sched_getaffinity(0, ...) answer.  sched_getaffinity(other_
+ * live_pid, ...) returns -EINVAL, not that process's mask, because
+ * donix has no per-process affinity to answer with -- every
+ * process on this machine is on CPU 0.  Returning -EINVAL names
+ * that; returning the caller's mask would be the wrong answer
+ * with the right shape.  A future caller that genuinely needs a
+ * cross-process answer is a scheduler feature, not a stub change.
+ *
+ * WHY THIS EXISTS.  busybox `nproc` calls sched_getaffinity to
+ * size the CPU count.  Without a handler, the call printed
+ * "Unknown syscall: 204" and returned -ENOSYS; nproc fell back
+ * to sysconf, which returned 1 -- correct, by accident.  With
+ * this handler the noise is gone and the answer is by
+ * construction.
+ */
+long sys_sched_getaffinity(int pid, size_t cpusetsize, void* mask) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    /* pid 0 is "me".  Any positive pid that names a live process
+     * is answered with -EINVAL (see the DEVIATION note); a
+     * positive pid that names no process is -ESRCH. */
+    if (pid != 0 && pid != (int)self->pid) {
+        /* ESRCH_ is defined later in this file, near sys_kill; use
+         * the literal 3 here rather than move the define, matching
+         * the same pattern fat_mkdir uses for EEXIST (17). */
+        if (!process_find_by_pid((uint64_t)pid)) return -(long)3;  /* ESRCH */
+        return -(long)EINVAL_;
+    }
+
+    /* One unsigned long is the minimum sized set that can hold
+     * bit 0; less is -EINVAL, as Linux. */
+    if (cpusetsize < sizeof(unsigned long)) return -(long)EINVAL_;
+
+    /* Build the mask in a kernel stack buffer.  128 bytes is
+     * musl's cpu_set_t on x86_64; a caller passing more than
+     * 128 gets only the first 128 copied, which is what the
+     * ABI permits (the caller's own larger set extends past
+     * what this kernel has to say about). */
+    unsigned long kmask[16];
+    for (size_t i = 0; i < sizeof(kmask) / sizeof(kmask[0]); i++) {
+        kmask[i] = 0;
+    }
+    kmask[0] = 1UL;   /* CPU 0 only */
+
+    size_t to_copy = cpusetsize;
+    if (to_copy > sizeof(kmask)) to_copy = sizeof(kmask);
+
+    if (safe_copy_to_user(mask, kmask, to_copy) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
+/*
  * The shared unlink body, given a path that is already an absolute
  * Unix-form path (from resolve_at or a direct caller).
  *
@@ -12591,6 +12669,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_UTIMENSAT:       result = (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3); break;
         case SYS_GETRANDOM:       result = (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2); break;
         case SYS_RSEQ:            result = (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3); break;
+        case SYS_SCHED_GETAFFINITY: result = (uint64_t)sys_sched_getaffinity((int)arg0, (size_t)arg1, (void*)arg2); break;
 
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); result = 0; break;

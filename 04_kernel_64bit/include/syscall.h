@@ -104,6 +104,7 @@
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
  * 200  tkill            sys_tkill         (slice 5: alias of kill; busybox `kill`)
+ * 204  sched_getaffinity sys_sched_getaffinity (one CPU; CPU 0 only)
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
  * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
@@ -209,6 +210,7 @@
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
 #define SYS_TKILL           200
+#define SYS_SCHED_GETAFFINITY 204
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_GETTIMEOFDAY    96
