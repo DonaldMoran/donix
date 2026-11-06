@@ -6193,7 +6193,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (got < 4 ||
         ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: not an ELF file\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOEXEC;
