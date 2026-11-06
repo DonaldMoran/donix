@@ -79,6 +79,7 @@
  *  62  kill              sys_kill           (slice 1: pending bit, no delivery)
  *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
+ *  73  flock             sys_flock          (advisory; FAT has none)
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
@@ -180,6 +181,7 @@
 #define SYS_GETPGRP         111
 #define SYS_GETPGID         121
 #define SYS_FCNTL           72
+#define SYS_FLOCK           73
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80

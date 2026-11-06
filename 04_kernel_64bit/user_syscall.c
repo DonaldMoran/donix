@@ -85,6 +85,19 @@ typedef struct file_slot_s {
      * pointer and bump the refcount, so the path rides along.
      */
     char    *dir_path;
+    /*
+     * Advisory flock(2) state.  0 = unlocked, LOCK_SH, LOCK_EX,
+     * or the same with LOCK_NB remembered.  set by sys_flock,
+     * cleared on LOCK_UN; the value is freed with the slot, which
+     * is the Unix advisory-lock contract -- a lock lives until
+     * the fd does.
+     *
+     * FAT has no lock bits and no inode to hang one on, so this
+     * is advisory-only, matching what Linux gives flock(2) on a
+     * FAT mount.  do not grow a global table until a test needs
+     * cross-process contention; per-fd is what flock means.
+     */
+    uint32_t flock_state;
 } file_slot_t;
 
 /* Defined below, in the stat section.  sys_open needs it for the
@@ -4007,6 +4020,69 @@ long sys_dup2(int oldfd, int newfd) {
  */
 long sys_dup(int fd) {
     return sys_fcntl(fd, F_DUPFD, 0);
+}
+
+/*
+ * Linux x86_64 flock(2) -- syscall 73.
+ *
+ * Advisory lock on an open fd.  LOCK_SH=1, LOCK_EX=2, LOCK_NB=4,
+ * LOCK_UN=8.  The lock is per-slot and lives as long as the slot;
+ * LOCK_UN clears it, close() frees it with the slot.
+ *
+ * ADVISORY ONLY.  FAT has no lock bits and no inode to hang one
+ * on, and Linux gives flock(2) on a FAT mount the same advisory
+ * semantics: two flock callers coordinate, nothing else notices.
+ * This implementation stores the state on the slot and never
+ * blocks.  LOCK_NB is accepted and remembered but has no visible
+ * effect here, because nothing on a single-user single-process
+ * system can contend for the slot.
+ *
+ * CROSS-PROCESS CONTENTION IS NOT IMPLEMENTED.  Two processes
+ * each holding the same file via fork share the file_slot_t
+ * (fork duplicates the slot pointer and bumps refcount), so
+ * they observe one lock word -- which is correct: flock(2) on a
+ * dup'd fd shares one lock.  Two INDEPENDENT opens of the same
+ * path get two slots and two lock words, and can both hold
+ * LOCK_EX at once.  If a test needs that case, add a global
+ * table keyed by (dir, name) -- but only when a test exists,
+ * per the "design against two examples" rule.  The slot shape
+ * is what flock means for one fd, and that is the whole of the
+ * syscall.
+ *
+ * Bad flags (-EINVAL): any bit outside the four; LOCK_SH|LOCK_EX
+ * together; LOCK_UN with no lock held is not an error (Linux
+ * returns 0); the fd must name a live slot (-EBADF).
+ */
+#define LOCK_SH_ 1
+#define LOCK_EX_ 2
+#define LOCK_NB_ 4
+#define LOCK_UN_ 8
+
+long sys_flock(int fd, int operation) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (!slot) return -(long)EBADF_;
+
+    /* Only the four documented bits are legal. */
+    if (operation & ~(LOCK_SH_ | LOCK_EX_ | LOCK_NB_ | LOCK_UN_)) {
+        return -(long)EINVAL_;
+    }
+    /* LOCK_SH and LOCK_EX are mutually exclusive. */
+    if ((operation & LOCK_SH_) && (operation & LOCK_EX_)) {
+        return -(long)EINVAL_;
+    }
+    /* LOCK_UN releases, with or without LOCK_NB; Linux permits
+     * the combination and ignores LOCK_NB on unlock. */
+    if (operation & LOCK_UN_) {
+        slot->flock_state = 0;
+        return 0;
+    }
+    /* Acquisition must name a lock type. */
+    int want = operation & (LOCK_SH_ | LOCK_EX_);
+    if (want == 0) return -(long)EINVAL_;
+
+    slot->flock_state = (uint32_t)(want |
+        ((operation & LOCK_NB_) ? LOCK_NB_ : 0));
+    return 0;
 }
 
 /*
@@ -12438,6 +12514,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_GETPGID:         result = (uint64_t)sys_getpgid((long)arg0); break;
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
+        case SYS_FLOCK:           result = (uint64_t)sys_flock((int)arg0, (int)arg1); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
         case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
         case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
