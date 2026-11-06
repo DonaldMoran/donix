@@ -385,6 +385,16 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open -- small defects and missing features
 
+- **`f_utime` on a file that `f_open` just created returns
+  `FR_NO_FILE`.** The directory entry is staged in `fs->win` and
+  not flushed until `f_sync` / `f_close`; `f_utime`'s `follow_path`
+  reads from disk. Same `sync_window` family as `a0664a8` (f_open)
+  and `d69c2ab` (f_write). A future fix would `f_sync` in `f_open`
+  before returning -- a behavior change to `f_open`, own commit,
+  own gate. User-visible symptom is one swallowed `FR_NO_FILE` on
+  `touch -d` against a nonexistent path; `touch` recovers, and the
+  set-on-existing case works. The `20261106-f-utime` commit's
+  KNOWN LIMIT paragraph is the source.
 - `kill(0, sig)` ("my group") still returns `-EINVAL`.
   `kill(-pgid, sig)` works (`9b1a4ed`).
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are latent
