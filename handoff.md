@@ -5,17 +5,18 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (sixth session), at `6406106`.
-**`v0.6.19` is the last pushed release.** `dev` is at `6406106`; its
+**Last updated:** 2026-11-06 (sixth session, part 2), at `b514b78`.
+**`v0.6.19` is the last pushed release.** `dev` is at `b514b78`; its
 recent history is `ac05bbf`, `bb8c8b2`, `6a6fb4d`, `4f48728`,
 `26c3bde`, `c3deb8e`, `62b5433`, `711ac16`, `695c53c`, `2bba981`,
-`c8ef340`, `63cb81b`. `origin/dev` = `ba56b3d`. Ahead **49**,
+`c8ef340`, `63cb81b`. `origin/dev` = `ba56b3d`. Ahead **52**,
 **clean**, **stash present** (`stash@{0}`: vfork 3b diagnostics;
 preserved, do not drop). No push, no tag this session; banner still
 `v0.6.19`. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`).
-Scratch tags: `20261104-gettimeofday-time` on `5a3b65e` (preserved)
-and `20261106-sys-execve-cr3` on `6406106` (new this session). Both
-are local; nothing is pushed.
+Scratch tags: `20261104-gettimeofday-time` on `5a3b65e`,
+`20261106-sys-execve-cr3` on `6406106`, and
+`20261106-wait4-rusage` on `b514b78` -- all preserved, all local,
+nothing is pushed.
 
 **`time true` is FIXED** by `6406106`. The fault was a stale `%cr3`
 register at the `sysret` after a vfork+exec: `sys_execve` switched
@@ -27,11 +28,16 @@ loads `%cr3` from `self->cr3` at the end of `sys_execve`'s section 8,
 guarded by a compare so a regular syscall (the scheduler already
 switched `%cr3`) is a no-op.
 
-**`time` still reports garbage `user`/`sys`** (`~152710235h`), which
-is the separate, open `getrusage`/`times` accounting bug in
-`WHAT IS BROKEN`. `real` is correct. Do not fix it in a session that
-touches `sys_execve`; it is a kernel accounting bug with its own
-commit.
+**`time`'s accounting is FIXED** by `b514b78`. The parent's struct
+rusage was never written -- Linux `wait4`'s fourth argument was
+absent from the signature and the dispatch, so busybox `time` read
+uninitialized stack (`~152710235h`, deterministic garbage, not a
+unit bug). `sys_wait4` now fills it from the reaped child's
+`total_ticks`, and `sys_times` (43) / `sys_getrusage` (98) are
+implemented from the same counters. **`total_ticks` is a single
+runnable-tick counter** (`/proc/<pid>/stat` reports it as both
+utime and stime), so `time sleep 1` charges ~1.1s to `user` -- the
+honest value of this counter, not a new bug.
 
 **`~/code/testme` is the `v0.6.19` reference tree (`ba56b3d`,
 tagged).** It is the known-good *boot* comparison. **Do not modify
@@ -86,10 +92,8 @@ broke the shell.
 Every `readelf`/`nm`/`objdump` diagnostic must point at
 `userland/musl/build/busybox.elf` (== `third_party/busybox/busybox`).
 
-**`time`'s accounting is garbage**: `real` is plausible but `user` /
-`sys` print about `152710235h`. This is `getrusage`/`times` returning
-nonsense on donix -- **a kernel accounting bug, separate from the
-(fixed) `time true` fault.** A hand-written `time` would inherit it.
+**`time`'s accounting is FIXED** by `b514b78` (see START HERE).
+`user`/`sys` are now in seconds; `real` was always correct.
 
 ---
 
@@ -120,30 +124,25 @@ nonsense on donix -- **a kernel accounting bug, separate from the
 
 ## WHAT IS BROKEN
 
-- **`time`'s accounting is garbage**: `real` is plausible but `user`
-  / `sys` print about `152710235h`. Kernel `getrusage`/`times`
-  accounting bug. **Separate from the (fixed) `time true` fault; do
-  not fix in the same session as a `sys_execve` change.**
+Nothing currently open. The `time true` fault (`6406106`) and the
+`time` accounting bug (`b514b78`) are both fixed and verified.
 
 ---
 
 ## NEXT -- the highest-value work, in order
 
-The `time true` fault is fixed; the `time` question is closed. The
-remaining items are independent and small.
+The `time true` fault and the `time` accounting bug are both fixed.
+The remaining items are independent and small.
 
-1. **The `time` accounting bug** (under WHAT IS BROKEN). Kernel
-   `getrusage`/`times` accounting. **Give it its own session and its
-   own commit; do not bundle it with anything else.**
-2. **`sys_mkdir` `-ENOTDIR` vs `-EEXIST`** for the file case.
+1. **`sys_mkdir` `-ENOTDIR` vs `-EEXIST`** for the file case.
    POSIX wants `-ENOTDIR` when the target exists as a file. Small,
    `sys_mkdir`-local; no current caller depends on it.
-3. **`docs/open-issues.md` item 10 -- SSE save/restore.** The test
+2. **`docs/open-issues.md` item 10 -- SSE save/restore.** The test
    is in the item; two separable commits (kernel save/restore, then
    userland flag removal).
-4. **`docs/open-issues.md` item 9 -- the privilege model.**
+3. **`docs/open-issues.md` item 9 -- the privilege model.**
    **Before starting, ask what it unlocks.** If "nothing," skip.
-5. **The cosmetic `f_open(usr/bin/BUSYBOX) -> 4`** on `busybox sh`
+4. **The cosmetic `f_open(usr/bin/BUSYBOX) -> 4`** on `busybox sh`
    re-entry. Recovered; worth one line when the exec path is next
    touched.
 
@@ -370,12 +369,14 @@ unpushed `dev` commit is intentional work. Run `git log --oneline
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `6406106`; recent history `ac05bbf`, `bb8c8b2`,
-`6a6fb4d`, `4f48728`, `26c3bde`, `c3deb8e`, `62b5433`, `711ac16`,
-`695c53c`, `2bba981`, `c8ef340`, `63cb81b`. Ahead **49**, **clean**,
-**stash present**. `origin/dev` = `ba56b3d`. Scratch tags
-`20261104-gettimeofday-time` on `5a3b65e` and
-`20261106-sys-execve-cr3` on `6406106`, both preserved. Work is now
+`dev` is at `b514b78`; recent history `43c4c6a`, `b1477fb`,
+`6406106`, `ac05bbf`, `bb8c8b2`, `6a6fb4d`, `4f48728`, `26c3bde`,
+`c3deb8e`, `62b5433`, `711ac16`, `695c53c`, `2bba981`, `c8ef340`,
+`63cb81b`. Ahead **52**, **clean**, **stash present**.
+`origin/dev` = `ba56b3d`. Scratch tags
+`20261104-gettimeofday-time` on `5a3b65e`,
+`20261106-sys-execve-cr3` on `6406106`, and
+`20261106-wait4-rusage` on `b514b78` -- all preserved. Work is now
 pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
 a gate is wanted it is set in this file before that release session,
 not during it. The user has said not to move to `v0.6.20` until they
@@ -493,17 +494,16 @@ preserved diagnostic trail. **Do not drop, do not pop.**
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `6406106`, ahead 49, clean,
-stash present, two scratch tags, nothing pushed.** **`time true` is
-fixed** by `6406106`: a stale `%cr3` at the `sysret` after vfork+exec
-(the new address space was never loaded into the register) made the
-child `sysret` into the parent's space and fault at `CR2 = 0` /
-`RIP = 0` / `error = 0x15`; `sys_execve` now loads `%cr3` from
-`self->cr3`. Verified: `time true` x5, `time ls`, `time echo hi`,
-`canary --full` 28/28, `test.sh` 57/57, `EXEC_CHURN` 24/24, `pipe7e`
-250000 iterations all-pass, `^C`/`^Z`/`fg`, `busybox sh` re-entry.
-`time`'s `user`/`sys` accounting is still garbage -- a separate,
-open kernel bug; `real` is correct. **NEXT: the `time` accounting
-bug, `sys_mkdir -ENOTDIR`, SSE save/restore, or the privilege
-model.** Do not re-walk the refuted `time true` routes. **Do not
-move to `v0.6.20` until the user says so.**
+**`v0.6.19` is released; `dev` is at `b514b78`, ahead 52, clean,
+stash present, three scratch tags, nothing pushed.** **`time true`
+is fixed** by `6406106` (stale `%cr3` at the `sysret` after
+vfork+exec; `sys_execve` now loads it from `self->cr3`). **`time`'s
+`user`/`sys` accounting is fixed** by `b514b78` (`sys_wait4` now
+fills the parent's struct rusage from the reaped child's
+`total_ticks`; `sys_times`/`sys_getrusage` implemented). Verified:
+`time true` / `time ls` / `time sleep 1` all in seconds,
+`canary --full` 28/28, `test.sh` 57/57, `sleep 100` + `^C`,
+`exit` -> `donix>` -> `busybox sh` re-entry. **NEXT: `sys_mkdir
+-ENOTDIR`, SSE save/restore, or the privilege model.** Do not
+re-walk the refuted `time true` routes. **Do not move to
+`v0.6.20` until the user says so.**
