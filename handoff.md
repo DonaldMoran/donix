@@ -5,212 +5,167 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (sixth session, part 2), at `9d7b5d3`.
-**`v0.6.19` is the last pushed release.** `dev` is at `23e37bb`; its
-recent history is `2d267da`, `5ccf862`, `b19a0ab`, `6651be4`,
-`3cade3f`, `e31395f`, `4ca001d`, `c5066e3`, `269ed07`, `bacbea1`,
-`65dac04`, `b514b78`. `origin/dev` = `ba56b3d`. Ahead **68**,
-**clean**, **no stash**. No push, no tag this session; banner still
-`v0.6.19`. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`).
-Scratch tags, all annotated, all preserved, nothing pushed:
-`20261104-gettimeofday-time` on `5a3b65e`,
-`20261106-sys-execve-cr3` on `6406106`,
-`20261106-wait4-rusage` on `b514b78`,
-`20261106-sys-flock` on `4ca001d`,
-`20261106-sys-fdatasync` on `e31395f`,
-`20261106-sys-sched-getaffinity` on `3cade3f`,
-`20261106-fat-rename-replace` on `6651be4`,
-`20261106-sys-link` on `b19a0ab`,
-`20261106-f-utime` on `5ccf862`,
-`20261106-coreutils-sweep` on `2d267da`,
-`20261106-busybox-coreutils-config` on `23e37bb`,
-`20261106-rtc-read` on `1479723`,
-`20261106-rtc-time-syscalls` on `9d7b5d3`.
-**Fifteen scratch tags.**
+**Last updated:** 2026-11-06 (seventh session), at `5575868`.
+**`v0.6.19` is the last pushed release.** `dev` is at `5575868`;
+recent history is `fc10881`, `0b07cd8`, `f6dd91a`, `d9df0bc`,
+`2e30866`, `3514bb1`, `23e37bb`. `origin/dev` = `ba56b3d`. Ahead
+**77**, **clean**, **no stash**, **24 scratch tags**. No push, no
+release this session; banner still `v0.6.19`. `main` = `7e4748b`
+(the `--no-ff` merge of `v0.6.19`).
 
-**The FAT-coreutils set is provable.** `tools/coreutils_sweep.exp`
-(self-checking, expect, per docs/expect-harness.md) runs ~95 applets
-PASS, `touch -d` PASS (five real timestamps via `5ccf862`), `ln`
-OBSERVE (honest `-EPERM` on FAT), six missing syscalls closed this
-session. The two shell behaviors `tools/gate.exp` leaves manual are
-in the sweep, but `^C`-over-serial `FAIL`s (see NEXT).
+**Scratch tags: 24, all annotated, all preserved, none pushed.**
+Newest first: `20261106-serial-ctrlc-ring` on `5575868`,
+`20261106-sweep-socket-serial` on `fc10881`,
+`20261106-sys-execve-no-elf-noise` on `0b07cd8`,
+`20261106-open-issues-tz` on `f6dd91a`,
+`20261106-rtc-localtime` on `d9df0bc`,
+`20261106-open-issues-touch-d-fresh`,
+`20261106-ata-flush-cache`, `20261106-get-fattime`,
+`20261106-handoff-rtc`, `20261106-rtc-time-syscalls` on `9d7b5d3`,
+`20261106-rtc-read` on `1479723`, `20261106-handoff-rewrite`,
+`20261106-open-issues-fr-no-file`,
+`20261106-busybox-coreutils-config` on `23e37bb`,
+`20261106-coreutils-sweep` on `2d267da`,
+`20261106-f-utime` on `5ccf862`, `20261106-sys-link` on `b19a0ab`,
+`20261106-fat-rename-replace` on `6651be4`,
+`20261106-sys-fdatasync` on `e31395f`,
+`20261106-sys-flock` on `4ca001d`,
+`20261106-sys-sched-getaffinity` on `3cade3f`,
+`20261106-wait4-rusage` on `b514b78`,
+`20261106-sys-execve-cr3` on `6406106`,
+`20261104-gettimeofday-time` on `5a3b65e`.
+
+**Stash:** none. `stash@{0}` ("vfork 3b", 2026-11-04) was dropped
+this session after the `^C` work was verified independent of it;
+the user chose not to keep it. There is no vfork-3b copy.
 
 ---
 
 ## START HERE
 
-**The next session is `^C`-over-serial.** It is the gate-gap: PS/2
-`^C` reaches `irq1_handler` and raises SIGINT on the foreground
-pgrp; UART `0x03` from `-serial stdio` is a data byte to the shell's
-line editor and does not. `tools/coreutils_sweep.exp`'s `sleep 100 +
-^C` row FAILs for exactly this reason. It is the last gate-gap item.
+**The next session is `FR_NO_FILE` create-then-set in `f_utime`.**
+It is the `sync_window` family (`a0664a8`, `d69c2ab`).  Visible
+symptom, now that the RTC is plumbed: `touch f` (no `-d`) on a
+nonexistent path shows `2026-01-01 00:00:00`, not the current time.
+The fix is `f_sync` in `f_open` before returning -- a behavior change
+to `f_open`, own commit, own gate.  See `open-issues.md`, the item at
+the top of `Also open -- small defects`.
 
-**The diagnostic plan (own session):**
-1. `stty -a` on the serial console -- is `isig` set?
-2. Send `^C` over `-serial stdio` while `sleep 100` runs -- does
-   `sys_kill(-fg, SIGINT)` fire from the UART path, or does the
-   shell's line editor see `0x03` as a byte?
-3. Whichever, the fix is in the UART RX path (route `0x03`
-   through the PS/2 signal logic) or in the shell's line editor
-   (honor `ISIG` on the UART path).
-
-After that fix, `tools/coreutils_sweep.exp`'s two shell `FAIL` lines
-become `PASS`, and a green `tools/coreutils_sweep.exp` plus a green
-`tools/gate.exp` is the full gate -- no manual shell tests.
-
-**The second item, for the session after that:** the `FR_NO_FILE`
-create-then-set in `f_utime` (see `open-issues.md`, the new item at
-the top of `Also open -- small defects`). The `sync_window` family
-as `a0664a8` and `d69c2ab`; a future fix would `f_sync` in
-`f_open` before returning, which is a behavior change to `f_open`
-and belongs in its own commit.
+**After that:** `sync(162)` / `fsync(74)` + `CONFIG_SYNC`/`CONFIG_FSYNC`
+(config-bound), then `getlogin` / `hostid` stubs (not in `test.sh`).
 
 ---
 
-## WHAT WORKS (verified in the 2026-11-06 boots)
+## WHAT WORKS (verified 2026-11-06, at `5575868`)
 
-- `canary --full` **28/28** (green on the split tree `5ccf862`,
-  byte-identical to `5129ac5`).
-- `test.sh` **57/57**.
+- **`canary --full` 28/28.**
+- **`test.sh` 57/57.**
 - **`EXEC_CHURN` 24/24 ALL-PASS.**
-- **`tools/coreutils_sweep.exp` ~95 PASS** (FAT-coreutils set).
-- **`time true` / `time ls` / `time echo hi`** complete.
-- **`touch -d '2020-01-01 12:34:56' f; stat -c %y f`** reads
-  `2020-01-01 12:34:56.000000000 +0000` (exact round-trip;
-  `5ccf862`).
-- **`date` prints the host's real date** -- `Fri Nov  6 17:42:04
-  UTC 2026` on the QEMU boot that verified `9d7b5d3`.  The
-  MC146818A RTC is read once at boot (`1479723`) and the time
-  syscalls add its epoch (`9d7b5d3`).
-- **`touch -d '<date>' f; stat -c %y f` still round-trips exactly**
-  -- that path supplies its own timestamp and ignores the RTC.
-- **`tar -xf`** preserves mtime of extracted file (same commit).
-- **`flock f true`** rc=0, no noise (`4ca001d`).
-- **`shred -n 1 f`** rc=0, no noise (`e31395f`).
-- **`nproc`** prints `1`, rc=0, no noise (`3cade3f`).
-- **`patch a < p`**, **`dos2unix`**, **`unix2dos`**, **`mv x y`**
-  all succeed where the destination exists (`6651be4`; Linux
-  rename(2) replace semantics on FAT).
-- **`ln f g`** prints "Operation not permitted" rc=1, source
-  untouched, no noise (`b19a0ab`; Linux on FAT returns `-EPERM` too).
-- **`^C` on a foreground `sleep 100`** returns the prompt from the
-  PS/2 keyboard (SDL window). **From `-serial stdio` it does not**
-  -- the gate-gap.
-- **`^Z` -> `[1]+ Stopped`; `jobs` lists it; `fg` resumes.**
-- **`exit` from `ash` -> `donix>`; `busybox sh` at `donix>` -> the
-  ash prompt** (re-entry works; the cosmetic
+- **`tools/coreutils_sweep.exp` PASS=97 FAIL=0** -- the full gate,
+  with both shell behaviors.  Its `sleep 100` + `^C` row is the
+  honest two-step: `sleep 100` alone, send `0x03`, require the prompt
+  back, then a separate `echo __INT__OK`.
+- **Serial `^C` works** (`5575868`: RX ring + bounded tick drain +
+  deferred SIGINT on the console fg pgrp).  Proven over three
+  transports, each a `/tmp` probe that required `sleep 100` to be
+  interrupted and a separate `__INT__OK` to run:
+  - UNIX socket: `-serial unix:...,server,nowait` +
+    `socat -,raw,echo=0` -- PASS.
+  - plain TCP: `-serial tcp:...,server,nowait` + `socat -,raw` -- PASS.
+  - **telnet: `-serial telnet:...,server,nowait` + a real `telnet`
+    client -- PASS.**
+  Caveats (see THE HARNESS RULE): `-serial stdio` cannot carry `^C`
+  (the host tty eats it and SIGINTs QEMU); a telnet client in **line
+  mode** handles `^C` client-side and never sends the byte.
+- **PS/2 `^C` (SDL) works and is unchanged** (`irq1_handler`).
+  `^Z` -> `[1]+ Stopped`; `jobs`; `fg`.  **`exit` from `ash` ->
+  `donix>`; `busybox sh` -> the ash prompt** (cosmetic
   `sys_execve: f_open(usr/bin/BUSYBOX) -> 4` still appears).
+- **`date` prints the host's real date** (RTC read at boot
+  `1479723`, plumbed `9d7b5d3`); `touch -d '<date>' f; stat -c %y f`
+  round-trips exactly.  `tar -xf` preserves mtime.
+- **`flock`, `shred -n 1`, `nproc`, `patch a < p`, `dos2unix`,
+  `unix2dos`, `mv x y` (replace), `ln f g` (`-EPERM` on FAT)** -- the
+  FAT-coreutils set, `23e37bb` onward.
 - **Interactive applets do NOT need `--install`**
   (`FEATURE_SH_STANDALONE=y`).
 
 ## WHAT IS BROKEN
 
-- **`^C` over `-serial stdio` does not raise SIGINT.** The
-  gate-gap. See NEXT.
+- **`touch f` (no `-d`) on a nonexistent path** shows
+  `2026-01-01 00:00:00` -- the `FR_NO_FILE` create-then-set in
+  `f_utime`.  NEXT.
 - **`logname`** prints `logname: getlogin` -- `SYS_GETLOGIN` not in
-  dispatcher. Not in `test.sh`.
+  dispatcher.  Not in `test.sh`.
 - **`hostid`** prints `00000000` -- `sys_gethostid` not in
-  dispatcher. Not in `test.sh`.
+  dispatcher.  Not in `test.sh`.
 - **`sync` / `fsync`** -- `CONFIG_SYNC`/`CONFIG_FSYNC` off, and
-  `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher. Config-bound,
-  separate round.
-- **`FR_NO_FILE` on create-then-set in `f_utime`** (see
-  `open-issues.md`).  The visible symptom, now that the RTC is
-  plumbed: `touch f` (no `-d`) on a nonexistent path shows
-  `2026-01-01 00:00:00`, not the current time.  `touch -d '<date>'`
-  on an existing path works.  The fix is `f_sync` in `f_open`
-  before returning -- a behavior change, own commit, own gate.
-- **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does
-  not export `PATH`. Environment gap, not syscall.
+  `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher.  Config-bound.
+- **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does not
+  export `PATH`.  Environment gap, not syscall.
 
 ---
 
-## NEXT -- the highest-value work, in order
+## THE HARNESS RULE (load-bearing)
 
-0. **RTC is done** (`1479723` read, `9d7b5d3` plumbing).  `date`
-   prints the host's real date; `touch -d` round-trips.  The
-   remaining gap is `touch f` (no -d) on a nonexistent path
-   (the `FR_NO_FILE` create-then-set, item 2).
-1. **`^C`-over-serial.** The gate-gap. Kernel diagnostic session.
-   Fix is in the UART RX path or the shell's line editor. See
-   START HERE.
-2. **`FR_NO_FILE` on create-then-set in `f_utime`.** The
-   `sync_window` family. One-line `open-issues.md` record, but a
-   real fix is `f_sync` in `f_open`, which is a behavior change and
-   needs its own commit. Low user-visible impact.
-3. **`sync(162)` / `fsync(74)` + `CONFIG_SYNC`/`CONFIG_FSYNC`** if
-   a future applet needs them. Config-bound.
-4. **`getlogin` / `hostid`** stubs if a future test needs them. Not
-   in `test.sh`.
+**A control byte (`^C` `0x03`, `^Z` `0x1A`) needs a byte path that
+actually delivers it to the guest UART.**
 
----
+- **`./run headless` (Pattern A) cannot**: `./run` pipes QEMU through
+  `tee`; an expect-pty byte never reaches the guest, and
+  `send "\003"` kills the wrapper (`spawn id ... not open`).
+- **`-serial stdio` cannot**: QEMU's stdin is a host tty; `^C` is the
+  tty INTR char and SIGINTs QEMU (`terminating on signal 2`).
+- **Use one of:** UNIX socket (`-serial unix:...,server,nowait` +
+  `socat -,raw,echo=0`), plain TCP (`-serial tcp:...` + raw socket),
+  or telnet with a raw/character-mode client.  `-,raw,echo=0` on
+  `socat` is load-bearing; without it `0x03` kills socat.
+  `tools/coreutils_sweep.exp`'s `^C` row is the worked example;
+  `docs/expect-harness.md` has the section.
 
-## THE GATE GAP
-
-**`canary --full` (28/28) and `test.sh` (57/57) do not cover `^C` on
-a foreground child or `busybox sh` re-entry.** Both `939e3ef` and
-`153dda9` passed the green gate and broke one of those two shell
-behaviors. **Any change to `sys_execve`'s user stack, to the
-`%fs_base` restore path, or to musl's startup path, must be tested
-with:**
-
-- **`sleep 100` then `^C`** -> the prompt returns (PS/2 keyboard)
-- **`exit` from `ash` -> `donix>` -> `busybox sh`** -> the ash
-  prompt returns
-
-before it is committed. **A green `canary`/`test.sh` is not
-sufficient.** Also useful: `pipe7e` (250000 iterations) and
-`EXEC_CHURN` (24 rounds).
-
-**`tools/coreutils_sweep.exp` now covers both**, plus the FAT-
-coreutils sweep. A green run is the gate. **But `^C`-over-serial
-FAILs today**, so the sweep's shell `FAIL` line is the current
-state, not a bug in the sweep.
+**A marker on the same line as `sleep` is not a verdict.**
+`send "sleep 100; echo __SLEPT__\r"` echoes the command line, so
+`expect __SLEPT__` matches the echo and always "passes".  Use the
+two-step form.
 
 ---
 
 ## WHAT WAS REFUTED -- do NOT re-walk.
 
-- **`-Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1`** -- no effect
-  on a static non-PIE link.
-- **`-fuse-ld=lld`** -- moves the base, adds `PT_INTERP`, loses
-  `date`/`time`/`uptime`.
-- **From-scratch `SECTIONS` in `busybox_ldscript`** -- discarded the
-  real sections.
-- **Patching musl's `static_init_tls` `base`** -- build has no
-  `PT_TLS`.
-- **`busybox_unstripped` as oracle** -- stale, different link. Use
-  `busybox.elf`.
-- **`testme` as applet-set reference** -- omits `date`/`time`/
-  `uptime`. Use `busybox --list`.
-- **`939e3ef`, `153dda9`** -- broke `^C` and `busybox sh` re-entry.
-- **`time /bin/true` as control** -- `/bin/true` does not exist.
-- **`$fs_base` as per-process marker** -- same VA every busybox.
-- **`argv_scratch` / `envp_scratch` as the cause** -- sizes are
-  fine; `envp_scratch` is kmalloc'd.
-- **`sh: date: not found` as missing symlink** -- missing applet in
-  the binary. Check `busybox --list`.
+**This session (the `^C` work):**
+- **Tick-time UART *read* to spot `0x03`.**  The data-register read is
+  destructive: the tick stole bytes the reader needed.  With a
+  one-byte pushback, the token printed and no prompt returned
+  (`cmp`); without it, the line corrupted and the shell showed its
+  `>` continuation prompt (`awk`).
+- **Unbounded drain `while (data-ready)`.**  Froze the guest on
+  `ed -s` -- the first row that stays in one syscall long enough for
+  the tick to spin.  The committed drain is **bounded to 16 bytes per
+  tick**.
+- **`__SLEPT__` on the `sleep` line** (matches the shell echo).
+- **`socat -v` as a probe** (verbose output fills the expect pty and
+  stalls the relay; the `^C` was delayed ~27 s).
+- **Raw `socat TCP:` against a `-serial telnet:` chardev**
+  (QEMU sends telnet `IAC` negotiation; expect's `i_read` fails on
+  the non-UTF-8 bytes).  Use a real telnet client, or `-serial tcp:`.
 
-*Earlier, unchanged.*  Do not re-walk: the `cli` window; signal
-delivery as the zeroer; `memset` as the zeroer; the sysret slot
-arithmetic; the three `exec_path` forms; `.bss`-not-zeroed; the
-auxv; `set_tid_address`'s return; mmap; V3/V3b register inheritance;
-the `efc8e08` rsp split and `frame_kind`; the four uncommitted
-scheduler guards; the `EXIT-REFUSE frame-CS` guard; the canary
-`.text` `#PF` probe stack; the physical-address gates on `.text` PTE
-zeroing; the `f91d31a` claim; `exec_churn`'s KVM slowness;
-`ata_poll_drq` spinning; the `perf kvm stat record` `double free` is
-a donix issue; the 2026-11-04 PTAUDIT "22 anomalies"; the
-empty-low-half `vmm_create_address_space`; V3/V3b register zeroing;
-the missing auxv; `kmain.c`'s self-tests map over the ELF text page.
-
-**This session's refutations:** the marker-only `run_cmd` in the
-sweep (fixed by numeric tokens and marker+prompt drain);
-`(?s)` in expect's ARE (unsupported, use `(\r?\n|^)...$`
-anchoring); `git checkout -- <file>` after `git reset --soft` (does
-not discard the diff -- restores from the index; use `git reset
---hard HEAD`); `grep -c 'UTIM'` as probe-existence check (counts
-legitimate `UTIME_NOW`/`UTIME_OMIT`; use `grep -c 'serial_print("UTIM'`).
+**Earlier, unchanged.**  Do not re-walk: `-Wl,--dynamic-linker`,
+`-fuse-ld=lld`, from-scratch `SECTIONS`, patching musl
+`static_init_tls` `base`, `busybox_unstripped` as oracle, `testme` as
+applet-set reference, `939e3ef`/`153dda9`, `time /bin/true` as
+control, `$fs_base` as per-process marker, `argv_scratch`/
+`envp_scratch`, `sh: date: not found` as a missing symlink; the
+`cli` window, signal delivery as the zeroer, `memset` as the zeroer,
+the sysret slot arithmetic, the three `exec_path` forms,
+`.bss`-not-zeroed, the auxv, `set_tid_address`'s return, mmap,
+V3/V3b register inheritance, the `efc8e08` rsp split and
+`frame_kind`, the four uncommitted scheduler guards, the
+`EXIT-REFUSE frame-CS` guard, the canary `.text` `#PF` probe stack,
+the physical-address gates on `.text` PTE zeroing, the `f91d31a`
+claim, `exec_churn`'s KVM slowness, `ata_poll_drq` spinning, the
+`perf kvm stat record` `double free`, the 2026-11-04 PTAUDIT "22
+anomalies", the empty-low-half `vmm_create_address_space`, V3/V3b
+register zeroing, `kmain.c`'s self-tests map over the ELF text page.
 
 ---
 
@@ -317,27 +272,24 @@ screen, that is the `-S`, not a fault**). **`./run tcg` /
 `-enable-kvm`). Default cwd `/root`.
 
 **Writing a new `expect` harness:** `docs/expect-harness.md` has
-the two spawn patterns (`./run headless` vs. QEMU directly for a
-staged binary), the two verdict-pattern rules, the `-no-shutdown`
-shutdown rule, and the capture rule. Read it before writing a
-`.exp`; `tools/gate.exp` and `tools/coreutils_sweep.exp` are worked
-examples.
+the two spawn patterns, the two verdict-pattern rules, the
+`-no-shutdown` shutdown rule, the capture rule, **and the
+control-byte transport rule**. Read it before writing a `.exp`;
+`tools/gate.exp` and `tools/coreutils_sweep.exp` are worked examples.
 
 **In-guest gate.** `cd /`, then `canary --full` (28/28) and
 `/root/scripts/test.sh` (57/57). **Plus the two shell tests:**
-`sleep 100` then `^C` returns the prompt; `exit` from `ash` ->
-`donix>` -> `busybox sh` -> the ash prompt. **Use multiple
-`^Z`/`fg` cycles.** **`--install -s /bin` is needed only if a test
-execs an applet by path**; interactive applet use does not require
-it.
+`sleep 100` then `^C` returns the prompt (PS/2 and, via a socket/
+TCP/telnet harness, serial); `exit` from `ash` -> `donix>` ->
+`busybox sh` -> the ash prompt. **Use multiple `^Z`/`fg` cycles.**
+**`--install -s /bin` is needed only if a test execs an applet by
+path**; interactive applet use does not require it.
 
 **Automated gate.** `tools/gate.exp` boots `./run headless` and
 runs the three automated gates. `tools/coreutils_sweep.exp` boots
 the same and runs the FAT-coreutils sweep **plus the two shell
-behaviors** -- this is the fuller gate. A green `gate.exp` is **not**
-the gate; a green `coreutils_sweep.exp` is, once `^C`-over-serial is
-fixed. `capture.txt` is written by `./run` and overwritten each
-run; the sweeps do not copy it (they write their own `.expect.log`).
+behaviors**; its `^C` row uses the socket serial form. A green
+`gate.exp` is **not** the gate; a green `coreutils_sweep.exp` is.
 
 ---
 
@@ -369,8 +321,7 @@ session does NOT drop them on its own initiative.
        git push origin dev
        git push origin vX.Y.Z
 
-6. **Merge to `main` with `--no-ff`** (keeps the merge point in
-   `main`'s history), push, return to `dev`:
+6. **Merge to `main` with `--no-ff`**, push, return to `dev`:
 
        git checkout main
        git merge --no-ff dev -m "<version summary>"
@@ -382,18 +333,16 @@ Do not use `git push --tags` -- it would push the scratch tags. Push
 
 **The GitHub push policy.** **Nothing is pushed until `vX.Y.Z` is
 ready and verified.** `origin/dev` is not force-pushed; every
-unpushed `dev` commit is intentional work. Run `git log --oneline
-origin/dev..dev | wc -l` for the current count.
+unpushed `dev` commit is intentional work. Run
+`git log --oneline origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `9d7b5d3`; recent history `1479723`, `2e30866`,
-`3514bb1`, `23e37bb`, `2d267da`, `5ccf862`, `b19a0ab`, `6651be4`,
-`3cade3f`, `e31395f`, `4ca001d`, `c5066e3`.
-Ahead **68**, **clean**, **no stash**, **fifteen scratch tags**.
-`origin/dev` = `ba56b3d`. Work is now pre-`v0.6.20`. **There is no
-release gate recorded for `v0.6.20`; if a gate is wanted it is set
-in this file before that release session, not during it. The user
-has said not to move to `v0.6.20` until they say so.**
+`dev` is at `5575868`; ahead **77**, **clean**, **no stash**,
+**24 scratch tags**. `origin/dev` = `ba56b3d`. Work is
+pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
+a gate is wanted it is set in this file before that release session,
+not during it. The user has said not to move to `v0.6.20` until they
+say so.**
 
 ---
 
@@ -411,14 +360,10 @@ applets. **`tar` creates, lists and extracts correct archive
 members, including directory members, preserving mtime.** **`mkdir
 -p` works.** **`flock`, `fdatasync`, `sched_getaffinity`, `link`
 are implemented.** **`rename(2)` replaces on FAT (`6651be4`).**
-**`utimensat` writes and `stat` reads mtime (`5ccf862`; FAT's
-2-second resolution is the honest limit).** `date` reports the real
-date -- the MC146818A RTC is read at boot (`1479723`) and
-plumbed through the time syscalls (`9d7b5d3`).  `uptime` still
-reports seconds since boot. **`time`'s accounting is correct in seconds**
-(`b514b78`); `time sleep 1` charges ~1.1s to `user` because
-`total_ticks` is a single runnable-tick counter reported as both
-utime and stime.
+**`utimensat` writes and `stat` reads mtime (`5ccf862`).** `date`
+reports the real date -- the MC146818A RTC is read at boot
+(`1479723`) and plumbed through the time syscalls (`9d7b5d3`).
+`uptime` still reports seconds since boot.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -445,31 +390,17 @@ built with `CONFIG_FEATURE_SH_STANDALONE=y`.
 of busybox.
 
 **`third_party/`** is **gitignored** -- do not commit edits to it.
-`third_party/busybox/` has `busybox` (stripped, 448512 bytes, sha
-changes across config flips -- verify with `readelf -lW` on
-`userland/musl/build/busybox.elf` if needed) and
+`third_party/busybox/` has `busybox` (stripped) and
 `busybox_unstripped` (stale, different link -- **do not use as
-oracle**). The `.map` file is **not** present. `third_party/musl-
-install/` is gitignored and needed for the build. **`configs/busybox.config`** is the busybox build config (currently
-with the FAT-coreutils flips from `23e37bb`); a bare
-`make -C third_party/busybox` uses host gcc and produces a glibc
-binary, the musl build is `make -C third_party/busybox
-CC="$PWD/toolchain/musl-gcc.sh"`.
-`userland/musl/build/.busybox.stamp` gates the rebuild and depends
-only on `.config`; any change to the busybox build flags or binary
-requires `rm -f userland/musl/build/.busybox.stamp
-userland/musl/build/busybox.elf` before the next build.
-
-**`third_party/busybox/.config` is a durable copy of the last-built
-config** -- it survives `git reset --hard` on `configs/busybox.config`
-(the tracked source). **If `configs/busybox.config` loses the flip
-on a reset, restore from `third_party/busybox/.config`.** That
-happened this session and was recovered.
+oracle**). `third_party/musl-install/` is gitignored and needed for
+the build. **`configs/busybox.config`** is the busybox build config.
+`third_party/busybox/.config` is a durable copy of the last-built
+config -- restore from it if `configs/busybox.config` loses a flip
+on a reset.
 
 **`toolchain/install_musl.sh` reuses `third_party/musl-src` in place
 if it is already at `v1.2.5`.** A patch applied to `musl-src`
-persists across runs; revert is `git -C third_party/musl-src
-checkout -- <file>` followed by a rebuild.
+persists across runs.
 
 **`04_kernel_64bit/fatfs/ff.c`** is tracked and has two
 `sync_window` fixes; any further edit there must re-run the full
@@ -483,22 +414,17 @@ edits only.
 `reset-baseline-873be27`. `efc8e08` is not on `dev`; it survives as a
 commit object. Treat its guards as **refuted**.
 
-**Stash.** No stash. `stash@{0}` was dropped this session (its
-content -- the sys_link + f-utime split -- was re-applied as two
-commits).
-
 ---
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `23e37bb`, ahead 64, clean, no
-stash, eleven scratch tags, nothing pushed. The FAT-coreutils set is
-provable via `tools/coreutils_sweep.exp` (~95 PASS, `touch -d`
-PASS, `ln` OBSERVE). Six missing syscalls closed this session
-(`flock`, `fdatasync`, `sched_getaffinity`, `link`, `utimensat`
-write + read, `rename` replace); config flipped for the FAT-
-coreutils applets; sweep harness tracked. **NEXT: `^C`-over-serial
-(the last gate-gap item).** Then the `FR_NO_FILE` create-then-set in
-`f_utime`.  RTC is done (`1479723`, `9d7b5d3`): `date` prints
-the host's real date, `touch -d` round-trips.  Do not move to
-`v0.6.20` until the user says so.**
+**`v0.6.19` is released; `dev` is at `5575868`, ahead 77, clean, no
+stash, 24 scratch tags, nothing pushed. Serial `^C` is FIXED and
+proven over UNIX socket, plain TCP, and telnet with a real client
+(RX ring + bounded tick drain + deferred SIGINT); `-serial stdio`
+still cannot carry `^C` (host tty SIGINTs QEMU) and line-mode telnet
+clients can eat it. `tools/coreutils_sweep.exp` PASS=97 FAIL=0 with
+an honest `^C` row; `gate.exp` CANARY 28/28, TEST_SH 57/57,
+EXEC_CHURN ALL-PASS. **NEXT: the `FR_NO_FILE` create-then-set in
+`f_utime`** (`f_sync` in `f_open`). Do not move to `v0.6.20` until
+the user says so.**
