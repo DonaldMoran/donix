@@ -1,0 +1,76 @@
+#!/usr/bin/expect -f
+# Automated gate: boots ./run headless and runs the three automated
+# gates (canary --full, /root/scripts/test.sh, /usr/bin/EXEC_CHURN).
+# Prints a three-line verdict; exit 0 on all-green.
+#
+# Run from the tree root:  expect -f tools/gate.exp
+#
+# This does NOT cover the two shell behaviors (sleep 100 + ^C,
+# exit -> donix> -> busybox sh).  Those stay manual -- a green
+# verdict here is NOT the gate.  See handoff.md, THE GATE GAP.
+#
+# ./run headless uses -no-shutdown, so `exit` from ash drops to
+# donix>; this script kills the ./run child rather than waiting for
+# a clean guest shutdown.  capture.txt is written by ./run and is
+# overwritten on every run (hand or expect) -- this script does not
+# copy it.
+
+set timeout 900
+log_file -a "$env(HOME)/code/donix/tools/gate.expect.log"
+
+spawn ./run headless
+set run_pid [exp_pid $spawn_id]
+
+expect {
+    -re {(\r?\n|^)(donix> |~ # |/ # )$} { puts "\n=== GATE: shell prompt ===" }
+    -re {(?i)(make.*\*\*\*|No rule to make|ERROR:)} {
+        puts "\n=== GATE: BUILD/BOOT FAILURE ==="
+        catch {exec kill -TERM $run_pid}
+        exit 3
+    }
+    timeout {
+        puts "\n=== GATE: TIMEOUT waiting for prompt ==="
+        catch {exec kill -TERM $run_pid}
+        exit 4
+    }
+}
+
+set timeout 300
+send "cd /\r"
+expect -re {(\r?\n|^)/ # $}
+
+send "canary --full\r"
+expect {
+    -re {28 passed, 0 failed} { puts "\n=== GATE: CANARY 28/28 ==="; set canary_ok 1 }
+    timeout                   { puts "\n=== GATE: CANARY TIMEOUT ==="; set canary_ok 0 }
+}
+expect -re {(\r?\n|^)/ # $}
+
+send "/root/scripts/test.sh\r"
+expect {
+    -re {57 passed, 0 failed} { puts "\n=== GATE: TEST_SH 57/57 ==="; set testsh_ok 1 }
+    timeout                   { puts "\n=== GATE: TEST_SH TIMEOUT ==="; set testsh_ok 0 }
+}
+expect -re {(\r?\n|^)/ # $}
+
+send "/usr/bin/EXEC_CHURN\r"
+expect {
+    -re {EXEC_CHURN-ALL-PASS} { puts "\n=== GATE: EXEC_CHURN PASS ==="; set churn_ok 1 }
+    timeout                   { puts "\n=== GATE: EXEC_CHURN TIMEOUT ==="; set churn_ok 0 }
+}
+expect -re {(\r?\n|^)/ # $}
+
+puts "\n===== GATE VERDICT ====="
+puts "CANARY:     [expr {$canary_ok ? "28/28 PASS" : "FAIL"}]"
+puts "TEST_SH:    [expr {$testsh_ok ? "57/57 PASS" : "FAIL"}]"
+puts "EXEC_CHURN: [expr {$churn_ok ? "ALL-PASS" : "FAIL"}]"
+puts "========================="
+
+send "exit\r"
+after 2000
+catch {exec kill -TERM $run_pid}
+catch {exec pkill -TERM -P $run_pid}
+close
+wait
+
+if {$canary_ok && $testsh_ok && $churn_ok} { exit 0 } else { exit 1 }

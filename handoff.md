@@ -322,6 +322,20 @@ screen, that is the `-S`, not a fault**). **`./run tcg` /
 execs an applet by path**; interactive applet use does not require
 it.
 
+**Automated gate (optional).** `tools/gate.exp` boots
+`./run headless` and runs the three automated gates (`canary
+--full`, `/root/scripts/test.sh`, `/usr/bin/EXEC_CHURN`), printing
+a three-line verdict. From the tree root:
+
+    expect -f tools/gate.exp
+
+`exit=0` on all-green. **It does not cover the two shell tests
+above** -- a green `tools/gate.exp` is not the gate. `./run
+headless` uses `-no-shutdown`, so the script kills the `./run`
+child rather than waiting for a clean guest shutdown.
+`capture.txt` is written by `./run` and overwritten each run; the
+script does not copy it. `tools/README.md` has the details.
+
 ---
 
 ## Releases
