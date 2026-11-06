@@ -4452,6 +4452,37 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
  * already-stripped FatFs-form paths. */
 static long fat_rename(const char* old_path, const char* new_path) {
     FRESULT r = f_rename(old_path, new_path);
+    /*
+     * Linux rename(2) replaces the destination.  FatFs's f_rename
+     * does not -- it returns FR_EXIST (8) when new_path exists --
+     * so an unlink-then-retry is what makes rename match Linux.
+     *
+     * This replaces the file's earlier behavior, which was to fail
+     * with -EPERM on FR_EXIST "because nothing in the applet set
+     * relies on the replace behavior."  Three applets do: patch,
+     * dos2unix, and unix2dos all write to a temp name and rename
+     * it over the original, which requires replace semantics.  The
+     * change is a design decision, not a bug fix -- it makes mv,
+     * patch, and the dos2unix/unix2dos pair behave as Linux does.
+     *
+     * ORDER.  Unlink the destination first, then retry.  If the
+     * unlink fails (write-protected, directory in the way, etc.),
+     * the retry of f_rename returns the same FR_EXIST and the
+     * error path below reports it.  If the retry succeeds, we own
+     * the rename.
+     *
+     * EDGE CASE -- new_path is a directory and old_path is a file
+     * (or vice versa).  f_unlink removes a directory only if it is
+     * empty, so a directory-vs-file mismatch will fail at the
+     * f_unlink step.  That is the same errno a Linux caller would
+     * get (-EISDIR or -ENOTDIR, mapped through fatfs_errno's
+     * FR_DENIED -> -EPERM), and the failure path below reports it
+     * with the same FRESULT.  No new code needed.
+     */
+    if (r == FR_EXIST) {
+        (void)f_unlink(new_path);
+        r = f_rename(old_path, new_path);
+    }
     if (r != FR_OK) {
         serial_print("sys_rename: f_rename FAIL old=");
         serial_print(old_path);
