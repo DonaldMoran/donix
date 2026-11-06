@@ -5,11 +5,11 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (sixth session, part 2), at `23e37bb`.
+**Last updated:** 2026-11-06 (sixth session, part 2), at `9d7b5d3`.
 **`v0.6.19` is the last pushed release.** `dev` is at `23e37bb`; its
 recent history is `2d267da`, `5ccf862`, `b19a0ab`, `6651be4`,
 `3cade3f`, `e31395f`, `4ca001d`, `c5066e3`, `269ed07`, `bacbea1`,
-`65dac04`, `b514b78`. `origin/dev` = `ba56b3d`. Ahead **64**,
+`65dac04`, `b514b78`. `origin/dev` = `ba56b3d`. Ahead **68**,
 **clean**, **no stash**. No push, no tag this session; banner still
 `v0.6.19`. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`).
 Scratch tags, all annotated, all preserved, nothing pushed:
@@ -23,8 +23,10 @@ Scratch tags, all annotated, all preserved, nothing pushed:
 `20261106-sys-link` on `b19a0ab`,
 `20261106-f-utime` on `5ccf862`,
 `20261106-coreutils-sweep` on `2d267da`,
-`20261106-busybox-coreutils-config` on `23e37bb`.
-**Eleven scratch tags.**
+`20261106-busybox-coreutils-config` on `23e37bb`,
+`20261106-rtc-read` on `1479723`,
+`20261106-rtc-time-syscalls` on `9d7b5d3`.
+**Fifteen scratch tags.**
 
 **The FAT-coreutils set is provable.** `tools/coreutils_sweep.exp`
 (self-checking, expect, per docs/expect-harness.md) runs ~95 applets
@@ -76,6 +78,12 @@ and belongs in its own commit.
 - **`touch -d '2020-01-01 12:34:56' f; stat -c %y f`** reads
   `2020-01-01 12:34:56.000000000 +0000` (exact round-trip;
   `5ccf862`).
+- **`date` prints the host's real date** -- `Fri Nov  6 17:42:04
+  UTC 2026` on the QEMU boot that verified `9d7b5d3`.  The
+  MC146818A RTC is read once at boot (`1479723`) and the time
+  syscalls add its epoch (`9d7b5d3`).
+- **`touch -d '<date>' f; stat -c %y f` still round-trips exactly**
+  -- that path supplies its own timestamp and ignores the RTC.
 - **`tar -xf`** preserves mtime of extracted file (same commit).
 - **`flock f true`** rc=0, no noise (`4ca001d`).
 - **`shred -n 1 f`** rc=0, no noise (`e31395f`).
@@ -107,7 +115,11 @@ and belongs in its own commit.
   `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher. Config-bound,
   separate round.
 - **`FR_NO_FILE` on create-then-set in `f_utime`** (see
-  `open-issues.md`).
+  `open-issues.md`).  The visible symptom, now that the RTC is
+  plumbed: `touch f` (no `-d`) on a nonexistent path shows
+  `2026-01-01 00:00:00`, not the current time.  `touch -d '<date>'`
+  on an existing path works.  The fix is `f_sync` in `f_open`
+  before returning -- a behavior change, own commit, own gate.
 - **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does
   not export `PATH`. Environment gap, not syscall.
 
@@ -115,6 +127,10 @@ and belongs in its own commit.
 
 ## NEXT -- the highest-value work, in order
 
+0. **RTC is done** (`1479723` read, `9d7b5d3` plumbing).  `date`
+   prints the host's real date; `touch -d` round-trips.  The
+   remaining gap is `touch f` (no -d) on a nonexistent path
+   (the `FR_NO_FILE` create-then-set, item 2).
 1. **`^C`-over-serial.** The gate-gap. Kernel diagnostic session.
    Fix is in the UART RX path or the shell's line editor. See
    START HERE.
@@ -370,9 +386,10 @@ unpushed `dev` commit is intentional work. Run `git log --oneline
 origin/dev..dev | wc -l` for the current count.
 
 **Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `23e37bb`; recent history `2d267da`, `5ccf862`,
-`b19a0ab`, `6651be4`, `3cade3f`, `e31395f`, `4ca001d`, `c5066e3`.
-Ahead **64**, **clean**, **no stash**, **eleven scratch tags**.
+`dev` is at `9d7b5d3`; recent history `1479723`, `2e30866`,
+`3514bb1`, `23e37bb`, `2d267da`, `5ccf862`, `b19a0ab`, `6651be4`,
+`3cade3f`, `e31395f`, `4ca001d`, `c5066e3`.
+Ahead **68**, **clean**, **no stash**, **fifteen scratch tags**.
 `origin/dev` = `ba56b3d`. Work is now pre-`v0.6.20`. **There is no
 release gate recorded for `v0.6.20`; if a gate is wanted it is set
 in this file before that release session, not during it. The user
@@ -395,9 +412,10 @@ members, including directory members, preserving mtime.** **`mkdir
 -p` works.** **`flock`, `fdatasync`, `sched_getaffinity`, `link`
 are implemented.** **`rename(2)` replaces on FAT (`6651be4`).**
 **`utimensat` writes and `stat` reads mtime (`5ccf862`; FAT's
-2-second resolution is the honest limit).** `date`/`uptime` report
-seconds since boot as a 1970-epoch date (no RTC -- the honest
-base). **`time`'s accounting is correct in seconds**
+2-second resolution is the honest limit).** `date` reports the real
+date -- the MC146818A RTC is read at boot (`1479723`) and
+plumbed through the time syscalls (`9d7b5d3`).  `uptime` still
+reports seconds since boot. **`time`'s accounting is correct in seconds**
 (`b514b78`); `time sleep 1` charges ~1.1s to `user` because
 `total_ticks` is a single runnable-tick counter reported as both
 utime and stime.
@@ -481,4 +499,6 @@ PASS, `ln` OBSERVE). Six missing syscalls closed this session
 write + read, `rename` replace); config flipped for the FAT-
 coreutils applets; sweep harness tracked. **NEXT: `^C`-over-serial
 (the last gate-gap item).** Then the `FR_NO_FILE` create-then-set in
-`f_utime`. Do not move to `v0.6.20` until the user says so.**
+`f_utime`.  RTC is done (`1479723`, `9d7b5d3`): `date` prints
+the host's real date, `touch -d` round-trips.  Do not move to
+`v0.6.20` until the user says so.**
