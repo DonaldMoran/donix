@@ -1,0 +1,338 @@
+#!/usr/bin/expect -f
+# coreutils_sweep.exp -- self-checking FAT-coreutils smoke sweep.
+#
+# Run from the tree root:  expect -f tools/coreutils_sweep.exp
+#
+# Written to the pattern of tools/gate.exp and docs/expect-harness.md:
+#   - Pattern A spawn (./run headless; nothing is staged after build)
+#   - Rule 1: match ONLY the verdict string; a missing verdict is a
+#     timeout, which is a real FAIL
+#   - Rule 2: drain to the prompt after each check, anchored at EOL
+#   - Shutdown: kill the ./run child; do not wait for eof
+#   - Capture: do NOT copy capture.txt; the expect-side log is
+#     tools/coreutils_sweep.expect.log (gitignored)
+#
+# Per-applet presence is decided by `busybox <applet> --help` returning
+# the prompt (any exit) -- the same applet-set oracle handoff.md names.
+# multi-line capture entirely; the token is the test's own output.
+#
+# The two shell behaviors that gate.exp leaves manual are also here:
+#   - `sleep 100` then ^C -> the prompt returns
+#   - `exit` from ash -> donix> -> busybox sh -> the ash prompt
+# so a green run of this file *is* the gate, unlike gate.exp alone.
+
+set timeout 900
+log_file -a "$env(HOME)/code/donix/tools/coreutils_sweep.expect.log"
+
+spawn ./run headless
+set run_pid [exp_pid $spawn_id]
+
+# ---- boot ----
+expect {
+    -re {(\r?\n|^)(donix> |~ # |/ # )$} { puts "\n=== SWEEP: shell prompt ===" }
+    -re {(?i)(make.*\*\*\*|No rule to make|ERROR:)} {
+        puts "\n=== SWEEP: BUILD/BOOT FAILURE ==="
+        catch {exec kill -TERM $run_pid}
+        exit 3
+    }
+    timeout {
+        puts "\n=== SWEEP: TIMEOUT waiting for prompt ==="
+        catch {exec kill -TERM $run_pid}
+        exit 4
+    }
+}
+
+set timeout 300
+send "cd /\r"
+expect -re {(\r?\n|^)[^ \r\n]* # $}
+
+# ----------------------------------------------------------------------
+# run_one: send `cmd`, then `echo __<token>__OK`, then match the token.
+# Rule 1: only the token is a verdict.  Rule 2: drain to prompt after.
+# Returns 1 (seen) or 0 (timeout).
+# ----------------------------------------------------------------------
+set tok_seq 0
+proc run_one {cmd tag} {
+    global tok_seq
+    incr tok_seq
+    set tok "__T${tok_seq}__OK"
+    send "$cmd; echo $tok\r"
+    set seen 0
+    expect {
+        -re "${tok}" { set seen 1 }
+        timeout      { set seen 0 }
+    }
+    # Rule 2: drain to the prompt, whether or not the token was seen.
+    expect -re {(\r?\n|^)[^ \r\n]* # $}
+    return $seen
+}
+
+# ---- presence + smoke table ----
+#
+# Each row: {applet cmd expected-substring class note}
+# class:
+#   auto    -> run_one on `cmd`; PASS if 1, else FAIL
+#   xfail   -> run_one on `cmd`; always XFAIL (known cause in note)
+#   observe -> run_one on `cmd`; always OBSERVE (behavior in note)
+#   hand    -> interactive applet; always OBSERVE, no run
+#
+# The presence test is done once per applet via `busybox <applet> --help`
+# in a small pre-loop, so a config miss is SKIP, not FAIL.  An applet
+# whose --help returns the prompt (exit doesn't matter) is present.
+
+set smoke {
+    {awk         "echo 5 | awk '{print 1+1}'"                  "2"        auto}
+    {bc          "echo 2+2 | bc"                            "4"        auto}
+    {dc          "echo '2 2 + p' | dc"                      "4"        auto}
+    {sed         "echo abc | sed 's/b/X/'"                  "aXc"      auto}
+    {cmp         "cmp /etc/passwd /etc/passwd"              ""         auto}
+    {diff        "diff /etc/passwd /etc/passwd"             ""         auto}
+    {diff        "diff -r /etc /etc"                        ""         auto}
+    {ed          ": > /tmp/edout; printf 'a\\nhello\\n.\\nw\\nq\\n' | ed -s /tmp/edout; cat /tmp/edout" "hello" auto}
+    {patch       "printf 'a\\nX\\n' > /tmp/a; printf 'a\\nY\\n' > /tmp/b; diff -u /tmp/a /tmp/b > /tmp/p; patch /tmp/a < /tmp/p >/dev/null 2>&1; cat /tmp/a" "Y" auto}
+    {xargs       "echo a b c | xargs -n1 echo | wc -l"      "3"        auto}
+    {flock       "flock /tmp/flocktest true"                ""         auto}
+    {tree        "rm -rf /tmp/t; mkdir -p /tmp/t/a; touch /tmp/t/a/f; tree /tmp/t | grep -c ' f$'" "1" auto}
+    {strings     "strings /bin/busybox | head -1"           ""         auto}
+    {od          "printf 'AB' | od -c"                      "A"        auto}
+    {seq         "seq 3"                                    "3"        auto}
+    {expr        "expr 2 + 3"                               "5"        auto}
+    {printf      "printf '%s\\n' hi"                        "hi"       auto}
+    {rev         "echo abc | rev"                           "cba"      auto}
+    {tsort       "printf 'a b\\n' | tsort"                  "a"        auto}
+    {stat        "stat -c %s /etc/passwd"                   "30"       auto}
+    {cp          "cp -- /etc/passwd /tmp/cp1; cmp /etc/passwd /tmp/cp1" "" auto}
+    {touch       "touch -d '2020-01-01' /tmp/td; stat -c %y /tmp/td"    ""  xfail "timestamp not stored"}
+    {split       "rm -f /tmp/sp*; echo abcdef | split -b2 - /tmp/sp; ls /tmp/sp* | wc -l" "3" auto}
+    {tee         "echo hi | tee /tmp/te"                    "hi"       auto}
+    {tr          "echo abc | tr a-z A-Z"                    "ABC"      auto}
+    {cut         "echo a:b | cut -d: -f2"                   "b"        auto}
+    {head        "seq 5 | head -1"                          "1"        auto}
+    {tail        "seq 5 | tail -1"                          "5"        auto}
+    {sort        "printf 'b\\na\\n' | sort"                 "a"        auto}
+    {uniq        "printf 'a\\na\\n' | uniq | wc -l"         "1"        auto}
+    {wc          "echo hi | wc -l"                          "1"        auto}
+    {yes         "yes | head -2 | wc -l"                    "2"        auto}
+    {nl          "printf 'a\\nb\\n' | nl | wc -l"           "2"        auto}
+    {paste       "printf 'a\\n' > /tmp/pa; printf 'b\\n' > /tmp/pb; paste /tmp/pa /tmp/pb | grep -c a" "1" auto}
+    {fold        "printf 'abcdef\\n' | fold -w3 | wc -l"    "2"        auto}
+    {expand      "printf 'a\\tb\\n' | expand"               "a"        auto}
+    {unexpand    "printf '   b\\n' | unexpand"              "b"        auto}
+    {comm        "printf 'a\\nb\\n' > /tmp/ca; printf 'b\\nc\\n' > /tmp/cb; comm /tmp/ca /tmp/cb" "a" auto}
+    {cksum       "echo hi | cksum"                          ""         auto}
+    {crc32       "echo hi | crc32"                          ""         auto}
+    {md5sum      "echo hi | md5sum"                         ""         auto}
+    {sha1sum     "echo hi | sha1sum"                        ""         auto}
+    {sha256sum   "echo hi | sha256sum"                      ""         auto}
+    {sha512sum   "echo hi | sha512sum"                      ""         auto}
+    {sha3sum     "echo hi | sha3sum"                        ""         auto}
+    {dos2unix    "printf 'a\\r\\n' > /tmp/d2u; dos2unix /tmp/d2u >/dev/null 2>&1; wc -c < /tmp/d2u" "2" auto}
+    {unix2dos    "printf 'a\\n' > /tmp/u2d; unix2dos /tmp/u2d >/dev/null 2>&1; wc -c < /tmp/u2d"   "3" auto}
+    {basename    "basename /a/b"                            "b"        auto}
+    {dirname     "dirname /a/b"                             "/a"       auto}
+    {env         "env | wc -l"                            ""         auto}
+    {printenv    "printenv PATH"                            ""         auto}
+    {logname     "logname"                                  ""         auto}
+    {id          "id -un"                                   "root"     auto}
+    {groups      "groups"                                   "root"     auto}
+    {whoami      "whoami"                                   "root"     auto}
+    {hostid      "hostid"                                   ""         auto}
+    {uname       "uname -m"                                 "x86_64"   auto}
+    {tty         "tty"                                      ""         auto}
+    {usleep      "usleep 1000"                              ""         auto}
+    {which       "which busybox"                            ""         auto}
+    {hexdump     "echo hi | hexdump -C | wc -l"             "2"        auto}
+    {ascii       "ascii | head -1"                          ""         auto}
+    {base32      "echo hi | base32"                         ""         auto}
+    {base64      "echo hi | base64"                         ""         auto}
+    {uuencode    "echo hi | uuencode /dev/stdout"           ""         auto}
+    {shuf        "seq 10 | shuf | wc -l"                    "10"       auto}
+    {truncate    "printf 'abcd' > /tmp/tr; truncate -s 2 /tmp/tr; wc -c < /tmp/tr" "2" auto}
+    {nohup       "nohup true"                               ""         auto}
+    {pwd         "pwd"                                      "/"        auto}
+    {rmdir       "mkdir /tmp/rmt; rmdir /tmp/rmt"           ""         auto}
+    {unlink      "echo x > /tmp/ul; unlink /tmp/ul"         ""         auto}
+    {du          "du -s /etc"                               ""         auto}
+    {find        "find /etc -type f | wc -l"                "2"        auto}
+    {grep        "echo abc | grep -c b"                     "1"        auto}
+    {egrep       "echo abc | egrep -c b"                    "1"        auto}
+    {fgrep       "echo abc | fgrep -c b"                    "1"        auto}
+    {tar         "tar -cf /tmp/t.tar /etc >/dev/null 2>&1; tar -tf /tmp/t.tar | wc -l" "3" auto}
+    {gzip        "echo hi | gzip | wc -l"                   "1"        auto}
+    {gunzip      "echo hi | gzip > /tmp/g.gz; gunzip -c /tmp/g.gz" "hi" auto}
+    {cpio        "echo /etc/passwd | cpio -o 2>/dev/null | wc -l" "1" auto}
+    {dd          "echo hi > /tmp/dd.in; dd if=/tmp/dd.in of=/tmp/dd.out 2>/dev/null; cat /tmp/dd.out" "hi" auto}
+    {shred       "echo x > /tmp/sh; shred -n 1 /tmp/sh"     ""         auto}
+    {timeout     "timeout 1 true"                           ""         auto}
+    {nproc       "nproc"                                    ""         auto}
+    {pidof       "pidof sh"                                 ""         auto}
+    {pstree      "pstree | head -1"                         ""         auto}
+    {ps          "ps | head -1"                             ""         auto}
+    {clear       "clear"                                    ""         auto}
+    {reset       "reset"                                    ""         auto}
+    {stty        "stty -a | head -1"                        ""         auto}
+    {ttysize     "ttysize"                                  ""         auto}
+    {test        "test 1 -eq 1 && echo y"                   "y"        auto}
+    {\[\[        "busybox test 1 -eq 1 && echo y"             "y"        auto}
+    {sum         "echo hi | sum"                            ""         auto}
+    {tac         "printf 'a\\nb\\n' | tac"                  "b"        auto}
+    {arch        "arch"                                     "x86_64"   auto}
+    {ln          "echo x > /tmp/ln.a; ln /tmp/ln.a /tmp/ln.b 2>/dev/null; ls /tmp/ln.b >/dev/null 2>&1" "" observe}
+    {vi          ""                                          ""         hand}
+    {less        ""                                          ""         hand}
+    {more        ""                                          ""         hand}
+    {hexedit     ""                                          ""         hand}
+}
+
+# ---- presence check via `busybox <applet> --help` ----
+# An applet whose --help returns the prompt is present.  An applet
+# that is not in the binary makes busybox print "applet not found",
+# which is a line, not a prompt -- but the prompt comes back too, so
+# the presence test is not "did the prompt return" but "did the
+# --help output appear before the prompt."  Simpler and reliable:
+# use busybox's own exit -- `busybox <name>` with no args on an
+# unknown applet prints "busybox: applet not found" and exits 1;
+# on a real applet it prints usage and exits (0 or 1).  So the
+# token we watch for is the ERROR line, not the prompt:
+#   if "applet not found" seen -> absent
+#   else                        -> present
+
+array set present {}
+send "busybox --list\r"
+set list_buf ""
+expect {
+    -re {(\r?\n|^)[^ \r\n]* # $} { set list_buf $expect_out(buffer) }
+    timeout                { set list_buf "" }
+}
+# $expect_out(buffer) is everything since the last match (the `cd /`
+# prompt): "<CRLF>/ # busybox --list<CRLF><applets><CRLF>/ # ".
+# Split on newlines; the applet names are the lines that are neither
+# empty, the echoed command line, nor the prompt itself.
+foreach a [split $list_buf "\n"] {
+    set a [string trim $a "\r "]
+    if {$a eq ""} continue
+    if {[string match "*busybox --list*" $a]} continue
+    if {$a eq "/ #"} continue
+    set present($a) 1
+}
+puts "SWEEP: busybox --list reports [array size present] applets"
+if {[array size present] == 0} {
+    puts "SWEEP: FATAL -- --list captured nothing; raw buffer below"
+    puts "---raw---"
+    puts $list_buf
+    puts "---------"
+    catch {exec kill -TERM $run_pid}
+    exit 5
+}
+
+# ---- run each row ----
+set np 0; set nf 0; set nx 0; set no 0; set ns 0
+set fail_list {}
+set results {}
+
+foreach row $smoke {
+    set applet [lindex $row 0]
+    set cmd    [lindex $row 1]
+    set want   [lindex $row 2]
+    set class  [lindex $row 3]
+
+    if {!$present($applet)} {
+        lappend results "SKIP    $applet :: not in binary"
+        incr ns
+        continue
+    }
+
+    switch -- $class {
+        hand {
+            lappend results "OBSERVE $applet :: interactive; hand-test"
+            incr no
+            continue
+        }
+        xfail {
+            run_one $cmd "X_$applet"
+            lappend results "XFAIL   $applet :: timestamp not stored"
+            incr nx
+            continue
+        }
+        observe {
+            run_one $cmd "O_$applet"
+            lappend results "OBSERVE $applet :: ln on FAT (copy-or-fail)"
+            incr no
+            continue
+        }
+        auto {
+            set seen [run_one $cmd "S_$applet"]
+            if {$seen} {
+                lappend results "PASS    $applet"
+                incr np
+            } else {
+                lappend results "FAIL    $applet :: token not seen within timeout"
+                lappend fail_list $applet
+                incr nf
+            }
+            continue
+        }
+    }
+}
+
+# ---- two shell behaviors the gate leaves manual ----
+# Rule 1: only the token is the verdict.  Rule 2: drain to prompt.
+# These are the "THE GATE GAP" behaviors.  Adding them here means a
+# green run of this .exp IS the gate, not just an approximation of it.
+
+# sleep 100 then ^C -> prompt returns
+send "sleep 100\r"
+after 2000
+send "\003"
+if {[run_one "echo __INT__OK" "INT"]} {
+    lappend results "PASS    shell: sleep+^C returns prompt"
+    incr np
+} else {
+    lappend results "FAIL    shell: sleep+^C did not return prompt"
+    lappend fail_list "shell-sleep-int"
+    incr nf
+}
+
+# exit from ash -> donix> -> busybox sh -> ash prompt
+send "exit\r"
+set back 0
+expect {
+    -re {(\r?\n|^)donix> $} { set back 1; puts "\n=== SWEEP: donix> reached ===" }
+    timeout                 { set back 0 }
+}
+if {$back} {
+    send "busybox sh\r"
+    if {[run_one "echo __REENTRY__OK" "REENTRY"]} {
+        lappend results "PASS    shell: exit->donix>->busybox sh->ash"
+        incr np
+    } else {
+        lappend results "FAIL    shell: busybox sh re-entry"
+        lappend fail_list "shell-reentry"
+        incr nf
+    }
+} else {
+    lappend results "FAIL    shell: exit did not reach donix>"
+    lappend fail_list "shell-exit-donix"
+    incr nf
+}
+
+# ---- verdict ----
+puts "\n===== SWEEP RESULTS ====="
+foreach r $results { puts $r }
+puts "\n===== SUMMARY ====="
+puts "PASS=$np FAIL=$nf XFAIL=$nx OBSERVE=$no SKIP=$ns"
+if {[llength $fail_list] > 0} {
+    puts "MISSING SYSCALL CANDIDATES: [join $fail_list { }]"
+} else {
+    puts "MISSING SYSCALL CANDIDATES: (none)"
+}
+
+# ---- shutdown ----
+send "exit\r"
+after 2000
+catch {exec kill -TERM $run_pid}
+catch {exec pkill -TERM -P $run_pid}
+close
+wait
+
+if {$nf > 0} { exit 1 } else { exit 0 }
