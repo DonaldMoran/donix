@@ -16,6 +16,7 @@
 #include "interrupts.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/rtc.h"
 
 /* Last syscall number that entered syscall_dispatch.  Read by the
  * fault handlers when a corrupted control target is reported, so
@@ -5463,7 +5464,7 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
      */
     uint64_t mtime_sec;
     if (!times) {
-        mtime_sec = g_ticks / 100;
+        mtime_sec = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
     } else {
         struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
         if (safe_copy_from_user(ts, times, sizeof(ts)) != 0) {
@@ -5473,7 +5474,7 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
             return 0;
         }
         if (ts[1].tv_nsec == UTIME_NOW_) {
-            mtime_sec = g_ticks / 100;
+            mtime_sec = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
         } else {
             if (ts[1].tv_nsec < 0 || ts[1].tv_nsec > 999999999LL) {
                 return -(long)EINVAL_;
@@ -8772,7 +8773,7 @@ long sys_uname(void* user_buf) {
  */
 long sys_time(void* user_tloc) {
     uint64_t ticks = g_ticks;               /* one read */
-    int64_t  secs  = (int64_t)(ticks / 100);
+    int64_t  secs  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
     if (user_tloc) {
         if (safe_copy_to_user(user_tloc, &secs, sizeof(secs)) != 0)
             return -(long)EFAULT_;
@@ -8793,7 +8794,7 @@ long sys_gettimeofday(void* user_tv, void* user_tz) {
     if (!user_tv) return 0;
     uint64_t ticks = g_ticks;               /* one read */
     struct { int64_t tv_sec; int64_t tv_usec; } tv;
-    tv.tv_sec  = (int64_t)(ticks / 100);
+    tv.tv_sec  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
     tv.tv_usec = (int64_t)((ticks % 100) * 10000);
     if (safe_copy_to_user(user_tv, &tv, sizeof(tv)) != 0)
         return -(long)EFAULT_;
@@ -8821,7 +8822,7 @@ long sys_clock_gettime(int clk_id, void* user_ts) {
         int64_t tv_nsec;
     } ts;
 
-    ts.tv_sec  = (int64_t)(ticks / 100);
+    ts.tv_sec  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
     ts.tv_nsec = (int64_t)((ticks % 100) * 10000000);
 
     if (safe_copy_to_user(user_ts, &ts, sizeof(ts)) != 0) {
