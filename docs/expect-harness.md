@@ -85,6 +85,26 @@ socket and drive it through `socat` in raw mode:
 and kills socat. `tools/coreutils_sweep.exp`'s `sleep 100 + ^C` row is
 the worked example.
 
+**`./run telnet`** launches the same guest with
+`-serial telnet:127.0.0.1:45456,server,nowait` and `-display none`.
+Connect with `telnet 127.0.0.1 45456`. `^C` reaches the guest with a
+character-mode client; a line-mode telnet client handles `^C`
+locally and never sends it. The console goes to the socket, so
+`capture.txt` from a `./run telnet` boot has only build output and
+QEMU's stderr, not the guest console.
+
+**`./run telnet-lan`** is the same console on `0.0.0.0:45456`, reachable
+from another machine. It is an **unauthenticated root console -- no
+auth, no encryption**, so it refuses to start unless
+`DONIX_ALLOW_LAN=1` is set, and prints a warning before the build. If a
+remote connect is refused, open the port (`sudo firewall-cmd
+--add-port=45456/tcp`, add `--permanent` to keep it) -- or skip the
+exposure and tunnel: `ssh -L 45456:127.0.0.1:45456 user@host`, then
+`telnet 127.0.0.1 45456` (SSH's auth and encryption; nothing new
+exposed). 23 is the well-known telnet port and is not used here: it is
+privileged and may collide with a real telnet daemon; 1234 is the gdb
+stub and cannot be reused while `-s` is present.
+
 
 ---
 
