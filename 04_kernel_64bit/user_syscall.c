@@ -6318,6 +6318,38 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
 
+    /* ---- 9. Commit the new address space. ----
+     *
+     * For a vfork child, self->cr3 was switched to a fresh
+     * address space at section 5, but the %cr3 register still
+     * holds the PARENT's cr3 -- vfork shares the address space
+     * until exec. The sysret stub
+     * (user_syscall_entry.asm) does not reload %cr3; it assumes
+     * the current register matches the process's cr3. That is
+     * true for a regular syscall (the scheduler switched cr3 on
+     * dispatch), but not for exec after vfork, where the switch
+     * must happen here.
+     *
+     * Without this load, the vfork child sysrets into the
+     * parent's address space. The new image's entry point is not
+     * mapped there, so the first instruction fetch faults with
+     * PTE NOT PRESENT (the live `time true` signature is
+     * CR2=0 / RIP=0 / error 0x15; a wrong CR2 here is history).
+     *
+     * All user-VA writes earlier in this function already
+     * target self->cr3 explicitly (safe_copy_to_user_cr3), so
+     * the data is in the new address space by the time this
+     * switch happens. Kernel mappings are shared (high half), so
+     * the switch is safe mid-function.
+     */
+    {
+        uint64_t _active_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(_active_cr3));
+        if ((_active_cr3 & ~0xFFFULL) != (self->cr3 & ~0xFFFULL)) {
+            __asm__ volatile("mov %0, %%cr3" : : "r"(self->cr3) : "memory");
+        }
+    }
+
     /* POSIX exec: caught signal dispositions reset to SIG_DFL,
      * SIG_IGN is preserved, the blocked mask is preserved, and
      * pending is cleared.  Without this a forked-then-exec'd
