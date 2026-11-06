@@ -65,6 +65,7 @@ qemu_base() {
     echo qemu-system-x86_64 \
         -drive "file=$IMG,format=raw,if=ide,index=0" \
         -enable-kvm -cpu host \
+        -rtc base=localtime \
         -serial stdio -s -monitor none \
         -no-reboot -no-shutdown
 }
@@ -75,6 +76,7 @@ qemu_base_nofreeze() {
     echo qemu-system-x86_64 \
         -drive "file=$IMG,format=raw,if=ide,index=0" \
         -enable-kvm -cpu host \
+        -rtc base=localtime \
         -serial stdio -s -monitor none
 }
 
@@ -83,6 +85,7 @@ qemu_base_tcg() {
     echo qemu-system-x86_64 \
         -drive "file=$IMG,format=raw,if=ide,index=0" \
         -cpu max \
+        -rtc base=localtime \
         -serial stdio -s -monitor none \
         -no-reboot -no-shutdown
 }
@@ -91,6 +94,7 @@ qemu_base_tcg_nofreeze() {
     echo qemu-system-x86_64 \
         -drive "file=$IMG,format=raw,if=ide,index=0" \
         -cpu max \
+        -rtc base=localtime \
         -serial stdio -s -monitor none
 }
 
