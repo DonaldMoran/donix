@@ -174,6 +174,12 @@ static char g_write_bounce[WRITE_CHUNK];
  */
 #define EPERM_   1
 #define ENOENT_  2
+/* utimensat(2) special tv_nsec values, from the Linux uapi
+ * (include/uapi/linux/stat.h).  UTIME_NOW means "use the current
+ * time"; UTIME_OMIT means "do not change this field".  A tv_nsec
+ * that is neither and is outside [0, 999999999] is -EINVAL. */
+#define UTIME_NOW_  0x3FFFFFFFL
+#define UTIME_OMIT_ 0x3FFFFFFEL
 #define EIO_     5
 #ifndef EBUSY_
 #define EBUSY_   16
@@ -4689,6 +4695,60 @@ static uint64_t fat_ino(uint32_t sclust, uint32_t objsize,
     return h;
 }
 
+/*
+ * Convert FAT's packed fdate/ftime back to a Unix epoch-1970 second
+ * count.  This is the read-side inverse of epoch_to_fat above: the
+ * write side (sys_utimensat) packs the user's timestamp into a
+ * FILINFO and hands it to f_utime; the read side (fill_kstat_
+ * from_filinfo) gets FILINFO.fdate/.ftime back from f_stat / f_readdir
+ * and must convert them to st_mtim's tv_sec.
+ *
+ * The algorithm is Howard Hinnant's `days_from_civil`, the inverse of
+ * the `civil_from_days` used in epoch_to_fat.  An fdate of 0 means
+ * "unset" (FAT's directory entry was zeroed and the date word never
+ * written) -- report 0, which the Linux stat view shows as
+ * 1970-01-01 00:00:00.  A year outside 1980..2107 is clamped to the
+ * nearest edge, the same range epoch_to_fat writes.
+ *
+ * FAT has 2-second granularity, so an odd second in the source is
+ * lost on write and was never on disk; the read side reports exactly
+ * what the on-disk word holds.  No timezone: donix has no TZ, and
+ * epoch_to_fat wrote UTC.
+ */
+static uint64_t fat_to_epoch(uint16_t fdate, uint16_t ftime) {
+    if (fdate == 0 && ftime == 0) return 0;   /* unset */
+
+    int year   = 1980 + ((fdate >> 9) & 0x7F);
+    int month  = (fdate >> 5) & 0x0F;
+    int day    = fdate & 0x1F;
+    int hour   = (ftime >> 11) & 0x1F;
+    int minute = (ftime >> 5) & 0x3F;
+    int sec    = (ftime & 0x1F) * 2;
+
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+    if (month < 1)   month = 1;
+    if (month > 12)  month = 12;
+    if (day < 1)     day = 1;
+    if (day > 31)    day = 31;
+
+    /* days_from_civil (Hinnant).  Months are March-based: month 3
+     * is March of the same year, 1 and 2 are March of the previous
+     * one, so January and February of a leap year fall on year-1. */
+    int64_t y   = (int64_t)year - (month <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    int64_t doe = yoe * 365 + yoe/4 - yoe/100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+
+    if (days < 0) return 0;
+    return (uint64_t)days * 86400ULL
+         + (uint64_t)hour * 3600ULL
+         + (uint64_t)minute * 60ULL
+         + (uint64_t)sec;
+}
+
 static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno,
                                     uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
@@ -4705,6 +4765,20 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno,
         st->st_mode   = KSTAT_IFREG | 0644;
         st->st_size   = (int64_t)fno->fsize;
         st->st_blocks = (st->st_size + 511) / 512;
+    }
+
+    /* FAT has mtime only; atime and ctime are reported as the same
+     * value, which is what Linux on a FAT mount does.  This is the
+     * read-side counterpart to sys_utimensat's f_utime write: the
+     * write side stores the packed fdate/ftime, and stat / ls -l /
+     * tar -tvf / find -mtime read st_mtim, which is now the same
+     * number the file on disk says. */
+    {
+        uint64_t mtime = fat_to_epoch(fno->fdate, fno->ftime);
+        st->st_mtim.tv_sec  = (int64_t)mtime;
+        st->st_mtim.tv_nsec = 0;
+        st->st_atim         = st->st_mtim;
+        st->st_ctim         = st->st_mtim;
     }
 }
 
@@ -5281,10 +5355,62 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
  * which donix does not implement.  A NULL path is -EFAULT, the
  * Linux errno for a bad pointer; -EINVAL is for bad flags.
  */
+/*
+ * Convert a Unix epoch-1970 second count to FAT's packed fdate/ftime.
+ *
+ * FAT stores modification time as two 16-bit words, both "local"
+ * (donix has no TZ, so UTC = local) with a 2-second resolution:
+ *
+ *   fdate = ((year - 1980) << 9) | (month << 5) | day
+ *   ftime = (hour << 11) | (minute << 5) | (sec / 2)
+ *
+ * Year 1980..2107 is representable; dates outside that range are
+ * clamped to the nearest edge.  A 1970 timestamp is therefore
+ * reported by FAT as 1980-01-01, which is the honest limit of the
+ * on-disk format, not a bug in this function.  Odd seconds round
+ * DOWN (sec / 2), so a 12:34:57 mtime is stored and reported as
+ * 12:34:56 -- again, FAT's resolution, not ours.
+ *
+ * The days-to-civil algorithm is Howard Hinnant's `civil_from_days`
+ * (public domain, from the "chrono-Compatible Low-Level Date
+ * Algorithms" paper).  It is inlined here rather than linked from a
+ * library because the kernel has no libc and this is the only
+ * caller; ~25 lines of arithmetic are cheaper than a header.
+ */
+static void epoch_to_fat(uint64_t unix_sec, uint16_t* out_fdate,
+                         uint16_t* out_ftime) {
+    uint64_t days = unix_sec / 86400ULL;
+    uint64_t rem  = unix_sec % 86400ULL;
+    int hour = (int)(rem / 3600ULL);
+    int min  = (int)((rem % 3600ULL) / 60ULL);
+    int sec  = (int)(rem % 60ULL);
+
+    int64_t z   = (int64_t)days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    int64_t y   = yoe + era * 400;
+    int64_t doy = doe - (365*yoe + yoe/4 - yoe/100);
+    int64_t mp  = (5*doy + 2)/153;
+    int day     = (int)(doy - (153*mp+2)/5 + 1);
+    int month   = (int)(mp < 10 ? mp + 3 : mp - 9);
+    int year    = (int)(y + (month <= 2));
+
+    /* FAT epoch is 1980; the max is 1980 + 127 = 2107. */
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+    if (month < 1)   month = 1;
+    if (month > 12)  month = 12;
+    if (day < 1)     day = 1;
+    if (day > 31)    day = 31;
+
+    *out_fdate = (uint16_t)(((year - 1980) << 9) | (month << 5) | day);
+    *out_ftime = (uint16_t)((hour << 11) | (min << 5) | (sec / 2));
+}
+
 long sys_utimensat(int dirfd, const char* path, const void* times,
                    int flags) {
     int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
-    (void)times;
 
     if (!path) return -(long)EFAULT_;
 
@@ -5313,23 +5439,128 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
     int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
-    return access_resolved(resolved, backend);
+    /*
+     * Non-FAT backends have no timestamps to set.  /dev and /proc
+     * entries are synthesized; the access check is the honest
+     * answer (existence, not storage).  This is the same fallback
+     * the function had before it grew a real timestamp path.
+     */
+    if (backend != BACKEND_FAT) {
+        return access_resolved(resolved, backend);
+    }
+
+    /*
+     * Parse the times array.  musl passes struct timespec times[2]
+     * (32 bytes on x86_64); a NULL pointer means "set both fields
+     * to now".  atime is discarded -- FAT has no atime -- so only
+     * times[1] (mtime) is used.
+     *
+     * mtime comes from one of three places:
+     *   - times == NULL               -> "now" (g_ticks / 100)
+     *   - times[1].tv_nsec == UTIME_NOW  -> "now"
+     *   - times[1].tv_nsec == UTIME_OMIT -> leave mtime alone; return 0
+     *   - otherwise                    -> times[1].tv_sec
+     */
+    uint64_t mtime_sec;
+    if (!times) {
+        mtime_sec = g_ticks / 100;
+    } else {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+        if (safe_copy_from_user(ts, times, sizeof(ts)) != 0) {
+            return -(long)EFAULT_;
+        }
+        if (ts[1].tv_nsec == UTIME_OMIT_) {
+            return 0;
+        }
+        if (ts[1].tv_nsec == UTIME_NOW_) {
+            mtime_sec = g_ticks / 100;
+        } else {
+            if (ts[1].tv_nsec < 0 || ts[1].tv_nsec > 999999999LL) {
+                return -(long)EINVAL_;
+            }
+            if (ts[1].tv_sec < 0) {
+                /* Pre-epoch: FAT clamps to 1980 anyway; accept and
+                 * clamp, matching the Linux "allow it, the fs clamps"
+                 * behavior. */
+                mtime_sec = 0;
+            } else {
+                mtime_sec = (uint64_t)ts[1].tv_sec;
+            }
+        }
+    }
+
+    /*
+     * Build a FILINFO with only fdate/ftime set.  f_utime reads
+     * only those two fields; every other byte is zeroed so the
+     * call is self-contained and nothing stale is written.
+     */
+    FILINFO fno;
+    for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+    epoch_to_fat(mtime_sec, &fno.fdate, &fno.ftime);
+
+    /* FatFs wants the stripped form ("0:/NAME", no leading '/'). */
+    char fat_path[USER_PATH_MAX];
+    if (path_copy(fat_path, sizeof(fat_path), resolved) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    strip_dot_prefix(fat_path);
+
+    FRESULT fr = f_utime(fat_path, &fno);
+    if (fr != FR_OK) {
+        return fatfs_errno(fr);
+    }
+    return 0;
 }
 
 /*
- * Linux x86_64 utimes(2) — syscall 235.
- * Legacy timeval form.  Same no-op semantics as utimensat.
+ * Linux x86_64 utimes(2) -- syscall 235.
+ *
+ * Legacy timeval form.  Its raw ABI is struct timeval times[2]
+ * (16 bytes each: i64 tv_sec, i64 tv_usec), which is a DIFFERENT
+ * LAYOUT from utimensat's timespec[2] (i64 tv_sec, i64 tv_nsec).
+ * musl's utimes(3) wrapper goes through utimensat(2) and never
+ * reaches this syscall; it exists for raw callers.  When it does
+ * reach us, parse timeval and convert to timespec (tv_usec * 1000
+ * for tv_nsec) before delegating, so the layout is honest.
  */
-long sys_utimes(const char* path, const void* times) {
-    return sys_utimensat(-100, path, times, 0);
+long sys_utimes(const char* path, const void* user_times) {
+    if (!user_times) {
+        return sys_utimensat(-100, path, NULL, 0);
+    }
+    struct { int64_t tv_sec; int64_t tv_usec; } tv[2];
+    if (safe_copy_from_user(tv, user_times, sizeof(tv)) != 0) {
+        return -(long)EFAULT_;
+    }
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+    ts[0].tv_sec  = tv[0].tv_sec;
+    ts[0].tv_nsec = tv[0].tv_usec * 1000LL;
+    ts[1].tv_sec  = tv[1].tv_sec;
+    ts[1].tv_nsec = tv[1].tv_usec * 1000LL;
+    return sys_utimensat(-100, path, ts, 0);
 }
 
 /*
- * Linux x86_64 futimesat(2) — syscall 261.
- * Older glibc form.  Same no-op semantics.
+ * Linux x86_64 futimesat(2) -- syscall 261.
+ *
+ * Older glibc form.  Same timeval[2] layout as utimes; musl's
+ * futimesat(3) wrapper goes through utimensat(2), so this is
+ * raw-caller-only.  Convert timeval to timespec and delegate, as
+ * sys_utimes does.
  */
-long sys_futimesat(int dirfd, const char* path, const void* times) {
-    return sys_utimensat(dirfd, path, times, 0);
+long sys_futimesat(int dirfd, const char* path, const void* user_times) {
+    if (!user_times) {
+        return sys_utimensat(dirfd, path, NULL, 0);
+    }
+    struct { int64_t tv_sec; int64_t tv_usec; } tv[2];
+    if (safe_copy_from_user(tv, user_times, sizeof(tv)) != 0) {
+        return -(long)EFAULT_;
+    }
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+    ts[0].tv_sec  = tv[0].tv_sec;
+    ts[0].tv_nsec = tv[0].tv_usec * 1000LL;
+    ts[1].tv_sec  = tv[1].tv_sec;
+    ts[1].tv_nsec = tv[1].tv_usec * 1000LL;
+    return sys_utimensat(dirfd, path, ts, 0);
 }
 
 /*
