@@ -58,4 +58,8 @@ int serial_rx_poll(void);
  * report POLLIN without consuming the byte read(2) will fetch. */
 int serial_rx_available(void);
 
+/* Drain the UART RX FIFO into the RX ring; returns 1 if a 0x03 was
+ * seen and consumed.  Called from the timer tick (interrupts off). */
+int serial_rx_drain_ring(void);
+
 #endif

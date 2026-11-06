@@ -214,6 +214,28 @@ int kbd_buffer_get(char *c) {
  * across a mode switch, which is not what we want.  Reading on demand
  * keeps the two sources independent.
  */
+/*
+ * serial_tick_poll: the serial ^C's "always runs" point.
+ *
+ * A serial ^C must fire even when NO process is reading the console
+ * -- during `sleep 100` the shell is blocked in wait4 and the child
+ * in nanosleep, so nobody calls kbd_buffer_get_mux.  The PS/2 path
+ * has no such problem: irq1_handler runs on the IRQ regardless of
+ * readers.  The UART is polled, so the equivalent point is the
+ * 100 Hz timer, which calls this every tick.
+ *
+ * It does NOT read the UART data register itself: serial.c's ring
+ * drain moves every pending byte into the RX ring (so the line
+ * editor still gets them) and reports whether a 0x03 was among them.
+ * Reading to "peek" was the earlier, refuted approach: the data
+ * register read is destructive, so the tick stole typed bytes.
+ */
+void serial_tick_poll(void) {
+    if (!serial_rx_drain_ring()) return;
+    long fg = (long)console_fg_pgrp_get();
+    if (fg > 1) console_request_sigint(fg);
+}
+
 int kbd_buffer_get_mux(char *c) {
     for (;;) {
         if (kbd_buffer_get(c)) {

@@ -151,22 +151,73 @@ void serial_print_dec(uint64_t value) {
  * Loopback is NOT enabled (MCR bit 4 is clear), so the bytes we read
  * here come from the terminal, not from our own serial_putc output.
  */
-int serial_rx_poll(void) {
-    if ((inb(0x3F8 + 5) & 0x01) == 0) {
-        return -1;
-    }
-    return (int)(unsigned char)inb(0x3F8);
-}
+/*
+ * Serial RX ring.
+ *
+ * The UART data register read is destructive, so a 0x03 cannot be
+ * spotted by "peeking": whoever reads the byte takes it.  A tick
+ * that reads to look therefore steals bytes the line editor needs --
+ * proven by two failed probes (token printed, no prompt; and a
+ * corrupted line with the shell's `>' continuation prompt).
+ *
+ * Instead the tick DRAINS the UART into this ring.  Ordinary bytes
+ * are never lost (they wait in the ring for the reader); a 0x03 is
+ * consumed at drain time as the ^C signal.  serial_rx_poll pops the
+ * ring, serial_rx_available reports "ring non-empty", so every
+ * existing caller (kbd_buffer_get_mux, sys_poll) keeps its contract.
+ *
+ * Hazards: the ring is 64 bytes; if the reader stalls longer than
+ * that, new bytes are DROPPED (the writer never overwrites unread
+ * data) -- a stuck reader stalls visibly rather than corrupting.
+ * Only the cli-held tick and the cli-held mux touch head/tail, so on
+ * this single core no lock is needed.  This is the minimal ring, not
+ * the console-task design the header names as long-term.
+ */
+#define SERIAL_RX_RING_SIZE 64u   /* power of two */
+static volatile uint8_t  rx_ring[SERIAL_RX_RING_SIZE];
+static volatile unsigned rx_head = 0;   /* write */
+static volatile unsigned rx_tail = 0;   /* read  */
 
 /*
- * Non-consuming readiness check for the UART.
- *
- * Returns 1 if a byte is waiting in the RX FIFO, 0 otherwise.
- * Unlike serial_rx_poll(), this does NOT read the byte -- it only
- * inspects the Line Status Register's Data Ready bit.  sys_poll
- * needs this to report POLLIN without consuming the byte that
- * read(2) is about to fetch.
+ * Drain the UART RX FIFO into the ring.  Returns 1 if a 0x03 was
+ * seen (and consumed) during the drain, else 0.  Called from the
+ * timer tick, interrupts off.  Does NOT take serial_lock: the tick
+ * is already cli-off and this prints nothing.
  */
+int serial_rx_drain_ring(void) {
+    int saw_ctrlc = 0;
+    /* Bounded: at most the FIFO depth per tick.  An unbounded
+     * while(data-ready) can spin forever if the emulated FIFO reports
+     * data-ready without the read clearing it (seen: the guest froze
+     * on ed -s, the first row that stays in one syscall long enough
+     * for the tick to spin).  Bounded means a stuck FIFO is retried
+     * next tick, never a hang. */
+    for (int _i = 0; _i < 16; _i++) {
+        if ((inb(0x3F8 + 5) & 0x01) == 0) break;
+        uint8_t b = (uint8_t)inb(0x3F8);
+        if (b == 0x03) {
+            saw_ctrlc = 1;
+            continue;   /* consume the signal byte, do not ring it */
+        }
+        unsigned next = (rx_head + 1u) & (SERIAL_RX_RING_SIZE - 1u);
+        if (next == rx_tail) {
+            /* Full: drop new, keep unread.  Visible stall, not corruption. */
+            continue;
+        }
+        rx_ring[rx_head] = b;
+        rx_head = next;
+    }
+    return saw_ctrlc;
+}
+
+int serial_rx_poll(void) {
+    if (rx_head == rx_tail) return -1;
+    uint8_t b = rx_ring[rx_tail];
+    rx_tail = (rx_tail + 1u) & (SERIAL_RX_RING_SIZE - 1u);
+    return (int)b;
+}
+
+/* Non-consuming: 1 iff a ring byte is waiting (sys_poll POLLIN). */
 int serial_rx_available(void) {
-    return (inb(0x3F8 + 5) & 0x01) != 0;
+    return rx_head != rx_tail;
 }

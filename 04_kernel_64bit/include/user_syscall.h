@@ -40,6 +40,11 @@ void user_syscall_clear_file_table(struct pcb* pcb);
 uint64_t console_fg_pgrp_get(void);
 uint64_t console_owner_pgrp_get(void);
 
+/* Deferred ^C from a non-IRQ caller (the serial RX path): record the
+ * target fg pgrp; console_raise_pending() raises it on the next tick.
+ * See the definition in interrupts.c. */
+void console_request_sigint(long fg);
+
 /* Slice 2/3 signal delivery.  signal_deliver_frame() reads the
  * syscall-entry stub's frame at g_syscall_stack_top - 120;
  * signal_deliver_frame_iretq(frame_base) reads a 20-slot iretq frame
