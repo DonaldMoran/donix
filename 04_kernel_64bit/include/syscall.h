@@ -80,6 +80,7 @@
  *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
  *  73  flock             sys_flock          (advisory; FAT has none)
+ *  74  fsync             sys_fsync          (f_sync + volume sync)
  *  75  fdatasync         sys_fdatasync      (f_sync; FAT table + dir entry)
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
@@ -104,6 +105,7 @@
  * 115  getgroups         sys_getgroups     (returns 0 groups)
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
+ * 162  sync              sys_sync           (flush all FAT windows + disk cache)
  * 200  tkill            sys_tkill         (slice 5: alias of kill; busybox `kill`)
  * 204  sched_getaffinity sys_sched_getaffinity (one CPU; CPU 0 only)
  * 217  getdents64        sys_getdents64
@@ -185,6 +187,7 @@
 #define SYS_GETPGID         121
 #define SYS_FCNTL           72
 #define SYS_FLOCK           73
+#define SYS_FSYNC           74
 #define SYS_FDATASYNC       75
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
@@ -211,6 +214,7 @@
 #define SYS_GETGROUPS       115
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
+#define SYS_SYNC            162
 #define SYS_TKILL           200
 #define SYS_SCHED_GETAFFINITY 204
 #define SYS_GETDENTS64      217

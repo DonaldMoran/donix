@@ -5476,6 +5476,36 @@ FRESULT f_settime (
 	LEAVE_FF(fs, res);
 }
 
+/*-----------------------------------------------------------------------*/
+/* API: Synchronize a Specific Volume                                    */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_sync_volume (
+	FATFS* fs
+)
+{
+	if (!fs || !fs->fs_type) return FR_INVALID_OBJECT;
+	return sync_fs(fs);
+}
+
+/*-----------------------------------------------------------------------*/
+/* API: Synchronize All Mounted Volumes                                  */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_syncfs (void)
+{
+	FRESULT res = FR_OK;
+	UINT i;
+	for (i = 0; i < FF_VOLUMES; i++) {
+		FATFS *fs = FatFs[i];
+		if (fs && fs->fs_type) {
+			FRESULT r = sync_fs(fs);
+			if (r != FR_OK && res == FR_OK) res = r;
+		}
+	}
+	return res;
+}
+
 FRESULT f_utime (
 	const TCHAR* path,	/* Pointer to the file/directory name */
 	const FILINFO* fno	/* Timestamp to be set */

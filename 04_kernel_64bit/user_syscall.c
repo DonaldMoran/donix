@@ -17,6 +17,7 @@
 #include "include/trace.h"
 #include "include/race_probe.h"
 #include "include/rtc.h"
+#include "include/ata.h"
 
 /* Last syscall number that entered syscall_dispatch.  Read by the
  * fault handlers when a corrupted control target is reported, so
@@ -4116,6 +4117,72 @@ long sys_flock(int fd, int operation) {
  * overwritten bytes may not have reached the disk before the
  * next pass, which is the opposite of shred's contract.
  */
+/*
+ * Linux x86_64 fsync(2) -- syscall 74.
+ *
+ * Synchronize a file or directory's in-core state with storage.
+ *
+ * For regular files: calls f_sync on the open FIL to write back
+ * dirty file data and update the directory entry, then calls
+ * f_sync_volume on the underlying filesystem to commit the
+ * directory sector and issues an ATA cache flush.
+ *
+ * For directories: calls f_sync_volume on the directory's
+ * underlying filesystem to commit any pending metadata/window
+ * updates and flush the drive cache.
+ *
+ * For non-synchronizable descriptors (pipes, consoles, character
+ * devices, /proc): returns -EINVAL per POSIX and Linux contract.
+ *
+ * Invalid or unallocated fds return -EBADF.
+ */
+long sys_fsync(int fd) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (!slot) return -(long)EBADF_;
+
+    if (slot->kind == FILE_KIND_FILE) {
+        FIL* file_obj = (FIL*)slot->obj;
+        if (!file_obj) return -(long)EBADF_;
+        FRESULT r = f_sync(file_obj);
+        if (r != FR_OK) return fatfs_errno(r);
+        r = f_sync_volume(file_obj->obj.fs);
+        return r == FR_OK ? 0 : fatfs_errno(r);
+    }
+
+    if (slot->kind == FILE_KIND_DIR) {
+        DIR* dir_obj = (DIR*)slot->obj;
+        if (!dir_obj || !dir_obj->obj.fs) return -(long)EBADF_;
+        FRESULT r = f_sync_volume(dir_obj->obj.fs);
+        return r == FR_OK ? 0 : fatfs_errno(r);
+    }
+
+    if (slot->kind == FILE_KIND_PIPE ||
+        slot->kind == FILE_KIND_CONSOLE ||
+        slot->kind == FILE_KIND_DEV ||
+        slot->kind == FILE_KIND_DEV_CHAR ||
+        slot->kind == FILE_KIND_DEV_NULL ||
+        slot->kind == FILE_KIND_PROC) {
+        return -(long)EINVAL_;
+    }
+
+    return -(long)EBADF_;
+}
+
+/*
+ * Linux x86_64 sync(2) -- syscall 162.
+ *
+ * Commit all filesystem caches and buffers to storage.
+ * Flushes every mounted FAT volume window and issues an ATA
+ * cache flush to commit drive write buffers.
+ *
+ * Linux sync(2) always succeeds and returns 0.
+ */
+long sys_sync(void) {
+    f_syncfs();
+    ata_flush_cache();
+    return 0;
+}
+
 long sys_fdatasync(int fd) {
     file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
     if (!slot) return -(long)EBADF_;
@@ -12952,6 +13019,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
         case SYS_FLOCK:           result = (uint64_t)sys_flock((int)arg0, (int)arg1); break;
+        case SYS_FSYNC:           result = (uint64_t)sys_fsync((int)arg0); break;
         case SYS_FDATASYNC:       result = (uint64_t)sys_fdatasync((int)arg0); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
         case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
@@ -12980,6 +13048,7 @@ uint64_t syscall_dispatch(uint64_t num,
 
         case SYS_PRCTL:           result = (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0); break;
         case SYS_ARCH_PRCTL:      result = (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1); break;
+        case SYS_SYNC:            result = (uint64_t)sys_sync(); break;
         case SYS_GETDENTS64:      result = (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2); break;
         case SYS_SET_TID_ADDRESS: result = (uint64_t)sys_set_tid_address((int*)arg0); break;
         case SYS_GETTIMEOFDAY:    result = (uint64_t)sys_gettimeofday((void*)arg0, (void*)arg1); break;

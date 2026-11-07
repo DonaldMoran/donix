@@ -378,6 +378,8 @@ TCHAR* f_gets (TCHAR* buff, int len, FIL* fp);						/* Get a string from the fil
 #if !FF_FS_READONLY && !FF_FS_NORTC
 DWORD get_fattime (void);	/* Get current time */
 FRESULT f_settime (FIL* fp, const FILINFO* fno);
+FRESULT f_sync_volume (FATFS* fs);
+FRESULT f_syncfs (void);
 #endif
 
 

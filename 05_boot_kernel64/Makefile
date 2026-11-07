@@ -97,7 +97,8 @@ USERLAND_ELFS := \
 	$(USERLAND_BIN)/realpath_probe.elf \
 	$(USERLAND_BIN)/sigstop_probe.elf \
 	$(USERLAND_BIN)/sigstop_peer_probe.elf \
-	$(USERLAND_BIN)/busybox.elf
+	$(USERLAND_BIN)/busybox.elf \
+	$(USERLAND_BIN)/test_sync.elf
 
 boot.bin: boot.asm
 	$(AS) -f bin boot.asm -o boot.bin
@@ -287,7 +288,8 @@ hdd-single.img: boot.bin stage2.bin ../04_kernel_64bit/kernel.bin musl-userland 
 	mcopy_one "$(USERLAND_BIN)/pipe7e_stdio_heapjmp.elf"  PIPE7E_STDIO_HEAPJMP ; \
 	mcopy_one "$(USERLAND_BIN)/pipe7e_sjlj_stale.elf"  PIPE7E_SJLJ_STALE ; \
 	mcopy_one "$(USERLAND_BIN)/realpath_probe.elf" REALPATH_PROBE ; \
-	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH
+	mcopy_one "$(USERLAND_BIN)/musl_sh.elf"        MUSL_SH ; \
+	mcopy_one "$(USERLAND_BIN)/test_sync.elf"      TEST_SYNC
 
 	@echo "--- staging /root/scripts/ from $(USERLAND_SCRIPTS) ---"
 	@if [ ! -d "$(USERLAND_SCRIPTS)" ]; then \
