@@ -5,13 +5,14 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (eighth session), at `f89f494`.
-**`v0.6.19` is the last pushed release.** `dev` is at `f89f494`;
-recent history is `446e3a0`, `d6969ea`, `cbe7ffb`, `5575868`,
-`fc10881`, `0b07cd8`. `origin/dev` = `ba56b3d`. Ahead **81**,
-**clean**, **no stash**, **27 scratch tags**. No push, no release
-this session; banner still `v0.6.19`. `main` = `7e4748b` (the
-`--no-ff` merge of `v0.6.19`).
+**Last updated:** 2026-11-06 (ninth session), at `1a737e2`.
+**`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
+commit `ba56b3d`). `dev` is at `1a737e2`; recent history is
+`1a737e2`, `47ae47f`, `f89f494`, `446e3a0`, `d6969ea`, `cbe7ffb`.
+`origin/dev` = `ba56b3d`. Ahead **83**, **clean**, **no stash**,
+**27 scratch tags**. No push, no release this session; banner still
+`v0.6.19`. `main` = `7e4748b`. **`1a737e2` has no scratch tag yet**
+-- see "Scratch tags" below.
 
 **Scratch tags: 27, all annotated, all preserved, none pushed.**
 Newest first: `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
@@ -38,59 +39,60 @@ Newest first: `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
 `20261106-sys-execve-cr3` on `6406106`,
 `20261104-gettimeofday-time` on `5a3b65e`.
 
-**Stash:** none. (`stash@{0}`, the vfork-3b work, was dropped last
-session by user decision; there is no copy.)
+`1a737e2` (the `FIL.timeset` fix) is **not** tagged. If the scratch
+tags are the source for the `v0.6.20` summary, either tag it now
+(`git tag -a 20261106-fil-timeset -m "..." 1a737e2`) or record the
+fix in the summary by hand. User decision; do not tag unprompted.
+
+**Stash:** none.
 
 ---
 
 ## START HERE
 
-**The next session is `FR_NO_FILE` create-then-set in `f_utime`.**
-It is the `sync_window` family (`a0664a8`, `d69c2ab`).  Visible
-symptom: `touch f` (no `-d`) on a nonexistent path shows
-`2026-01-01 00:00:00`, not the current time.  The fix is `f_sync` in
-`f_open` before returning -- a behavior change to `f_open`, own
-commit, own gate.  See `open-issues.md`, the item at the top of
-`Also open -- small defects`.
+**The next session is `sync(162)` / `fsync(74)` plus `CONFIG_SYNC` /
+`CONFIG_FSYNC`.** It is config-bound: `configs/busybox.config` has
+`# CONFIG_SYNC is not set` and `# CONFIG_FSYNC is not set`, and the
+kernel dispatcher has no `SYS_SYNC`/`SYS_FSYNC` case. Two commits'
+worth of decision there (kernel syscalls vs. config flip order), but
+one behavior: `sync` and `fsync` run and report success. See
+`open-issues.md`.
 
-**After that:** `sync(162)` / `fsync(74)` + `CONFIG_SYNC`/`CONFIG_FSYNC`
-(config-bound), then `getlogin` / `hostid` stubs (not in `test.sh`).
+**After that:** `getlogin` / `hostid` stubs (not in `test.sh`), then
+the `env`/`PATH` gap.
 
 ---
 
-## WHAT WORKS (verified 2026-11-06, at `f89f494`)
+## WHAT WORKS (verified 2026-11-06, at `1a737e2`)
 
 - **`canary --full` 28/28.**
 - **`test.sh` 57/57.**
 - **`EXEC_CHURN` 24/24 ALL-PASS.**
-- **`tools/coreutils_sweep.exp` PASS=97 FAIL=0** -- the full gate,
-  with both shell behaviors.  Its `sleep 100` + `^C` row is the
-  honest two-step: `sleep 100` alone, send `0x03`, require the prompt
-  back, then a separate `echo __INT__OK`.
-- **Serial `^C` AND `^Z` work.**  The kernel drains the UART into a
-  64-byte RX ring on the 100 Hz tick (bounded 16 bytes/tick), consumes
-  `0x03` as SIGINT and `0x1A` as SIGTSTP, and raises them through the
-  same deferred `console_raise_pending` path the PS/2 signals use.
-  `^C` uses `fg > 1` (the raise skips the shell by pid); `^Z` uses the
-  PS/2 owner rule `fg > 1 && fg != owner`.
-  Proven over **UNIX socket, plain TCP, and telnet with a real
-  client**: `sleep 100` -> `0x03` -> prompt back; `sleep 100` ->
-  `0x1A` -> `[1]+ Stopped`, `jobs` lists it, `fg` resumes, `^C` kills.
-- **PS/2 `^C`/`^Z` (SDL)** unchanged and working.
-- **`./run telnet`** = guest console on `127.0.0.1:45456`
-  (`-serial telnet:...,server,nowait`, `-display none`).
-  **`./run telnet-lan`** = same on `0.0.0.0:45456`; it is an
-  unauthenticated root console, so it **refuses to start unless
-  `DONIX_ALLOW_LAN=1`** and prints a warning before the build
-  (measured: refusal in 6 ms, exit 3, no build, no QEMU).  Reachable
-  from another machine (verified); open the port with
-  `firewall-cmd --add-port=45456/tcp` if refused, or use
-  `ssh -L 45456:127.0.0.1:45456` instead of exposing it.  Console
-  goes to the socket, so `capture.txt` from these modes has build/
-  QEMU output only.
+- **`tools/coreutils_sweep.exp` PASS=98 FAIL=0 XFAIL=0 OBSERVE=5.**
+  The full gate, with both shell behaviors. **The `touch` row is now
+  a real `auto` row** (`rm -f /tmp/td; touch -d '2020-01-01
+  12:34:56' /tmp/td; stat -c %y /tmp/td`, asserting the
+  stat-output-only token `12:34:56.000000000`) and it **PASSes**.
+  Before `1a737e2` it was a hard-coded `xfail` that ran the command
+  and then recorded `XFAIL` regardless.
+- **`touch -d '<date>'` on a nonexistent path now round-trips**
+  (`1a737e2`). The create-then-set case in a single `touch` is
+  fixed. `touch f` (no `-d`), `touch -d` on an existing path, `vi`,
+  and `tar -xf` mtime preservation all still work.
+- **`futimens(fd, times)` works.** `sys_utimensat`'s `path == NULL`
+  branch resolves the slot's `FIL*` and calls the new `f_settime`,
+  which writes `DIR_ModTime` on the open file's entry.
+- **Serial `^C` AND `^Z` work** over UNIX socket, plain TCP, and
+  telnet. The kernel drains the UART into a 64-byte RX ring on the
+  100 Hz tick (bounded 16 bytes/tick), consumes `0x03` as SIGINT and
+  `0x1A` as SIGTSTP, and raises them through the deferred
+  `console_raise_pending` path. PS/2 `^C`/`^Z` (SDL) unchanged.
+- **`./run telnet`** = guest console on `127.0.0.1:45456`;
+  **`./run telnet-lan`** = same on `0.0.0.0:45456`, gated on
+  `DONIX_ALLOW_LAN=1`.
 - **`date` prints the host's real date** (RTC read at boot
   `1479723`, plumbed `9d7b5d3`); `touch -d '<date>' f; stat -c %y f`
-  round-trips exactly.  `tar -xf` preserves mtime.
+  round-trips exactly on an existing file and on a fresh path.
 - **`flock`, `shred -n 1`, `nproc`, `patch a < p`, `dos2unix`,
   `unix2dos`, `mv x y` (replace), `ln f g` (`-EPERM` on FAT)** -- the
   FAT-coreutils set, `23e37bb` onward.
@@ -101,17 +103,15 @@ commit, own gate.  See `open-issues.md`, the item at the top of
 
 ## WHAT IS BROKEN
 
-- **`touch f` (no `-d`) on a nonexistent path** shows
-  `2026-01-01 00:00:00` -- the `FR_NO_FILE` create-then-set in
-  `f_utime`.  NEXT.
 - **`logname`** prints `logname: getlogin` -- `SYS_GETLOGIN` not in
-  dispatcher.  Not in `test.sh`.
+  dispatcher. Not in `test.sh`.
 - **`hostid`** prints `00000000` -- `sys_gethostid` not in
-  dispatcher.  Not in `test.sh`.
+  dispatcher. Not in `test.sh`.
 - **`sync` / `fsync`** -- `CONFIG_SYNC`/`CONFIG_FSYNC` off, and
-  `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher.  Config-bound.
+  `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher. Config-bound.
+  NEXT.
 - **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does not
-  export `PATH`.  Environment gap, not syscall.
+  export `PATH`. Environment gap, not syscall.
 
 ---
 
@@ -122,50 +122,72 @@ actually delivers it to the guest UART.**
 
 - **`./run headless` (Pattern A) cannot**: `./run` pipes QEMU through
   `tee`; an expect-pty byte never reaches the guest, and
-  `send "\003"` kills the wrapper (`spawn id ... not open`).
-- **`-serial stdio` cannot**: QEMU's stdin is a host tty; `^C` is the
-  tty INTR char and SIGINTs QEMU (`terminating on signal 2`).
+  `send "\003"` kills the wrapper. Plain text commands (no control
+  byte) *do* reach the guest through this path -- but not reliably,
+  and this session burned several boots on `.exp` writes that never
+  arrived. **For anything that matters, prefer `./run telnet` or a
+  UNIX socket.**
+- **`-serial stdio` cannot**: QEMU's stdin is a host tty; `^C` is
+  the tty INTR char and SIGINTs QEMU.
 - **Use one of:** `./run telnet` (easiest, loopback), `./run
   telnet-lan` (LAN, gated), UNIX socket (`-serial unix:...` +
-  `socat -,raw,echo=0`), or plain TCP (`-serial tcp:...` + raw
-  socket).  `-,raw,echo=0` on socat is load-bearing; without it
-  `0x03` kills socat.  A telnet client must be in **character
-  mode** -- a line-mode client handles `^C` locally and never sends
-  it.
-- **Ports:** 23 is the well-known telnet port and is NOT used
-  (privileged, may collide with a telnet daemon).  **1234 is the gdb
-  stub** (`-s`) and cannot be reused for the serial while `-s` is
-  present.  donix uses 45456.
+  `socat -,raw,echo=0`), or plain TCP. `-,raw,echo=0` on socat is
+  load-bearing; without it `0x03` kills socat. A telnet client must
+  be in **character mode**.
+- **Ports:** 23 is not used (privileged). **1234 is the gdb stub**
+  (`-s`). donix uses 45456.
 
-**A marker on the same line as `sleep` is not a verdict.**
+**A marker on the same line as the command is not a verdict.**
 `send "sleep 100; echo __SLEPT__\r"` echoes the command line, so
-`expect __SLEPT__` matches the echo and always "passes".  Use the
-two-step form.
+`expect __SLEPT__` matches the echo. Use the two-step form.
+
+**The same trap bit the `coreutils_sweep` `touch` row**: the shell
+echoes the command, so a `want` token that appears in the command
+line passes on the echo. The row now asserts
+`12:34:56.000000000`, which appears only in `stat -c %y` output.
 
 ---
 
 ## WHAT WAS REFUTED -- do NOT re-walk.
 
-**Recent (the serial-control-byte work):**
-- **Tick-time UART *read* to spot a control byte.**  The data-register
-  read is destructive: the tick stole bytes the reader needed.  With a
-  one-byte pushback, a token printed and no prompt returned (`cmp`);
-  without it, the line corrupted and the shell showed its `>`
-  continuation prompt (`awk`).  The ring replaced it.
-- **Unbounded drain `while (data-ready)`.**  Froze the guest on
-  `ed -s`.  The committed drain is **bounded to 16 bytes per tick**.
-- **The reader-path `0x1A` branch** (`kbd_buffer_get_mux`).  Proven
-  dead and removed (`f89f494`): with it gone, the `^Z` probe still
-  passes, because the tick drain consumes `0x1A` before the reader.
-  Do not re-add a control-byte branch in the reader.
-- **`__SLEPT__` on the `sleep` line** (matches the shell echo).
-- **`socat -v` as a probe** (verbose output fills the expect pty and
-  stalls the relay; a `^C` was delayed ~27 s).
-- **Raw `socat TCP:` against a `-serial telnet:` chardev** (QEMU
-  sends telnet `IAC`; expect's `i_read` fails on the non-UTF-8
-  bytes).  Use a real telnet client, or `-serial tcp:`.
+**This session (the `touch -d` / `futimens` work):**
+- **`f_sync` in `f_open`** -- the previous START HERE. It was already
+  there (`ff.c` create path calls `sync_window` after
+  `dir_register`), and `touch f` (no `-d`) already worked. The
+  symptom was never "the create entry is not flushed".
+- **`fp->dir_sect = dj.sect`** (instead of `fs->winsect`). Tried,
+  built, booted, **still failed**. `dir_sect` was never wrong.
+- **"`dir_sect = 128` collides with `dd … seek=128`"** -- a
+  coincidence. `128` is the **volume-relative** sector of `::/`'s
+  root directory (`fs->dirbase`), and `diskio.c` adds the
+  `FAT_PARTITION_OFFSET` 2048 on every read/write. `etc/passwd` at
+  `132` is the same root directory, four sectors on. `128` is
+  correct.
+- **`follow_path` / `dir_sdi` parent-directory resolution.** Read in
+  full: `follow_path` sets `dp->obj.sclust` for each non-last
+  segment, `dir_sdi` takes the `clst2sect` branch for a
+  sub-directory. Both correct.
+- **The path-based `futimens`** (record the open path on the slot,
+  call `f_utime(slot->file_path)`). Never applied -- the patch
+  script's anchor did not match and it aborted. Then the real cause
+  was found, so it is unnecessary. **Do not resurrect it**: it would
+  have worked, but `f_settime` + `FIL.timeset` is smaller and does
+  not grow `file_slot_t`.
+- **`PROBE_FSYNC` / `PROBE_FUTIME_FR`** -- removed in `1a737e2`.
+  Do not re-add them.
 
-**Earlier, unchanged.**  Do not re-walk: `-Wl,--dynamic-linker`,
+**THE PROVEN CAUSE (so it is not re-derived):** `f_settime` wrote
+`DIR_ModTime` correctly; `f_close` -> `f_sync` then re-stamped it to
+`GET_FATTIME()` because `FA_MODIFIED` is set on create (`f_open`:
+`if (mode & FA_CREATE_ALWAYS) mode |= FA_MODIFIED;`). The serial
+probe printed `cur_mod=0x50241A5C` (the 2020 stamp) and
+`new_mod=GET_FATTIME()`. **The fix is `FIL.timeset`**: set by
+`f_settime` on success, initialised to 0 in `f_open`, `f_sync`
+skips the `GET_FATTIME()` re-stamp when it is set and clears it after
+the sync. `f_utime` (path form) needs no flag -- no open `FIL`
+remains to overwrite it.
+
+**Earlier, unchanged.** Do not re-walk: `-Wl,--dynamic-linker`,
 `-fuse-ld=lld`, from-scratch `SECTIONS`, patching musl
 `static_init_tls` `base`, `busybox_unstripped` as oracle, `testme` as
 applet-set reference, `939e3ef`/`153dda9`, `time /bin/true` as
@@ -211,6 +233,13 @@ or cleared: re-write it in the same paste that runs it, or `cat` it
 and read before running.** Durable captures go under
 `~/code/donix-backup-*` or another non-`/tmp` path.
 
+**A multi-line paste can silently skip its `python3`.** This session
+lost three boots to pastes where `cat > script` ran but the
+`python3 /tmp/script.py` line did not. **Put the apply and the
+verification in one paste**, and verify with a number: `grep -c
+'PROBE_…'` in the source, and **`strings kernel.bin | grep -c`**
+before any boot counts.
+
 **Never put a destructive git command inside a block that also runs
 diagnostics.** A `git checkout -- <file>`, `git restore`, or `git
 reset --hard` in a block whose other lines are `git status`/`git
@@ -228,9 +257,11 @@ must assert the old anchor is ABSENT (`after.count(old) == 0`), and
 **Binary-safe edits for files with CRLF line endings.** `open(p,
 "rb").read()` / `open(p, "wb").write(data)` -- Python's universal-
 newline mode silently rewrites CRLF to LF on read/write, which turns
-a one-line diff into a whole-file diff. `configs/busybox.config` and
-`04_kernel_64bit/fatfs/ffconf.h` are CRLF. **Check with `file` first
-if unsure.**
+a one-line diff into a whole-file diff. **This session's line-ending
+facts:** `04_kernel_64bit/fatfs/ff.c` and `ffconf.h` and `ff.h` are
+**CRLF**; `04_kernel_64bit/user_syscall.c` and
+`tools/coreutils_sweep.exp` are **LF**. **Check with `file` (or a
+`b"\r\n" in b` test) before every edit; do not assume.**
 
 **NO `set -e` in a runner pasted at the prompt.** It closes the
 terminal on the non-zero exit and hides the abort message, which is
@@ -241,14 +272,21 @@ itself; it is the *runner* pasted at the prompt that must not have
 it.
 
 **A one-run diagnostic on the FAILURE path beats three guesses.**
+This session proved the point: five theories (f_sync-in-f_open,
+dj.sect, the 128 collision, follow_path, path-based futimens) were
+each wrong, and one serial probe (`cur_mod` vs `new_mod`) named the
+real cause. **Instrument, one boot, read the number.**
 
 **ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION -- AND ON A
 STATEMENT BOUNDARY, NOT A FRAGMENT INSIDE A STRING LITERAL.** Grep
 the file, confirm the count is 1 **and** the match is in the
 intended function. Anchor from the file's current bytes. If an
-anchor aborts, **ask for the current bytes** -- do not guess a second
-anchor. **When the anchor is a full paragraph, use the full
-paragraph** -- first byte to last byte.
+anchor aborts, **ask for the current bytes -- do not guess a second
+anchor.** **When the anchor is a full paragraph, use the full
+paragraph** -- first byte to last byte. **This session's anchor
+failures were whitespace**: the `coreutils_sweep` touch row has
+**four spaces** before `""`, not one; the right way to find that out
+is `awk '{print "["$0"]"}'` or a Python `repr`, not memory.
 
 **The build is TWO steps.** `make -C 04_kernel_64bit
 FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
@@ -281,31 +319,33 @@ This is the single most expensive mistake this project has made.
 `hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
 gdb stub on `:1234`, `capture.txt` written (overwritten each run --
 **copy it aside after any failure or pass you want to keep**).
-`./run debug` adds `-S`.  **`./run tcg` / `./run tcg-debug`** = TCG
-(`-cpu max`, no `-enable-kvm`).  **`./run telnet` / `./run
+`./run debug` adds `-S`. **`./run tcg` / `./run tcg-debug`** = TCG
+(`-cpu max`, no `-enable-kvm`). **`./run telnet` / `./run
 telnet-lan`** = console on `127.0.0.1:45456` / `0.0.0.0:45456`
-(LAN gated by `DONIX_ALLOW_LAN=1`).  Default cwd `/root`.
+(LAN gated by `DONIX_ALLOW_LAN=1`). Default cwd `/root`.
 
 **Writing a new `expect` harness:** `docs/expect-harness.md` has the
 two spawn patterns, the two verdict-pattern rules, the
 `-no-shutdown` shutdown rule, the capture rule, the control-byte
-transport rule, and the `./run telnet` note.  Read it before writing
+transport rule, and the `./run telnet` note. Read it before writing
 a `.exp`; `tools/gate.exp` and `tools/coreutils_sweep.exp` are
 worked examples.
 
 **In-guest gate.** `cd /`, then `canary --full` (28/28) and
-`/root/scripts/test.sh` (57/57).  **Plus the two shell tests:**
+`/root/scripts/test.sh` (57/57). **Plus the two shell tests:**
 `sleep 100` then `^C` returns the prompt; `sleep 100` then `^Z` stops
 it and `jobs`/`fg` work; `exit` from `ash` -> `donix>` ->
-`busybox sh` -> the ash prompt.  **`--install -s /bin` is needed only
+`busybox sh` -> the ash prompt. **`--install -s /bin` is needed only
 if a test execs an applet by path**; interactive applet use does not
 require it.
 
 **Automated gate.** `tools/gate.exp` boots `./run headless` and runs
-the three automated gates.  `tools/coreutils_sweep.exp` boots the
+the three automated gates. `tools/coreutils_sweep.exp` boots the
 same and runs the FAT-coreutils sweep **plus the two shell
-behaviors**; its `^C` row uses the socket serial form.  A green
+behaviors**; its `^C` row uses the socket serial form. A green
 `gate.exp` is **not** the gate; a green `coreutils_sweep.exp` is.
+**Stop any manual QEMU before running either** -- both boot their own
+and collide on `hdd-single.img` and `:1234`.
 
 ---
 
@@ -352,13 +392,14 @@ ready and verified.** `origin/dev` is not force-pushed; every
 unpushed `dev` commit is intentional work. Run
 `git log --oneline origin/dev..dev | wc -l` for the current count.
 
-**Current release state.** **`v0.6.19` is the last pushed release.**
-`dev` is at `f89f494`; ahead **81**, **clean**, **no stash**,
-**27 scratch tags**. `origin/dev` = `ba56b3d`. Work is
-pre-`v0.6.20`. **There is no release gate recorded for `v0.6.20`; if
-a gate is wanted it is set in this file before that release session,
-not during it. The user has said not to move to `v0.6.20` until they
-say so.**
+**Current release state.** **`v0.6.19` is the last pushed release**
+(tag `v0.6.19` = `ba56b3d`, which is also `origin/dev`). `dev` is at
+`1a737e2`; ahead **83**, **clean**, **no stash**, **27 scratch
+tags**. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`). Work
+is pre-`v0.6.20`. **There is no release gate recorded for
+`v0.6.20`; if a gate is wanted it is set in this file before that
+release session, not during it. The user has said not to move to
+`v0.6.20` until they say so.**
 
 ---
 
@@ -377,10 +418,11 @@ lists and extracts correct archive members, including directory
 members, preserving mtime.** **`mkdir -p` works.** **`flock`,
 `fdatasync`, `sched_getaffinity`, `link` are implemented.**
 **`rename(2)` replaces on FAT (`6651be4`).** **`utimensat` writes and
-`stat` reads mtime (`5ccf862`).** `date` reports the real date -- the
-MC146818A RTC is read at boot (`1479723`) and plumbed through the
-time syscalls (`9d7b5d3`).  `uptime` still reports seconds since
-boot.
+`stat` reads mtime (`5ccf862`), and a timestamp set via
+`futimens`/`f_settime` now survives `f_close` (`1a737e2`).** `date`
+reports the real date -- the MC146818A RTC is read at boot
+(`1479723`) and plumbed through the time syscalls (`9d7b5d3`).
+`uptime` still reports seconds since boot.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -419,9 +461,10 @@ on a reset.
 if it is already at `v1.2.5`.** A patch applied to `musl-src`
 persists across runs.
 
-**`04_kernel_64bit/fatfs/ff.c`** is tracked and has two
-`sync_window` fixes; any further edit there must re-run the full
-gate. **`04_kernel_64bit/fatfs/ffconf.h`** is CRLF; binary-safe
+**`04_kernel_64bit/fatfs/ff.c`** is tracked and has three timestamp
+fixes now (`a0664a8` f_open flush, `d69c2ab` f_write, `1a737e2`
+`FIL.timeset`); any further edit there must re-run the full gate.
+**`ff.c` is CRLF. `ffconf.h` is CRLF. `ff.h` is CRLF.** Binary-safe
 edits only.
 
 **`~/code/saved`** -- not a baseline. Run
@@ -435,15 +478,17 @@ commit object. Treat its guards as **refuted**.
 
 ## One-line summary
 
-**`v0.6.19` is released; `dev` is at `f89f494`, ahead 81, clean, no
-stash, 27 scratch tags, nothing pushed. Serial `^C` AND `^Z` work --
-drain the UART into a 64-byte RX ring on the tick (bounded 16/tick),
-consume 0x03/0x1A, raise SIGINT/SIGTSTP via the deferred console path;
-proven over UNIX socket, TCP, and telnet. `./run telnet` (loopback
-127.0.0.1:45456) and `./run telnet-lan` (0.0.0.0:45456,
-DONIX_ALLOW_LAN=1 gate) let you drive it from another machine.
-`-serial stdio` cannot carry control bytes. `tools/coreutils_sweep.exp`
-PASS=97 FAIL=0; `gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN
-ALL-PASS. **NEXT: the `FR_NO_FILE` create-then-set in `f_utime`**
-(`f_sync` in `f_open`). Do not move to `v0.6.20` until the user says
-so.**
+**`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
+at `1a737e2`, ahead 83, clean, no stash, 27 scratch tags, nothing
+pushed, `1a737e2` itself untagged. `touch -d '<date>'` on a fresh
+path is FIXED (`1a737e2`): `f_settime`/`futimens` wrote the entry
+correctly and `f_close` -> `f_sync` re-stamped `DIR_ModTime` to
+`GET_FATTIME()` because `FA_MODIFIED` is set on create; the fix is
+`FIL.timeset`, set by `f_settime`, skipped and cleared by `f_sync`.
+The `coreutils_sweep` `touch` row is now a real `auto` assertion
+(stat-only token `12:34:56.000000000`) instead of a hard-coded xfail.
+Serial `^C` AND `^Z` work over socket/TCP/telnet; `-serial stdio`
+cannot carry control bytes. `tools/coreutils_sweep.exp` PASS=98
+FAIL=0 XFAIL=0; `gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN
+ALL-PASS. **NEXT: `sync(162)`/`fsync(74)` + `CONFIG_SYNC`/
+`CONFIG_FSYNC`.** Do not move to `v0.6.20` until the user says so.**

@@ -1,6 +1,6 @@
 # Open issues
 
-**Last updated: 2026-11-06 (sixth session).**
+**Last updated: 2026-11-06 (ninth session), at `1a737e2`.**
 This file lists **only open issues**. Closed items are removed, not
 struck through; their history is in `git log`. An item appears here
 only while it is a defect, a missing feature, or an unverified claim
@@ -11,6 +11,18 @@ the un-numbered entries below them are smaller and were filed later.
 Numbers are stable -- a closed number is retired, not reused.
 
 **Recently closed, do not re-open without new evidence:**
+- **`touch -d '<date>'` on a nonexistent path kept `get_fattime`'s
+  value; `f_utime` on a just-created file returned `FR_NO_FILE`.**
+  Fixed by `1a737e2`. The proven cause was **not** a missing flush in
+  `f_open` and **not** a wrong `dir_sect`: `f_settime` (the
+  `futimens` path) wrote `DIR_ModTime` correctly, and then
+  `f_close` -> `f_sync` re-stamped it to `GET_FATTIME()` because
+  `f_open` sets `FA_MODIFIED` on create. The fix is `FIL.timeset`
+  (`ff.h`), set by `f_settime` on success, initialised to 0 in
+  `f_open`, skipped and cleared by `f_sync`. `f_utime` (path form)
+  needed no flag. The `coreutils_sweep` `touch` row is now a real
+  `auto` assertion and passes. Do not re-file "touch -d on a fresh
+  path"; it is closed and gated.
 - **The `time true` fault** -- fixed by `6406106`. A stale `%cr3` at
   the `sysret` after vfork+exec: `sys_execve` switched `self->cr3`
   but never loaded it into `%cr3`, and the sysret stub does not
@@ -119,6 +131,30 @@ The investigation starts at `sys_times`/`sys_getrusage` and the tick
 accounting in `scheduler.c` (whether per-process `utime`/`stime` are
 accumulated at all, and in what unit).
 
+**`sync` / `fsync` are off in the config and absent from the
+dispatcher.** `configs/busybox.config` has `# CONFIG_SYNC is not
+set` and `# CONFIG_FSYNC is not set`, so neither command is on the
+image; and the kernel has no `SYS_SYNC(162)` / `SYS_FSYNC(74)` case
+in the dispatcher. **This is the next item.** Two separable pieces:
+the kernel syscalls (`SYS_SYNC` = flush every dirty FAT window /
+`sync_fs`; `SYS_FSYNC(fd)` = flush the `FIL`'s window and the
+volume), and the busybox config flip. **The kernel side first**, with
+its own gate; then the config flip, which changes the image and
+needs the full sweep. A `sync` that silently does nothing is worse
+than a `sync` that is absent -- so the kernel case must call
+`sync_fs` (or the disk-level equivalent) for every mounted volume,
+and `fsync` must call it for the fd's volume.
+
+**`logname` and `hostid` are stubs.** `logname` prints
+`logname: getlogin` because `SYS_GETLOGIN(25)` is not in the
+dispatcher; `hostid` prints `00000000` because `sys_gethostid` is
+not in the dispatcher. Neither is in `test.sh`, so neither fails a
+gate. The honest values: `getlogin` returns `"root"` (item 9's
+world is uid 0, and `/etc/passwd` has the entry); `gethostid` can
+return 0 (QEMU has no stable id) or a boot-time value; a stub that
+returns 0 is acceptable only if documented. Small, one session,
+one commit each.
+
 **`chmod`/`chown` accept and drop, and their applets are not
 compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and store
 nothing: FAT has no mode bits and no ownership, everything is uid 0,
@@ -134,6 +170,19 @@ commands run and report success while changing nothing (FAT has no
 mode store).  Honoring FAT's read-only attribute via FatFs's
 `f_chmod` would be a real but two-state mode change, and a separate,
 larger decision.
+
+**`f_utime` (path form) does not protect an open `FIL`'s timestamp.**
+`1a737e2` guards the timestamp a `futimens`/`f_settime` caller set on
+an **open** `FIL` via `FIL.timeset`. The **path** form, `f_utime`,
+writes the directory entry directly and has no `FIL` to mark, so if
+the same file is **also** open with `FA_MODIFIED` set, that open
+`FIL`'s `f_close` -> `f_sync` will still re-stamp `ModTime` with
+`GET_FATTIME()`, overwriting the path-form value. No caller in the
+tree does this today -- busybox's `touch -d` goes through
+`futimens` -> `f_settime`, not the path form, once the file exists --
+so it is a latent corner, not a live bug. If a future caller needs
+it, the fix is a timestamp generation counter or a per-volume "last
+timestamp write" epoch, not another `FIL` flag.
 
 **`tar` is enabled, and link restoration is verified.**  The v0.6.16
 note named a real symptom but the wrong cause.  busybox's
@@ -349,11 +398,12 @@ path shape, not on `process_find_by_pid`.  `ps` only stats pids
 line when `/proc` is next touched.
 
 **`gettimeofday` (96) and `time` (201) are implemented.**  Both read
-the existing 100 Hz `g_ticks` counter -- no RTC, no wall clock, `tv_sec`
-is seconds since boot, `tv_usec` has 10 ms PIT granularity.  `date`
-and `uptime` use them.  **`time`'s accounting is the open bug above**
-(`user`/`sys` garbage), not these two syscalls.  Noted so they are not
-re-filed as "unimplemented".
+the existing 100 Hz `g_ticks` counter plus the boot RTC offset, so
+`tv_sec` is wall-clock time (not seconds since boot, as it was
+before `1479723`/`9d7b5d3`), and `tv_usec` has 10 ms PIT
+granularity.  `date` and `uptime` use them.  **`time`'s accounting
+is the open bug above** (`user`/`sys` garbage), not these two
+syscalls.  Noted so they are not re-filed as "unimplemented".
 
 **A live pipe slot's `end` field is 0; no writer is in the source.**
 Latent, not active.  A `file_slot_t` of kind `FILE_KIND_PIPE` was
@@ -391,6 +441,9 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
   tty INTR char and SIGINTs QEMU. Any harness that sends `^C`/`^Z`
   must use `-serial unix:...,server,nowait` + `socat -,raw,echo=0`.
   See `docs/expect-harness.md` and `tools/coreutils_sweep.exp`.
+  **Plain-text commands through `headless` also proved unreliable
+  this session** -- several `.exp` writes never reached the guest.
+  For anything that matters, prefer `./run telnet` or a UNIX socket.
 
 - **No timezone: `date` prints the host's local time labeled
   `UTC`.** The RTC work reads the CMOS and reports the epoch
@@ -408,40 +461,19 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
   `execve` of busybox.  Setting `TZ=EST5EDT` (musl parses the
   POSIX TZ string without a zoneinfo file) needs the same
   argv/envp frame layout as `sys_execve`'s section 6 -- ~80
-  lines.  Own session.
+  lines.  Own session.  **The same frame is the `PATH` gap below.**
 
-- **`touch -d '<date>'` on a nonexistent path keeps `get_fattime`'s
-  value.** `touch -d '2020-01-01 12:34:56' /tmp/newfile` does
-  `open(O_CREAT)` then `utimensat(times)` in the same call.  The
-  create writes the directory entry (and the `ATA` flush from
-  `09d2f98` makes it durable), but `f_utime` returns `FR_NO_FILE`
-  on the just-created file and the file keeps `get_fattime`'s
-  value (the current time, not the `-d` value).  **On an existing
-  file, `touch -d` round-trips exactly** (the `09d2f98` fix), and
-  `touch f` (no `-d`), `vi`, `tar -xf` mtime preservation, and the
-  cross-`touch` read all work.  The gap is the create-then-set in
-  one `touch` invocation.  A `winsect = (LBA_t)-1` invalidate was
-  tried and reverted: `(LBA_t)-1` is a sector number, and a later
-  `sync_window` wraps it below the `ATA_WRITE_PROTECT_LBAS` floor.
-  The real fix is in `f_utime`'s path or a `sync_fs` + re-stat in
-  `sys_utimensat`; own session.
+- **The shell does not export `PATH`.** `env | wc -l` is 2 and
+  `printenv PATH` is empty, because the initial `musl_sh` frame has
+  `envp = NULL`.  This is an environment gap, not a syscall gap, and
+  it lands in the same `kmain.c` frame code as the TZ item.  One
+  session can do both; it needs the `sys_execve` section-6 argv/envp
+  layout.
 
-- **`f_utime` on a file that `f_open` just created returns
-  `FR_NO_FILE`.** The directory entry is staged in `fs->win` and
-  not flushed until `f_sync` / `f_close`; `f_utime`'s `follow_path`
-  reads from disk. Same `sync_window` family as `a0664a8` (f_open)
-  and `d69c2ab` (f_write). A future fix would `f_sync` in `f_open`
-  before returning -- a behavior change to `f_open`, own commit,
-  own gate. User-visible symptom is one swallowed `FR_NO_FILE` on
-  `touch -d` against a nonexistent path; `touch` recovers, and the
-  set-on-existing case works. The `20261106-f-utime` commit's
-  KNOWN LIMIT paragraph is the source.
 - `kill(0, sig)` ("my group") still returns `-EINVAL`.
   `kill(-pgid, sig)` works (`9b1a4ed`).
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are latent
   collisions.
-- Real FatFs timestamp storage: the three timestamp syscalls return 0
-  without storing.
 - `prctl` is minimal (`PR_SET_NAME` accepted and dropped).
 - Syscall-table audit script.
 - `musl_wait`'s WNOHANG loop spins.
@@ -486,7 +518,7 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 - `sys_execve` now loads `%cr3` from `self->cr3` at the end of
   section 8 (`6406106`).  Any change to the exec stack, the `%cr3`
   switch, or the sysret stub must be tested with the two shell gate
-  tests in `handoff.md`'s "THE GATE GAP", not just
+  tests in `handoff.md`'s "THE HARNESS RULE", not just
   `canary`/`test.sh`.
 - `sys_mkdir`'s `"/"` check must stay **before** `strip_dot_prefix`.
   `strip_dot_prefix` turns `"/"` into `"."`, `f_mkdir(".")` returns
@@ -499,10 +531,30 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
   other FatFs caller (`open(O_CREAT|O_EXCL)`, `rename`, `link`).  Do
   not move the translation into `fatfs_errno` without checking every
   caller; that is a wider behavior change than `mkdir`.
+- **`FIL.timeset` is cleared by `f_sync` after a `FA_MODIFIED`
+  sync.** Any new code that sets `DIR_ModTime` on an **open** `FIL`
+  must set `fp->timeset` too, or the close-time `f_sync` will
+  overwrite it with `GET_FATTIME()`.  The path form `f_utime` is not
+  covered (see the un-numbered item above).
+- **`ff.c` and `ff.h` are CRLF; `user_syscall.c` is LF.** Any edit
+  to those files must use binary-safe I/O (`open(p,"rb")` /
+  `write_bytes`), and the patch script must assert the file's
+  endings before and after.  A `write_text` on `ff.c` turns a
+  one-line change into a whole-file diff.
 
 ---
 
 ## Measurement corrections and history notes
+
+**The sector-128 theory was a red herring.** During the `touch -d`
+investigation, `fp->dir_sect = 128` for a freshly created file
+looked like a collision with the boot kernel's `dd … seek=128`. It
+is not: `128` is the **volume-relative** sector of `::/`'s root
+directory (`fs->dirbase` = `fatbase + fasize`), and `diskio.c`
+adds `FAT_PARTITION_OFFSET` 2048 on every read/write, so the raw
+disk sector is 2176. `etc/passwd` at `132` is the same root
+directory four sectors on. `dir_sect` was correct the whole time;
+the bug was the close-time `f_sync` re-stamp.
 
 **`time /bin/true` never worked, and "no fault" was not an
 improvement.**  `/bin/true` does not exist.  `sys_execve` reported
