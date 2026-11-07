@@ -163,6 +163,8 @@ set smoke {
     {cpio        "echo /etc/passwd | cpio -o 2>/dev/null | wc -l" "1" auto}
     {dd          "echo hi > /tmp/dd.in; dd if=/tmp/dd.in of=/tmp/dd.out 2>/dev/null; cat /tmp/dd.out" "hi" auto}
     {shred       "echo x > /tmp/sh; shred -n 1 /tmp/sh"     ""         auto}
+    {sync        "sync"                                     ""         auto}
+    {fsync       "echo x > /tmp/fs; fsync /tmp/fs"          ""         auto}
     {timeout     "timeout 1 true"                           ""         auto}
     {nproc       "nproc"                                    ""         auto}
     {pidof       "pidof sh"                                 ""         auto}
