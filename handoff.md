@@ -9,13 +9,14 @@ session** -- ask for it when the current task needs it.
 **`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
 commit `ba56b3d`). `dev` is at `1a737e2`; recent history is
 `1a737e2`, `47ae47f`, `f89f494`, `446e3a0`, `d6969ea`, `cbe7ffb`.
-`origin/dev` = `ba56b3d`. Ahead **83**, **clean**, **no stash**,
-**27 scratch tags**. No push, no release this session; banner still
+`origin/dev` = `ba56b3d`. Ahead **84**, **clean**, **no stash**,
+**28 scratch tags**. No push, no release this session; banner still
 `v0.6.19`. `main` = `7e4748b`. **`1a737e2` has no scratch tag yet**
 -- see "Scratch tags" below.
 
-**Scratch tags: 27, all annotated, all preserved, none pushed.**
-Newest first: `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
+**Scratch tags: 28, all annotated, all preserved, none pushed.**
+Newest first: `20261106-fil-timeset` on `1a737e2`,
+`20261106-kbd-drop-dead-ctrlz` on `f89f494`,
 `20261106-serial-ctrlsz` on `446e3a0`,
 `20261106-run-telnet-lan` on `d6969ea`,
 `20261106-serial-ctrlc-ring` on `5575868`,
@@ -39,10 +40,8 @@ Newest first: `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
 `20261106-sys-execve-cr3` on `6406106`,
 `20261104-gettimeofday-time` on `5a3b65e`.
 
-`1a737e2` (the `FIL.timeset` fix) is **not** tagged. If the scratch
-tags are the source for the `v0.6.20` summary, either tag it now
-(`git tag -a 20261106-fil-timeset -m "..." 1a737e2`) or record the
-fix in the summary by hand. User decision; do not tag unprompted.
+`1a737e2` (the `FIL.timeset` fix) is tagged `20261106-fil-timeset`.
+It is in the `v0.6.20` summary source.
 
 **Stash:** none.
 
@@ -479,8 +478,8 @@ commit object. Treat its guards as **refuted**.
 ## One-line summary
 
 **`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
-at `1a737e2`, ahead 83, clean, no stash, 27 scratch tags, nothing
-pushed, `1a737e2` itself untagged. `touch -d '<date>'` on a fresh
+at `1a737e2`, ahead 84, clean, no stash, 28 scratch tags, nothing
+pushed. `touch -d '<date>'` on a fresh
 path is FIXED (`1a737e2`): `f_settime`/`futimens` wrote the entry
 correctly and `f_close` -> `f_sync` re-stamped `DIR_ModTime` to
 `GET_FATTIME()` because `FA_MODIFIED` is set on create; the fix is
