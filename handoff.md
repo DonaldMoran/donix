@@ -5,16 +5,18 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (ninth session), at `6d14dc9`.
+**Last updated:** 2026-11-07 (tenth session), at `f4dd5ee`.
 **`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
-commit `ba56b3d`). `dev` is at `6d14dc9`; recent history is
-`6d14dc9`, `f49c392`, `1a737e2`, `47ae47f`, `f89f494`, `446e3a0`.
-`origin/dev` = `ba56b3d`. Ahead **87**, **clean**, **no stash**,
-**30 scratch tags**. No push, no release this session; banner still
+commit `ba56b3d`). `dev` is at `f4dd5ee`; recent history is
+`f4dd5ee`, `04e584b`, `6d14dc9`, `f49c392`, `1a737e2`, `47ae47f`.
+`origin/dev` = `ba56b3d`. Ahead **89**, **clean**, **no stash**,
+**32 scratch tags**. No push, no release this session; banner still
 `v0.6.19`. `main` = `7e4748b`.
 
-**Scratch tags: 30, all annotated, all preserved, none pushed.**
-Newest first: `20261106-busybox-sync-fsync` on `6d14dc9`,
+**Scratch tags: 32, all annotated, all preserved, none pushed.**
+Newest first: `20261107-logname-env` on `f4dd5ee`,
+`20261106-handoff-sync-fsync` on `04e584b`,
+`20261106-busybox-sync-fsync` on `6d14dc9`,
 `20261106-sys-sync-fsync` on `f49c392`,
 `20261106-fil-timeset` on `1a737e2`,
 `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
@@ -50,15 +52,12 @@ It is in the `v0.6.20` summary source.
 
 ## START HERE
 
-**The next session is `logname` (`SYS_GETLOGIN` 25) and `hostid` stubs.**
-`logname` prints `logname: getlogin` because `SYS_GETLOGIN(25)` is not in
-the dispatcher; `hostid` prints `00000000` because `sys_gethostid` is not in
-the dispatcher. Neither is in `test.sh`, so neither fails a gate. The
-honest values: `getlogin` returns `"root"` (item 9's single-user root
-userland contract) and `hostid` returns a fixed host identifier. See
-`open-issues.md`.
-
-**After that:** the `env`/`PATH` gap (`env | wc -l` is 2; `printenv PATH` empty).
+**The next session is the `env` / `PATH` gap.**
+`printenv PATH` is currently empty because `ash` does not export `PATH`
+(asserted by `canary.c`'s `printenv PATH is empty` check). Evaluate
+whether `PATH` should be exported by default (which requires updating
+`canary.c`), or if the current unexported behavior is the intended
+donix design. See `open-issues.md`.
 
 ---
 
@@ -72,6 +71,9 @@ userland contract) and `hostid` returns a fixed host identifier. See
   by `sys_sync(162)` (iterates mounted volumes, calls `f_syncfs` and
   `ata_flush_cache`) and `sys_fsync(74)` (`f_sync` + `f_sync_volume`).
   Verified with `test_sync` in-guest and the automated sweep.
+- **`logname` prints `root`** (`f4dd5ee`), backed by `LOGNAME=root` in
+  `musl_sh.c` default environment. `hostid` prints `00000000` (verified
+  upstream Musl `gethostid()` behavior). Both pass the coreutils sweep.
   The full gate, with both shell behaviors. **The `touch` row is now
   a real `auto` row** (`rm -f /tmp/td; touch -d '2020-01-01
   12:34:56' /tmp/td; stat -c %y /tmp/td`, asserting the
@@ -106,12 +108,8 @@ userland contract) and `hostid` returns a fixed host identifier. See
 
 ## WHAT IS BROKEN
 
-- **`logname`** prints `logname: getlogin` -- `SYS_GETLOGIN` not in
-  dispatcher. Not in `test.sh`.
-- **`hostid`** prints `00000000` -- `sys_gethostid` not in
-  dispatcher. Not in `test.sh`.
-- **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does not
-  export `PATH`. Environment gap, not syscall.
+- **`printenv PATH` empty** -- the shell does not export `PATH` (asserted
+  by canary). Environment gap, not syscall.
 
 ---
 
@@ -479,13 +477,11 @@ commit object. Treat its guards as **refuted**.
 ## One-line summary
 
 **`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
-at `6d14dc9`, ahead 87, clean, no stash, 30 scratch tags, nothing
+at `f4dd5ee`, ahead 89, clean, no stash, 32 scratch tags, nothing
 pushed. `sync(162)` and `fsync(74)` are IMPLEMENTED and gated
-(`f49c392`, `6d14dc9`): `sys_sync` flushes all mounted FatFs volumes
-via `f_syncfs` and issues `ata_flush_cache`; `sys_fsync` flushes files
-via `f_sync` + `f_sync_volume` and directories via `f_sync_volume`.
-`CONFIG_SYNC=y` and `CONFIG_FSYNC=y` are enabled in BusyBox.
+(`f49c392`, `6d14dc9`); `logname` prints `root` and `hostid` prints
+`00000000` (`f4dd5ee`, resolved via `musl_sh.c` default environment).
 `tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5;
 `gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN ALL-PASS.
-**NEXT: `logname` (`SYS_GETLOGIN` 25) and `hostid` stubs.** Do not move to
-`v0.6.20` until the user says so.**
+**NEXT: the `env` / `PATH` gap.** Do not move to `v0.6.20` until the
+user says so.**

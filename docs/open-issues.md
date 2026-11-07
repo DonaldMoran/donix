@@ -11,6 +11,15 @@ the un-numbered entries below them are smaller and were filed later.
 Numbers are stable -- a closed number is retired, not reused.
 
 **Recently closed, do not re-open without new evidence:**
+- **`logname` and `hostid` are stubs.** Fixed and documented in `f4dd5ee`.
+  Neither is a missing kernel syscall: Linux x86_64 has no `getlogin` or
+  `gethostid` syscall (syscall 25 is `mremap`). Musl libc's `gethostid()`
+  hardcodes `return 0;` so `hostid` printing `00000000` is the standard
+  upstream Musl behavior on Linux. Musl's `getlogin()` reads `getenv("LOGNAME")`.
+  `musl_sh.c` previously invoked `execve` with an empty environment; providing
+  `default_envp` with `LOGNAME=root`, `USER=root`, `HOME=/root`, and `TERM=linux`
+  allows `logname` to print `root` and exit 0. `coreutils_sweep.exp` asserts
+  `root` on `logname` and passes.
 - **`sync` / `fsync` syscalls and BusyBox commands.**
   Fixed by `f49c392` (kernel syscalls) and `6d14dc9` (BusyBox config).
   Kernel side implements `SYS_FSYNC(74)` (flushes `FIL` data/metadata
@@ -140,16 +149,6 @@ touches `sys_execve` -- give it its own session and its own commit.
 The investigation starts at `sys_times`/`sys_getrusage` and the tick
 accounting in `scheduler.c` (whether per-process `utime`/`stime` are
 accumulated at all, and in what unit).
-
-**`logname` and `hostid` are stubs.** `logname` prints
-`logname: getlogin` because `SYS_GETLOGIN(25)` is not in the
-dispatcher; `hostid` prints `00000000` because `sys_gethostid` is
-not in the dispatcher. Neither is in `test.sh`, so neither fails a
-gate. The honest values: `getlogin` returns `"root"` (item 9's
-world is uid 0, and `/etc/passwd` has the entry); `gethostid` can
-return 0 (QEMU has no stable id) or a boot-time value; a stub that
-returns 0 is acceptable only if documented. Small, one session,
-one commit each.
 
 **`chmod`/`chown` accept and drop, and their applets are not
 compiled in.**  Syscalls 90-93 (path and fd forms) return 0 and store
