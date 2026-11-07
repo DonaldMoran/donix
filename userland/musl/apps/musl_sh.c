@@ -10,6 +10,14 @@
  */
 static void run_external(char** argv);
 
+static char* const default_envp[] = {
+    (char*)"LOGNAME=root",
+    (char*)"USER=root",
+    (char*)"HOME=/root",
+    (char*)"TERM=linux",
+    (char*)0
+};
+
 static void puts_raw(const char* s, unsigned long n) {
     __asm__ volatile("syscall"
                      :
@@ -50,7 +58,7 @@ static void run_busybox_sh(void) {
         argv[0] = (char*)"/bin/busybox";
         argv[1] = (char*)"sh";
         argv[2] = (char*)0;
-        execve(argv[0], argv, (char**)0);
+        execve(argv[0], argv, (char**)default_envp);
         puts_raw("EXEC-FAILED\n", 12);
         _exit(127);
     }
@@ -401,7 +409,7 @@ static void run_external(char** argv) {
     /* A path, not a name: no search. */
     for (const char* p = name; *p; p++) {
         if (*p == '/') {
-            execve(name, argv, (char**)0);
+            execve(name, argv, (char**)default_envp);
             return;
         }
     }
@@ -428,7 +436,7 @@ static void run_external(char** argv) {
         }
         path[o] = '\0';
 
-        execve(path, argv, (char**)0);
+        execve(path, argv, (char**)default_envp);
         /* execve returned: not found here.  Try the next
          * directory. */
     }

@@ -132,7 +132,7 @@ set smoke {
     {dirname     "dirname /a/b"                             "/a"       auto}
     {env         "env | wc -l"                            ""         auto}
     {printenv    "printenv PATH"                            ""         auto}
-    {logname     "logname"                                  ""         auto}
+    {logname     "logname"                                  "root"     auto}
     {id          "id -un"                                   "root"     auto}
     {groups      "groups"                                   "root"     auto}
     {whoami      "whoami"                                   "root"     auto}
