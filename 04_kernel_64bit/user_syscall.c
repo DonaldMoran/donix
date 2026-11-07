@@ -5413,7 +5413,44 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
                    int flags) {
     int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
 
-    if (!path) return -(long)EFAULT_;
+    /*
+     * futimens(fd, times) reaches here as path == NULL (musl's
+     * futimens is literally utimensat(fd, 0, times, 0)).  There is
+     * no fd->path mapping in the tree, so resolve the fd to its
+     * FIL* and stamp the directory entry directly.
+     */
+    if (!path) {
+        if (dirfd < 0) return -(long)EBADF_;
+        file_slot_t* slot = get_file_slot_any(dirfd);
+        if (!slot || slot->kind != FILE_KIND_FILE || !slot->obj) {
+            return -(long)EBADF_;
+        }
+        FIL* fp = (FIL*)slot->obj;
+        uint64_t mt;
+        if (!times) {
+            mt = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+        } else {
+            struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+            if (safe_copy_from_user(ts, times, sizeof(ts)) != 0) {
+                return -(long)EFAULT_;
+            }
+            if (ts[1].tv_nsec == UTIME_OMIT_) return 0;
+            if (ts[1].tv_nsec == UTIME_NOW_) {
+                mt = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+            } else {
+                if (ts[1].tv_nsec < 0 || ts[1].tv_nsec > 999999999LL) {
+                    return -(long)EINVAL_;
+                }
+                mt = (ts[1].tv_sec < 0) ? 0 : (uint64_t)ts[1].tv_sec;
+            }
+        }
+        FILINFO fno;
+        for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+        epoch_to_fat(mt, &fno.fdate, &fno.ftime);
+        FRESULT fr = f_settime(fp, &fno);
+        if (fr != FR_OK) return fatfs_errno(fr);
+        return 0;
+    }
 
     /*
      * Flags.  Linux's utimensat accepts AT_SYMLINK_NOFOLLOW (0x100)

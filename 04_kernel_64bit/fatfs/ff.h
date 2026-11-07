@@ -232,6 +232,7 @@ typedef struct {
 #if !FF_FS_TINY
 	BYTE	buf[FF_MAX_SS];	/* File private data read/write window */
 #endif
+	BYTE	timeset;	/* Timestamp was set; f_sync must not re-stamp */
 } FIL;
 
 
@@ -376,6 +377,7 @@ TCHAR* f_gets (TCHAR* buff, int len, FIL* fp);						/* Get a string from the fil
 /* RTC function (provided by user) */
 #if !FF_FS_READONLY && !FF_FS_NORTC
 DWORD get_fattime (void);	/* Get current time */
+FRESULT f_settime (FIL* fp, const FILINFO* fno);
 #endif
 
 

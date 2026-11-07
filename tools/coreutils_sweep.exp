@@ -102,7 +102,7 @@ set smoke {
     {tsort       "printf 'a b\\n' | tsort"                  "a"        auto}
     {stat        "stat -c %s /etc/passwd"                   "30"       auto}
     {cp          "cp -- /etc/passwd /tmp/cp1; cmp /etc/passwd /tmp/cp1" "" auto}
-    {touch       "touch -d '2020-01-01' /tmp/td; stat -c %y /tmp/td"    ""  xfail "timestamp not stored"}
+    {touch       "rm -f /tmp/td; touch -d '2020-01-01 12:34:56' /tmp/td; stat -c %y /tmp/td" "2020-01-01" auto}
     {split       "rm -f /tmp/sp*; echo abcdef | split -b2 - /tmp/sp; ls /tmp/sp* | wc -l" "3" auto}
     {tee         "echo hi | tee /tmp/te"                    "hi"       auto}
     {tr          "echo abc | tr a-z A-Z"                    "ABC"      auto}
