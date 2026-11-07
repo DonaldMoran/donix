@@ -5,17 +5,18 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-06 (ninth session), at `1a737e2`.
+**Last updated:** 2026-11-06 (ninth session), at `6d14dc9`.
 **`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
-commit `ba56b3d`). `dev` is at `1a737e2`; recent history is
-`1a737e2`, `47ae47f`, `f89f494`, `446e3a0`, `d6969ea`, `cbe7ffb`.
-`origin/dev` = `ba56b3d`. Ahead **84**, **clean**, **no stash**,
-**28 scratch tags**. No push, no release this session; banner still
-`v0.6.19`. `main` = `7e4748b`. **`1a737e2` has no scratch tag yet**
--- see "Scratch tags" below.
+commit `ba56b3d`). `dev` is at `6d14dc9`; recent history is
+`6d14dc9`, `f49c392`, `1a737e2`, `47ae47f`, `f89f494`, `446e3a0`.
+`origin/dev` = `ba56b3d`. Ahead **87**, **clean**, **no stash**,
+**30 scratch tags**. No push, no release this session; banner still
+`v0.6.19`. `main` = `7e4748b`.
 
-**Scratch tags: 28, all annotated, all preserved, none pushed.**
-Newest first: `20261106-fil-timeset` on `1a737e2`,
+**Scratch tags: 30, all annotated, all preserved, none pushed.**
+Newest first: `20261106-busybox-sync-fsync` on `6d14dc9`,
+`20261106-sys-sync-fsync` on `f49c392`,
+`20261106-fil-timeset` on `1a737e2`,
 `20261106-kbd-drop-dead-ctrlz` on `f89f494`,
 `20261106-serial-ctrlsz` on `446e3a0`,
 `20261106-run-telnet-lan` on `d6969ea`,
@@ -49,16 +50,15 @@ It is in the `v0.6.20` summary source.
 
 ## START HERE
 
-**The next session is `sync(162)` / `fsync(74)` plus `CONFIG_SYNC` /
-`CONFIG_FSYNC`.** It is config-bound: `configs/busybox.config` has
-`# CONFIG_SYNC is not set` and `# CONFIG_FSYNC is not set`, and the
-kernel dispatcher has no `SYS_SYNC`/`SYS_FSYNC` case. Two commits'
-worth of decision there (kernel syscalls vs. config flip order), but
-one behavior: `sync` and `fsync` run and report success. See
+**The next session is `logname` (`SYS_GETLOGIN` 25) and `hostid` stubs.**
+`logname` prints `logname: getlogin` because `SYS_GETLOGIN(25)` is not in
+the dispatcher; `hostid` prints `00000000` because `sys_gethostid` is not in
+the dispatcher. Neither is in `test.sh`, so neither fails a gate. The
+honest values: `getlogin` returns `"root"` (item 9's single-user root
+userland contract) and `hostid` returns a fixed host identifier. See
 `open-issues.md`.
 
-**After that:** `getlogin` / `hostid` stubs (not in `test.sh`), then
-the `env`/`PATH` gap.
+**After that:** the `env`/`PATH` gap (`env | wc -l` is 2; `printenv PATH` empty).
 
 ---
 
@@ -67,7 +67,11 @@ the `env`/`PATH` gap.
 - **`canary --full` 28/28.**
 - **`test.sh` 57/57.**
 - **`EXEC_CHURN` 24/24 ALL-PASS.**
-- **`tools/coreutils_sweep.exp` PASS=98 FAIL=0 XFAIL=0 OBSERVE=5.**
+- **`tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5.**
+- **`sync` and `fsync` work.** Configs flipped on (`6d14dc9`), backed
+  by `sys_sync(162)` (iterates mounted volumes, calls `f_syncfs` and
+  `ata_flush_cache`) and `sys_fsync(74)` (`f_sync` + `f_sync_volume`).
+  Verified with `test_sync` in-guest and the automated sweep.
   The full gate, with both shell behaviors. **The `touch` row is now
   a real `auto` row** (`rm -f /tmp/td; touch -d '2020-01-01
   12:34:56' /tmp/td; stat -c %y /tmp/td`, asserting the
@@ -106,9 +110,6 @@ the `env`/`PATH` gap.
   dispatcher. Not in `test.sh`.
 - **`hostid`** prints `00000000` -- `sys_gethostid` not in
   dispatcher. Not in `test.sh`.
-- **`sync` / `fsync`** -- `CONFIG_SYNC`/`CONFIG_FSYNC` off, and
-  `SYS_SYNC(162)` / `SYS_FSYNC(74)` not in dispatcher. Config-bound.
-  NEXT.
 - **`env | wc -l` is 2**; `printenv PATH` empty -- the shell does not
   export `PATH`. Environment gap, not syscall.
 
@@ -478,16 +479,13 @@ commit object. Treat its guards as **refuted**.
 ## One-line summary
 
 **`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
-at `1a737e2`, ahead 84, clean, no stash, 28 scratch tags, nothing
-pushed. `touch -d '<date>'` on a fresh
-path is FIXED (`1a737e2`): `f_settime`/`futimens` wrote the entry
-correctly and `f_close` -> `f_sync` re-stamped `DIR_ModTime` to
-`GET_FATTIME()` because `FA_MODIFIED` is set on create; the fix is
-`FIL.timeset`, set by `f_settime`, skipped and cleared by `f_sync`.
-The `coreutils_sweep` `touch` row is now a real `auto` assertion
-(stat-only token `12:34:56.000000000`) instead of a hard-coded xfail.
-Serial `^C` AND `^Z` work over socket/TCP/telnet; `-serial stdio`
-cannot carry control bytes. `tools/coreutils_sweep.exp` PASS=98
-FAIL=0 XFAIL=0; `gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN
-ALL-PASS. **NEXT: `sync(162)`/`fsync(74)` + `CONFIG_SYNC`/
-`CONFIG_FSYNC`.** Do not move to `v0.6.20` until the user says so.**
+at `6d14dc9`, ahead 87, clean, no stash, 30 scratch tags, nothing
+pushed. `sync(162)` and `fsync(74)` are IMPLEMENTED and gated
+(`f49c392`, `6d14dc9`): `sys_sync` flushes all mounted FatFs volumes
+via `f_syncfs` and issues `ata_flush_cache`; `sys_fsync` flushes files
+via `f_sync` + `f_sync_volume` and directories via `f_sync_volume`.
+`CONFIG_SYNC=y` and `CONFIG_FSYNC=y` are enabled in BusyBox.
+`tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5;
+`gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN ALL-PASS.
+**NEXT: `logname` (`SYS_GETLOGIN` 25) and `hostid` stubs.** Do not move to
+`v0.6.20` until the user says so.**

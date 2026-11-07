@@ -11,6 +11,16 @@ the un-numbered entries below them are smaller and were filed later.
 Numbers are stable -- a closed number is retired, not reused.
 
 **Recently closed, do not re-open without new evidence:**
+- **`sync` / `fsync` syscalls and BusyBox commands.**
+  Fixed by `f49c392` (kernel syscalls) and `6d14dc9` (BusyBox config).
+  Kernel side implements `SYS_FSYNC(74)` (flushes `FIL` data/metadata
+  via `f_sync`, calls `f_sync_volume` on the underlying `FATFS` instance
+  to flush window and drive cache; flushes directories via `f_sync_volume`;
+  returns `-EBADF` on invalid fds and `-EINVAL` on pipes/special fds)
+  and `SYS_SYNC(162)` (iterates all mounted volumes via `f_syncfs` and
+  calls `ata_flush_cache`). BusyBox config enabled `CONFIG_SYNC=y` and
+  `CONFIG_FSYNC=y`. Verified with `test_sync` in guest and
+  `tools/coreutils_sweep.exp` PASS=100 (both `sync` and `fsync` pass).
 - **`touch -d '<date>'` on a nonexistent path kept `get_fattime`'s
   value; `f_utime` on a just-created file returned `FR_NO_FILE`.**
   Fixed by `1a737e2`. The proven cause was **not** a missing flush in
@@ -130,20 +140,6 @@ touches `sys_execve` -- give it its own session and its own commit.
 The investigation starts at `sys_times`/`sys_getrusage` and the tick
 accounting in `scheduler.c` (whether per-process `utime`/`stime` are
 accumulated at all, and in what unit).
-
-**`sync` / `fsync` are off in the config and absent from the
-dispatcher.** `configs/busybox.config` has `# CONFIG_SYNC is not
-set` and `# CONFIG_FSYNC is not set`, so neither command is on the
-image; and the kernel has no `SYS_SYNC(162)` / `SYS_FSYNC(74)` case
-in the dispatcher. **This is the next item.** Two separable pieces:
-the kernel syscalls (`SYS_SYNC` = flush every dirty FAT window /
-`sync_fs`; `SYS_FSYNC(fd)` = flush the `FIL`'s window and the
-volume), and the busybox config flip. **The kernel side first**, with
-its own gate; then the config flip, which changes the image and
-needs the full sweep. A `sync` that silently does nothing is worse
-than a `sync` that is absent -- so the kernel case must call
-`sync_fs` (or the disk-level equivalent) for every mounted volume,
-and `fsync` must call it for the fd's volume.
 
 **`logname` and `hostid` are stubs.** `logname` prints
 `logname: getlogin` because `SYS_GETLOGIN(25)` is not in the
