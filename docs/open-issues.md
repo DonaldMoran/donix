@@ -1,6 +1,6 @@
 # Open issues
 
-**Last updated: 2026-11-06 (ninth session), at `1a737e2`.**
+**Last updated: 2026-11-16 (eleventh session), at `201fac1`.**
 This file lists **only open issues**. Closed items are removed, not
 struck through; their history is in `git log`. An item appears here
 only while it is a defect, a missing feature, or an unverified claim
@@ -11,6 +11,37 @@ the un-numbered entries below them are smaller and were filed later.
 Numbers are stable -- a closed number is retired, not reused.
 
 **Recently closed, do not re-open without new evidence:**
+- **The shell exports `PATH`, and the clock is correct (2026-11-16).**
+  `a6b5511`: `musl_sh.c`'s `default_envp` carries
+  `PATH=/bin:/usr/bin`; `printenv PATH` prints it and the canary row
+  asserts "exported". Mechanism: `musl_sh` is `int main(void)` and
+  builds every child's environment from `default_envp`; the inherited
+  envp (`NULL` from `kmain.c`) is never consulted -- so no `kmain.c`
+  frame work was needed (the earlier note that prescribed an ~80-line
+  `kmain.c` change was wrong about the mechanism). `canary.c`'s
+  `run_capture` gained an `envp` parameter, `NULL` from the two
+  unrelated callers.
+  `201fac1`: `run` drops `-rtc base=localtime` (restoring QEMU
+  `base=utc`, so `g_rtc_epoch_offset` is a true UTC epoch -- the
+  localtime flag of `d9df0bc` was a label workaround that made `date`
+  double-subtract once `TZ` existed); `musl_sh.c` sets
+  `TZ=EST5EDT,M3.2.0,M11.1.0` (the bare `EST5EDT` mislabeled November
+  as `EDT`); `configs/busybox.config` sets
+  `CONFIG_FEATURE_TIMEZONE=y` (`libbb/time.c` gates its `localise:`
+  path on it). Verified: `date` = `Mon Nov 16 09:43:34 EST` (host
+  `09:40 EST`); boot epoch `1794840284` = `2026-11-16 14:44:44 UTC`
+  (real UTC); `touch -d '2020-01-01 12:34:56'` round-trips as
+  `12:34:56 -0500`; canary 28/28; test.sh 57/57; sweep 100/0/0/5.
+  **Known limitation (open follow-up): `TZ` is hardcoded US-Eastern.**
+  A future change should make it settable -- a staged `/etc/TZ`, or an
+  inherited-env fallback (which `musl_sh` is `int main(void)` and so
+  cannot read today; the `/etc/TZ` route is smaller).
+  **Measurement note (this session's refuted read):** a source-only
+  reading of `get_fattime()` suggested FAT would shift 5 h under
+  `base=utc`; the guest disproved it. `get_fattime` writes raw epoch
+  fields, and **FAT timestamps are TZ-localized at display time** by
+  `stat`/`ls`/`date`, like everything else. Do not "fix" FAT by
+  subtracting an offset in `get_fattime`.
 - **`logname` and `hostid` are stubs.** Fixed and documented in `f4dd5ee`.
   Neither is a missing kernel syscall: Linux x86_64 has no `getlogin` or
   `gethostid` syscall (syscall 25 is `mremap`). Musl libc's `gethostid()`
@@ -430,51 +461,23 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
 
 ## Also open -- small defects and missing features
 
+- **`TZ` is hardcoded US-Eastern.** `musl_sh.c`'s `default_envp`
+  carries `TZ=EST5EDT,M3.2.0,M11.1.0`. Every donix guest is
+  US-Eastern. Making it settable is the follow-up: a staged `/etc/TZ`
+  (read at shell start) or an inherited-env fallback. `musl_sh` is
+  `int main(void)` and cannot read an inherited envp today, so
+  `/etc/TZ` is the smaller route -- it needs a file on the image and a
+  `getenv`-style read in `musl_sh.c`, not a `kmain.c` change.
 - **Control bytes need a socket serial in `.exp` harnesses.**
   `./run` pipes QEMU through `tee` (Pattern A), so an expect pty byte
   never reaches the guest; `-serial stdio` (Pattern B) makes `^C` the
   tty INTR char and SIGINTs QEMU. Any harness that sends `^C`/`^Z`
-  must use `-serial unix:...,server,nowait` + `socat -,raw,echo=0`.
-  See `docs/expect-harness.md` and `tools/coreutils_sweep.exp`.
-  **Plain-text commands through `headless` also proved unreliable
-  this session** -- several `.exp` writes never reached the guest.
-  For anything that matters, prefer `./run telnet` or a UNIX socket.
-
-- **RESOLVED (2026-11-16): the clock is honest and `date` shows
-  real US-Eastern.** Three coupled changes. (1) `run` drops
-  `-rtc base=localtime` from all six QEMU invocations (and the
-  sweep's mirrored boot), restoring QEMU's `base=utc` default.
-  The localtime flag (`d9df0bc`) was a label workaround: it made
-  the CMOS carry local time, so `g_rtc_epoch_offset` was a
-  local-time epoch. Once `TZ` existed, `date` subtracted the
-  offset a second time (printed `05:3x` for a real `09:3x`).
-  With `base=utc` the epoch is true UTC -- verified by
-  `RTC: boot epoch = 1794840284 (2026-11-16 14:44:44 UTC)` = real
-  UTC for a `09:44 EST` host. (2) `musl_sh.c`'s `default_envp`
-  carries `TZ=EST5EDT,M3.2.0,M11.1.0` -- the explicit US DST
-  rule. The bare `EST5EDT` mislabeled Nov 16 as `EDT` (applying
-  -4 instead of -5); the rule string fixes the transition. musl
-  parses this POSIX string without a zoneinfo file, so no
-  `/usr/share/zoneinfo` is needed. (3) `configs/busybox.config`
-  sets `CONFIG_FEATURE_TIMEZONE=y` so `date`/`stat` honor `TZ`
-  (`libbb/time.c` gates its `localise:` path on it). `date` now
-  prints `Mon Nov 16 09:43:34 EST`, matching the host;
-  `touch -d '2020-01-01 12:34:56'` round-trips as
-  `12:34:56 -0500`. Known limitation: `TZ` is hardcoded
-  US-Eastern; a future change should make it settable (e.g. a
-  staged `/etc/TZ` or an inherited-env fallback).
-
-- **RESOLVED (2026-11-16): the shell exports `PATH`.**
-  `musl_sh.c`'s `default_envp` now carries `PATH=/bin:/usr/bin`, so
-  `printenv PATH` prints it and `canary --full` is 28/28 with the
-  row flipped to `printenv PATH is exported`.  Mechanism note: the
-  initial `musl_sh` frame is `argc=0`/`envp=NULL` (`kmain.c`),
-  but `musl_sh` is `int main(void)` and builds every child's
-  environment from `default_envp` -- the inherited envp is never
-  consulted.  No `kmain.c` frame work was needed.  `canary.c`'s
-  `run_capture` also gained an `envp` parameter so the row passes
-  an explicit environment (`NULL` from the two unrelated callers).
-
+  must use `-serial unix:...,server=on,wait=off` + `socat
+  -,raw,echo=0`. See `docs/expect-harness.md` and
+  `tools/coreutils_sweep.exp`. **Plain-text commands through
+  `headless` also proved unreliable** -- several `.exp` writes never
+  reached the guest. For anything that matters, prefer `./run telnet`
+  or a UNIX socket.
 - `kill(0, sig)` ("my group") still returns `-EINVAL`.
   `kill(-pgid, sig)` works (`9b1a4ed`).
 - `sys_brk`'s fixed `heap_base` and the 4 MB mmap window are latent
@@ -599,3 +602,16 @@ general lesson: a diagnostic on the failure path named the failing
 call in one run, after three guesses had failed.**  `set -e` in the
 runner also closed the terminal on the abort; the abort itself was
 the useful signal and must be visible.
+
+**FAT timestamps are TZ-localized at display time (2026-11-16).**
+`get_fattime()` (`diskio.c`) writes FAT fields from
+`g_ticks/100 + g_rtc_epoch_offset` **raw, with no offset**. The
+TZ conversion happens on the **display** side, in `stat`/`ls`/`date`.
+A source-only read of `get_fattime` suggested FAT would shift 5 h
+under `base=utc`; the guest disproved it (`touch; stat -c %y` showed
+the TZ-localized time both before and after the epoch fix). So with
+an honest UTC epoch, `touch`/`stat` and `date` agree, and `touch -d`
+round-trips. **Do not "fix" FAT by subtracting an offset in
+`get_fattime`** -- that would double-count, since the display already
+applies TZ. This is the same class as the `dir_sect=128` red herring:
+read the actual value in the guest before editing.

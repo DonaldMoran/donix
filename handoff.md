@@ -5,16 +5,19 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-07 (tenth session), at `f4dd5ee`.
+**Last updated:** 2026-11-16 (eleventh session), at `201fac1`.
 **`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
-commit `ba56b3d`). `dev` is at `f4dd5ee`; recent history is
-`f4dd5ee`, `04e584b`, `6d14dc9`, `f49c392`, `1a737e2`, `47ae47f`.
-`origin/dev` = `ba56b3d`. Ahead **89**, **clean**, **no stash**,
-**32 scratch tags**. No push, no release this session; banner still
+commit `ba56b3d`). `dev` is at `201fac1`; recent history is
+`201fac1`, `a6b5511`, `a60f3c9`, `f4dd5ee`, `04e584b`.
+`origin/dev` = `ba56b3d`. Ahead **92**, **clean**, **no stash**,
+**35 scratch tags**. No push, no release this session; banner still
 `v0.6.19`. `main` = `7e4748b`.
 
-**Scratch tags: 32, all annotated, all preserved, none pushed.**
-Newest first: `20261107-logname-env` on `f4dd5ee`,
+**Scratch tags: 35, all annotated, all preserved, none pushed.**
+Newest first: `20261116-rtc-tz-honest` on `201fac1`,
+`20261116-path-export` on `a6b5511`,
+`20261107-handoff-logname` on `a60f3c9`,
+`20261107-logname-env` on `f4dd5ee`,
 `20261106-handoff-sync-fsync` on `04e584b`,
 `20261106-busybox-sync-fsync` on `6d14dc9`,
 `20261106-sys-sync-fsync` on `f49c392`,
@@ -44,7 +47,11 @@ Newest first: `20261107-logname-env` on `f4dd5ee`,
 `20261104-gettimeofday-time` on `5a3b65e`.
 
 `1a737e2` (the `FIL.timeset` fix) is tagged `20261106-fil-timeset`.
-It is in the `v0.6.20` summary source.
+It is in the `v0.6.20` summary source. **The tag count is 35, not the
+32/27 the previous revisions recorded** -- prior sessions' counts had
+drifted. The authoritative number at release time is
+`git tag --list '2026*' | wc -l`; do not copy a number from this
+file.
 
 **Stash:** none.
 
@@ -64,12 +71,30 @@ See `open-issues.md`.
 
 ---
 
-## WHAT WORKS (verified 2026-11-06, at `1a737e2`)
+## WHAT WORKS (verified 2026-11-16, at `201fac1`)
 
-- **`canary --full` 28/28.**
+- **`canary --full` 28/28.** The `printenv PATH` row now asserts
+  `PATH` **is exported** (flipped this session; the old row asserted
+  empty).
 - **`test.sh` 57/57.**
 - **`EXEC_CHURN` 24/24 ALL-PASS.**
 - **`tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5.**
+- **The clock is correct.** `date` prints real US-Eastern with the
+  right label (`Mon Nov 16 09:43:34 EST`); the boot line
+  `RTC: boot epoch = … (… UTC)` is **true** UTC (`14:44:44 UTC` for a
+  `09:44 EST` host); `touch -d '2020-01-01 12:34:56'` round-trips as
+  `12:34:56 -0500`. Three coupled changes (`201fac1`): `run` uses
+  QEMU's `base=utc` default (the `-rtc base=localtime` of `d9df0bc`
+  was a label workaround and made the epoch local-time, so `date`
+  double-subtracted); `TZ=EST5EDT,M3.2.0,M11.1.0` (the bare
+  `EST5EDT` mislabeled November as `EDT`); `CONFIG_FEATURE_TIMEZONE=y`
+  so `date`/`stat` honor `TZ`.
+- **`PATH` is exported.** `musl_sh.c`'s `default_envp` carries
+  `PATH=/bin:/usr/bin` (`a6b5511`). Mechanism: `musl_sh` is
+  `int main(void)` and builds every child's environment from
+  `default_envp`; the inherited envp (`NULL` from `kmain.c`'s initial
+  frame) is never consulted. `canary.c`'s `run_capture` gained an
+  `envp` parameter (`NULL` from the two unrelated callers).
 - **`sync` and `fsync` work.** Configs flipped on (`6d14dc9`), backed
   by `sys_sync(162)` (iterates mounted volumes, calls `f_syncfs` and
   `ata_flush_cache`) and `sys_fsync(74)` (`f_sync` + `f_sync_volume`).
@@ -98,9 +123,6 @@ See `open-issues.md`.
 - **`./run telnet`** = guest console on `127.0.0.1:45456`;
   **`./run telnet-lan`** = same on `0.0.0.0:45456`, gated on
   `DONIX_ALLOW_LAN=1`.
-- **`date` prints the host's real date** (RTC read at boot
-  `1479723`, plumbed `9d7b5d3`); `touch -d '<date>' f; stat -c %y f`
-  round-trips exactly on an existing file and on a fresh path.
 - **`flock`, `shred -n 1`, `nproc`, `patch a < p`, `dos2unix`,
   `unix2dos`, `mv x y` (replace), `ln f g` (`-EPERM` on FAT)** -- the
   FAT-coreutils set, `23e37bb` onward.
@@ -111,8 +133,9 @@ See `open-issues.md`.
 
 ## WHAT IS BROKEN
 
-- **`printenv PATH` empty** -- the shell does not export `PATH` (asserted
-  by canary). Environment gap, not syscall.
+- Nothing known in the shell environment or the clock. `TZ` is
+  hardcoded US-Eastern (see `open-issues.md`); everything else here
+  is either working or recorded as open/latent in `open-issues.md`.
 
 ---
 
@@ -151,7 +174,7 @@ line passes on the echo. The row now asserts
 
 ## WHAT WAS REFUTED -- do NOT re-walk.
 
-**This session (the `touch -d` / `futimens` work):**
+**This session (the `touch -d` / `futimens` work, 2026-11-07):**
 - **`f_sync` in `f_open`** -- the previous START HERE. It was already
   there (`ff.c` create path calls `sync_window` after
   `dir_register`), and `touch f` (no `-d`) already worked. The
@@ -395,7 +418,7 @@ unpushed `dev` commit is intentional work. Run
 
 **Current release state.** **`v0.6.19` is the last pushed release**
 (tag `v0.6.19` = `ba56b3d`, which is also `origin/dev`). `dev` is at
-`1a737e2`; ahead **83**, **clean**, **no stash**, **27 scratch
+`201fac1`; ahead **92**, **clean**, **no stash**, **35 scratch
 tags**. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`). Work
 is pre-`v0.6.20`. **There is no release gate recorded for
 `v0.6.20`; if a gate is wanted it is set in this file before that
@@ -420,10 +443,11 @@ members, preserving mtime.** **`mkdir -p` works.** **`flock`,
 `fdatasync`, `sched_getaffinity`, `link` are implemented.**
 **`rename(2)` replaces on FAT (`6651be4`).** **`utimensat` writes and
 `stat` reads mtime (`5ccf862`), and a timestamp set via
-`futimens`/`f_settime` now survives `f_close` (`1a737e2`).** `date`
-reports the real date -- the MC146818A RTC is read at boot
-(`1479723`) and plumbed through the time syscalls (`9d7b5d3`).
-`uptime` still reports seconds since boot.
+`futimens`/`f_settime` now survives `f_close` (`1a737e2`).**
+**`PATH` is exported and the clock is correct** (`a6b5511`,
+`201fac1`): `date` reports real US-Eastern with the right label, the
+RTC epoch is honest UTC, and `touch -d`/`stat` round-trip. `uptime`
+still reports seconds since boot.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -468,6 +492,14 @@ fixes now (`a0664a8` f_open flush, `d69c2ab` f_write, `1a737e2`
 **`ff.c` is CRLF. `ffconf.h` is CRLF. `ff.h` is CRLF.** Binary-safe
 edits only.
 
+**FAT timestamps and `TZ`.** `get_fattime()` (`diskio.c`) writes FAT
+fields from `g_ticks/100 + g_rtc_epoch_offset` **raw, no offset**;
+the TZ conversion happens on the **display** side, in `stat`/`ls`
+and `date`. So with an honest UTC epoch, `touch`/`stat` and `date`
+agree, and `touch -d` round-trips. Do not "fix" FAT by subtracting an
+offset in `get_fattime` -- that would double-count, since the display
+already applies TZ.
+
 **`~/code/saved`** -- not a baseline. Run
 `git -C ~/code/saved status --short` before any comparison.
 
@@ -480,11 +512,11 @@ commit object. Treat its guards as **refuted**.
 ## One-line summary
 
 **`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
-at `f4dd5ee`, ahead 89, clean, no stash, 32 scratch tags, nothing
-pushed. `sync(162)` and `fsync(74)` are IMPLEMENTED and gated
-(`f49c392`, `6d14dc9`); `logname` prints `root` and `hostid` prints
-`00000000` (`f4dd5ee`, resolved via `musl_sh.c` default environment).
+at `201fac1`, ahead 92, clean, no stash, 35 scratch tags, nothing
+pushed. `PATH` is exported (`a6b5511`); the clock is correct
+(`201fac1` -- honest UTC epoch, `TZ=EST5EDT,M3.2.0,M11.1.0`,
+`FEATURE_TIMEZONE=y`; `date` prints real US-Eastern).
 `tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5;
-`gate.exp` CANARY 28/28, TEST_SH 57/57, EXEC_CHURN ALL-PASS.
-**NEXT: the `env` / `PATH` gap.** Do not move to `v0.6.20` until the
-user says so.**
+`canary --full` 28/28, `test.sh` 57/57, `EXEC_CHURN` ALL-PASS.
+**NEXT: user's choice.** Do not move to `v0.6.20` until the user
+says so.**
