@@ -38,6 +38,20 @@ int vmm_is_mapped(uint64_t virt);
 void vmm_dump_page_table(uint64_t virt);
 
 uint64_t vmm_clone_page_table(uint64_t src_cr3);
+/*
+ * Build a fresh address space with ONLY the shared kernel mappings
+ * (PML4 entries 256..511 shallow-copied from src_cr3) and an empty
+ * low half.  This is the exec primitive: vmm_clone_page_table
+ * deep-copies the low half (right for fork, wrong for exec on a
+ * vfork child, where the new image must be loaded into a clean
+ * space rather than over the parent's user PTEs).  It KEEPS every
+ * kernel mapping, including the low 2 MB identity map vmm_init
+ * installs at PML4 index 0, and clears only the four user ranges
+ * (ELF, stack, brk, mmap).
+ */
+uint64_t vmm_create_address_space(uint64_t src_cr3,
+                                   uint64_t stack_virt, uint64_t stack_top,
+                                   uint64_t brk_virt);
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt);
 int vmm_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags);
 void vmm_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);

@@ -24,6 +24,7 @@
 #include "ff.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/rtc.h"
 
 extern void pit_init(uint32_t freq);
 extern unsigned char test_program[];
@@ -1148,9 +1149,9 @@ static void handle_command(const char *cmd) {
     if (strcmp(cmd, "help") == 0) {
         PRINT_BOTH("\nCmds:\n  help, clear, version, reboot, pmmtest, info, mem, test,\n  vmmtest, serialtest, heapstat, maptest, testrec, heaptest,\n  heapcheck, heapstress, nxtest, syscall, elfload, proclist,\n  sigdump, killtest,\n  proccreate, vmmclone, runproc, schstat, testyield,\n  gdtdump, tssdump, atatest, fatmount, fatls, fatcat <file>,\n  selftest\n> ");
     } else if (strcmp(cmd, "clear") == 0) {
-        vga_clear(); vga_print("donix v0.6.19\nType 'help'\n> ");
+        vga_clear(); vga_print("donix v0.6.20\nType 'help'\n> ");
     } else if (strcmp(cmd, "version") == 0) {
-        vga_print("\ndonix v0.6.19 (64-bit Core)\n> ");
+        vga_print("\ndonix v0.6.20 (64-bit Core)\n> ");
     } else if (strcmp(cmd, "info") == 0) {
         vga_print("\n=== Boot Telemetry ===\n");
         if (g_bootinfo) {
@@ -1425,7 +1426,7 @@ static void handle_command(const char *cmd) {
     }
 }
 __attribute__((noreturn)) void kmain_shell_loop(void) {
-    PRINT_BOTH("donix v0.6.19\n> ");
+    PRINT_BOTH("donix v0.6.20\n> ");
     char cmd_buffer[128]; int cmd_pos = 0;
     for (;;) {
         asm volatile("hlt"); char c;
@@ -1580,6 +1581,28 @@ void kmain(BootInfo *info) {
     gdt_init();
     idt_init();
     pit_init(100);
+
+    /*
+     * Read the RTC once at boot and record the epoch offset from
+     * 1970.  g_ticks / 100 is seconds-since-boot; the time syscalls
+     * add g_rtc_epoch_offset so `date` on a machine up 10 minutes
+     * reads 2026-...-10:00 instead of 1970-01-01 00:10:00.  QEMU's
+     * pc machine has this RTC by default; so does every real x86
+     * board.  If the read fails, the offset is 0 and the pre-RTC
+     * behavior is preserved.
+     */
+    {
+        g_rtc_epoch_offset = rtc_read_unix_seconds();
+        serial_print("RTC: boot epoch = ");
+        serial_print_dec((uint64_t)g_rtc_epoch_offset);
+        serial_print(" (");
+        if (g_rtc_epoch_offset > 0) {
+            rtc_print_boot_line(g_rtc_epoch_offset);
+        } else {
+            serial_print("no RTC; using g_ticks/100 as epoch");
+        }
+        serial_print(")\n");
+    }
 
     /*
      * Enable EFER.NXE before sti, before pmm_init, before anything

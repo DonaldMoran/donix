@@ -79,12 +79,16 @@
  *  62  kill              sys_kill           (slice 1: pending bit, no delivery)
  *  63  uname             sys_uname
  *  72  fcntl             sys_fcntl
+ *  73  flock             sys_flock          (advisory; FAT has none)
+ *  74  fsync             sys_fsync          (f_sync + volume sync)
+ *  75  fdatasync         sys_fdatasync      (f_sync; FAT table + dir entry)
  *  77  ftruncate         sys_ftruncate     (session 31)
  *  79  getcwd            sys_getcwd
  *  80  chdir             sys_chdir
  *  82  rename            sys_rename
  *  83  mkdir             sys_mkdir
  *  84  rmdir             sys_rmdir
+ *  86  link              sys_link           (returns -EPERM; FAT has no hardlinks)
  *  87  unlink            sys_unlink
  *  88  symlink           sys_symlink       (writes a DONIX_LINK marker)
  *  89  readlink          sys_readlink      (returns the marker's target)
@@ -101,7 +105,9 @@
  * 115  getgroups         sys_getgroups     (returns 0 groups)
  * 157  prctl             sys_prctl         (PR_SET_NAME only; see note)
  * 158  arch_prctl        sys_arch_prctl
+ * 162  sync              sys_sync           (flush all FAT windows + disk cache)
  * 200  tkill            sys_tkill         (slice 5: alias of kill; busybox `kill`)
+ * 204  sched_getaffinity sys_sched_getaffinity (one CPU; CPU 0 only)
  * 217  getdents64        sys_getdents64
  * 218  set_tid_address   sys_set_tid_address
  * 228  clock_gettime     sys_clock_gettime (from g_ticks; 100 Hz PIT)
@@ -167,22 +173,29 @@
 #define SYS_DUP2            33
 #define SYS_NANOSLEEP       35
 #define SYS_GETPID          39
+#define SYS_TIMES           43
 #define SYS_FORK            57
+#define SYS_VFORK           58
 #define SYS_EXECVE          59
 #define SYS_EXIT            60
 #define SYS_WAIT4           61
 #define SYS_KILL            62
+#define SYS_GETRUSAGE       98
 #define SYS_UNAME           63
 #define SYS_SETPGID         109
 #define SYS_GETPGRP         111
 #define SYS_GETPGID         121
 #define SYS_FCNTL           72
+#define SYS_FLOCK           73
+#define SYS_FSYNC           74
+#define SYS_FDATASYNC       75
 #define SYS_FTRUNCATE       77
 #define SYS_GETCWD          79
 #define SYS_CHDIR           80
 #define SYS_RENAME          82
 #define SYS_MKDIR           83
 #define SYS_RMDIR           84
+#define SYS_LINK            86
 #define SYS_UNLINK          87
 #define SYS_SYMLINK         88
 #define SYS_READLINK        89
@@ -190,6 +203,7 @@
 #define SYS_FCHMOD          91
 #define SYS_CHOWN           92
 #define SYS_FCHOWN          93
+#define SYS_UMASK           95
 #define SYS_SYSINFO          99
 #define SYS_GETUID          102
 #define SYS_GETGID          104
@@ -200,9 +214,13 @@
 #define SYS_GETGROUPS       115
 #define SYS_PRCTL           157
 #define SYS_ARCH_PRCTL      158
+#define SYS_SYNC            162
 #define SYS_TKILL           200
+#define SYS_SCHED_GETAFFINITY 204
 #define SYS_GETDENTS64      217
 #define SYS_SET_TID_ADDRESS 218
+#define SYS_GETTIMEOFDAY    96
+#define SYS_TIME            201
 #define SYS_CLOCK_GETTIME   228
 #define SYS_EXIT_GROUP      231
 #define SYS_TGKILL          234
@@ -299,7 +317,7 @@ long sys_lseek(int fd, long offset, int whence);
 long sys_fstat(int fd, void* user_stat);
 long sys_stat(const char* user_path, void* user_stat);
 long sys_newfstatat(int dirfd, const char* pathname, void* user_stat, int flags);
-long sys_wait4(long pid, int* user_status, int options);
+long sys_wait4(long pid, int* user_status, int options, void* user_rusage);
 /*
  * kill(62) and tgkill(234) -- slice 1 of docs/signal-design.md.
  *

@@ -61,6 +61,16 @@ typedef enum {
 #define BLOCK_KIND_PIPE_WRITE 3
 #define BLOCK_KIND_PAUSE      4
 #define BLOCK_KIND_NANOSLEEP 5
+/*
+ * Blocked in vfork(2) waiting for the child to exec or exit.
+ * A specific kind, not NONE: process_wake_all_blocked skips any
+ * process whose block_kind != BLOCK_KIND_NONE, so the 100 Hz
+ * tick does NOT wake a vfork parent.  That is load-bearing --
+ * a tick-woken parent would run concurrently with a child still
+ * on the shared cr3.  The only waker for this kind is the child's
+ * exec/exit path (process_wake_parent_if_waiting's vfork arm).
+ */
+#define BLOCK_KIND_VFORK      6
 
 // Process Control Block
 typedef struct pcb {
@@ -390,6 +400,57 @@ typedef struct pcb {
     /* Declarations for the helpers (defined in user_syscall.c next
      * to signal_default_action).  They are declared in this header
      * so process.c and the probe's compile-time view agree. */
+
+    /*
+     * Set by sys_vfork: the child shares its parent's cr3 and does
+     * not own the pages it runs on.  process_cleanup_elf_pages and
+     * the process_free_clone call sites in process_reclaim and
+     * process_destroy must skip their frees when this is set, or a
+     * vfork child's exit frees the parent's live address space.
+     *
+     * APPENDED AT THE END, after shebang_depth, so no offset the
+     * _Static_assert block pins moves.  Same rule as cwd,
+     * fault_signal, signal_restorer, wake_tick, and the
+     * job-control fields.  A bool, not a refcount: a vfork parent
+     * blocks until its single child execs/exits, so there is never
+     * a second borrower.  Zero-initialized by
+     * process_initialize_pcb's memset, so a reused slot starts
+     * clean.
+     */
+    uint64_t borrows_cr3;
+
+    /* Linux clear_child_tid (set_tid_address(2), syscall 218).
+     * The user VA passed to set_tid_address; the kernel writes 0
+     * there when this process exits, so a thread-joining peer sees
+     * the exit.  We are single-threaded and musl only reads the
+     * return value in __libc_start_main, so no current test
+     * depends on the clear -- this is correctness, not a fix for
+     * the time-true fault (open-issues has the record).
+     *
+     * APPENDED AT THE END, after borrows_cr3, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset, so a reused slot starts
+     * clean. */
+    uint64_t clear_child_tid;
+
+    /* umask(2), syscall 95.  Stored and returned; NOT consulted by
+     * FatFs, which has no mode store.  sys_mkdir applies it to the
+     * mode it passes the driver, so a caller that reads back its
+     * umask and a caller that inspects a created directory see
+     * consistent values -- but the directory's mode is still the
+     * synthesized 0755/0644, because FAT has nowhere to keep it.
+     *
+     * APPENDED AT THE END, after clear_child_tid, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset. */
+    uint32_t umask;
+
+    /* Accumulated total_ticks of this process's reaped children,
+     * for wait4's rusage and getrusage(RUSAGE_CHILDREN).
+     * APPENDED AT THE END, after umask, so no offset the
+     * _Static_assert block pins moves.  Zeroed by
+     * process_initialize_pcb's memset. */
+    uint64_t children_ticks;
 } pcb_t;
 
 /* Job-control helpers.  Defined in user_syscall.c.  Called from

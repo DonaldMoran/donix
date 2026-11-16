@@ -802,7 +802,10 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
         #endif
         return NULL;
     }
-    if (parent->block_kind != BLOCK_KIND_WAITPID) {
+    int _is_waitpid = (parent->block_kind == BLOCK_KIND_WAITPID);
+    int _is_vfork   = (parent->block_kind == BLOCK_KIND_VFORK &&
+                       parent->wait_pid == child->pid);
+    if (!_is_waitpid && !_is_vfork) {
         RACE_P11_WAKE_TRY(cpid, parent->pid, 4, parent->state,
                           parent->block_kind, parent->wait_pid);
         #if TRACE_WAKE
@@ -819,7 +822,7 @@ pcb_t* process_wake_parent_if_waiting(pcb_t* child) {
 
     /* Match: parent->wait_pid == child->pid, or == (uint64_t)-1
        (wait for any child). */
-    if (parent->wait_pid != (uint64_t)-1 &&
+    if (_is_waitpid && parent->wait_pid != (uint64_t)-1 &&
         parent->wait_pid != child->pid) {
         RACE_P11_WAKE_TRY(cpid, parent->pid, 5, parent->state,
                           parent->block_kind, parent->wait_pid);
@@ -986,7 +989,7 @@ void process_start(pcb_t* process) {
 }
 
 void process_cleanup_elf_pages(pcb_t* pcb) {
-    if (!pcb || !pcb->elf_page_list) return;
+    if (!pcb || pcb->borrows_cr3 || !pcb->elf_page_list) return;
     for (uint64_t i = 0; i < pcb->elf_num_pages; i++) {
         uint64_t phys = pcb->elf_page_list[i];
         if (phys) pmm_free_page(phys);
@@ -1001,7 +1004,7 @@ void process_reclaim(pcb_t* pcb) {
     if (pcb->state == PROC_STATE_UNUSED) return;
 
     process_cleanup_elf_pages(pcb);
-    process_free_clone(pcb->cr3);
+    if (!pcb->borrows_cr3) process_free_clone(pcb->cr3);
     pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
@@ -1067,7 +1070,7 @@ void process_reclaim(pcb_t* pcb) {
 void process_destroy(pcb_t* pcb) {
     if (!pcb || pcb->state == PROC_STATE_UNUSED) return;
     process_cleanup_elf_pages(pcb);
-    process_free_clone(pcb->cr3);
+    if (!pcb->borrows_cr3) process_free_clone(pcb->cr3);
     pcb->cr3 = 0;
     pcb->user_stack_phys = 0;
     kernel_stack_slot_free(pcb);
@@ -1118,6 +1121,7 @@ _Static_assert(offsetof(pcb_t, rax)              == 0x108, "context_switch.asm: 
 _Static_assert(offsetof(pcb_t, rsp)              == 0x110, "context_switch.asm: rsp offset");
 _Static_assert(offsetof(pcb_t, rip)              == 0x118, "context_switch.asm: rip offset");
 _Static_assert(offsetof(pcb_t, block_kind)       == 0x158, "context_switch.asm: block_kind offset");
+_Static_assert(offsetof(pcb_t, fs_base)          == 0x378, "context_switch.asm: fs_base offset");
 _Static_assert(offsetof(pcb_t, user_rsp)         == 0x610, "context_switch.asm: user_rsp offset");
 
 /*

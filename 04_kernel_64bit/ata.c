@@ -425,6 +425,33 @@ static int ata_write_chunk(uint8_t drive, uint32_t lba, uint8_t count,
         }
         ata_400ns_delay();
     }
+
+    /*
+     * Flush the drive's write cache.  ATA_CMD_WRITE_SECTORS
+     * returns from the drive's perspective when the sector
+     * data has been transferred, but the drive may still hold
+     * the sector in an internal write cache.  A following
+     * ata_read_chunk of the same LBA returns the PRE-write
+     * bytes until the cache is flushed.  Without this, a
+     * disk_read immediately after a disk_write of the same
+     * sector (FatFs's sync_window then f_readdir) sees the
+     * old sector -- visible as a just-created directory
+     * entry that f_readdir/f_stat/f_utime cannot find.
+     *
+     * Linux's ata_pio_sector-equivalent path issues FLUSH
+     * CACHE after every write; this is the same shape.
+     */
+    rc = ata_poll_bsy_clear();
+    if (rc != 0) return rc;
+    ata_select_drive(drive, lba);
+    outb(ATA_PRIMARY_STATUS, 0xE7);   /* ATA_CMD_FLUSH_CACHE */
+    ata_400ns_delay();
+    rc = ata_poll_bsy_clear();
+    if (rc != 0) return rc;
+    {
+        uint8_t st = inb(ATA_PRIMARY_STATUS);
+        if (st & 0x01) return -1;     /* ERR */
+    }
     return 0;
 }
 

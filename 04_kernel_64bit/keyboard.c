@@ -214,6 +214,39 @@ int kbd_buffer_get(char *c) {
  * across a mode switch, which is not what we want.  Reading on demand
  * keeps the two sources independent.
  */
+/*
+ * serial_tick_poll: the serial ^C's "always runs" point.
+ *
+ * A serial ^C must fire even when NO process is reading the console
+ * -- during `sleep 100` the shell is blocked in wait4 and the child
+ * in nanosleep, so nobody calls kbd_buffer_get_mux.  The PS/2 path
+ * has no such problem: irq1_handler runs on the IRQ regardless of
+ * readers.  The UART is polled, so the equivalent point is the
+ * 100 Hz timer, which calls this every tick.
+ *
+ * It does NOT read the UART data register itself: serial.c's ring
+ * drain moves every pending byte into the RX ring (so the line
+ * editor still gets them) and reports whether a 0x03 was among them.
+ * Reading to "peek" was the earlier, refuted approach: the data
+ * register read is destructive, so the tick stole typed bytes.
+ */
+void serial_tick_poll(void) {
+    int sig = serial_rx_drain_ring();
+    if (!sig) return;
+    long fg = (long)console_fg_pgrp_get();
+    if (sig == 2) {
+        /* ^C: deliver to the fg pgrp; console_raise_pending skips the
+         * shell by pid, so fg == owner (busybox ash's layout) works. */
+        if (fg > 1) console_request_signal(fg, 2);
+        return;
+    }
+    /* ^Z: same owner rule as irq1_handler's Ctrl-Z -- fg > 1 and the
+     * fg pgrp is not the shell's own.  Applied here, at record time,
+     * because the delivery is deferred. */
+    long owner = (long)console_owner_pgrp_get();
+    if (fg > 1 && fg != owner) console_request_signal(fg, 20);
+}
+
 int kbd_buffer_get_mux(char *c) {
     for (;;) {
         if (kbd_buffer_get(c)) {
@@ -225,39 +258,12 @@ int kbd_buffer_get_mux(char *c) {
         }
 
         /*
-         * Serial Ctrl-Z -> SIGTSTP to the console foreground pgrp.
-         *
-         * The PS/2 path raises this in irq1_handler (9b1a4ed), but a
-         * serial console sends no PS/2 scan code: the byte 0x1A
-         * arrives on the UART and reaches a reader through this
-         * function.  Without this branch, Ctrl-Z on a serial console
-         * is just a byte, and the reader echoes it as a glyph -- the
-         * "backward question mark" the 2026-10-30 test showed.  That
-         * is correct for a PS/2 keyboard and unimplemented for the
-         * UART; this is the UART half.
-         *
-         * The raise is the same sys_kill(-fg, SIGTSTP) the PS/2
-         * branch calls, so there is one raise path, not two.  fg > 1
-         * refuses pid 1 as a group, as the PS/2 branch does.  When no
-         * foreground group is set (fg == 0) the byte is passed
-         * through unchanged: a tty with no job-control owner is not
-         * a tty whose Ctrl-Z means "stop someone."
-         *
-         * The byte is consumed (loop, do not return) so the caller
-         * sees "no character yet" rather than 0x1A.  console_read
-         * then re-checks sig_pending and returns -EINTR (7f83b52),
-         * or blocks again if the raise matched nobody.
+         * Serial Ctrl-Z (0x1A) is not handled here: serial_rx_drain_ring
+         * (called from the timer tick) consumes 0x03 and 0x1A and
+         * serial_tick_poll raises SIGINT/SIGTSTP, so the reader never
+         * sees a control byte.  This comment records why there is no
+         * branch here, so a future reader does not re-add one.
          */
-        if ((uint8_t)ch == 0x1A) {
-            long fg    = (long)console_fg_pgrp_get();
-            long owner = (long)console_owner_pgrp_get();
-            /* Same owner rule as irq1_handler. */
-            if (fg > 1 && fg != owner) {
-                sys_kill(-fg, 20);   /* SIGTSTP */
-                continue;            /* byte eaten; look again */
-            }
-            /* No foreground group: fall through and pass 0x1A. */
-        }
 
         *c = (char)ch;
         return 1;

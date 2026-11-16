@@ -16,6 +16,8 @@
 #include "interrupts.h"
 #include "include/trace.h"
 #include "include/race_probe.h"
+#include "include/rtc.h"
+#include "include/ata.h"
 
 /* Last syscall number that entered syscall_dispatch.  Read by the
  * fault handlers when a corrupted control target is reported, so
@@ -85,6 +87,19 @@ typedef struct file_slot_s {
      * pointer and bump the refcount, so the path rides along.
      */
     char    *dir_path;
+    /*
+     * Advisory flock(2) state.  0 = unlocked, LOCK_SH, LOCK_EX,
+     * or the same with LOCK_NB remembered.  set by sys_flock,
+     * cleared on LOCK_UN; the value is freed with the slot, which
+     * is the Unix advisory-lock contract -- a lock lives until
+     * the fd does.
+     *
+     * FAT has no lock bits and no inode to hang one on, so this
+     * is advisory-only, matching what Linux gives flock(2) on a
+     * FAT mount.  do not grow a global table until a test needs
+     * cross-process contention; per-fd is what flock means.
+     */
+    uint32_t flock_state;
 } file_slot_t;
 
 /* Defined below, in the stat section.  sys_open needs it for the
@@ -161,6 +176,12 @@ static char g_write_bounce[WRITE_CHUNK];
  */
 #define EPERM_   1
 #define ENOENT_  2
+/* utimensat(2) special tv_nsec values, from the Linux uapi
+ * (include/uapi/linux/stat.h).  UTIME_NOW means "use the current
+ * time"; UTIME_OMIT means "do not change this field".  A tv_nsec
+ * that is neither and is outside [0, 999999999] is -EINVAL. */
+#define UTIME_NOW_  0x3FFFFFFFL
+#define UTIME_OMIT_ 0x3FFFFFFEL
 #define EIO_     5
 #ifndef EBUSY_
 #define EBUSY_   16
@@ -4010,6 +4031,245 @@ long sys_dup(int fd) {
 }
 
 /*
+ * Linux x86_64 flock(2) -- syscall 73.
+ *
+ * Advisory lock on an open fd.  LOCK_SH=1, LOCK_EX=2, LOCK_NB=4,
+ * LOCK_UN=8.  The lock is per-slot and lives as long as the slot;
+ * LOCK_UN clears it, close() frees it with the slot.
+ *
+ * ADVISORY ONLY.  FAT has no lock bits and no inode to hang one
+ * on, and Linux gives flock(2) on a FAT mount the same advisory
+ * semantics: two flock callers coordinate, nothing else notices.
+ * This implementation stores the state on the slot and never
+ * blocks.  LOCK_NB is accepted and remembered but has no visible
+ * effect here, because nothing on a single-user single-process
+ * system can contend for the slot.
+ *
+ * CROSS-PROCESS CONTENTION IS NOT IMPLEMENTED.  Two processes
+ * each holding the same file via fork share the file_slot_t
+ * (fork duplicates the slot pointer and bumps refcount), so
+ * they observe one lock word -- which is correct: flock(2) on a
+ * dup'd fd shares one lock.  Two INDEPENDENT opens of the same
+ * path get two slots and two lock words, and can both hold
+ * LOCK_EX at once.  If a test needs that case, add a global
+ * table keyed by (dir, name) -- but only when a test exists,
+ * per the "design against two examples" rule.  The slot shape
+ * is what flock means for one fd, and that is the whole of the
+ * syscall.
+ *
+ * Bad flags (-EINVAL): any bit outside the four; LOCK_SH|LOCK_EX
+ * together; LOCK_UN with no lock held is not an error (Linux
+ * returns 0); the fd must name a live slot (-EBADF).
+ */
+#define LOCK_SH_ 1
+#define LOCK_EX_ 2
+#define LOCK_NB_ 4
+#define LOCK_UN_ 8
+
+long sys_flock(int fd, int operation) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (!slot) return -(long)EBADF_;
+
+    /* Only the four documented bits are legal. */
+    if (operation & ~(LOCK_SH_ | LOCK_EX_ | LOCK_NB_ | LOCK_UN_)) {
+        return -(long)EINVAL_;
+    }
+    /* LOCK_SH and LOCK_EX are mutually exclusive. */
+    if ((operation & LOCK_SH_) && (operation & LOCK_EX_)) {
+        return -(long)EINVAL_;
+    }
+    /* LOCK_UN releases, with or without LOCK_NB; Linux permits
+     * the combination and ignores LOCK_NB on unlock. */
+    if (operation & LOCK_UN_) {
+        slot->flock_state = 0;
+        return 0;
+    }
+    /* Acquisition must name a lock type. */
+    int want = operation & (LOCK_SH_ | LOCK_EX_);
+    if (want == 0) return -(long)EINVAL_;
+
+    slot->flock_state = (uint32_t)(want |
+        ((operation & LOCK_NB_) ? LOCK_NB_ : 0));
+    return 0;
+}
+
+/*
+ * Linux x86_64 fdatasync(2) -- syscall 75.
+ *
+ * Flush the file's data and the FAT metadata that describes it
+ * (the cluster chain and the directory entry) to disk.
+ * FatFs's f_sync does exactly that; there is no finer-grained
+ * "data only" call on FAT, and the size / first-cluster fields
+ * live in the directory entry, so f_sync is the correct
+ * implementation of fdatasync here.
+ *
+ * fd must be an open FILE slot.  A pipe, a console, a directory,
+ * a /proc entry, or a /dev entry is not a FAT file and gets
+ * -EBADF.  Linux gives fdatasync on a directory -EINVAL; the
+ * difference is not observable to any current caller and the
+ * sweep will not exercise it.  If a caller ever needs the
+ * distinction, split it here.
+ *
+ * WHY THIS EXISTS.  busybox `shred` calls fdatasync(75) after
+ * each overwrite pass.  Without a handler the call printed
+ * "Unknown syscall: 75" and returned -ENOSYS, which shred treats
+ * as "the sync did not happen" -- best-effort, but the
+ * overwritten bytes may not have reached the disk before the
+ * next pass, which is the opposite of shred's contract.
+ */
+/*
+ * Linux x86_64 fsync(2) -- syscall 74.
+ *
+ * Synchronize a file or directory's in-core state with storage.
+ *
+ * For regular files: calls f_sync on the open FIL to write back
+ * dirty file data and update the directory entry, then calls
+ * f_sync_volume on the underlying filesystem to commit the
+ * directory sector and issues an ATA cache flush.
+ *
+ * For directories: calls f_sync_volume on the directory's
+ * underlying filesystem to commit any pending metadata/window
+ * updates and flush the drive cache.
+ *
+ * For non-synchronizable descriptors (pipes, consoles, character
+ * devices, /proc): returns -EINVAL per POSIX and Linux contract.
+ *
+ * Invalid or unallocated fds return -EBADF.
+ */
+long sys_fsync(int fd) {
+    file_slot_t* slot = get_file_slot_any(fd);
+    if (!slot) return -(long)EBADF_;
+
+    if (slot->kind == FILE_KIND_FILE) {
+        FIL* file_obj = (FIL*)slot->obj;
+        if (!file_obj) return -(long)EBADF_;
+        FRESULT r = f_sync(file_obj);
+        if (r != FR_OK) return fatfs_errno(r);
+        r = f_sync_volume(file_obj->obj.fs);
+        return r == FR_OK ? 0 : fatfs_errno(r);
+    }
+
+    if (slot->kind == FILE_KIND_DIR) {
+        DIR* dir_obj = (DIR*)slot->obj;
+        if (!dir_obj || !dir_obj->obj.fs) return -(long)EBADF_;
+        FRESULT r = f_sync_volume(dir_obj->obj.fs);
+        return r == FR_OK ? 0 : fatfs_errno(r);
+    }
+
+    if (slot->kind == FILE_KIND_PIPE ||
+        slot->kind == FILE_KIND_CONSOLE ||
+        slot->kind == FILE_KIND_DEV ||
+        slot->kind == FILE_KIND_DEV_CHAR ||
+        slot->kind == FILE_KIND_DEV_NULL ||
+        slot->kind == FILE_KIND_PROC) {
+        return -(long)EINVAL_;
+    }
+
+    return -(long)EBADF_;
+}
+
+/*
+ * Linux x86_64 sync(2) -- syscall 162.
+ *
+ * Commit all filesystem caches and buffers to storage.
+ * Flushes every mounted FAT volume window and issues an ATA
+ * cache flush to commit drive write buffers.
+ *
+ * Linux sync(2) always succeeds and returns 0.
+ */
+long sys_sync(void) {
+    f_syncfs();
+    ata_flush_cache();
+    return 0;
+}
+
+long sys_fdatasync(int fd) {
+    file_slot_t* slot = get_file_slot(fd, FILE_KIND_FILE);
+    if (!slot) return -(long)EBADF_;
+    FIL* file_obj = (FIL*)slot->obj;
+    FRESULT r = f_sync(file_obj);
+    return r == FR_OK ? 0 : fatfs_errno(r);
+}
+
+/*
+ * Linux x86_64 sched_getaffinity(2) -- syscall 204.
+ *
+ * Copy the calling process's CPU affinity mask into `mask`, which
+ * holds `cpusetsize` bytes.  donix is a single-CPU build: one
+ * PIT, one scheduler, one idle process.  The mask is CPU 0 only:
+ * bit 0 set, all other bits zero.  That is not a placeholder; it
+ * is the truth of the machine this kernel boots on.
+ *
+ * ABI.  musl on x86_64 defines cpu_set_t as `unsigned long[16]`
+ * -- 128 bytes, CPU_SETSIZE 1024, one bit per CPU.  The syscall
+ * must not write more than cpusetsize bytes, and must accept any
+ * cpusetsize the ABI permits (including values larger than the
+ * kernel's own struct, which the caller may use to size a
+ * larger set than the one this kernel has).  Linux's minimum is
+ * one unsigned long -- 8 bytes -- because a smaller set cannot
+ * hold bit 0.
+ *
+ * ERRORS, matching Linux where they can:
+ *   -EINVAL   cpusetsize < sizeof(unsigned long)
+ *   -ESRCH    pid is positive and names no live process
+ *   -EFAULT   mask is a bad user pointer
+ *
+ * DEVIATION FROM LINUX, NAMED.  sched_getaffinity(getpid(), ...)
+ * and sched_getaffinity(0, ...) answer.  sched_getaffinity(other_
+ * live_pid, ...) returns -EINVAL, not that process's mask, because
+ * donix has no per-process affinity to answer with -- every
+ * process on this machine is on CPU 0.  Returning -EINVAL names
+ * that; returning the caller's mask would be the wrong answer
+ * with the right shape.  A future caller that genuinely needs a
+ * cross-process answer is a scheduler feature, not a stub change.
+ *
+ * WHY THIS EXISTS.  busybox `nproc` calls sched_getaffinity to
+ * size the CPU count.  Without a handler, the call printed
+ * "Unknown syscall: 204" and returned -ENOSYS; nproc fell back
+ * to sysconf, which returned 1 -- correct, by accident.  With
+ * this handler the noise is gone and the answer is by
+ * construction.
+ */
+long sys_sched_getaffinity(int pid, size_t cpusetsize, void* mask) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+
+    /* pid 0 is "me".  Any positive pid that names a live process
+     * is answered with -EINVAL (see the DEVIATION note); a
+     * positive pid that names no process is -ESRCH. */
+    if (pid != 0 && pid != (int)self->pid) {
+        /* ESRCH_ is defined later in this file, near sys_kill; use
+         * the literal 3 here rather than move the define, matching
+         * the same pattern fat_mkdir uses for EEXIST (17). */
+        if (!process_find_by_pid((uint64_t)pid)) return -(long)3;  /* ESRCH */
+        return -(long)EINVAL_;
+    }
+
+    /* One unsigned long is the minimum sized set that can hold
+     * bit 0; less is -EINVAL, as Linux. */
+    if (cpusetsize < sizeof(unsigned long)) return -(long)EINVAL_;
+
+    /* Build the mask in a kernel stack buffer.  128 bytes is
+     * musl's cpu_set_t on x86_64; a caller passing more than
+     * 128 gets only the first 128 copied, which is what the
+     * ABI permits (the caller's own larger set extends past
+     * what this kernel has to say about). */
+    unsigned long kmask[16];
+    for (size_t i = 0; i < sizeof(kmask) / sizeof(kmask[0]); i++) {
+        kmask[i] = 0;
+    }
+    kmask[0] = 1UL;   /* CPU 0 only */
+
+    size_t to_copy = cpusetsize;
+    if (to_copy > sizeof(kmask)) to_copy = sizeof(kmask);
+
+    if (safe_copy_to_user(mask, kmask, to_copy) != 0) {
+        return -(long)EFAULT_;
+    }
+    return 0;
+}
+
+/*
  * The shared unlink body, given a path that is already an absolute
  * Unix-form path (from resolve_at or a direct caller).
  *
@@ -4266,6 +4526,37 @@ long sys_unlinkat(int dirfd, const char* path, int flags) {
  * already-stripped FatFs-form paths. */
 static long fat_rename(const char* old_path, const char* new_path) {
     FRESULT r = f_rename(old_path, new_path);
+    /*
+     * Linux rename(2) replaces the destination.  FatFs's f_rename
+     * does not -- it returns FR_EXIST (8) when new_path exists --
+     * so an unlink-then-retry is what makes rename match Linux.
+     *
+     * This replaces the file's earlier behavior, which was to fail
+     * with -EPERM on FR_EXIST "because nothing in the applet set
+     * relies on the replace behavior."  Three applets do: patch,
+     * dos2unix, and unix2dos all write to a temp name and rename
+     * it over the original, which requires replace semantics.  The
+     * change is a design decision, not a bug fix -- it makes mv,
+     * patch, and the dos2unix/unix2dos pair behave as Linux does.
+     *
+     * ORDER.  Unlink the destination first, then retry.  If the
+     * unlink fails (write-protected, directory in the way, etc.),
+     * the retry of f_rename returns the same FR_EXIST and the
+     * error path below reports it.  If the retry succeeds, we own
+     * the rename.
+     *
+     * EDGE CASE -- new_path is a directory and old_path is a file
+     * (or vice versa).  f_unlink removes a directory only if it is
+     * empty, so a directory-vs-file mismatch will fail at the
+     * f_unlink step.  That is the same errno a Linux caller would
+     * get (-EISDIR or -ENOTDIR, mapped through fatfs_errno's
+     * FR_DENIED -> -EPERM), and the failure path below reports it
+     * with the same FRESULT.  No new code needed.
+     */
+    if (r == FR_EXIST) {
+        (void)f_unlink(new_path);
+        r = f_rename(old_path, new_path);
+    }
     if (r != FR_OK) {
         serial_print("sys_rename: f_rename FAIL old=");
         serial_print(old_path);
@@ -4374,6 +4665,14 @@ long sys_rename(const char* user_oldpath, const char* user_newpath) {
 /* The FatFs mkdir operation, moved out of sys_mkdir. */
 static long fat_mkdir(const char* local_path) {
     FRESULT r = f_mkdir(local_path);
+    /* Linux wants -EEXIST (17) when the name exists, not -EPERM.
+     * Translated here, not in fatfs_errno, so the change is scoped
+     * to mkdir: fatfs_errno's FR_EXIST -> -EPERM_ is shared by
+     * every FatFs caller.  The literal 17 follows the note above
+     * this function; the tree has no EEXIST_ define. */
+    if (r == FR_EXIST) {
+        return -(long)17;
+    }
     if (r != FR_OK) {
         return fatfs_errno(r);
     }
@@ -4404,13 +4703,26 @@ long sys_mkdir(const char* path, int mode) {
         }
         local_path[i] = '\0';
     }
+    /* A resolved path of "/" is the root, and the root exists.
+     * This MUST be checked before strip_dot_prefix, which turns
+     * "/" into "." -- f_mkdir rejects "." as FR_INVALID_NAME and
+     * fatfs_errno maps that to -ENOENT, so without this branch
+     * mkdir("/") reports "no such file or directory" for the
+     * root.  busybox mkdir -p calls mkdir on every path prefix
+     * including "/", and treats -EEXIST as "already there,
+     * fine"; -ENOENT made it stop with "can't create directory
+     * '/': No such file or directory".  (Verified by a one-run
+     * serial_print: path='/', rr=0, resolved='/', and after
+     * strip_dot_prefix local_path was ".". ) */
+    if (local_path[0] == '/' && local_path[1] == '\0') {
+        return -(long)17;  /* EEXIST */
+    }
+
     strip_dot_prefix(local_path);
 
     if (local_path[0] == '\0') {
-        /* An empty path is not a valid path on any Unix.  Linux
-         * returns -ENOENT from mkdir("") too.  The early return
-         * keeps an empty-path call out of the FatFs diagnostic
-         * path. */
+        /* mkdir("") is -ENOENT, as on Linux.  The root case was
+         * handled above, before strip_dot_prefix. */
         return -(long)ENOENT_;
     }
 
@@ -4451,6 +4763,60 @@ static uint64_t fat_ino(uint32_t sclust, uint32_t objsize,
     return h;
 }
 
+/*
+ * Convert FAT's packed fdate/ftime back to a Unix epoch-1970 second
+ * count.  This is the read-side inverse of epoch_to_fat above: the
+ * write side (sys_utimensat) packs the user's timestamp into a
+ * FILINFO and hands it to f_utime; the read side (fill_kstat_
+ * from_filinfo) gets FILINFO.fdate/.ftime back from f_stat / f_readdir
+ * and must convert them to st_mtim's tv_sec.
+ *
+ * The algorithm is Howard Hinnant's `days_from_civil`, the inverse of
+ * the `civil_from_days` used in epoch_to_fat.  An fdate of 0 means
+ * "unset" (FAT's directory entry was zeroed and the date word never
+ * written) -- report 0, which the Linux stat view shows as
+ * 1970-01-01 00:00:00.  A year outside 1980..2107 is clamped to the
+ * nearest edge, the same range epoch_to_fat writes.
+ *
+ * FAT has 2-second granularity, so an odd second in the source is
+ * lost on write and was never on disk; the read side reports exactly
+ * what the on-disk word holds.  No timezone: donix has no TZ, and
+ * epoch_to_fat wrote UTC.
+ */
+static uint64_t fat_to_epoch(uint16_t fdate, uint16_t ftime) {
+    if (fdate == 0 && ftime == 0) return 0;   /* unset */
+
+    int year   = 1980 + ((fdate >> 9) & 0x7F);
+    int month  = (fdate >> 5) & 0x0F;
+    int day    = fdate & 0x1F;
+    int hour   = (ftime >> 11) & 0x1F;
+    int minute = (ftime >> 5) & 0x3F;
+    int sec    = (ftime & 0x1F) * 2;
+
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+    if (month < 1)   month = 1;
+    if (month > 12)  month = 12;
+    if (day < 1)     day = 1;
+    if (day > 31)    day = 31;
+
+    /* days_from_civil (Hinnant).  Months are March-based: month 3
+     * is March of the same year, 1 and 2 are March of the previous
+     * one, so January and February of a leap year fall on year-1. */
+    int64_t y   = (int64_t)year - (month <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    int64_t doe = yoe * 365 + yoe/4 - yoe/100 + doy;
+    int64_t days = era * 146097 + doe - 719468;
+
+    if (days < 0) return 0;
+    return (uint64_t)days * 86400ULL
+         + (uint64_t)hour * 3600ULL
+         + (uint64_t)minute * 60ULL
+         + (uint64_t)sec;
+}
+
 static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno,
                                     uint64_t ino) {
     for (size_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
@@ -4467,6 +4833,20 @@ static void fill_kstat_from_filinfo(kernel_stat_t* st, const FILINFO* fno,
         st->st_mode   = KSTAT_IFREG | 0644;
         st->st_size   = (int64_t)fno->fsize;
         st->st_blocks = (st->st_size + 511) / 512;
+    }
+
+    /* FAT has mtime only; atime and ctime are reported as the same
+     * value, which is what Linux on a FAT mount does.  This is the
+     * read-side counterpart to sys_utimensat's f_utime write: the
+     * write side stores the packed fdate/ftime, and stat / ls -l /
+     * tar -tvf / find -mtime read st_mtim, which is now the same
+     * number the file on disk says. */
+    {
+        uint64_t mtime = fat_to_epoch(fno->fdate, fno->ftime);
+        st->st_mtim.tv_sec  = (int64_t)mtime;
+        st->st_mtim.tv_nsec = 0;
+        st->st_atim         = st->st_mtim;
+        st->st_ctim         = st->st_mtim;
     }
 }
 
@@ -5043,12 +5423,101 @@ long sys_faccessat(int dirfd, const char* user_path, int mode, int flags) {
  * which donix does not implement.  A NULL path is -EFAULT, the
  * Linux errno for a bad pointer; -EINVAL is for bad flags.
  */
+/*
+ * Convert a Unix epoch-1970 second count to FAT's packed fdate/ftime.
+ *
+ * FAT stores modification time as two 16-bit words, both "local"
+ * (donix has no TZ, so UTC = local) with a 2-second resolution:
+ *
+ *   fdate = ((year - 1980) << 9) | (month << 5) | day
+ *   ftime = (hour << 11) | (minute << 5) | (sec / 2)
+ *
+ * Year 1980..2107 is representable; dates outside that range are
+ * clamped to the nearest edge.  A 1970 timestamp is therefore
+ * reported by FAT as 1980-01-01, which is the honest limit of the
+ * on-disk format, not a bug in this function.  Odd seconds round
+ * DOWN (sec / 2), so a 12:34:57 mtime is stored and reported as
+ * 12:34:56 -- again, FAT's resolution, not ours.
+ *
+ * The days-to-civil algorithm is Howard Hinnant's `civil_from_days`
+ * (public domain, from the "chrono-Compatible Low-Level Date
+ * Algorithms" paper).  It is inlined here rather than linked from a
+ * library because the kernel has no libc and this is the only
+ * caller; ~25 lines of arithmetic are cheaper than a header.
+ */
+static void epoch_to_fat(uint64_t unix_sec, uint16_t* out_fdate,
+                         uint16_t* out_ftime) {
+    uint64_t days = unix_sec / 86400ULL;
+    uint64_t rem  = unix_sec % 86400ULL;
+    int hour = (int)(rem / 3600ULL);
+    int min  = (int)((rem % 3600ULL) / 60ULL);
+    int sec  = (int)(rem % 60ULL);
+
+    int64_t z   = (int64_t)days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    int64_t y   = yoe + era * 400;
+    int64_t doy = doe - (365*yoe + yoe/4 - yoe/100);
+    int64_t mp  = (5*doy + 2)/153;
+    int day     = (int)(doy - (153*mp+2)/5 + 1);
+    int month   = (int)(mp < 10 ? mp + 3 : mp - 9);
+    int year    = (int)(y + (month <= 2));
+
+    /* FAT epoch is 1980; the max is 1980 + 127 = 2107. */
+    if (year < 1980) year = 1980;
+    if (year > 2107) year = 2107;
+    if (month < 1)   month = 1;
+    if (month > 12)  month = 12;
+    if (day < 1)     day = 1;
+    if (day > 31)    day = 31;
+
+    *out_fdate = (uint16_t)(((year - 1980) << 9) | (month << 5) | day);
+    *out_ftime = (uint16_t)((hour << 11) | (min << 5) | (sec / 2));
+}
+
 long sys_utimensat(int dirfd, const char* path, const void* times,
                    int flags) {
     int follow_final = (flags & AT_SYMLINK_NOFOLLOW_) ? 0 : 1;
-    (void)times;
 
-    if (!path) return -(long)EFAULT_;
+    /*
+     * futimens(fd, times) reaches here as path == NULL (musl's
+     * futimens is literally utimensat(fd, 0, times, 0)).  There is
+     * no fd->path mapping in the tree, so resolve the fd to its
+     * FIL* and stamp the directory entry directly.
+     */
+    if (!path) {
+        if (dirfd < 0) return -(long)EBADF_;
+        file_slot_t* slot = get_file_slot_any(dirfd);
+        if (!slot || slot->kind != FILE_KIND_FILE || !slot->obj) {
+            return -(long)EBADF_;
+        }
+        FIL* fp = (FIL*)slot->obj;
+        uint64_t mt;
+        if (!times) {
+            mt = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+        } else {
+            struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+            if (safe_copy_from_user(ts, times, sizeof(ts)) != 0) {
+                return -(long)EFAULT_;
+            }
+            if (ts[1].tv_nsec == UTIME_OMIT_) return 0;
+            if (ts[1].tv_nsec == UTIME_NOW_) {
+                mt = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+            } else {
+                if (ts[1].tv_nsec < 0 || ts[1].tv_nsec > 999999999LL) {
+                    return -(long)EINVAL_;
+                }
+                mt = (ts[1].tv_sec < 0) ? 0 : (uint64_t)ts[1].tv_sec;
+            }
+        }
+        FILINFO fno;
+        for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+        epoch_to_fat(mt, &fno.fdate, &fno.ftime);
+        FRESULT fr = f_settime(fp, &fno);
+        if (fr != FR_OK) return fatfs_errno(fr);
+        return 0;
+    }
 
     /*
      * Flags.  Linux's utimensat accepts AT_SYMLINK_NOFOLLOW (0x100)
@@ -5075,23 +5544,128 @@ long sys_utimensat(int dirfd, const char* path, const void* times,
     int rr = vfs_resolve(dirfd, local, resolved, sizeof(resolved), &backend, follow_final);
     if (rr != 0) return rr;
 
-    return access_resolved(resolved, backend);
+    /*
+     * Non-FAT backends have no timestamps to set.  /dev and /proc
+     * entries are synthesized; the access check is the honest
+     * answer (existence, not storage).  This is the same fallback
+     * the function had before it grew a real timestamp path.
+     */
+    if (backend != BACKEND_FAT) {
+        return access_resolved(resolved, backend);
+    }
+
+    /*
+     * Parse the times array.  musl passes struct timespec times[2]
+     * (32 bytes on x86_64); a NULL pointer means "set both fields
+     * to now".  atime is discarded -- FAT has no atime -- so only
+     * times[1] (mtime) is used.
+     *
+     * mtime comes from one of three places:
+     *   - times == NULL               -> "now" (g_ticks / 100)
+     *   - times[1].tv_nsec == UTIME_NOW  -> "now"
+     *   - times[1].tv_nsec == UTIME_OMIT -> leave mtime alone; return 0
+     *   - otherwise                    -> times[1].tv_sec
+     */
+    uint64_t mtime_sec;
+    if (!times) {
+        mtime_sec = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+    } else {
+        struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+        if (safe_copy_from_user(ts, times, sizeof(ts)) != 0) {
+            return -(long)EFAULT_;
+        }
+        if (ts[1].tv_nsec == UTIME_OMIT_) {
+            return 0;
+        }
+        if (ts[1].tv_nsec == UTIME_NOW_) {
+            mtime_sec = (uint64_t)((int64_t)(g_ticks / 100) + g_rtc_epoch_offset);
+        } else {
+            if (ts[1].tv_nsec < 0 || ts[1].tv_nsec > 999999999LL) {
+                return -(long)EINVAL_;
+            }
+            if (ts[1].tv_sec < 0) {
+                /* Pre-epoch: FAT clamps to 1980 anyway; accept and
+                 * clamp, matching the Linux "allow it, the fs clamps"
+                 * behavior. */
+                mtime_sec = 0;
+            } else {
+                mtime_sec = (uint64_t)ts[1].tv_sec;
+            }
+        }
+    }
+
+    /*
+     * Build a FILINFO with only fdate/ftime set.  f_utime reads
+     * only those two fields; every other byte is zeroed so the
+     * call is self-contained and nothing stale is written.
+     */
+    FILINFO fno;
+    for (size_t i = 0; i < sizeof(fno); i++) ((uint8_t*)&fno)[i] = 0;
+    epoch_to_fat(mtime_sec, &fno.fdate, &fno.ftime);
+
+    /* FatFs wants the stripped form ("0:/NAME", no leading '/'). */
+    char fat_path[USER_PATH_MAX];
+    if (path_copy(fat_path, sizeof(fat_path), resolved) != 0) {
+        return -(long)ENAMETOOLONG_;
+    }
+    strip_dot_prefix(fat_path);
+
+    FRESULT fr = f_utime(fat_path, &fno);
+    if (fr != FR_OK) {
+        return fatfs_errno(fr);
+    }
+    return 0;
 }
 
 /*
- * Linux x86_64 utimes(2) — syscall 235.
- * Legacy timeval form.  Same no-op semantics as utimensat.
+ * Linux x86_64 utimes(2) -- syscall 235.
+ *
+ * Legacy timeval form.  Its raw ABI is struct timeval times[2]
+ * (16 bytes each: i64 tv_sec, i64 tv_usec), which is a DIFFERENT
+ * LAYOUT from utimensat's timespec[2] (i64 tv_sec, i64 tv_nsec).
+ * musl's utimes(3) wrapper goes through utimensat(2) and never
+ * reaches this syscall; it exists for raw callers.  When it does
+ * reach us, parse timeval and convert to timespec (tv_usec * 1000
+ * for tv_nsec) before delegating, so the layout is honest.
  */
-long sys_utimes(const char* path, const void* times) {
-    return sys_utimensat(-100, path, times, 0);
+long sys_utimes(const char* path, const void* user_times) {
+    if (!user_times) {
+        return sys_utimensat(-100, path, NULL, 0);
+    }
+    struct { int64_t tv_sec; int64_t tv_usec; } tv[2];
+    if (safe_copy_from_user(tv, user_times, sizeof(tv)) != 0) {
+        return -(long)EFAULT_;
+    }
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+    ts[0].tv_sec  = tv[0].tv_sec;
+    ts[0].tv_nsec = tv[0].tv_usec * 1000LL;
+    ts[1].tv_sec  = tv[1].tv_sec;
+    ts[1].tv_nsec = tv[1].tv_usec * 1000LL;
+    return sys_utimensat(-100, path, ts, 0);
 }
 
 /*
- * Linux x86_64 futimesat(2) — syscall 261.
- * Older glibc form.  Same no-op semantics.
+ * Linux x86_64 futimesat(2) -- syscall 261.
+ *
+ * Older glibc form.  Same timeval[2] layout as utimes; musl's
+ * futimesat(3) wrapper goes through utimensat(2), so this is
+ * raw-caller-only.  Convert timeval to timespec and delegate, as
+ * sys_utimes does.
  */
-long sys_futimesat(int dirfd, const char* path, const void* times) {
-    return sys_utimensat(dirfd, path, times, 0);
+long sys_futimesat(int dirfd, const char* path, const void* user_times) {
+    if (!user_times) {
+        return sys_utimensat(dirfd, path, NULL, 0);
+    }
+    struct { int64_t tv_sec; int64_t tv_usec; } tv[2];
+    if (safe_copy_from_user(tv, user_times, sizeof(tv)) != 0) {
+        return -(long)EFAULT_;
+    }
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts[2];
+    ts[0].tv_sec  = tv[0].tv_sec;
+    ts[0].tv_nsec = tv[0].tv_usec * 1000LL;
+    ts[1].tv_sec  = tv[1].tv_sec;
+    ts[1].tv_nsec = tv[1].tv_usec * 1000LL;
+    return sys_utimensat(dirfd, path, ts, 0);
 }
 
 /*
@@ -5208,6 +5782,31 @@ long sys_symlink(const char* user_target, const char* user_linkpath) {
     f_close(&f);
     if (fr != FR_OK || wrote != (UINT)n) return -(long)EIO_;
     return 0;
+}
+
+/*
+ * Linux x86_64 link(2) -- syscall 86.
+ *
+ * FAT has no hard links.  Linux on a FAT mount returns -EPERM for
+ * link(2); donix does the same.  busybox `ln` sees -EPERM and
+ * falls back to copying the file, which is what `ln` does on
+ * filesystems without hardlinks -- the same behavior a Linux user
+ * sees if they `ln` on a FAT mount.
+ *
+ * This does NOT make `ln` a hardlink; it cannot, on FAT.  It
+ * only removes the "Unknown syscall: 86" noise by giving
+ * link(2) the errno Linux gives it on FAT.  The sweep row `ln`
+ * stays OBSERVE (copy-or-fail), not PASS -- `ln` on FAT is a
+ * copy tool, and the honest answer is that it copies.
+ *
+ * oldpath and newpath are not validated: -EPERM is the answer
+ * for any call, whether the source exists or not, exactly as
+ * Linux on FAT.  A caller that probes for hardlink support sees
+ * the same answer either way.
+ */
+long sys_link(const char* oldpath, const char* newpath) {
+    (void)oldpath; (void)newpath;
+    return -(long)EPERM_;
 }
 
 long sys_readlink(const char* user_path, char* buf, size_t bufsiz) {
@@ -5698,7 +6297,9 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     if (got < 4 ||
         ehdr.e_ident[0] != ELF_MAGIC0 || ehdr.e_ident[1] != ELF_MAGIC1 ||
         ehdr.e_ident[2] != ELF_MAGIC2 || ehdr.e_ident[3] != ELF_MAGIC3) {
+        #if TRACE_EXECVE_ERR
         serial_print("sys_execve: not an ELF file\n");
+        #endif
         f_close(&file);
         __asm__ volatile("sti");
         return -(long)ENOEXEC;
@@ -5910,6 +6511,35 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
     }
 
     /* ---- 5. Tear down the old address space, then load the new one. ---- */
+    /*
+     * vfork child exec: stop borrowing.  It needs its own address
+     * space before the new image is mapped.  elf_load_into_process
+     * maps into pcb->cr3 (it does not allocate a fresh one), so
+     * mapping into the parent's cr3 would overwrite the parent's
+     * PTEs.  Build a fresh kernel-only address space, and do NOT
+     * free the old one -- it is the parent's.  borrows_cr3 clears
+     * here; the clone is now owned, so the normal free/load below
+     * applies to it.
+     *
+     * KNOWN: vmm_clone_page_table deep-copies the low half, so the
+     * clone still contains the parent's user mappings outside the
+     * new image's segments.  That is a child-visible stale mapping
+     * (not a parent corruption -- separate PTEs) and is recorded as
+     * an open issue, not solved here.
+     */
+    if (self->borrows_cr3) {
+        uint64_t _fresh = vmm_create_address_space(self->cr3,
+                                                   self->user_stack_virt,
+                                                   self->user_stack_top,
+                                                   self->brk_virt);
+        if (!_fresh) {
+            __asm__ volatile("sti");
+            sys_exit(-1);
+            return -1;  /* unreachable */
+        }
+        self->cr3 = _fresh;
+        self->borrows_cr3 = 0;
+    }
     exec_free_and_unmap_user_pages(self);
     self->user_stack_virt = 0;
     self->user_stack_phys = 0;
@@ -5974,13 +6604,128 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
         uint64_t array_base    = argv_region_bottom;
         uint64_t envp_array_base = argv_region_bottom + array_bytes;
-        uint64_t strings_start = argv_region_bottom + array_bytes + envp_bytes;
+        uint64_t auxv_base = envp_array_base + envp_bytes;
+        uint64_t auxv_va   = auxv_base + 16;
+        uint64_t strings_start = auxv_va + 14 * 2 * 8;
 
         /*
          * Pack argv strings, then envp strings, growing up from
          * strings_start.  A single cursor so the two pools cannot
          * overlap.
          */
+        /*
+         * auxv.  musl's __init_libc reads the auxv that follows
+         * the envp NULL on the stack; without it AT_PHDR,
+         * AT_PHNUM, AT_ENTRY, and AT_RANDOM are all 0, and the
+         * startup path (static_init_tls, __libc_start_main)
+         * jumps or calls through a NULL that the missing auxv
+         * left there.  time true's post-V3b fault (RIP 0, CR2 0,
+         * error 0x15, rax 0, __clock_gettime / time_main on the
+         * stack) is that shape.
+         *
+         * Linux stack order: argc, argv[] pointers, NULL,
+         * envp[] pointers, NULL, auxv pairs, AT_NULL, then the
+         * strings above.  This block places the auxv at
+         * auxv_base = envp_array_base + envp_bytes (immediately
+         * after the envp pointer array's NULL, which is where
+         * musl's __init_libc starts walking), and strings_start
+         * is above the auxv so the strings cannot run into it.
+         * The overflow check auxv_base + 16 + 2*14*8 >
+         * argv_region_top bounds the auxv; the strings loop's
+         * own cursor + slen > argv_region_top bounds the
+         * strings.
+         *
+         * AT_RANDOM needs 16 bytes of seed; musl uses it for the
+         * stack canary and __randname.  g_ticks-seeded, non-
+         * cryptographic -- the honest limit donix has.
+         *
+         * HEAP, not stack: sys_execve's argv_scratch is 16 KB on
+         * a 16 KB PROC_STACK_SIZE stack, so this function has no
+         * room for another few hundred bytes of stack locals.
+         * envp_scratch is kmalloc'd for the same reason; this is
+         * the same pattern.  The first auxv attempt used stack
+         * arrays and the resulting overflow corrupted the iretq
+         * frame's SS slot, producing a #GP error 0x2BE0 in the
+         * kernel on test.sh.  Do not move these back to stack.
+         */
+        {
+            extern volatile uint64_t g_ticks;
+            enum {
+                A_NULL=0, A_PHDR=3, A_PHENT=4, A_PHNUM=5, A_PAGESZ=6,
+                A_BASE=7, A_ENTRY=9, A_UID=11, A_EUID=12, A_GID=13,
+                A_EGID=14, A_HWCAP=16, A_SECURE=23, A_RANDOM=25
+            };
+            /* 14 entries * 2 uint64 + AT_RANDOM's 16 seed bytes. */
+            uint8_t* _auxv_buf = (uint8_t*)kmalloc(2 * 14 * 8 + 16);
+            if (!_auxv_buf) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: kmalloc auxv failed\n");
+                #endif
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t* _rnd = (uint64_t*)_auxv_buf;
+            uint64_t* _auxv = (uint64_t*)(_auxv_buf + 16);
+            uint64_t _t = g_ticks;
+            _rnd[0] = _t * 0x9E3779B97F4A7C15ULL;
+            _rnd[1] = _t ^ 0x2545F4914F6CDD1DULL;
+            if (auxv_base + 16 + 2 * 14 * 8 > argv_region_top) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv region overflow\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            uint64_t _rnd_va = auxv_base;
+            if (safe_copy_to_user_cr3(self->cr3, (void*)_rnd_va,
+                                      _rnd, 16) != 0) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv random write failed\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+
+            int _n = 0;
+            #define _AV(t, v) do { _auxv[_n++] = (uint64_t)(t); _auxv[_n++] = (uint64_t)(v); } while (0)
+            _AV(A_PHDR,   0x400000ULL + (uint64_t)ehdr.e_phoff);
+            _AV(A_PHNUM,  (uint64_t)ehdr.e_phnum);
+            _AV(A_PHENT,  (uint64_t)ehdr.e_phentsize);
+            _AV(A_ENTRY,  entry);
+            _AV(A_BASE,   0ULL);
+            _AV(A_PAGESZ, 4096ULL);
+            _AV(A_RANDOM, _rnd_va);
+            _AV(A_HWCAP,  0ULL);
+            _AV(A_UID,    0ULL);
+            _AV(A_EUID,   0ULL);
+            _AV(A_GID,    0ULL);
+            _AV(A_EGID,   0ULL);
+            _AV(A_SECURE, 0ULL);
+            _AV(A_NULL,   0ULL);
+            #undef _AV
+            size_t _auxv_bytes = (size_t)_n * sizeof(uint64_t);
+            if (safe_copy_to_user_cr3(self->cr3, (void*)auxv_va,
+                                      _auxv, _auxv_bytes) != 0) {
+                #if TRACE_EXECVE_ERR
+                serial_print("sys_execve: auxv write failed\n");
+                #endif
+                kfree(_auxv_buf);
+                kfree(envp_scratch);
+                __asm__ volatile("sti");
+                sys_exit(-1);
+                return -1;  /* unreachable */
+            }
+            kfree(_auxv_buf);
+        }
+
         uint64_t cursor = strings_start;
         uint64_t arg_vaddrs[EXEC_MAX_ARGC];
         uint64_t env_vaddrs[EXEC_MAX_ENVC];
@@ -6130,11 +6875,60 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 
     /* ---- 8. Update PCB fields. ---- */
     self->entry_point = entry;
+    /* clear_child_tid is a per-address-space registration:
+     * the VA is meaningful only in the address space that
+     * set it.  execve replaces the address space, so the
+     * old VA (if any) is stale and must not be written on
+     * exit.  The new program's __init_tls calls
+     * set_tid_address again and sets it fresh.  Without this
+     * reset, the exec'd process carries the pre-exec VA into
+     * its new CR3, and process_exit's store faults when that
+     * VA is unmapped there (pipe7e, CR2 0x4087D0, kernel
+     * #PF error 0x2). */
+    self->clear_child_tid = 0;
+    /* True vfork wakes the parent on exec.  Exit already wakes via
+     * process_wake_parent_if_waiting (scheduler.c:624); this is the
+     * exec half.  Under the cli execve opened with; the waker only
+     * sets the parent READY + enqueues, no dispatch (contract
+     * #3/#4). */
+    process_wake_parent_if_waiting(self);
     self->rip         = entry;
     self->exit_status = 0;
     self->wait_pid    = 0;
     self->block_kind  = BLOCK_KIND_NONE;
     self->state       = PROC_STATE_RUNNING;
+
+    /* ---- 9. Commit the new address space. ----
+     *
+     * For a vfork child, self->cr3 was switched to a fresh
+     * address space at section 5, but the %cr3 register still
+     * holds the PARENT's cr3 -- vfork shares the address space
+     * until exec. The sysret stub
+     * (user_syscall_entry.asm) does not reload %cr3; it assumes
+     * the current register matches the process's cr3. That is
+     * true for a regular syscall (the scheduler switched cr3 on
+     * dispatch), but not for exec after vfork, where the switch
+     * must happen here.
+     *
+     * Without this load, the vfork child sysrets into the
+     * parent's address space. The new image's entry point is not
+     * mapped there, so the first instruction fetch faults with
+     * PTE NOT PRESENT (the live `time true` signature is
+     * CR2=0 / RIP=0 / error 0x15; a wrong CR2 here is history).
+     *
+     * All user-VA writes earlier in this function already
+     * target self->cr3 explicitly (safe_copy_to_user_cr3), so
+     * the data is in the new address space by the time this
+     * switch happens. Kernel mappings are shared (high half), so
+     * the switch is safe mid-function.
+     */
+    {
+        uint64_t _active_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(_active_cr3));
+        if ((_active_cr3 & ~0xFFFULL) != (self->cr3 & ~0xFFFULL)) {
+            __asm__ volatile("mov %0, %%cr3" : : "r"(self->cr3) : "memory");
+        }
+    }
 
     /* POSIX exec: caught signal dispositions reset to SIG_DFL,
      * SIG_IGN is preserved, the blocked mask is preserved, and
@@ -6207,9 +7001,17 @@ long sys_execve(const char* user_path, char** user_argv, char** user_envp) {
 }
 
 // ============================================================
+/* Convert a 100 Hz tick count to (sec, usec).  The ONLY place
+ * the 100 Hz constant belongs; every rusage and times fill goes
+ * through it. */
+static void ticks_to_timeval(uint64_t ticks, uint64_t* tv_sec, uint64_t* tv_usec) {
+    *tv_sec  = ticks / 100;
+    *tv_usec = (ticks % 100) * 10000;
+}
+
 // SYS_WAIT4 (61)
 // ============================================================
-long sys_wait4(long pid, int* user_status, int options) {
+long sys_wait4(long pid, int* user_status, int options, void* user_rusage) {
     pcb_t* self = process_get_current();
     if (!self) return -(long)ECHILD;
 
@@ -6343,6 +7145,24 @@ long sys_wait4(long pid, int* user_status, int options) {
              * console_fg_pgrp_reclaim_if, which now only resets
              * when the pgrp has no live member left.
              */
+            /* Fill the parent's struct rusage from the child's
+             * total_ticks (wait4's fourth argument, previously
+             * absent).  struct rusage on x86_64 is 144 bytes:
+             * ru_utime and ru_stime are each (i64 tv_sec, i64
+             * tv_usec), then 14 long counters.  utime from
+             * total_ticks, stime zeroed, matching
+             * /proc/<pid>/stat's "both total_ticks" honesty. */
+            if (user_rusage != NULL) {
+                unsigned char ru[144];
+                uint64_t usec = 0;
+                for (int k = 0; k < 144; k++) ru[k] = 0;
+                ticks_to_timeval(zombie->total_ticks,
+                                 (uint64_t*)(ru + 0), &usec);
+                *(uint64_t*)(ru + 8) = usec;
+                if (safe_copy_to_user(user_rusage, ru, 144) != 0) {
+                    return -(long)EFAULT_;
+                }
+            }
             process_reclaim(zombie);
             if (user_status) {
                 if (safe_copy_to_user(user_status, &status, sizeof(status)) != 0) {
@@ -6516,6 +7336,52 @@ long sys_wait4(long pid, int* user_status, int options) {
         
         process_yield();
     }
+}
+
+// SYS_TIMES (43)
+//
+// struct tms on x86_64 is four clock_t (i64):
+//   tms_utime, tms_stime, tms_cutime, tms_cstime.
+// Returns jiffies since boot (Linux semantics).
+long sys_times(void* user_tms) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (user_tms != NULL) {
+        uint64_t buf[4];
+        buf[0] = self->total_ticks;
+        buf[1] = 0;
+        buf[2] = self->children_ticks;
+        buf[3] = 0;
+        if (safe_copy_to_user(user_tms, buf, sizeof(buf)) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+    extern volatile uint64_t g_ticks;
+    return (long)g_ticks;
+}
+
+// SYS_GETRUSAGE (98)
+//
+// who: 0 = RUSAGE_SELF, -1 = RUSAGE_CHILDREN, 1 = RUSAGE_THREAD.
+// 144-byte struct rusage, same layout as wait4's fill.
+long sys_getrusage(int who, void* user_rusage) {
+    pcb_t* self = process_get_current();
+    if (!self) return -(long)EINVAL_;
+    if (user_rusage != NULL) {
+        uint64_t ticks;
+        if (who == -1) ticks = self->children_ticks;
+        else if (who == 0 || who == 1) ticks = self->total_ticks;
+        else return -(long)EINVAL_;
+        unsigned char ru[144];
+        uint64_t usec = 0;
+        for (int k = 0; k < 144; k++) ru[k] = 0;
+        ticks_to_timeval(ticks, (uint64_t*)(ru + 0), &usec);
+        *(uint64_t*)(ru + 8) = usec;
+        if (safe_copy_to_user(user_rusage, ru, 144) != 0) {
+            return -(long)EFAULT_;
+        }
+    }
+    return 0;
 }
 
 // ============================================================
@@ -8003,6 +8869,44 @@ long sys_uname(void* user_buf) {
  * point.  Reading it twice would be worse; this reads it once
  * into a local.
  */
+/*
+ * Linux x86_64 time(2) -- syscall 201.
+ *
+ * donix has no wall clock (see sys_clock_gettime).  time() reports
+ * the same g_ticks counter as seconds since boot: g_ticks / 100 at
+ * the 100 Hz PIT.  If user_tloc is non-NULL, the seconds are also
+ * stored there (Linux permits NULL).
+ */
+long sys_time(void* user_tloc) {
+    uint64_t ticks = g_ticks;               /* one read */
+    int64_t  secs  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
+    if (user_tloc) {
+        if (safe_copy_to_user(user_tloc, &secs, sizeof(secs)) != 0)
+            return -(long)EFAULT_;
+    }
+    return (long)secs;
+}
+
+/*
+ * Linux x86_64 gettimeofday(2) -- syscall 96.
+ *
+ * Fills struct timeval { int64 tv_sec; int64 tv_usec; } from the
+ * same g_ticks counter.  tv_usec = (g_ticks % 100) * 10000, i.e.
+ * 10 ms granularity -- the PIT resolution, reported honestly.
+ * tz (arg1) is obsolete and ignored; NULL tv is permitted.
+ */
+long sys_gettimeofday(void* user_tv, void* user_tz) {
+    (void)user_tz;
+    if (!user_tv) return 0;
+    uint64_t ticks = g_ticks;               /* one read */
+    struct { int64_t tv_sec; int64_t tv_usec; } tv;
+    tv.tv_sec  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
+    tv.tv_usec = (int64_t)((ticks % 100) * 10000);
+    if (safe_copy_to_user(user_tv, &tv, sizeof(tv)) != 0)
+        return -(long)EFAULT_;
+    return 0;
+}
+
 long sys_clock_gettime(int clk_id, void* user_ts) {
     if (!user_ts) return -(long)EFAULT_;
 
@@ -8024,7 +8928,7 @@ long sys_clock_gettime(int clk_id, void* user_ts) {
         int64_t tv_nsec;
     } ts;
 
-    ts.tv_sec  = (int64_t)(ticks / 100);
+    ts.tv_sec  = (int64_t)(ticks / 100) + g_rtc_epoch_offset;
     ts.tv_nsec = (int64_t)((ticks % 100) * 10000000);
 
     if (safe_copy_to_user(user_ts, &ts, sizeof(ts)) != 0) {
@@ -8984,10 +9888,39 @@ long sys_poll(void* user_fds_arg, unsigned long nfds, int timeout) {
  * specific test requires it.
  */
 long sys_set_tid_address(int* tidptr) {
-    (void)tidptr;
     pcb_t* current = process_get_current();
     if (!current) return 1;
+    current->clear_child_tid = (uint64_t)tidptr;
     return (long)current->pid;
+}
+
+/*
+ * Linux x86_64 umask(2) -- syscall 95.
+ *
+ * Store the new mask and return the previous one.  Only the low
+ * nine mode bits are meaningful (0777); the rest are dropped, as
+ * on Linux.
+ *
+ * FatFs has no mode store, so the mask is not persisted anywhere
+ * a later stat() could read it.  sys_mkdir applies it to the mode
+ * it hands the driver, which is the honest extent: a caller that
+ * reads its own umask back gets the value it set, and a directory
+ * created with a restrictive umask is still 0755 on disk because
+ * there is nowhere to record the difference.  See the pcb_t
+ * field comment.
+ *
+ * Default is 022, set here on first use because
+ * process_initialize_pcb zeroes the field.  Matching Linux's
+ * default matters for mkdir -p, which busybox calls first.
+ */
+long sys_umask(int mask) {
+    pcb_t* current = process_get_current();
+    if (!current) return -(long)EFAULT_;
+    uint32_t new_mask = (uint32_t)(mask & 0777);
+    uint32_t old_mask = current->umask;
+    if (old_mask == 0) old_mask = 022;
+    current->umask = new_mask;
+    return (long)old_mask;
 }
 
 /*
@@ -11502,6 +12435,173 @@ long sys_getdents64(int fd, void* dirp, size_t count) {
  * tick mid-clone could schedule another process whose allocations
  * race with ours.
  */
+/*
+ * Linux x86_64 vfork(2) -- syscall 58.
+ *
+ * True vfork, not an alias of fork: the child runs on the parent's
+ * address space (child->cr3 = parent->cr3, no eager copy), and the
+ * parent blocks until the child execs or exits.  The child's
+ * elf_page_list is empty and borrows_cr3 is set, so its exit does
+ * not free the parent's pages (see process_cleanup_elf_pages and
+ * the process_reclaim/process_destroy guards).
+ *
+ * The tail (fs_base, signal state, cwd, fd copy, frame, brk, pgrp,
+ * parent_pid) matches sys_fork's tail deliberately: those are PCB
+ * fields, not address-space pages, and the child needs them before
+ * it execs.  Skipping them would leave the child with fs_base == 0
+ * and fault at CR2 = 0 on its first TLS access, exactly the failure
+ * sys_fork's comment documents.
+ *
+ * The parent block uses the console_read/pipe block idiom: set
+ * state=BLOCKED under cli, dequeue, sti, process_yield, reset
+ * state=RUNNING on resume.  No hand-rolled scheduler_switch_to.
+ */
+long sys_vfork(void) {
+    __asm__ volatile("cli");
+
+    pcb_t* parent = process_get_current();
+    if (!parent) {
+        __asm__ volatile("sti");
+        return -(long)EAGAIN_;
+    }
+
+    pcb_t* child = process_create(parent->name, parent->entry_point, 0);
+    if (!child) {
+        __asm__ volatile("sti");
+        return -(long)EAGAIN_;
+    }
+    scheduler_ready_queue_remove(child);
+
+    /* SHARE the address space.  No EAGER_COPY_REGION calls. */
+    child->cr3          = parent->cr3;
+    child->borrows_cr3  = 1;
+    child->elf_page_list = NULL;
+    child->elf_num_pages = 0;
+
+    /* PCB state the child needs before it execs (see the header). */
+    child->fs_base    = parent->fs_base;
+    child->sig_blocked = parent->sig_blocked;
+    child->sig_pending = 0;
+    for (int _i = 0; _i < 64; _i++) {
+        child->signal_handler[_i]  = parent->signal_handler[_i];
+        child->signal_restorer[_i] = parent->signal_restorer[_i];
+    }
+    {
+        size_t _i = 0;
+        while (parent->cwd[_i] && _i < sizeof(child->cwd) - 1) {
+            child->cwd[_i] = parent->cwd[_i];
+            _i++;
+        }
+        child->cwd[_i] = '\0';
+    }
+
+    user_syscall_clear_file_table(child);     
+     
+    for (int _fd = 0; _fd < MAX_PROCESS_FILES; _fd++) {
+        file_slot_t* _slot = (file_slot_t*)parent->file_table[_fd];
+        if (!_slot) continue;
+        __atomic_fetch_add(&_slot->refcount, 1, __ATOMIC_SEQ_CST);
+        child->file_table[_fd] = _slot;
+    }
+
+    /*
+     * Build the child's iretq-resume frame from the parent's current
+     * syscall-entry frame.  This sets the child's %rax to 0, which is
+     * how fork() signals "you are the child" to user code.
+     */
+    process_fork_copy_frame(child, parent);
+    /*
+     * Child inherits the parent's heap break so its brk region starts
+     * where the parent's was.  The pages themselves are now copied
+     * (see the eager-copy block above), so writes to the brk region
+     * in either process no longer alias.
+     */
+    child->brk_virt = parent->brk_virt;
+
+    /* POSIX: a fork child inherits the parent's process group (only a
+     * session leader gets a new one).  Without this, every forked child
+     * stayed in its own group (process_create sets pgrp = pid), so a ^C
+     * or ^Z to the shell's foreground group never reached the pipeline
+     * children: the pool walk showed four zombies with pgrp == pid, and
+     * the ^C print fg=<shell group> matched none of them.  The wait4
+     * parent then blocked forever and the console stalled. */
+    child->pgrp = parent->pgrp;
+    /* Apply a deferred setpgid the parent issued before we
+     * created this child.  See sys_setpgid. */
+    extern struct deferred_setpgid g_defer_pgid[16];
+    for (int _i = 0; _i < 16; _i++) {
+        if (g_defer_pgid[_i].pid == (long)child->pid) {
+            child->pgrp = (uint64_t)g_defer_pgid[_i].pgid;
+            g_defer_pgid[_i].pid = 0;
+            g_defer_pgid[_i].pgid = 0;
+            break;
+        }
+    }
+    child->parent_pid = parent->pid;
+    child->state = PROC_STATE_READY;
+    scheduler_ready_queue_add(child);
+
+    /*
+     * Block the parent until the child execs or exits (true vfork
+     * semantics).  The block is set under the cli this function
+     * opened with; the dispatch goes through process_yield ->
+     * scheduler_switch_to, which does its own cli and tail check.
+     *
+     * docs/contract.md: #1/#2 state write + dequeue under cli.
+     * #3 voluntary block, the dispatcher's tail does the restore.
+     * #4 through process_yield, no direct current_process write.
+     * #5 no async writer in this commit -- process_wake_all_blocked
+     *    skips block_kind != BLOCK_KIND_NONE, so the tick does not
+     *    wake us; the child's exec/exit is the only waker, and that
+     *    is not wired yet.  So vfork currently blocks forever; that
+     *    is the expected result of this commit, not a bug.
+     * #6 the child shares our cr3; borrows_cr3 (set below, before
+     *    the child can run) makes its exit skip the frees.
+     */
+    parent->state      = PROC_STATE_BLOCKED;
+    parent->block_kind = BLOCK_KIND_VFORK;
+    parent->wait_pid   = child->pid;
+    /*
+     * Save the live caller-saved GPRs before yielding.
+     *
+     * context_switch.asm's ring-0 save path persists only the
+     * six callee-saved GPRs; on resume it loads all 15 from the
+     * PCB, so rax..r11 come from whatever is in the PCB slots.
+     * Every other block site in this file (console_read, pipe
+     * read, pipe write) writes those slots from the live
+     * registers before process_yield.  sys_vfork did not, so a
+     * vfork parent resumed with rax..r11 zeroed and ran the
+     * rest of sys_vfork on that register file.  V1 fix; see
+     * handoff.md, NEXT item 1.
+     */
+    __asm__ volatile("movq %%rax, %0" : "=m"(parent->rax) :: "memory");
+    __asm__ volatile("movq %%rcx, %0" : "=m"(parent->rcx) :: "memory");
+    __asm__ volatile("movq %%rdx, %0" : "=m"(parent->rdx) :: "memory");
+    __asm__ volatile("movq %%rsi, %0" : "=m"(parent->rsi) :: "memory");
+    __asm__ volatile("movq %%rdi, %0" : "=m"(parent->rdi) :: "memory");
+    __asm__ volatile("movq %%r8,  %0" : "=m"(parent->r8)  :: "memory");
+    __asm__ volatile("movq %%r9,  %0" : "=m"(parent->r9)  :: "memory");
+    __asm__ volatile("movq %%r10, %0" : "=m"(parent->r10) :: "memory");
+    __asm__ volatile("movq %%r11, %0" : "=m"(parent->r11) :: "memory");
+    scheduler_ready_queue_remove(parent);
+    __asm__ volatile("sti");
+    process_yield();
+    /* Resumed by the child's exec/exit wake. */
+    parent->state = PROC_STATE_RUNNING;
+    /*
+     * Clear the block state.  process_wake_all_blocked skips any
+     * process whose block_kind != BLOCK_KIND_NONE, so a parent that
+     * left BLOCK_KIND_VFORK set on resume would never be woken by
+     * the 100 Hz tick for any later block.  wait_pid likewise: it
+     * names the child of the vfork that has now exec'd or exited.
+     * (V2 fix; see handoff.md, NEXT item 1.)
+     */
+    parent->block_kind = BLOCK_KIND_NONE;
+    parent->wait_pid   = 0;
+
+    return (long)child->pid;
+}
+
 long sys_fork(void) {
     __asm__ volatile("cli");
 
@@ -11906,21 +13006,29 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_NANOSLEEP:       result = (uint64_t)sys_nanosleep((const void*)arg0, (void*)arg1); break;
         case SYS_GETPID:          result = (uint64_t)sys_getpid(); break;
         case SYS_FORK:            result = (uint64_t)sys_fork(); break;
+        case SYS_VFORK:           result = (uint64_t)sys_vfork(); break;
         case SYS_EXECVE:          result = (uint64_t)sys_execve((const char*)arg0, (char**)arg1, (char**)arg2); break;
         case SYS_EXIT:            sys_exit((int)arg0); result = 0; break;
-        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2); break;
+        case SYS_WAIT4:           result = (uint64_t)sys_wait4((long)arg0, (int*)arg1, (int)arg2, (void*)arg3); break;
+        case SYS_TIMES:           result = (uint64_t)sys_times((void*)arg0); break;
+        case SYS_GETRUSAGE:       result = (uint64_t)sys_getrusage((int)arg0, (void*)arg1); break;
         case SYS_KILL:            result = (uint64_t)sys_kill((long)arg0, (int)arg1); break;
         case SYS_SETPGID:         result = (uint64_t)sys_setpgid((long)arg0, (long)arg1); break;
         case SYS_GETPGRP:         result = (uint64_t)sys_getpgrp(); break;
         case SYS_GETPGID:         result = (uint64_t)sys_getpgid((long)arg0); break;
         case SYS_UNAME:           result = (uint64_t)sys_uname((void*)arg0); break;
         case SYS_FCNTL:           result = (uint64_t)sys_fcntl((int)arg0, (int)arg1, (unsigned long)arg2); break;
+        case SYS_FLOCK:           result = (uint64_t)sys_flock((int)arg0, (int)arg1); break;
+        case SYS_FSYNC:           result = (uint64_t)sys_fsync((int)arg0); break;
+        case SYS_FDATASYNC:       result = (uint64_t)sys_fdatasync((int)arg0); break;
         case SYS_FTRUNCATE:       result = (uint64_t)sys_ftruncate((int)arg0, (long)arg1); break;
         case SYS_GETCWD:          result = (uint64_t)sys_getcwd((char*)arg0, (unsigned long)arg1); break;
         case SYS_CHDIR:           result = (uint64_t)sys_chdir((const char*)arg0); break;
         case SYS_RENAME:          result = (uint64_t)sys_rename((const char*)arg0, (const char*)arg1); break;
         case SYS_MKDIR:           result = (uint64_t)sys_mkdir((const char*)arg0, (int)arg1); break;
+        case SYS_UMASK:           result = (uint64_t)sys_umask((int)arg0); break;
         case SYS_RMDIR:           result = (uint64_t)sys_rmdir((const char*)arg0); break;
+        case SYS_LINK:            result = (uint64_t)sys_link((const char*)arg0, (const char*)arg1); break;
         case SYS_UNLINK:          result = (uint64_t)sys_unlink((const char*)arg0); break;
 
         case SYS_SYMLINK:         result = (uint64_t)sys_symlink((const char*)arg0, (const char*)arg1); break;
@@ -11940,8 +13048,11 @@ uint64_t syscall_dispatch(uint64_t num,
 
         case SYS_PRCTL:           result = (uint64_t)sys_prctl((int)arg0, (unsigned long)arg1, 0, 0, 0); break;
         case SYS_ARCH_PRCTL:      result = (uint64_t)sys_arch_prctl((int)arg0, (void*)arg1); break;
+        case SYS_SYNC:            result = (uint64_t)sys_sync(); break;
         case SYS_GETDENTS64:      result = (uint64_t)sys_getdents64((int)arg0, (void*)arg1, (size_t)arg2); break;
         case SYS_SET_TID_ADDRESS: result = (uint64_t)sys_set_tid_address((int*)arg0); break;
+        case SYS_GETTIMEOFDAY:    result = (uint64_t)sys_gettimeofday((void*)arg0, (void*)arg1); break;
+        case SYS_TIME:            result = (uint64_t)sys_time((void*)arg0); break;
         case SYS_CLOCK_GETTIME:   result = (uint64_t)sys_clock_gettime((int)arg0, (void*)arg1); break;
         case SYS_EXIT_GROUP:      sys_exit((int)arg0); result = 0; break;
         case SYS_TGKILL:          result = (uint64_t)sys_tgkill((long)arg0, (long)arg1, (int)arg2); break;
@@ -11955,6 +13066,7 @@ uint64_t syscall_dispatch(uint64_t num,
         case SYS_UTIMENSAT:       result = (uint64_t)sys_utimensat((int)arg0, (const char*)arg1, (const void*)arg2, (int)arg3); break;
         case SYS_GETRANDOM:       result = (uint64_t)sys_getrandom((void*)arg0, (size_t)arg1, (unsigned int)arg2); break;
         case SYS_RSEQ:            result = (uint64_t)sys_rseq((void*)arg0, (uint32_t)arg1, (int)arg2, (uint32_t)arg3); break;
+        case SYS_SCHED_GETAFFINITY: result = (uint64_t)sys_sched_getaffinity((int)arg0, (size_t)arg1, (void*)arg2); break;
 
         /* --- donix-private numbers (500+) --- */
         case SYS_REBOOT:          kernel_do_reboot(); result = 0; break;

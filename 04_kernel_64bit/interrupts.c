@@ -57,6 +57,28 @@ extern volatile uint64_t g_arch_prctl_addr[32];
 static volatile long g_console_sig_pgrp = 0;
 static volatile long g_console_sig_no   = 0;
 
+/*
+ * console_request_sigint: deferred ^C from a NON-IRQ caller (the serial
+ * RX path in keyboard.c).  Same effect as irq1_handler's ^C branch:
+ * record the target pgrp and signal; the next timer tick's
+ * console_raise_pending() sets sig_pending on every non-shell member
+ * of that pgrp.  NO sys_kill here -- kbd_buffer_get_mux runs under cli
+ * (console_read disables interrupts around the call), and sys_kill can
+ * context-switch, which is fatal under cli and was the proven post-^C
+ * IRQ1 lockup.  One delivery mechanism, not two.
+ */
+void console_request_signal(long fg, int sig) {
+    if (fg > 1 && sig > 0) {
+        g_console_sig_pgrp = fg;
+        g_console_sig_no   = sig;
+    }
+}
+
+/* Kept for existing callers; equivalent to console_request_signal(fg,2). */
+void console_request_sigint(long fg) {
+    console_request_signal(fg, 2);
+}
+
 void console_raise_pending(void) {
     long pgrp, sig;
     pgrp = g_console_sig_pgrp; sig = g_console_sig_no;
@@ -451,6 +473,11 @@ static void dump_user_stack_window(uint64_t fault_rsp, uint64_t fault_cs) {
    normal prototype. Not done yet. */
 uint64_t __attribute__((noinline))
 timer_preempt_handler(uint64_t stack_pointer) {
+    /* Serial ^C: drain the UART into the RX ring every tick and
+     * raise SIGINT on a 0x03, even when no process is reading.
+     * Before console_raise_pending so a ^C seen this tick is
+     * delivered this tick. */
+    { extern void serial_tick_poll(void); serial_tick_poll(); }
     { extern void console_raise_pending(void); console_raise_pending(); }
     g_ticks++;
     /*

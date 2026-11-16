@@ -389,6 +389,63 @@ uint64_t vmm_clone_page_table(uint64_t src_cr3) {
     return new_pml4_phys;
 }
 
+/*
+ * Build the address space a freshly exec'd vfork child runs on:
+ * every kernel mapping preserved, no user mappings.
+ *
+ * It is vmm_clone_page_table followed by unmapping the four user
+ * ranges.  The clone is what keeps the kernel mappings -- including
+ * the low 2 MB identity map vmm_init installs at PML4 index 0, which
+ * the fault handler and early boot structures live in.  An earlier
+ * version of this function built a PML4 with an empty low half and
+ * dropped that identity map; the child's first kernel access then
+ * faulted, the fault handler faulted in turn, and the machine
+ * triple-faulted and reset.  The clone-then-clear shape is the fix.
+ *
+ * The user pages cleared here are the parent's physical pages (the
+ * child borrowed them); the PTEs are zeroed but the pages are NOT
+ * freed -- the parent still owns them.  elf_load_into_process then
+ * fills the low half with the new image.
+ *
+ * stack_virt..stack_top and [0x8000200000, brk_virt) are the dynamic
+ * ranges, passed by the caller (sys_execve knows them from the pcb).
+ * The ELF (0x400000-0x600000) and mmap (0x8010000000-0x8010400000)
+ * ranges are fixed.
+ *
+ * Returns the new cr3, or 0 if the clone failed.
+ */
+uint64_t vmm_create_address_space(uint64_t src_cr3,
+                                  uint64_t stack_virt, uint64_t stack_top,
+                                  uint64_t brk_virt) {
+    uint64_t new_cr3 = vmm_clone_page_table(src_cr3);
+    if (!new_cr3) return 0;
+
+    /* Fixed user ranges. */
+    const struct { uint64_t start, end; } fixed[] = {
+        { 0x0000000000400000ULL, 0x0000000000600000ULL },  /* ELF    */
+        { 0x0000008010000000ULL, 0x0000008010400000ULL },  /* mmap   */
+    };
+    for (size_t r = 0; r < sizeof(fixed)/sizeof(fixed[0]); r++) {
+        for (uint64_t va = fixed[r].start; va < fixed[r].end; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
+        }
+    }
+
+    /* Dynamic user ranges, if the caller supplied them. */
+    if (stack_virt && stack_top && stack_top > stack_virt) {
+        for (uint64_t va = stack_virt; va < stack_top; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
+        }
+    }
+    if (brk_virt > 0x0000008000200000ULL) {
+        for (uint64_t va = 0x0000008000200000ULL; va < brk_virt; va += 0x1000) {
+            vmm_unmap_page_in_cr3(new_cr3, va);
+        }
+    }
+
+    return new_cr3;
+}
+
 uint64_t vmm_get_phys_from_cr3(uint64_t cr3, uint64_t virt) {
     uint64_t* pml4 = (uint64_t*)phys_to_virt(cr3);
     uint32_t pml4_idx = (virt >> 39) & 0x1FF;

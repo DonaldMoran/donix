@@ -3817,6 +3817,7 @@ FRESULT f_open (
 
 	if (res == FR_OK) {
 		fp->obj.fs = fs;
+		fp->timeset = 0;
 		dj.obj.fs = fs;
 		INIT_NAMEBUFF(fs);
 		res = follow_path(&dj, path);	/* Follow the file path */
@@ -4291,11 +4292,12 @@ FRESULT f_sync (
 					dir[DIR_Attr] |= AM_ARC;					/* Set archive attribute to indicate that the file has been changed */
 					st_clust(fp->obj.fs, dir, fp->obj.sclust);	/* Update file allocation information  */
 					st_32(dir + DIR_FileSize, (DWORD)fp->obj.objsize);	/* Update file size */
-					st_32(dir + DIR_ModTime, GET_FATTIME());	/* Update modified time */
+					if (!fp->timeset) st_32(dir + DIR_ModTime, GET_FATTIME());	/* Update modified time */
 					st_16(dir + DIR_LstAccDate, 0);				/* Invalidate last access date */
 					fs->wflag = 1;
 					res = sync_fs(fs);							/* Restore it to the directory */
 					fp->flag &= (BYTE)~FA_MODIFIED;
+					fp->timeset = 0;
 				}
 			}
 		}
@@ -5447,6 +5449,62 @@ FRESULT f_chmod (
 /*-----------------------------------------------------------------------*/
 /* API: Change Timestamp                                                 */
 /*-----------------------------------------------------------------------*/
+
+FRESULT f_settime (
+	FIL* fp,			/* Open file whose directory entry to stamp */
+	const FILINFO* fno	/* Timestamp to be set (fdate/ftime) */
+)
+{
+	FRESULT res;
+	FATFS *fs;
+
+	res = validate(&fp->obj, &fs);
+	if (res != FR_OK) LEAVE_FF(fs, res);
+	if (fp->obj.attr & AM_DIR) LEAVE_FF(fs, FR_INVALID_NAME);
+
+	res = move_window(fs, fp->dir_sect);
+	if (res == FR_OK) {
+		BYTE *dir = fp->dir_ptr;
+		if (fno->fdate) {
+			st_32(dir + DIR_ModTime, (DWORD)fno->fdate << 16 | fno->ftime);
+			st_16(dir + DIR_LstAccDate, 0);
+		}
+		fs->wflag = 1;
+		res = sync_fs(fs);
+		if (res == FR_OK) fp->timeset = 1;
+	}
+	LEAVE_FF(fs, res);
+}
+
+/*-----------------------------------------------------------------------*/
+/* API: Synchronize a Specific Volume                                    */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_sync_volume (
+	FATFS* fs
+)
+{
+	if (!fs || !fs->fs_type) return FR_INVALID_OBJECT;
+	return sync_fs(fs);
+}
+
+/*-----------------------------------------------------------------------*/
+/* API: Synchronize All Mounted Volumes                                  */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_syncfs (void)
+{
+	FRESULT res = FR_OK;
+	UINT i;
+	for (i = 0; i < FF_VOLUMES; i++) {
+		FATFS *fs = FatFs[i];
+		if (fs && fs->fs_type) {
+			FRESULT r = sync_fs(fs);
+			if (r != FR_OK && res == FR_OK) res = r;
+		}
+	}
+	return res;
+}
 
 FRESULT f_utime (
 	const TCHAR* path,	/* Pointer to the file/directory name */

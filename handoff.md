@@ -5,119 +5,229 @@ This file is rewritten fresh each session; it does not accumulate.
 Reference material lives in `docs/` and is **not needed to start a
 session** -- ask for it when the current task needs it.
 
-**Last updated:** 2026-11-03, documentation pass for `v0.6.19`.
-**`v0.6.18` is the last pushed release; nothing was pushed.** `dev` =
-`d69c2ab` plus the uncommitted docs edits (ahead of `origin/dev` by
-100 before the edits). `origin/dev` = `799e98f` = `v0.6.18`. No
-stashes. Build green. `canary --full` 28/28 and `test.sh` 57/57 at
-`d69c2ab` (clean rebuild, no probes). Two scratch tags from the
-2026-11-03 tar session: `20261103-tar-dirflush` (`a0664a8`) and
-`20261103-tar-padding` (`d69c2ab`).
+**Last updated:** 2026-11-16 (eleventh session), at `201fac1`.
+**`v0.6.19` is the last pushed release** (annotated tag `v0.6.19` =
+commit `ba56b3d`). `dev` is at `201fac1`; recent history is
+`201fac1`, `a6b5511`, `a60f3c9`, `f4dd5ee`, `04e584b`.
+`origin/dev` = `ba56b3d`. Ahead **92**, **clean**, **no stash**,
+**35 scratch tags**. No push, no release this session; banner still
+`v0.6.19`. `main` = `7e4748b`.
 
-**WHERE WE ARE.** The 2026-11-03 session fixed **busybox `tar`**.
-It was two bugs, both in vendored FatFs, both the same class: **state
-staged in `fs->win` is not flushed before something else moves the
-window.** `move_window()` is a no-op when `fs->winsect` already
-equals the requested sector even if `fs->win` holds something else.
+**Scratch tags: 35, all annotated, all preserved, none pushed.**
+Newest first: `20261116-rtc-tz-honest` on `201fac1`,
+`20261116-path-export` on `a6b5511`,
+`20261107-handoff-logname` on `a60f3c9`,
+`20261107-logname-env` on `f4dd5ee`,
+`20261106-handoff-sync-fsync` on `04e584b`,
+`20261106-busybox-sync-fsync` on `6d14dc9`,
+`20261106-sys-sync-fsync` on `f49c392`,
+`20261106-fil-timeset` on `1a737e2`,
+`20261106-kbd-drop-dead-ctrlz` on `f89f494`,
+`20261106-serial-ctrlsz` on `446e3a0`,
+`20261106-run-telnet-lan` on `d6969ea`,
+`20261106-serial-ctrlc-ring` on `5575868`,
+`20261106-sweep-socket-serial` on `fc10881`,
+`20261106-sys-execve-no-elf-noise` on `0b07cd8`,
+`20261106-open-issues-tz` on `f6dd91a`,
+`20261106-rtc-localtime` on `d9df0bc`,
+`20261106-open-issues-touch-d-fresh`, `20261106-ata-flush-cache`,
+`20261106-get-fattime`, `20261106-handoff-rtc`,
+`20261106-rtc-time-syscalls` on `9d7b5d3`,
+`20261106-rtc-read` on `1479723`, `20261106-handoff-rewrite`,
+`20261106-open-issues-fr-no-file`,
+`20261106-busybox-coreutils-config` on `23e37bb`,
+`20261106-coreutils-sweep` on `2d267da`,
+`20261106-f-utime` on `5ccf862`, `20261106-sys-link` on `b19a0ab`,
+`20261106-fat-rename-replace` on `6651be4`,
+`20261106-sys-fdatasync` on `e31395f`,
+`20261106-sys-flock` on `4ca001d`,
+`20261106-sys-sched-getaffinity` on `3cade3f`,
+`20261106-wait4-rusage` on `b514b78`,
+`20261106-sys-execve-cr3` on `6406106`,
+`20261104-gettimeofday-time` on `5a3b65e`.
 
-1. **`a0664a8` (`20261103-tar-dirflush`)** -- `f_open`: `dir_register`
-   stages the new directory entry into `fs->win` via `dj.dir` but
-   does not flush it. A later `f_open`/`f_read`/`f_write` on the same
-   volume calls `move_window`, reloads `fs->win`, and the staged name
-   is discarded; the close-time `sync_window` then writes the **old**
-   sector back over the entry. Fix: `sync_window(fs)` right after
-   `dir_register` succeeds in `f_open`, while `dj.dir` is valid.
-2. **`d69c2ab` (`20261103-tar-padding`)** -- `f_write`: the
-   cluster-boundary code above the **direct-write branch** sets the
-   new FAT link in `fs->win` (`wflag=1`), but the direct branch
-   writes data sectors from the caller's buffer and `continue`s
-   without flushing. A later `create_chain`'s `move_window` is a
-   no-op if `winsect` already equals the FAT sector, the chain read
-   is stale, `create_chain` returns 1, `ABORT(FR_INT_ERR)` sets
-   `FIL.err=2` -- **sticky** -- and every later `f_write` fails. That
-   made tar's end-of-archive padding write return short:
-   `write error: I/O error` on create, `short read` on list/extract.
-   Fix: `sync_window(fs)` before the direct `disk_write`.
+`1a737e2` (the `FIL.timeset` fix) is tagged `20261106-fil-timeset`.
+It is in the `v0.6.20` summary source. **The tag count is 35, not the
+32/27 the previous revisions recorded** -- prior sessions' counts had
+drifted. The authoritative number at release time is
+`git tag --list '2026*' | wc -l`; do not copy a number from this
+file.
 
-Both verified on a clean rebuild: `canary --full` 28/28,
-`test.sh` 57/57, full `tar -cvf` / `-tvf` / `-xvf` round trip
-**silent with `rc=0`** and matching contents (3072-byte archive for
-two small members; 2048 for one), and the six-line redirect/tar
-matrix green. **Directory members work too:** `tar -cvf dir.tar
-a.txt b.txt src` (with `src/c.txt`) creates a 4608-byte archive
-listing `src/` as `drwxr-xr-x`, and `tar -xvf` recreates the tree
-with matching contents and `rc=0`. One cosmetic warning remains on
-extract -- see NEXT item 4.
+**Stash:** none.
 
-The prior session (2026-11-02) closed the `exec_churn`
-performance issue (ATA PIO data port, `rep insw`/`rep outsw`) and
-the `sys_fork` eager-copy issue (byte loop -> `rep movsb`); see
-the 2026-11-02 commits list under "State on disk".
+---
 
-**NEXT -- highest-value work.**
-1. **`docs/open-issues.md` item 10 -- SSE save/restore.**
-   `CR4.OSFXSR` is set but the kernel saves no SSE state;
-   userland is pinned to `-mno-sse*` as a stopgap. The fix is
-   `fxsave`/`fxrstor`/`xsave` in `context_switch.asm` and the
-   interrupt path, then remove the `-mno-sse*` flags from the
-   userland build. One commit, one test. The risky part is
-   alignment of the save region and any latent SSE use in the
-   kernel once `-mno-sse` is dropped from kernel CFLAGS (do not
-   drop the kernel's flags in the same commit as the userland
-   flags -- kernel SSE and userland SSE are two separate
-   decisions).
-2. **`docs/open-issues.md` item 9 -- the privilege model.**
-   uid/gid are 0 for every process; no per-process uid/euid
-   split, no setuid, no `chown`. The item lists the shape:
-   `setuid`/`seteuid` (105/117), a setuid-root marker on a
-   FAT-hostile filesystem (magic-marker, same shape as item 8),
-   a `sudoers` equivalent, then 102/104/107/108/115 return 1000
-   with root as an escalation.
+## START HERE
 
-   **NOTE FOR THE NEXT SESSION BEFORE STARTING ITEM 2.** Item 9
-   is the second-biggest numbered item, not a thing donix needs
-   right now. There is no current user-facing feature it
-   unlocks: every binary on the image is built here, there is no
-   network service, no multi-user login, and no applet in
-   `test.sh` that behaves differently as non-root. The cost is
-   real -- every filesystem syscall grows a permission check,
-   the five identity syscalls flip from 0 to 1000 together (and
-   `tar -x`/`ps`/`whoami` output changes with them), `chmod`/
-   `chown` become real (which means FAT needs a mode store or a
-   side-channel), and the setuid marker is security-relevant in
-   a way item 8's symlink marker is not. **Before starting item
-   9, ask what it unlocks that will be used soon.** If the
-   answer is "nothing in the near term," pick one of the
-   visible-payoff items instead: real FatFs timestamps,
-   `gettimeofday` (96) / `time` (201), or SSE (item 10). Item 9
-   is a multi-session project and is correctly deferred until
-   there is a reason for it.
-3. **`umask` is unimplemented (syscall 95).** `mkdir -p` fails
-   with `Unknown syscall: 95` and then mis-creates; `mkdir`
-   without `-p` works. Small, self-contained, and it unblocks
-   `mkdir -p` for scripts. Candidate for a short session.
-4. **`mkdir` on an existing directory returns `EPERM` instead of
-   `EEXIST`.** Symptom: `tar -xvf` of an archive with a directory
-   member prints `tar: can't create directory 'src': Operation
-   not permitted`, even though the directory is created and the
-   tree extracts correctly (`rc=0`, contents match). Cause:
-   busybox `tar` does `mkdir`, then treats `EEXIST` as "already
-   there, fine" but warns on any other errno; the kernel's
-   `sys_mkdir` returns `-EPERM` for an existing directory.
-   Correct POSIX: `-EEXIST` when the target exists and is a
-   directory, `-ENOTDIR` when it exists as a file. Small; read
-   `sys_mkdir` before patching (not read this session). Pair it
-   with `umask` -- both are small syscall-completion fixes, both
-   unblock script-level behavior, neither touches FatFs.
+**`PATH` and the clock are both resolved; the next session is
+whatever the user picks.** `PATH` is exported (`printenv PATH` =
+`/bin:/usr/bin`). The clock is correct: the RTC epoch is honest UTC
+(`run` uses QEMU's `base=utc` default), `date` prints real US-Eastern
+(`EST5EDT,M3.2.0,M11.1.0` in `musl_sh.c`'s `default_envp`, with
+`CONFIG_FEATURE_TIMEZONE=y`), and `touch -d`/`stat` round-trip. The
+`-rtc base=localtime` flag (`d9df0bc`) was a label workaround and is
+removed. `TZ` is hardcoded US-Eastern; making it settable is open.
+See `open-issues.md`.
 
-**THE C HALT -- OPEN, NOT THE CURRENT FOCUS.** The C is
-`context_switch_resume`'s unknown-CS branch. Not observed since the
-2026-11-02 disk-path fixes (`905bc70` ATA rep-pio, `a0664a8` /
-`d69c2ab` FatFs window flush). Three clean `canary --full` runs
-before that (`873be27`, `6df4fef`, `78216bc`), and none since. That
-is evidence, not a close -- no mechanism was ever named, and the
-fault is intermittent. No C work is planned. The refuted paths below
-are still refuted.
+---
+
+## WHAT WORKS (verified 2026-11-16, at `201fac1`)
+
+- **`canary --full` 28/28.** The `printenv PATH` row now asserts
+  `PATH` **is exported** (flipped this session; the old row asserted
+  empty).
+- **`test.sh` 57/57.**
+- **`EXEC_CHURN` 24/24 ALL-PASS.**
+- **`tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5.**
+- **The clock is correct.** `date` prints real US-Eastern with the
+  right label (`Mon Nov 16 09:43:34 EST`); the boot line
+  `RTC: boot epoch = … (… UTC)` is **true** UTC (`14:44:44 UTC` for a
+  `09:44 EST` host); `touch -d '2020-01-01 12:34:56'` round-trips as
+  `12:34:56 -0500`. Three coupled changes (`201fac1`): `run` uses
+  QEMU's `base=utc` default (the `-rtc base=localtime` of `d9df0bc`
+  was a label workaround and made the epoch local-time, so `date`
+  double-subtracted); `TZ=EST5EDT,M3.2.0,M11.1.0` (the bare
+  `EST5EDT` mislabeled November as `EDT`); `CONFIG_FEATURE_TIMEZONE=y`
+  so `date`/`stat` honor `TZ`.
+- **`PATH` is exported.** `musl_sh.c`'s `default_envp` carries
+  `PATH=/bin:/usr/bin` (`a6b5511`). Mechanism: `musl_sh` is
+  `int main(void)` and builds every child's environment from
+  `default_envp`; the inherited envp (`NULL` from `kmain.c`'s initial
+  frame) is never consulted. `canary.c`'s `run_capture` gained an
+  `envp` parameter (`NULL` from the two unrelated callers).
+- **`sync` and `fsync` work.** Configs flipped on (`6d14dc9`), backed
+  by `sys_sync(162)` (iterates mounted volumes, calls `f_syncfs` and
+  `ata_flush_cache`) and `sys_fsync(74)` (`f_sync` + `f_sync_volume`).
+  Verified with `test_sync` in-guest and the automated sweep.
+- **`logname` prints `root`** (`f4dd5ee`), backed by `LOGNAME=root` in
+  `musl_sh.c` default environment. `hostid` prints `00000000` (verified
+  upstream Musl `gethostid()` behavior). Both pass the coreutils sweep.
+  The full gate, with both shell behaviors. **The `touch` row is now
+  a real `auto` row** (`rm -f /tmp/td; touch -d '2020-01-01
+  12:34:56' /tmp/td; stat -c %y /tmp/td`, asserting the
+  stat-output-only token `12:34:56.000000000`) and it **PASSes**.
+  Before `1a737e2` it was a hard-coded `xfail` that ran the command
+  and then recorded `XFAIL` regardless.
+- **`touch -d '<date>'` on a nonexistent path now round-trips**
+  (`1a737e2`). The create-then-set case in a single `touch` is
+  fixed. `touch f` (no `-d`), `touch -d` on an existing path, `vi`,
+  and `tar -xf` mtime preservation all still work.
+- **`futimens(fd, times)` works.** `sys_utimensat`'s `path == NULL`
+  branch resolves the slot's `FIL*` and calls the new `f_settime`,
+  which writes `DIR_ModTime` on the open file's entry.
+- **Serial `^C` AND `^Z` work** over UNIX socket, plain TCP, and
+  telnet. The kernel drains the UART into a 64-byte RX ring on the
+  100 Hz tick (bounded 16 bytes/tick), consumes `0x03` as SIGINT and
+  `0x1A` as SIGTSTP, and raises them through the deferred
+  `console_raise_pending` path. PS/2 `^C`/`^Z` (SDL) unchanged.
+- **`./run telnet`** = guest console on `127.0.0.1:45456`;
+  **`./run telnet-lan`** = same on `0.0.0.0:45456`, gated on
+  `DONIX_ALLOW_LAN=1`.
+- **`flock`, `shred -n 1`, `nproc`, `patch a < p`, `dos2unix`,
+  `unix2dos`, `mv x y` (replace), `ln f g` (`-EPERM` on FAT)** -- the
+  FAT-coreutils set, `23e37bb` onward.
+- **`exit` from `ash` -> `donix>` -> `busybox sh` -> ash prompt**
+  (cosmetic `sys_execve: f_open(usr/bin/BUSYBOX) -> 4` still appears).
+- **Interactive applets do NOT need `--install`**
+  (`FEATURE_SH_STANDALONE=y`).
+
+## WHAT IS BROKEN
+
+- Nothing known in the shell environment or the clock. `TZ` is
+  hardcoded US-Eastern (see `open-issues.md`); everything else here
+  is either working or recorded as open/latent in `open-issues.md`.
+
+---
+
+## THE HARNESS RULE (load-bearing)
+
+**A control byte (`^C` `0x03`, `^Z` `0x1A`) needs a byte path that
+actually delivers it to the guest UART.**
+
+- **`./run headless` (Pattern A) cannot**: `./run` pipes QEMU through
+  `tee`; an expect-pty byte never reaches the guest, and
+  `send "\003"` kills the wrapper. Plain text commands (no control
+  byte) *do* reach the guest through this path -- but not reliably,
+  and this session burned several boots on `.exp` writes that never
+  arrived. **For anything that matters, prefer `./run telnet` or a
+  UNIX socket.**
+- **`-serial stdio` cannot**: QEMU's stdin is a host tty; `^C` is
+  the tty INTR char and SIGINTs QEMU.
+- **Use one of:** `./run telnet` (easiest, loopback), `./run
+  telnet-lan` (LAN, gated), UNIX socket (`-serial unix:...` +
+  `socat -,raw,echo=0`), or plain TCP. `-,raw,echo=0` on socat is
+  load-bearing; without it `0x03` kills socat. A telnet client must
+  be in **character mode**.
+- **Ports:** 23 is not used (privileged). **1234 is the gdb stub**
+  (`-s`). donix uses 45456.
+
+**A marker on the same line as the command is not a verdict.**
+`send "sleep 100; echo __SLEPT__\r"` echoes the command line, so
+`expect __SLEPT__` matches the echo. Use the two-step form.
+
+**The same trap bit the `coreutils_sweep` `touch` row**: the shell
+echoes the command, so a `want` token that appears in the command
+line passes on the echo. The row now asserts
+`12:34:56.000000000`, which appears only in `stat -c %y` output.
+
+---
+
+## WHAT WAS REFUTED -- do NOT re-walk.
+
+**This session (the `touch -d` / `futimens` work, 2026-11-07):**
+- **`f_sync` in `f_open`** -- the previous START HERE. It was already
+  there (`ff.c` create path calls `sync_window` after
+  `dir_register`), and `touch f` (no `-d`) already worked. The
+  symptom was never "the create entry is not flushed".
+- **`fp->dir_sect = dj.sect`** (instead of `fs->winsect`). Tried,
+  built, booted, **still failed**. `dir_sect` was never wrong.
+- **"`dir_sect = 128` collides with `dd … seek=128`"** -- a
+  coincidence. `128` is the **volume-relative** sector of `::/`'s
+  root directory (`fs->dirbase`), and `diskio.c` adds the
+  `FAT_PARTITION_OFFSET` 2048 on every read/write. `etc/passwd` at
+  `132` is the same root directory, four sectors on. `128` is
+  correct.
+- **`follow_path` / `dir_sdi` parent-directory resolution.** Read in
+  full: `follow_path` sets `dp->obj.sclust` for each non-last
+  segment, `dir_sdi` takes the `clst2sect` branch for a
+  sub-directory. Both correct.
+- **The path-based `futimens`** (record the open path on the slot,
+  call `f_utime(slot->file_path)`). Never applied -- the patch
+  script's anchor did not match and it aborted. Then the real cause
+  was found, so it is unnecessary. **Do not resurrect it**: it would
+  have worked, but `f_settime` + `FIL.timeset` is smaller and does
+  not grow `file_slot_t`.
+- **`PROBE_FSYNC` / `PROBE_FUTIME_FR`** -- removed in `1a737e2`.
+  Do not re-add them.
+
+**THE PROVEN CAUSE (so it is not re-derived):** `f_settime` wrote
+`DIR_ModTime` correctly; `f_close` -> `f_sync` then re-stamped it to
+`GET_FATTIME()` because `FA_MODIFIED` is set on create (`f_open`:
+`if (mode & FA_CREATE_ALWAYS) mode |= FA_MODIFIED;`). The serial
+probe printed `cur_mod=0x50241A5C` (the 2020 stamp) and
+`new_mod=GET_FATTIME()`. **The fix is `FIL.timeset`**: set by
+`f_settime` on success, initialised to 0 in `f_open`, `f_sync`
+skips the `GET_FATTIME()` re-stamp when it is set and clears it after
+the sync. `f_utime` (path form) needs no flag -- no open `FIL`
+remains to overwrite it.
+
+**Earlier, unchanged.** Do not re-walk: `-Wl,--dynamic-linker`,
+`-fuse-ld=lld`, from-scratch `SECTIONS`, patching musl
+`static_init_tls` `base`, `busybox_unstripped` as oracle, `testme` as
+applet-set reference, `939e3ef`/`153dda9`, `time /bin/true` as
+control, `$fs_base` as per-process marker, `argv_scratch`/
+`envp_scratch`, `sh: date: not found` as a missing symlink; the
+`cli` window, signal delivery as the zeroer, `memset` as the zeroer,
+the sysret slot arithmetic, the three `exec_path` forms,
+`.bss`-not-zeroed, the auxv, `set_tid_address`'s return, mmap,
+V3/V3b register inheritance, the `efc8e08` rsp split and
+`frame_kind`, the four uncommitted scheduler guards, the
+`EXIT-REFUSE frame-CS` guard, the canary `.text` `#PF` probe stack,
+the physical-address gates on `.text` PTE zeroing, the `f91d31a`
+claim, `exec_churn`'s KVM slowness, `ata_poll_drq` spinning, the
+`perf kvm stat record` `double free`, the 2026-11-04 PTAUDIT "22
+anomalies", the empty-low-half `vmm_create_address_space`, V3/V3b
+register zeroing, `kmain.c`'s self-tests map over the ELF text page.
 
 ---
 
@@ -138,146 +248,143 @@ block, with the message inline via heredoc. **Do not paste a block
 with `cd ... || exit 1` into an interactive shell** -- the `exit`
 closes the terminal. Write to `/tmp/<name>.sh` with
 `cat > ... <<'SCRIPT_EOF'`, then run it as a **separate** paste.
-Never paste a multi-line block with trailing backslashes into an
-interactive shell. **`cd "$HOME/..."` or a literal path in the
-script, never `cd "$(dirname "$0")"` when the script is pasted --
-`$0` is the interactive shell, and the `cd` fails.** A `set -e`
-at the top of the *script* is fine; a `set -e` pasted into the
-interactive shell is a terminal-killer.
+**`cd "$HOME/..."` or a literal path in the script, never `cd
+"$(dirname "$0")"` when the script is pasted.**
 
-**Never put a destructive git command inside a block that also
-runs diagnostics.** A `git checkout -- <file>` or `git restore`
-in a block whose other lines are `git status`/`git log`/`grep` is
-a trap. If a revert is wanted, name it on its own line, say what
-it discards, and run it as its own paste.
+**A block that writes a file must actually be run as its own paste.**
+Two steps, both explicit. **And a `/tmp/<name>.sh` file may be stale
+or cleared: re-write it in the same paste that runs it, or `cat` it
+and read before running.** Durable captures go under
+`~/code/donix-backup-*` or another non-`/tmp` path.
 
-**Python edits with `count != 1` abort checks are the preferred
-edit style.** **`set -e` at the top.** **Idempotent edit scripts.**
-**Do the count check IN PYTHON (`str.count`), not with `grep`.**
-`grep -Fc` does not do multi-line matches; `grep -Fxc` requires a
-whole-line match. `str.count` is the only honest multi-line count.
+**A multi-line paste can silently skip its `python3`.** This session
+lost three boots to pastes where `cat > script` ran but the
+`python3 /tmp/script.py` line did not. **Put the apply and the
+verification in one paste**, and verify with a number: `grep -c
+'PROBE_…'` in the source, and **`strings kernel.bin | grep -c`**
+before any boot counts.
 
-**BEFORE ASSERTING A COUNT, count the occurrences in the file and
-write the expected number from that count, not from memory.**
+**Never put a destructive git command inside a block that also runs
+diagnostics.** A `git checkout -- <file>`, `git restore`, or `git
+reset --hard` in a block whose other lines are `git status`/`git
+log`/`grep` is a trap. If a revert is wanted, name it on its own
+line, say what it discards, and run it as its own paste.
 
-**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION.** Grep the
-file, confirm the count is 1 **and** the match is in the intended
-function. Anchor from the file's current bytes (`cat -A`), open
-`rb`/`wb` to preserve line endings. If an anchor aborts, **ask for
-the current bytes** -- do not guess a second anchor.
+**Python edits with `count != 1` abort checks are the preferred edit
+style.** **Idempotent edit scripts.** **Do the count check IN PYTHON
+(`str.count` / `bytes.count`), not with `grep`.** `grep -Fc` does not
+do multi-line matches; `grep -Fxc` requires a whole-line match;
+`str.count` is the only honest multi-line count. **A post-write check
+must assert the old anchor is ABSENT (`after.count(old) == 0`), and
+`new` must not re-emit `old` as a prefix.**
 
-**A post-write check string must be copied from the `new`
-literal, not retyped.**
+**Binary-safe edits for files with CRLF line endings.** `open(p,
+"rb").read()` / `open(p, "wb").write(data)` -- Python's universal-
+newline mode silently rewrites CRLF to LF on read/write, which turns
+a one-line diff into a whole-file diff. **This session's line-ending
+facts:** `04_kernel_64bit/fatfs/ff.c` and `ffconf.h` and `ff.h` are
+**CRLF**; `04_kernel_64bit/user_syscall.c` and
+`tools/coreutils_sweep.exp` are **LF**. **Check with `file` (or a
+`b"\r\n" in b` test) before every edit; do not assume.**
 
-**Ask for source you do not have.** Before patching a file it has
-not seen **in this session**, ask for it. **Before writing an
-anchor, read the file with `cat -A` and quote the bytes.**
+**NO `set -e` in a runner pasted at the prompt.** It closes the
+terminal on the non-zero exit and hides the abort message, which is
+the signal. Use `python3 /tmp/patch.py ; git diff --stat`
+(semicolon) and read the `ABORT` line. `set -e` **inside** a written
+`/tmp/*.sh` script is fine and is the preferred style for the script
+itself; it is the *runner* pasted at the prompt that must not have
+it.
+
+**A one-run diagnostic on the FAILURE path beats three guesses.**
+This session proved the point: five theories (f_sync-in-f_open,
+dj.sect, the 128 collision, follow_path, path-based futimens) were
+each wrong, and one serial probe (`cur_mod` vs `new_mod`) named the
+real cause. **Instrument, one boot, read the number.**
+
+**ANCHOR ON STRUCTURE UNIQUE TO THE TARGET FUNCTION -- AND ON A
+STATEMENT BOUNDARY, NOT A FRAGMENT INSIDE A STRING LITERAL.** Grep
+the file, confirm the count is 1 **and** the match is in the
+intended function. Anchor from the file's current bytes. If an
+anchor aborts, **ask for the current bytes -- do not guess a second
+anchor.** **When the anchor is a full paragraph, use the full
+paragraph** -- first byte to last byte. **This session's anchor
+failures were whitespace**: the `coreutils_sweep` touch row has
+**four spaces** before `""`, not one; the right way to find that out
+is `awk '{print "["$0"]"}'` or a Python `repr`, not memory.
 
 **The build is TWO steps.** `make -C 04_kernel_64bit
 FAT_CONFIG=single` builds the kernel; `make -C 05_boot_kernel64
-hdd-single.img` builds the image. Running only the second copies
-a STALE `kernel.bin`. Always run both, and verify the mtime chain
+hdd-single.img` builds the image. Running only the second copies a
+STALE `kernel.bin`. Always run both, and verify the mtime chain
 `source` < `.o` < `kernel.elf` < `kernel.bin` < `hdd-single.img`.
-**After a session of probe edits and reverts, run a full
-`make clean` before the next behavioral test** -- per-file `rm`
-is not enough when multiple files were patched.
+**`make: Nothing to be done` after editing a header means the object
+was not rebuilt -- run `make -C 04_kernel_64bit clean` first.**
+**After a session of probe edits and reverts, run a full `make
+clean` before the next behavioral test.**
 
-**The patch-script write changes the mode of the file it writes.**
-A Python `open(..., "wb")` or `os.replace` drops the `+x` bit
-that the file had. `78216bc`'s follow-up `ea4dc2e` restored
-`user_syscall.c` from 100644 to 100755 for exactly this reason.
-If a patched file was executable, `chmod +x` it back, or commit
-the mode change as its own explicit commit -- do not leave a
-mode change hidden inside a content commit.
+**The patch-script write changes the mode of the file it writes in
+some environments.** Verify `stat -c '%a'` before and after every
+patch script; if the mode is not `644` on a tracked file, `chmod
+644` as its own paste before staging.
 
-**`nm` output moves between builds.** Re-run `nm` before using
-any address.
+**`nm` output moves between builds.** Re-run `nm` before using any
+address. **And the symbol at an address may be the *next* symbol,
+not the function the address is in** -- the first symbol `<=` the
+address is the enclosing function; the first `>=` is the *next*
+function. Verify both.
 
-**A diagnostic on the SUCCESS path is noise. A diagnostic on
-the FAILURE path is signal.** `SW2-*`, `HEAP_TRACE_MERGE`, the
-`HEAP: corrupt` prints, and `heap_validate`'s check prints are
-success-or-transient-path; they are gated. The refuse lines
-(`SWITCH-DEAD`, `YIELD-REFUSE`, `SWITCH-REFUSE`, `EXIT-REFUSE`)
-and the `C` report are failure-path (kept).
+**gdb printf with no per-process marker is not evidence about a
+process.** `%rsp` is the same VA in every process; `$fs_base` is the
+same VA in every busybox process. **Print `pid` or `CR3` at every
+hit, or the lines are cross-process and the inference is invalid.**
+This is the single most expensive mistake this project has made.
 
 **Test harness.** `./run` (no arg) = clean rebuild + fresh
 `hdd-single.img` + `-enable-kvm -cpu host -display sdl`, no freeze,
 gdb stub on `:1234`, `capture.txt` written (overwritten each run --
 **copy it aside after any failure or pass you want to keep**).
-`./run debug` adds `-S` (frozen at reset). **`./run tcg` /
-`./run tcg-debug`** = the same flow in TCG (`-cpu max`, no
-`-enable-kvm`). The Makefile run targets also use `-cpu max` + TCG
--- **state which launcher was used.** Default cwd `/root` (prompt
-`~`).
+`./run debug` adds `-S`. **`./run tcg` / `./run tcg-debug`** = TCG
+(`-cpu max`, no `-enable-kvm`). **`./run telnet` / `./run
+telnet-lan`** = console on `127.0.0.1:45456` / `0.0.0.0:45456`
+(LAN gated by `DONIX_ALLOW_LAN=1`). Default cwd `/root`.
+
+**Writing a new `expect` harness:** `docs/expect-harness.md` has the
+two spawn patterns, the two verdict-pattern rules, the
+`-no-shutdown` shutdown rule, the capture rule, the control-byte
+transport rule, and the `./run telnet` note. Read it before writing
+a `.exp`; `tools/gate.exp` and `tools/coreutils_sweep.exp` are
+worked examples.
 
 **In-guest gate.** `cd /`, then `canary --full` (28/28) and
-`/root/scripts/test.sh` (57/57). **Use multiple `^Z`/`fg` cycles.**
-One is not always enough to reach an intermittent fault; several
-reliably do.
+`/root/scripts/test.sh` (57/57). **Plus the two shell tests:**
+`sleep 100` then `^C` returns the prompt; `sleep 100` then `^Z` stops
+it and `jobs`/`fg` work; `exit` from `ash` -> `donix>` ->
+`busybox sh` -> the ash prompt. **`--install -s /bin` is needed only
+if a test execs an applet by path**; interactive applet use does not
+require it.
 
-**`perf kvm stat` is the way to count VM-Exits.** `sudo dnf
-install -y perf` on the Fedora host. Two terminals: guest runs
-the test; host runs `sudo perf kvm stat record -a sleep 15`, then
-`sudo perf kvm stat report` (`q` to quit the pager), then
-`rm -f perf.data.guest`. The report names `io`, `npf`,
-`interrupt`, `vintr`, `idle-halt`. **An `io`-dominated report
-does not mean "port I/O is slow"; it means "the guest is doing
-port I/O on a hot path."** The 2026-11-02 session spent hours
-chasing that to the console before finding the ATA data port.
-Read the guest source before reading the exit reason.
-
-**On Fedora 44, `perf kvm stat record` aborts with `double free
-or corruption (!prev)` in cleanup, after writing `perf.data.guest`.**
-The capture is complete and `perf kvm stat report` on it works.
-The abort is in `kvm_events_record()` (it `strdup`s `rec_argv`
-entries and frees them after `parse_options()` reorders `argv`),
-not in the guest and not in the kernel. Do not chase it as a
-donix issue. If `report` also aborts on the same host, use
-`sudo perf kvm stat live` as the workaround. The `perf.data*`
-files are now in `.gitignore` (`e52bd2f`).
-
-**GDB over `-s` has no types** (`kernel.elf` is built WITHOUT
-`-g`). Use raw offsets: `pid` 0x000, `name` 0x008, `state` 0x028,
-`cr3` 0x030, `entry_point` 0x038, `kernel_stack_virt` 0x048,
-`kernel_stack_top` 0x050, `rsp` 0x110, `rip` 0x118, `next` 0x120,
-`prev` 0x128, `block_kind` 0x158. `sizeof(pcb_t)` = 0x618.
-**CONSIDER BUILDING WITH `-g`.**
-
-**gdb write watchpoint is safe for the canary `.text` `#PF`.** The
-"do not use gdb" applies to timing-sensitive repro (gdb-at-fault
-masks the race). A **write watchpoint** on the physical or virtual
-PTE does not mask it.
-
-**Do not** `git reset --hard` without stashing; **do not** edit
-`third_party/`; **do not** commit `kmain.c`'s `pit_init` knob -- the
-committed value is 100; **do not** call a race closed on one clean
-run.
-
-**Do not** assume a commit fixed something because its message says
-it did. `f91d31a` claims to fix canary/pipe7e/ctrl-Z; it does not.
-`7cb26fb` claims to fix `^C`/`^Z`/nesting and DOES -- and it also
-introduces the pipe7e `#GP` (`0196d66`, `162a1d3` fixed that).
-**Test every commit before trusting its message -- and note that one
-commit can be both a fix and a regression at once.**
-
-**A handoff claim is not evidence.** The old handoff said `d1ae213` was
-green; it was not. **Re-run every repro on a fresh boot and read the
-bytes before acting.**
+**Automated gate.** `tools/gate.exp` boots `./run headless` and runs
+the three automated gates. `tools/coreutils_sweep.exp` boots the
+same and runs the FAT-coreutils sweep **plus the two shell
+behaviors**; its `^C` row uses the socket serial form. A green
+`gate.exp` is **not** the gate; a green `coreutils_sweep.exp` is.
+**Stop any manual QEMU before running either** -- both boot their own
+and collide on `hdd-single.img` and `:1234`.
 
 ---
 
 ## Releases
 
-**Before a release:** the scratch `2026MMDD-*` tags are annotated
-and are the source for the version summary. **The scratch tags
-are PRESERVED until the user decides to push to GitHub, and
-are dropped ONLY after the summary is written and reviewed by
-the user.** A session does NOT drop them on its own initiative.
+**Before a release:** the scratch `2026MMDD-*` tags are annotated and
+are the source for the version summary. **The scratch tags are
+PRESERVED until the user decides to push to GitHub, and are dropped
+ONLY after the summary is written and reviewed by the user.** A
+session does NOT drop them on its own initiative.
 
 **The release procedure** (on `dev`, pre-release):
 
-1. **Patch the docs first.** Update this file's release paragraph
-   and (optionally) `docs/version-history.md`. Commit.
+1. **Patch the docs first.** Update this file's release paragraph and
+   (optionally) `docs/version-history.md`. Commit.
 2. **Bump the version string in `kmain.c` manually** (the banner).
    Commit.
 3. **Tag** `vX.Y.Z` annotated, on `dev`, summary from the scratch
@@ -285,8 +392,7 @@ the user.** A session does NOT drop them on its own initiative.
 
        git tag -a vX.Y.Z -m "<version summary>"
 
-4. **Drop the scratch tags locally** (the tag and summary now
-   exist):
+4. **Drop the scratch tags locally** (the tag and summary now exist):
 
        for t in $(git tag --list '2026*'); do git tag -d "$t"; done
 
@@ -295,42 +401,53 @@ the user.** A session does NOT drop them on its own initiative.
        git push origin dev
        git push origin vX.Y.Z
 
-6. **Merge to `main` with `--no-ff`** (keeps the merge point in
-   `main`'s history), push, return to `dev`:
+6. **Merge to `main` with `--no-ff`**, push, return to `dev`:
 
        git checkout main
        git merge --no-ff dev -m "<version summary>"
        git push origin main
        git checkout dev
 
-Do not use `git push --tags` -- it would push the scratch tags.
-Push `vX.Y.Z` by name.
+Do not use `git push --tags` -- it would push the scratch tags. Push
+`vX.Y.Z` by name.
 
 **The GitHub push policy.** **Nothing is pushed until `vX.Y.Z` is
 ready and verified.** `origin/dev` is not force-pushed; every
 unpushed `dev` commit is intentional work. Run
 `git log --oneline origin/dev..dev | wc -l` for the current count.
 
-**Current release state.** **`v0.6.18` is the last pushed release.**
-This session is the `v0.6.19` documentation pass; the banner bump
-and tag happen only when the user says so, and **nothing is pushed
-until the user says so.** The scratch tags are preserved. Do not
-push, tag a release, or drop the scratch tags on the session's own
-initiative.
+**Current release state.** **`v0.6.19` is the last pushed release**
+(tag `v0.6.19` = `ba56b3d`, which is also `origin/dev`). `dev` is at
+`201fac1`; ahead **92**, **clean**, **no stash**, **35 scratch
+tags**. `main` = `7e4748b` (the `--no-ff` merge of `v0.6.19`). Work
+is pre-`v0.6.20`. **There is no release gate recorded for
+`v0.6.20`; if a gate is wanted it is set in this file before that
+release session, not during it. The user has said not to move to
+`v0.6.20` until they say so.**
 
 ---
 
 ## What donix is
 
-A fork of dons-os. Goal: a Unix-like OS that runs static
-musl-linked binaries on the Linux x86_64 ABI, natively. Newlib is
-gone. Userland is a tracked source tree at `userland/musl/`. Phase B
-(busybox) is well underway: the shell is interactive, pipelines and
-redirection work, job control works (`^C`, `^Z`, `jobs`, `fg`), and
-the applet set now includes `bc`, `dc`, `diff`, `du`, `awk` in
-addition to the file/text applets. **`tar` now creates, lists and
-extracts correct, well-formed archives, including directory
-members** (`a0664a8` + `d69c2ab`).
+A fork of dons-os. Goal: a Unix-like OS that runs static musl-linked
+binaries on the Linux x86_64 ABI, natively. Newlib is gone. Userland
+is a tracked source tree at `userland/musl/`. Phase B (busybox) is
+well underway: the shell is interactive, pipelines and redirection
+work, job control works (`^C`, `^Z`, `jobs`, `fg`) on both the PS/2
+and serial consoles, and the applet set includes `bc`, `dc`, `diff`,
+`du`, `awk`, `date`, `uptime`, `time`, `ed`, `patch`, `xargs`,
+`flock`, `dd`, `shred`, `timeout`, `nproc`, `less`, `more`,
+`hexedit` in addition to the file/text applets. **`tar` creates,
+lists and extracts correct archive members, including directory
+members, preserving mtime.** **`mkdir -p` works.** **`flock`,
+`fdatasync`, `sched_getaffinity`, `link` are implemented.**
+**`rename(2)` replaces on FAT (`6651be4`).** **`utimensat` writes and
+`stat` reads mtime (`5ccf862`), and a timestamp set via
+`futimens`/`f_settime` now survives `f_close` (`1a737e2`).**
+**`PATH` is exported and the clock is correct** (`a6b5511`,
+`201fac1`): `date` reports real US-Eastern with the right label, the
+RTC epoch is honest UTC, and `touch -d`/`stat` round-trip. `uptime`
+still reports seconds since boot.
 
 Full strategy: `docs/strategy.md`. Direction: `ROADMAP.md`.
 Concurrency rules: `docs/contract.md`. Open issues:
@@ -338,168 +455,68 @@ Concurrency rules: `docs/contract.md`. Open issues:
 
 ---
 
-## Where we are
-
-### Current baseline
-
-- `test.sh` **57/57** at `78216bc` (2026-11-02 very late, gate for
-  the fork commit).
-- `canary --full` **28/28** at `78216bc` (same run). The full 28-row
-  sequence, no skips.
-- `exec_churn` 24 rounds pass at `78216bc`; every round reports
-  `fork 0` (tick-quantized). See the Refuted section -- this is
-  not a measurement of the fork copy.
-- `^Z` on a foreground child -> `[1]+ Stopped`; `jobs` lists it;
-  `fg` resumes.
-- `^C` -> SIGINT reaches the foreground pgrp; the console survives
-  and the prompt returns.
-- `busybox sh` nesting -> works.
-- The C is not observed since the 2026-11-02 disk-path fixes; still
-  open -- evidence, not a close. See "THE C HALT" above.
-
-### Next -- the highest-value work
-
-1. `docs/open-issues.md` item 10 -- SSE save/restore.
-2. `docs/open-issues.md` item 9 -- the privilege model, **with the
-   note above**: no current user-facing payoff; ask what it unlocks
-   before starting it. Real FatFs timestamps, `gettimeofday`/
-   `time`, or SSE may be a better use of the next session.
-
-### Refuted -- do NOT re-walk
-
-These were discarded in earlier sessions. They are listed so a
-future session does not spend the same cycles. If any turns out
-to be a different root cause, that is a **new** hypothesis, not a
-revival of these.
-
-- **The `efc8e08` rsp/irq0_rsp split, and `frame_kind`.** Discarded
-  with the 2026-11-02 reset; not on `dev`.
-- **The four uncommitted scheduler guards** (`process_yield`
-  FRAME_IRQ0 skip, `scheduler_ready_queue_add` non-PCB guard,
-  `scheduler_switch_to` non-PCB guard, `scheduler_switch_to`
-  frame-CS validate). Discarded with the reset and the stash drop.
-- **The `EXIT-REFUSE frame-CS` guard in `process_exit`.** Discarded
-  with the reset and the stash drop.
-- **The canary `.text` `#PF` probe stack** (`[PT-CANARY]`,
-  `[PT-WP]`, `[PHDR]`/`[EHDR]`, `[UNMAP_IN_CR3]`, `[FREE_CLONE]`,
-  `[PCLAIM]`). Dropped with `stash@{1}`.
-- **The physical-address gates on `.text` PTE zeroing.** Boot
-  dependent; do not reapply without new evidence.
-- **The `f91d31a` "scheduler guards fix canary/pipe7e/ctrl-Z"
-  claim.** Disproved by running.
-- **`exec_churn`'s KVM slowness is the console / the serial poll
-  loop / the VGA cursor CRTC writes.** Refuted 2026-11-02: the
-  serial `inb` poll was commented out and `prnt` was unchanged;
-  `console_timer` measured the console at microseconds in the
-  same boot that ran `exec_churn` at 4 s; the VGA cursor patch
-  (later committed as `20261102-console-cursor-defer`) also did
-  not move `prnt`. The cost was the ATA data port in `ata.c`,
-  fixed by `rep insw`/`rep outsw`.
-- **`ata_poll_drq` spinning.** Instrumented 2026-11-02:
-  2,113 calls, 128 total spins. Not the cost.
-- **`exec_churn` can measure the `sys_fork` eager-copy cost.**
-  Refuted 2026-11-02, same session as the fork `rep movsb` commit
-  (`78216bc`). `exec_churn`'s floor is the 10 ms PIT tick; every
-  round reports `fork 0` **before and after** the fix. The byte
-  loop was ~1-3 ms per fork (below one tick), and so is the
-  `rep movsb` -- the two are indistinguishable to `exec_churn`.
-  The round totals vary between boots (`360,000 us` in the
-  handoff's baseline vs `440,000 us` at `78216bc`) because they
-  are dominated by how many rounds happened to land on 1 vs 2
-  ticks, not by the fork copy. **A sub-tick fork benchmark is
-  what the next session needs if this is ever to be measured.**
-  Do not re-walk `exec_churn` as evidence for or against a fork
-  change.
-- **The `perf kvm stat record` `double free` is a donix issue.**
-  Refuted 2026-11-02. It is a Fedora 44 `perf` bug in
-  `kvm_events_record()`'s cleanup (see "Test harness" above). The
-  capture writes and the report reads correctly. Do not chase it
-  in the kernel.
-
-### Open issues
-
-The full list is `docs/open-issues.md`. The numbered items are 9
-(no privilege model) and 10 (no SSE save/restore). The
-un-numbered items (7a, 7b, 7e, the `0x413962` `#PF`, the
-`.bss`-adjacent faults, and the small VFS/proc/pipe entries) are
-real and stay in that file; they are not in this session's NEXT.
-Read `docs/open-issues.md` before touching the VFS, fork, exec,
-or the signal paths.
-
----
-
 ## State on disk
 
 Kernel sources: `04_kernel_64bit/`. `capture.txt` is gitignored,
-overwritten each `./run` -- **copy it aside after any failure or
-pass you want to keep.**
+overwritten each `./run` -- **copy it aside after any failure or pass
+you want to keep.**
 
-**After a fresh image, one manual step:** the image stages
-`/bin/busybox` alone. To get the applet symlinks (including
-`/bin/sh`, which shebang needs), boot and run
-`/bin/busybox --install -s /bin`. The absolute path is required:
-busybox reads `/proc/self/exe` to find itself, donix has no
-`/proc/self/exe`, and it falls back to `argv[0]` -- which must
-start with `/`. This is a manual step, not part of the build.
+**`~/code/testme` is the `v0.6.19` reference tree (`ba56b3d`,
+tagged).** Known-good *boot* comparison. **Do not modify it.** Its
+busybox omits `date`/`time`/`uptime`; use `busybox --list` for the
+applet-set oracle.
+
+**Interactive applet use does NOT need `--install`.** BusyBox is
+built with `CONFIG_FEATURE_SH_STANDALONE=y`.
+
+**`--install` is needed only for path-based exec** (`#!/bin/date`,
+`execve("/bin/date")`). `/bin/sh` is staged by the build as a copy
+of busybox.
 
 **`third_party/`** is **gitignored** -- do not commit edits to it.
 `third_party/busybox/` has `busybox` (stripped) and
-`busybox_unstripped` + `.map` if a userspace symbol is ever needed.
-**`third_party/musl-install/` is gitignored and is needed for the
-build.** If it's missing after a `git clean -xdf`, copy it back from
-a working tree, or rebuild it with `toolchain/install_musl.sh`.
-`04_kernel_64bit/fatfs/ff.c` is **tracked** (not `third_party/`),
-built by the cross-GCC, and now contains **two** `sync_window` fixes
-(`a0664a8` in `f_open`, `d69c2ab` in `f_write`). Any further edit
-there must re-run the full gate (`canary --full` + `test.sh` + the
-tar round trip + the redirect/tar matrix), not just a build.
+`busybox_unstripped` (stale, different link -- **do not use as
+oracle**). `third_party/musl-install/` is gitignored and needed for
+the build. **`configs/busybox.config`** is the busybox build config.
+`third_party/busybox/.config` is a durable copy of the last-built
+config -- restore from it if `configs/busybox.config` loses a flip
+on a reset.
+
+**`toolchain/install_musl.sh` reuses `third_party/musl-src` in place
+if it is already at `v1.2.5`.** A patch applied to `musl-src`
+persists across runs.
+
+**`04_kernel_64bit/fatfs/ff.c`** is tracked and has three timestamp
+fixes now (`a0664a8` f_open flush, `d69c2ab` f_write, `1a737e2`
+`FIL.timeset`); any further edit there must re-run the full gate.
+**`ff.c` is CRLF. `ffconf.h` is CRLF. `ff.h` is CRLF.** Binary-safe
+edits only.
+
+**FAT timestamps and `TZ`.** `get_fattime()` (`diskio.c`) writes FAT
+fields from `g_ticks/100 + g_rtc_epoch_offset` **raw, no offset**;
+the TZ conversion happens on the **display** side, in `stat`/`ls`
+and `date`. So with an honest UTC epoch, `touch`/`stat` and `date`
+agree, and `touch -d` round-trips. Do not "fix" FAT by subtracting an
+offset in `get_fattime` -- that would double-count, since the display
+already applies TZ.
 
 **`~/code/saved`** -- not a baseline. Run
-`git -C ~/code/saved status --short` before any comparison; treat
-"not a baseline" as the default. It has been dirty twice.
+`git -C ~/code/saved status --short` before any comparison.
 
-**The reset baseline.** `dev` = `873be27`, tag
-`reset-baseline-873be27`. No stashes exist. `efc8e08` is not on
-`dev`; it survives as a commit object. If a future session needs
-the discarded guards, they are not in the tree -- read
-`git log --all --oneline` for `efc8e08` and the session log, but
-treat them as **refuted** per the section above.
-
-**The 2026-11-02 performance and correctness commits** (six, on
-top of `f902af6`):
-- `78216bc` `20261102-fork-rep-movsb` -- fork `EAGER_COPY_REGION`
-  `rep movsb`. **The item 1 commit.**
-- `ea4dc2e` -- `user_syscall.c` mode restore (100644 -> 100755,
-  dropped by `78216bc`'s Python write).
-- `e52bd2f` -- gitignore `perf.data*`.
-- `905bc70` `20261102-ata-rep-pio` -- the ATA fix.
-- `fdbcbc7` `20261102-console-cursor-defer` -- independent
-  improvement.
-- `5db42f2` `20261102-exec-churn-ns-timing` -- test-only.
-- `6df4fef` `20261102-console-timer` -- test-only.
-
-(`f902af6` is `20261102-handoff-rewrite`; the six above are the
-work on top of it.)
+**The reset baseline.** `dev` was reset to `873be27`, tag
+`reset-baseline-873be27`. `efc8e08` is not on `dev`; it survives as a
+commit object. Treat its guards as **refuted**.
 
 ---
 
 ## One-line summary
 
-**`v0.6.18` is the last pushed release; nothing is pushed.** The
-tree is at `d69c2ab` plus the uncommitted docs edits, no stashes,
-ahead of `origin/dev` by 100 before the edits. The **busybox `tar`
-bug is fixed in two parts**: `a0664a8` (`f_open` flushes the
-staged directory entry after `dir_register`) and `d69c2ab`
-(`f_write` flushes the FAT window before a direct data write).
-Both are stale-`fs->win` bugs. `canary --full` 28/28, `test.sh`
-57/57, a full `tar` create/list/extract round trip (regular files
-**and directory members**) silent with `rc=0` and matching
-contents, and the six-line redirect/tar matrix are green on a
-clean rebuild with the probes reverted. **This session is the
-`v0.6.19` documentation pass; the bump and tag happen when the
-user says so, and nothing is pushed until the user says so.**
-NEXT, if the user wants OS work, is item 10 (SSE), item 9
-(privilege model, with the "is this worth a session" note), or the
-two small syscall-completion fixes (`umask` 95, `mkdir`/`EEXIST`);
-otherwise treat any user-reported bug as a new task. Read
-`docs/contract.md` and this file's NEXT before any code.
+**`v0.6.19` is released (tag on `ba56b3d` = `origin/dev`); `dev` is
+at `201fac1`, ahead 92, clean, no stash, 35 scratch tags, nothing
+pushed. `PATH` is exported (`a6b5511`); the clock is correct
+(`201fac1` -- honest UTC epoch, `TZ=EST5EDT,M3.2.0,M11.1.0`,
+`FEATURE_TIMEZONE=y`; `date` prints real US-Eastern).
+`tools/coreutils_sweep.exp` PASS=100 FAIL=0 XFAIL=0 OBSERVE=5;
+`canary --full` 28/28, `test.sh` 57/57, `EXEC_CHURN` ALL-PASS.
+**NEXT: user's choice.** Do not move to `v0.6.20` until the user
+says so.**

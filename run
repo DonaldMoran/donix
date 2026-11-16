@@ -44,7 +44,7 @@ CAPTURE=capture.txt
 # diagnosis.
 DEFAULT_MODE=clean-nofreeze
 
-MODES=(clean-nofreeze nofreeze sdl gtk headless debug monitor int verbose clean-sdl clean-headless tcg tcg-debug)
+MODES=(clean-nofreeze nofreeze sdl gtk headless telnet telnet-lan debug monitor int verbose clean-sdl clean-headless tcg tcg-debug)
 
 # ---- build + stage ---------------------------------------------------
 build() {
@@ -105,6 +105,16 @@ mode_qemu() {
         sdl)            echo "$base -display sdl" ;;
         gtk)            echo "$base -display gtk" ;;
         headless)       echo "$base -display none" ;;
+        telnet)         echo "qemu-system-x86_64 \
+    -drive file=$IMG,format=raw,if=ide,index=0 \
+    -enable-kvm -cpu host \
+    -serial telnet:127.0.0.1:45456,server,nowait \
+    -s -monitor none -no-reboot -no-shutdown -display none" ;;
+        telnet-lan)     echo "qemu-system-x86_64 \
+    -drive file=$IMG,format=raw,if=ide,index=0 \
+    -enable-kvm -cpu host \
+    -serial telnet:0.0.0.0:45456,server,nowait \
+    -s -monitor none -no-reboot -no-shutdown -display none" ;;
         debug)          echo "$base -display sdl -S" ;;
         monitor)        echo "$base -display sdl -monitor unix:/tmp/donix-mon,server,nowait" ;;
         int)            echo "$base -display none -d int" ;;
@@ -124,6 +134,8 @@ mode_desc() {
         sdl)            echo "SDL window, incremental         fault freezes" ;;
         gtk)            echo "GTK window, incremental         fault freezes" ;;
         headless)       echo "no display, incremental        fault freezes" ;;
+        telnet)         echo "telnet console 127.0.0.1:45456  connect: telnet 127.0.0.1 45456 (console NOT in capture.txt)" ;;
+        telnet-lan)     echo "telnet on 0.0.0.0:45456          NO AUTH, NO ENCRYPTION; needs DONIX_ALLOW_LAN=1" ;;
         debug)          echo "SDL, QEMU waits for gdb (-S)   fault freezes, break before boot" ;;
         monitor)        echo "SDL + monitor socket           unix:/tmp/donix-mon" ;;
         int)            echo "no display, interrupt log      -d int (into capture.txt)" ;;
@@ -150,6 +162,29 @@ show_menu() {
     printf "choose [1-%d]: " "${#MODES[@]}"
 }
 
+# ---- LAN guard -------------------------------------------------------
+# telnet-lan binds 0.0.0.0:45456, which is an UNAUTHENTICATED root
+# console on the network.  It refuses to start unless the user opts in
+# explicitly.  telnet (loopback) is unaffected.
+mode_guard() {
+    if [ "$1" != "telnet-lan" ]; then return 0; fi
+    if [ "${DONIX_ALLOW_LAN:-0}" != "1" ]; then
+        echo "run: REFUSING telnet-lan: binds 0.0.0.0:45456 with NO auth, NO encryption."
+        echo "run: set DONIX_ALLOW_LAN=1 to allow it (LAN use only; prefer an SSH tunnel)."
+        return 1
+    fi
+    echo "WARNING: telnet-lan binds 0.0.0.0:45456 -- NO auth, NO encryption; LAN use only."
+    return 0
+}
+
+# Repeated inside the capture group so capture.txt records that this
+# boot was LAN-exposed.
+mode_lan_banner() {
+    if [ "$1" = "telnet-lan" ]; then
+        echo "run: WARNING this boot bound 0.0.0.0:45456 (no auth, no encryption)"
+    fi
+}
+
 # ---- run -------------------------------------------------------------
 # The entire body -- echoes, build, QEMU -- is inside one `2>&1 | tee`,
 # so capture.txt is the full transcript, build output included.
@@ -158,11 +193,13 @@ show_menu() {
 run_mode() {
     local name=$1
     local q c
+    mode_guard "$name" || exit 3
     q=$(mode_qemu "$name") || { echo "run: unknown mode '$name'"; exit 2; }
     c=$(mode_clean "$name")
     {
         echo "run: mode=$name${c:+ (clean build)}"
         echo "run: $(date '+%Y-%m-%d %H:%M:%S')"
+        mode_lan_banner "$name"
         build "$c"
         echo "run: $q"
         echo "run: capture -> $CAPTURE;  gdb: target remote :1234"
