@@ -68,8 +68,12 @@ That's the point. That's the whole point.
   `unlinkat`, `rmdir`, `uname`, `readv`, `writev`, `readlink`,
   `symlink`, `chmod`, `fchmod`, `chown`, `fchown`,
   `clock_gettime`, `nanosleep`, `ioctl` (`TIOCGWINSZ`), `kill`,
-  `tgkill`, `tkill`, `getpgid`, `getpgrp`, `setpgid`,
-  `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` -
+  `tgkill`, `tkill` (200), `getpgid`, `getpgrp`, `setpgid`,
+  `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `flock` (73),
+  `fsync` (74), `fdatasync` (75), `link` (86), `times` (43),
+  `getrusage` (98), `umask` (95), `sync` (162), `set_tid_address`
+  (218), `gettimeofday` (96), `time` (201), `sched_getaffinity`
+  (204) -
   the numbers
   and semantics match Linux x86_64. musl's `printf`, `malloc`, and
   `opendir` work unmodified.
@@ -94,10 +98,20 @@ That's the point. That's the whole point.
   `stty`, `arch`, `mktemp`, `sleep`, `usleep`, `truncate`, `env`,
   `printenv`, `bc`, `dc`, `diff`, `du`, `awk`, `tar` - run
   in-process via standalone mode, and `/bin/busybox` is a real path
-  on the image. It forks and execs external binaries, and it shares
-  the working directory with the rest of the system. This is the
-  strongest evidence that the syscall ABI is right - busybox expects
-  a real Unix kernel underneath it, and on donix it gets one.
+  on the image. Beyond that core set, `v0.6.20` adds a broad
+  FAT-coreutils group the automated sweep verifies (100 applet rows):
+  `flock`, `shred`, `nproc`, `patch`, `dos2unix`, `unix2dos`,
+  `timeout`, the `date`/`time`/`uptime` trio, `logname`/`hostid`,
+  `sync`/`fsync`, the `sha*sum`/`cksum`/`crc32` hash-and-checksum
+  group, `id`/`groups`/`whoami`, `split`, `strings`, `tree`, `which`,
+  `pidof`, `nohup`, `shuf`, `base32`/`base64`/`uuencode`, and the
+  interactive `ed`/`xargs`/`less`/`more`/`hexedit`.  **The authority
+  for the applet set is `tools/coreutils_sweep.exp`**, not this prose;
+  a hardcoded list in a README drifts. It forks and execs external
+  binaries, and it shares the working directory with the rest of the
+  system. This is the strongest evidence that the syscall ABI is
+  right - busybox expects a real Unix kernel underneath it, and on
+  donix it gets one.
 - **Handles signals.** `kill`, `tgkill`, and `tkill` raise;
   `rt_sigaction` installs a disposition (`SIG_DFL`, `SIG_IGN`, or
   a handler and restorer); the handler runs and `rt_sigreturn`
@@ -118,8 +132,20 @@ That's the point. That's the whole point.
   `SIGTSTP` stop, `SIGCONT` resumes, and `wait4` reports a stopped
   child (`WUNTRACED`); `^C` delivers `SIGINT` to the foreground
   process group, `^Z` stops the foreground child, `jobs` lists it,
-  and `fg`/`bg` resume and continue it.  Remaining kernel limits
-  (SSE state, privilege model) are in `docs/open-issues.md`.
+  and `fg`/`bg` resume and continue it.  This holds over the
+  framebuffer console and over the serial/telnet transports alike
+  (`v0.6.20`: a 64-byte RX ring on the 100 Hz tick consumes `0x03`
+  and `0x1A` and raises them through the deferred console path).
+  Remaining kernel limits (SSE state, privilege model) are in
+  `docs/open-issues.md`.
+- **Keeps an honest clock.** The MC146818A RTC is read at boot into a
+  true UTC epoch (`run` uses QEMU's `base=utc`), and the shell's
+  default environment carries `TZ=EST5EDT,M3.2.0,M11.1.0` with
+  `CONFIG_FEATURE_TIMEZONE=y`, so `date` prints real US-Eastern with
+  the right label (`EST` in winter, `EDT` in summer), the boot line's
+  `UTC` is the real UTC, and `touch -d '<date>'; stat -c %y` round-trips.
+  `TZ` is hardcoded to US-Eastern; making it settable is a recorded
+  follow-up in `docs/open-issues.md`.
 - **Lists processes.** `ps` works: it reads `/proc`, and prints a
   process table with pid, user, vsize, state, and command - for
   `idle`, `musl_sh`, `busybox`, and every process you start.
@@ -129,15 +155,15 @@ That's the point. That's the whole point.
   per-process fields. (See "Synthesizes `/dev` and `/proc`", below,
   for what `/proc` does *not* do yet.)
 - **Has a real terminal on a linear framebuffer.** The console is a
-  VT100 emulator drawing on a 1024Ă—768 VBE linear framebuffer, with
-  **Terminus 10Ă—18** text (OFL-1.1) rendered unscaled - 102 columns
+  VT100 emulator drawing on a 1024×768 VBE linear framebuffer, with
+  **Terminus 10×18** text (OFL-1.1) rendered unscaled - 102 columns
   by 42 rows. Full CSI parsing, cursor addressing, SGR colors, the
   erase, insert, and delete families, and a software alternate
   screen. Full-screen software gets what it expects: `vi don.txt`
   fills the screen, edit, `:wq`, then `cat don.txt` reads it back.
   The framebuffer was chosen over VGA text mode because VGA text is
   hard to read in a half-screen window on a modern display; the
-  console grid is 102Ă—42 instead of 80Ă—25.
+  console grid is 102×42 instead of 80×25.
 - **Has a second, real shell.** Typing `exit` at the busybox `$`
   prompt returns you to `musl_sh`, the project's own shell, with its
   own `cd`, `pwd`, and `exit` builtins and a `donix> ` prompt. It
@@ -146,7 +172,10 @@ That's the point. That's the whole point.
   redirection and pipelines work at `donix>` directly, not only in
   `ash`. `cat hello-world.txt | head -n 2`, `echo hi > out.txt`, and
   `echo a && echo b` all behave. `cat hello-world.txt` prints the
-  file; `echo hi` prints `hi`; `ls` lists the FAT volume.
+  file; `echo hi` prints `hi`; `ls` lists the FAT volume.  `musl_sh`
+  exports `PATH=/bin:/usr/bin` (so `printenv PATH` prints it) and the
+  clock's `TZ`; it builds each child's environment from its own
+  `default_envp`, so those reach every process it execs.
 - **Is small enough to read.** The whole kernel is a few thousand lines
   of C and assembly. The boot chain is under 400 lines. The userland
   tree is a few dozen short C files. There is no build system you
@@ -159,7 +188,7 @@ That's the point. That's the whole point.
   `/dev/null` across `open`, `stat`, and `access` (`2>/dev/null`
   works); `/proc/self/status`, which reads back five real
   per-process fields; `/dev/console`; and
-  `/proc/self/fd/0`â€“`2`, whose `readlink` target is
+  `/proc/self/fd/0`–`2`, whose `readlink` target is
   `/dev/console`.  The point of the last one is that
   `tty` now prints `/dev/console` instead of `not a tty` -
   `ttyname(3)`'s three gates all pass, including the one that
@@ -264,18 +293,14 @@ tracked config sets `CONFIG_STATIC=y`, `CONFIG_FEATURE_EDITING=y`,
 `CONFIG_FEATURE_EDITING_FANCY_PROMPT=y`,
 `CONFIG_FEATURE_SH_STANDALONE=y`, `CONFIG_FEATURE_HUMAN_READABLE=y`,
 `CONFIG_READLINK=y`, `CONFIG_LONG_OPTS=y`, `CONFIG_PS=y` (with
-`CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, `CONFIG_SHOW_USAGE=y`, and
+`CONFIG_FEATURE_PS_WIDE=y`), `CONFIG_PSTREE=y`, `CONFIG_SHOW_USAGE=y`,
+`CONFIG_FEATURE_TIMEZONE=y`, and
 `CONFIG_FEATURE_VI_WIN_RESIZE=y` (so `vi` fills the framebuffer
 console). It also enables the `bc`, `dc`, `diff`, `du`, and `awk`
-applets, and `tar`.  (`tar` was briefly off at `v0.6.16` because
-its creation path wrote an empty archive: every FAT file reported
-`Inode: 0`, so busybox's self-archive check treated every member
-as the archive.  `76d66db` gives FAT a real `st_ino` -- necessary
-but not sufficient: the archive was still lost on create and short
-on list/extract because of two vendored-FatFs `fs->win` flush bugs
-(`a0664a8`, `d69c2ab`).  `tar -cvf`/`-tvf`/`-xvf` now round-trip,
-including directory members, and `tar -tvf` records a symlink as
-`lrwxrwxrwx ... -> target`.  Detail in `docs/open-issues.md`.)
+applets, and `tar`.  `tar -cvf`/`-tvf`/`-xvf` round-trip, including
+directory members and symlink records; the `v0.6.16`-era empty-archive
+bug and its two vendored-FatFs flush fixes are recorded in
+`docs/open-issues.md`, not restated here.
 
 ---
 
@@ -411,7 +436,7 @@ userland/musl/          musl userland source tree
                         at_step1/2, pipe_step1-3b, envp_step1,
                         fcntl_lowfd, musl_exec2, musl_min, proc_dir,
                         proc_stat, proc_walk, mmap_stress, exec_churn,
-                        ...)
+                        test_sync, ...)
   Makefile              builds every .c into build/*.elf; also builds
                         busybox from source
 configs/                tracked build configs (busybox.config)
@@ -448,7 +473,7 @@ not reach into `userland/musl/`; the image Makefile invokes
     attempts.  Recent sessions in full; older ones indexed.  Not a
     second commit record — `git log` and the `v*` tag annotations
     carry that.
-  - `docs/migration-history.md` - the A1â€“A6 migration from dons-os
+  - `docs/migration-history.md` - the A1–A6 migration from dons-os
     (newlib) to musl, step by step.
   - `docs/dons-os-history.md` - the pre-fork dons-os version-by-version
     story.
