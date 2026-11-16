@@ -16,6 +16,7 @@ static char* const default_envp[] = {
     (char*)"HOME=/root",
     (char*)"TERM=linux",
     (char*)"PATH=/bin:/usr/bin",
+    (char*)"TZ=EST5EDT,M3.2.0,M11.1.0",
     (char*)0
 };
 

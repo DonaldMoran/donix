@@ -52,14 +52,15 @@ It is in the `v0.6.20` summary source.
 
 ## START HERE
 
-**The next session is the `TZ` / timezone item.** `PATH` is resolved
-(the shell exports `PATH=/bin:/usr/bin`; `printenv PATH` prints it;
-`canary --full` 28/28 with the flipped `printenv PATH is exported`
-row). The remaining time work is making `date` print a real zone
-label instead of `UTC`: add `TZ=EST5EDT` to `musl_sh.c`'s
-`default_envp` and flip `CONFIG_FEATURE_TIMEZONE=y` in
-`configs/busybox.config` (both are needed -- with the busybox bit
-off, `date` cannot honor `TZ`). See `open-issues.md`.
+**`PATH` and the clock are both resolved; the next session is
+whatever the user picks.** `PATH` is exported (`printenv PATH` =
+`/bin:/usr/bin`). The clock is correct: the RTC epoch is honest UTC
+(`run` uses QEMU's `base=utc` default), `date` prints real US-Eastern
+(`EST5EDT,M3.2.0,M11.1.0` in `musl_sh.c`'s `default_envp`, with
+`CONFIG_FEATURE_TIMEZONE=y`), and `touch -d`/`stat` round-trip. The
+`-rtc base=localtime` flag (`d9df0bc`) was a label workaround and is
+removed. `TZ` is hardcoded US-Eastern; making it settable is open.
+See `open-issues.md`.
 
 ---
 

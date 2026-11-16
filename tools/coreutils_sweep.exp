@@ -326,7 +326,7 @@ catch {exec rm -f /tmp/donix-ctrlc.sock}
 # QEMU flags mirrored from run's qemu_base(), with the serial on a socket.
 spawn qemu-system-x86_64 \
     -drive "file=05_boot_kernel64/hdd-single.img,format=raw,if=ide,index=0" \
-    -enable-kvm -cpu host -rtc base=localtime \
+    -enable-kvm -cpu host \
     -serial unix:/tmp/donix-ctrlc.sock,server,nowait \
     -monitor none -no-reboot -no-shutdown -display none
 set qemu_pid [exp_pid $spawn_id]

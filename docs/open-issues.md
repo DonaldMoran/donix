@@ -440,26 +440,29 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
   this session** -- several `.exp` writes never reached the guest.
   For anything that matters, prefer `./run telnet` or a UNIX socket.
 
-- **No timezone: `date` prints the host's local time labeled
-  `UTC`.** The RTC reads the CMOS and reports the epoch second
-  count; the C library prints that as `UTC` because donix has no
-  `TZ` and no `/usr/share/zoneinfo`.  `run` passes
-  `-rtc base=localtime` (`20261106-rtc-localtime`), so the RTC
-  carries the host's local time and the guest's `date` shows the
-  same wall time the host does -- mislabeled `UTC` because the
-  label is the absent TZ.  This matches a real PC's CMOS, which
-  is localtime by default.  **Mechanism (corrected 2026-11-16):
-  the fix is `TZ=EST5EDT` in `musl_sh.c`'s `default_envp`, not
-  `kmain.c` frame work.** The initial `musl_sh` frame is
-  `argc=0`/`envp=NULL`, but `musl_sh` is `int main(void)` and
-  passes `default_envp` to every child it execs, so a `TZ`
-  entry propagates exactly as `PATH` did.  **Both** halves are
-  needed: `TZ=EST5EDT` in `default_envp`, and
-  `CONFIG_FEATURE_TIMEZONE=y` in `configs/busybox.config` -- with
-  the busybox bit off (`libbb/time.c` gates its `localise:` path
-  on `ENABLE_FEATURE_TIMEZONE`), `date` cannot honor `TZ` at all.
-  musl parses the POSIX `TZ` string without a zoneinfo file, so
-  `EST5EDT` needs no `/usr/share/zoneinfo`.
+- **RESOLVED (2026-11-16): the clock is honest and `date` shows
+  real US-Eastern.** Three coupled changes. (1) `run` drops
+  `-rtc base=localtime` from all six QEMU invocations (and the
+  sweep's mirrored boot), restoring QEMU's `base=utc` default.
+  The localtime flag (`d9df0bc`) was a label workaround: it made
+  the CMOS carry local time, so `g_rtc_epoch_offset` was a
+  local-time epoch. Once `TZ` existed, `date` subtracted the
+  offset a second time (printed `05:3x` for a real `09:3x`).
+  With `base=utc` the epoch is true UTC -- verified by
+  `RTC: boot epoch = 1794840284 (2026-11-16 14:44:44 UTC)` = real
+  UTC for a `09:44 EST` host. (2) `musl_sh.c`'s `default_envp`
+  carries `TZ=EST5EDT,M3.2.0,M11.1.0` -- the explicit US DST
+  rule. The bare `EST5EDT` mislabeled Nov 16 as `EDT` (applying
+  -4 instead of -5); the rule string fixes the transition. musl
+  parses this POSIX string without a zoneinfo file, so no
+  `/usr/share/zoneinfo` is needed. (3) `configs/busybox.config`
+  sets `CONFIG_FEATURE_TIMEZONE=y` so `date`/`stat` honor `TZ`
+  (`libbb/time.c` gates its `localise:` path on it). `date` now
+  prints `Mon Nov 16 09:43:34 EST`, matching the host;
+  `touch -d '2020-01-01 12:34:56'` round-trips as
+  `12:34:56 -0500`. Known limitation: `TZ` is hardcoded
+  US-Eastern; a future change should make it settable (e.g. a
+  staged `/etc/TZ` or an inherited-env fallback).
 
 - **RESOLVED (2026-11-16): the shell exports `PATH`.**
   `musl_sh.c`'s `default_envp` now carries `PATH=/bin:/usr/bin`, so
