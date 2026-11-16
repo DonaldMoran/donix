@@ -75,8 +75,8 @@
  * than a pipe buffer cannot deadlock.  The output of every row here
  * is far under 64 KB.
  * ------------------------------------------------------------------ */
-static int run_capture(char* const argv[], char* out, size_t out_cap,
-                       int merge_stderr) {
+static int run_capture(char* const argv[], char* const envp[], char* out,
+                       size_t out_cap, int merge_stderr) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
 
@@ -92,7 +92,7 @@ static int run_capture(char* const argv[], char* out, size_t out_cap,
         dup2(fds[1], 1);
         if (merge_stderr) dup2(fds[1], 2);
         if (fds[1] != 1) close(fds[1]);
-        execve(argv[0], argv, (char**)0);
+        execve(argv[0], argv, (char* const*)envp);
         /* execve failed: caller sees exit 127 and empty output */
         _exit(127);
     }
@@ -163,7 +163,7 @@ static void check(const char* label, char* const argv[],
     static char out[8192];
     out[0] = '\0';
 
-    int rc = run_capture(argv, out, sizeof(out), merge_stderr);
+    int rc = run_capture(argv, (char* const*)0, out, sizeof(out), merge_stderr);
 
     int ok = (rc == 0);
     const char* missing = NULL;
@@ -358,16 +358,14 @@ static void run_readonly(void) {
                NULL, NULL, w, 0);
     }
 
-    /* --- $PATH is not exported by ash (recorded, not a bug) --------- */
+    /* --- $PATH is exported to child processes (flipped 2026-11-16) -- */
     /*
-     * busybox printenv PATH prints nothing because ash keeps PATH as
-     * a shell variable and does not export it.  This row asserts that
-     * THE OUTPUT IS EMPTY -- it is the one row where "no output" is
-     * the pass.  printenv exits 1 when the variable is unset, so
-     * "success" here means exit 0 OR 1 with empty output.
-     *
-     * If it ever prints a path, ash started exporting PATH and the
-     * handoff's note should be updated.
+     * The shell's default environment now includes PATH=/bin:/usr/bin,
+     * so busybox printenv PATH prints that path and exits 0.  This row
+     * asserts THE OUTPUT IS NON-EMPTY and exit 0 -- the inverse of the
+     * tripwire it used to be.  The child is given an explicit PATH
+     * environment here (run_capture now takes an envp) so the row does
+     * not depend on the parent shell's env.
      */
     {
         static char out[512];
@@ -377,16 +375,17 @@ static void run_readonly(void) {
         argv[1] = (char*)"printenv";
         argv[2] = (char*)"PATH";
         argv[3] = NULL;
-        int rc = run_capture(argv, out, sizeof(out), 0);
+        static char* const penv[] = { (char*)"PATH=/bin:/usr/bin", (char*)0 };
+        int rc = run_capture(argv, penv, out, sizeof(out), 0);
         size_t l = strlen(out);
         while (l > 0 && (out[l-1] == '\n' || out[l-1] == '\r'))
             out[--l] = '\0';
-        int ok = (l == 0) && (rc == 0 || rc == 1);
+        int ok = (l > 0) && (rc == 0);
         if (ok) {
-            printf("ok   printenv PATH is empty (ash does not export PATH)\n");
+            printf("ok   printenv PATH is exported\n");
             g_pass++;
         } else {
-            printf("FAIL printenv PATH is empty (ash does not export PATH)\n");
+            printf("FAIL printenv PATH is empty or missing\n");
             printf("       exit %d, output \"%s\"\n", rc, out);
             g_fail++;
         }
@@ -408,7 +407,7 @@ static void run_readonly(void) {
 static void expect_nonzero(const char* label, char* const argv[]) {
     static char out[2048];
     out[0] = '\0';
-    int rc = run_capture(argv, out, sizeof(out), 1);
+    int rc = run_capture(argv, (char* const*)0, out, sizeof(out), 1);
     if (rc != 0) {
         printf("ok   %s (exit %d, as expected)\n", label, rc);
         g_pass++;

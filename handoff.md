@@ -52,12 +52,14 @@ It is in the `v0.6.20` summary source.
 
 ## START HERE
 
-**The next session is the `env` / `PATH` gap.**
-`printenv PATH` is currently empty because `ash` does not export `PATH`
-(asserted by `canary.c`'s `printenv PATH is empty` check). Evaluate
-whether `PATH` should be exported by default (which requires updating
-`canary.c`), or if the current unexported behavior is the intended
-donix design. See `open-issues.md`.
+**The next session is the `TZ` / timezone item.** `PATH` is resolved
+(the shell exports `PATH=/bin:/usr/bin`; `printenv PATH` prints it;
+`canary --full` 28/28 with the flipped `printenv PATH is exported`
+row). The remaining time work is making `date` print a real zone
+label instead of `UTC`: add `TZ=EST5EDT` to `musl_sh.c`'s
+`default_envp` and flip `CONFIG_FEATURE_TIMEZONE=y` in
+`configs/busybox.config` (both are needed -- with the busybox bit
+off, `date` cannot honor `TZ`). See `open-issues.md`.
 
 ---
 

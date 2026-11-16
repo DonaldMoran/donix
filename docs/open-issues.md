@@ -441,29 +441,36 @@ bound, or walk `elf_page_list` and unmap by VA from the list itself.
   For anything that matters, prefer `./run telnet` or a UNIX socket.
 
 - **No timezone: `date` prints the host's local time labeled
-  `UTC`.** The RTC work reads the CMOS and reports the epoch
-  second count; the C library prints that as `UTC` because
-  donix has no `TZ` and no `/usr/share/zoneinfo`.  `run` now
-  passes `-rtc base=localtime` (`20261106-rtc-localtime`), so
-  the RTC carries the host's local time and the guest's `date`
-  shows the same wall time the host does -- mislabeled
-  `UTC` because the label is the absent TZ.  This matches a
-  real PC's CMOS, which is localtime by default.  The proper
-  fix is a TZ in the shell's envp: `load_elf_into_user_process`
-  in `kmain.c` builds the initial `musl_sh` frame with
-  `argc=0`, `argv=NULL`, `envp=NULL` -- the shell has no
-  environment, and the envp propagates through `musl_sh`'s
-  `execve` of busybox.  Setting `TZ=EST5EDT` (musl parses the
-  POSIX TZ string without a zoneinfo file) needs the same
-  argv/envp frame layout as `sys_execve`'s section 6 -- ~80
-  lines.  Own session.  **The same frame is the `PATH` gap below.**
+  `UTC`.** The RTC reads the CMOS and reports the epoch second
+  count; the C library prints that as `UTC` because donix has no
+  `TZ` and no `/usr/share/zoneinfo`.  `run` passes
+  `-rtc base=localtime` (`20261106-rtc-localtime`), so the RTC
+  carries the host's local time and the guest's `date` shows the
+  same wall time the host does -- mislabeled `UTC` because the
+  label is the absent TZ.  This matches a real PC's CMOS, which
+  is localtime by default.  **Mechanism (corrected 2026-11-16):
+  the fix is `TZ=EST5EDT` in `musl_sh.c`'s `default_envp`, not
+  `kmain.c` frame work.** The initial `musl_sh` frame is
+  `argc=0`/`envp=NULL`, but `musl_sh` is `int main(void)` and
+  passes `default_envp` to every child it execs, so a `TZ`
+  entry propagates exactly as `PATH` did.  **Both** halves are
+  needed: `TZ=EST5EDT` in `default_envp`, and
+  `CONFIG_FEATURE_TIMEZONE=y` in `configs/busybox.config` -- with
+  the busybox bit off (`libbb/time.c` gates its `localise:` path
+  on `ENABLE_FEATURE_TIMEZONE`), `date` cannot honor `TZ` at all.
+  musl parses the POSIX `TZ` string without a zoneinfo file, so
+  `EST5EDT` needs no `/usr/share/zoneinfo`.
 
-- **The shell does not export `PATH`.** `env | wc -l` is 2 and
-  `printenv PATH` is empty, because the initial `musl_sh` frame has
-  `envp = NULL`.  This is an environment gap, not a syscall gap, and
-  it lands in the same `kmain.c` frame code as the TZ item.  One
-  session can do both; it needs the `sys_execve` section-6 argv/envp
-  layout.
+- **RESOLVED (2026-11-16): the shell exports `PATH`.**
+  `musl_sh.c`'s `default_envp` now carries `PATH=/bin:/usr/bin`, so
+  `printenv PATH` prints it and `canary --full` is 28/28 with the
+  row flipped to `printenv PATH is exported`.  Mechanism note: the
+  initial `musl_sh` frame is `argc=0`/`envp=NULL` (`kmain.c`),
+  but `musl_sh` is `int main(void)` and builds every child's
+  environment from `default_envp` -- the inherited envp is never
+  consulted.  No `kmain.c` frame work was needed.  `canary.c`'s
+  `run_capture` also gained an `envp` parameter so the row passes
+  an explicit environment (`NULL` from the two unrelated callers).
 
 - `kill(0, sig)` ("my group") still returns `-EINVAL`.
   `kill(-pgid, sig)` works (`9b1a4ed`).
